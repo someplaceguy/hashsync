@@ -4,7 +4,9 @@ This file is the design specification of `hashsync`. Contributors and AI agents
 follow it and update it when the design changes. Section 10 logs rejected and
 reverted decisions; section 12 lists the open questions.
 
-Status (2026-09-10): design stage. No code exists yet.
+Status (2026-09-10): design stage. No code exists yet. The implementation
+language is Rust. An earlier version of this document, from the same day,
+targeted Go (section 10).
 
 ## 1. Purpose
 
@@ -18,8 +20,10 @@ host already holds in indexed files, in any order and at any alignment: for
 example a package tree or an archive stream produced after a rebuild in which
 most files did not change.
 
-The program is written in Go. One binary contains both roles: the local side
-and the remote side. The local side starts the remote side through `ssh`.
+The program is written in Rust. One binary contains both roles: the local side
+and the remote side. The local side starts the remote side through `ssh`. The
+program uses threads and blocking system calls for parallelism. It has no
+asynchronous runtime and no event loop (section 4.6).
 
 ## 2. Terminology
 
@@ -83,7 +87,8 @@ and the remote side. The local side starts the remote side through `ssh`.
    (section 6.4).
 8. The remote sends the resolved output over the data session, in order: literal
    runs, and one reference for each window that got a "yes". A window that got a
-   "no" is sent as literal bytes.
+   "no" is scanned again from its second byte (section 6.3); the bytes that no
+   later window covers are sent as literals.
 9. The local writes literal runs, pinned block bytes, and synthesized runs to
    its stdout, in order.
 10. When the command exits, the remote sends the exit status. The local exits
@@ -118,16 +123,27 @@ indexing, and weak hash collisions cost efficiency, never correctness.
   a run of one byte value as one RLE frame (section 6.3), so such blocks never
   need a lookup. This also removes the many rows that zero padding would
   produce.
+- Blocks with a short period are not stored either: a block whose bytes repeat
+  with a period `p` of 1 to 16 bytes (`block[p..] == block[..B - p]`; period 1
+  is the constant block above). zstd encodes such a window in a few bytes,
+  about the cost of a reference and without a query, so matching it gains
+  nothing. It also keeps periodic windows out of the remote's Blake3
+  computation: without such rows they miss the table (section 6.3). The bound
+  of 16 covers the usual fill patterns; it is an efficiency choice, not a
+  protocol constant.
 - Holes in sparse files are not read. A block that lies entirely inside a hole
   is neither read nor stored (section 4.5); it would be a constant block anyway.
 
 ### 4.2 Roots and change detection
 
 Roots come from `config.toml`. A root path can be a glob. Each match is its own
-root. The indexer expands globs at every update with `filepath.Glob`, so the syntax
-is that of Go's `filepath.Match`. Note that `*` also matches names that start
-with a dot: `/nix/store/*` matches `/nix/store/.links`. Use `exclude` for such
-entries. A root that is a regular file is indexed as that single file.
+root. The indexer expands globs at every update with the `glob` crate
+(`glob::glob_with`, section 9). The match options are
+`require_literal_separator = true`, so that `*` and `?` never match a `/`, and
+the crate's default `require_literal_leading_dot = false`, so that `*` also
+matches names that start with a dot: `/nix/store/*` matches
+`/nix/store/.links`. Use `exclude` for such entries. `**` matches any number of
+path components. A root that is a regular file is indexed as that single file.
 
 Roots are opened by path at every update. Together with the SQLite file and the
 `ssh` processes, this is the only path-based filesystem access of the program
@@ -140,7 +156,8 @@ Mutable root (`immutable = false`, the default):
   inode row. If both are equal, the file is not read again. Otherwise the
   indexer hashes the whole file and replaces all its block rows. This is the
   only criterion for hashing a file again.
-- Path rows under the root that the traversal did not see are deleted.
+- Path rows under the root that the traversal did not see are deleted
+  (section 4.6).
 
 Immutable root (`immutable = true`):
 
@@ -168,10 +185,11 @@ design principle in section 3). Choose immutable roots accordingly.
 
 Per-root options:
 
-- `exclude`: glob patterns in the same syntax. A pattern that starts with `/`
-  is matched against the absolute path of an entry, including the glob matches
-  of `path` themselves; any other pattern is matched against the base name.
-  Matching entries and everything below them are skipped.
+- `exclude`: glob patterns in the same syntax and with the same match options
+  (`glob::Pattern::matches_with`). A pattern that starts with `/` is matched
+  against the absolute path of an entry, including the glob matches of `path`
+  themselves; any other pattern is matched against the base name. Matching
+  entries and everything below them are skipped.
 - `one_filesystem`: do not cross mount points. An entry whose `stx_mnt_id`
   differs from its parent's is skipped, together with everything below it.
 
@@ -185,21 +203,24 @@ deletion. The index therefore identifies:
 - A **filesystem** by the UUID that the `FS_IOC_GETFSUUID` ioctl returns
   (Linux 6.9 and newer). The request is `_IOR(0x15, 0, struct fsuuid2)` with
   `struct fsuuid2 { u8 len; u8 uuid[16]; }`, which is `0x80111500` on amd64
-  and arm64. `golang.org/x/sys/unix` (v0.48.0) has no constant for it; define
-  the number and the 17-byte struct in the project and call it through
-  `unix.Syscall(unix.SYS_IOCTL, ...)`. A filesystem that does not implement the
-  ioctl (`ENOTTY`) falls back to its mount id from `statx` (`stx_mnt_id`; the
-  program requests `STATX_MNT_ID_UNIQUE`, and a kernel before 6.8 returns the
-  non-unique `STATX_MNT_ID` value and leaves the unique bit clear in
-  `stx_mask`), stored with a tag so that it cannot collide with a UUID. A
-  mount id is not stable across boots, so such a filesystem is indexed again
-  after a reboot.
+  and arm64. No crate defines the request number (checked: `rustix` 1.1.4,
+  `libc` 0.2.189, `linux-raw-sys` 0.12.1; the last one defines the struct).
+  Build the opcode in the project with
+  `rustix::ioctl::opcode::read::<fsuuid2>(0x15, 0)` and call it through
+  `rustix::ioctl::ioctl` with a `Getter` (section 9). A filesystem that does
+  not implement the ioctl (`ENOTTY`) falls back to its mount id from `statx`
+  (`stx_mnt_id`; the program requests `STATX_MNT_ID_UNIQUE`, and a kernel
+  before 6.8 returns the non-unique `STATX_MNT_ID` value and leaves the unique
+  bit clear in `stx_mask`), stored with a tag so that it cannot collide with a
+  UUID. A mount id is not stable across boots, so such a filesystem is indexed
+  again after a reboot.
 - An **inode** by the file handle that `name_to_handle_at` returns
-  (`unix.NameToHandleAt`). The handle is unique within its filesystem and
-  persistent, and it includes the inode generation, so a reused inode number
-  gets a different handle. Handles are opaque byte strings of up to 128 bytes,
-  usually 8 to 40. If the filesystem does not support handles (`EOPNOTSUPP`),
-  fall back to the inode number from `statx`, stored with a tag.
+  (`libc::name_to_handle_at`; `rustix` has no wrapper). The handle is unique
+  within its filesystem and persistent, and it includes the inode generation,
+  so a reused inode number gets a different handle. Handles are opaque byte
+  strings of up to 128 bytes (`MAX_HANDLE_SZ`), usually 8 to 40. If the
+  filesystem does not support handles (`EOPNOTSUPP`), fall back to the inode
+  number from `statx`, stored with a tag.
 
 The index assigns a 64-bit integer id to every filesystem and to every inode and
 uses these ids as foreign keys. The pair `(fs_id, handle)` is unique.
@@ -252,11 +273,20 @@ Rules:
   entries. Identical blocks (for example zero blocks) legitimately share one
   weak value; the lookup uses `LIMIT` and stops at the first candidate that
   verifies, so their number does not matter.
-- Store `weak` as the int64 bit pattern of the uint64 value.
+- Store `weak` as the `i64` bit pattern of the `u64` value (`weak as i64`).
 - Only inodes with at least one stored block have rows (sections 4.1 and 4.5).
 - Keep the Blake3 hash in the row, not in an index. It rejects stale candidates
   without disk reads. Option: store only the first 16 bytes; the verification
   still uses the full 32-byte hash from the query.
+- Give the writer's connection a large page cache (`PRAGMA cache_size`, about
+  256 MiB). The keys of `blocks_by_weak` are random, so every insert touches a
+  random page of that B-tree; once the tree outgrows the cache, every insert
+  costs a page read. Reader connections (section 4.6) keep a small cache; the
+  OS page cache holds the file for them.
+- `--rebuild` and the first build of an index insert the block rows without
+  `blocks_by_weak` and create the index at the end. An index built over the
+  finished table costs about a second per million rows; random inserts into a
+  B-tree that has outgrown the cache cost several microseconds each.
 - Expected size: about 55 bytes per block row plus about 20 bytes per index
   entry, about 75 bytes per block, or 0.23 % of the indexed data at 32 KiB
   blocks. A 256 GiB tree (8M blocks) needs about 600 MB.
@@ -265,42 +295,49 @@ Rules:
 
 ### 4.5 Traversal and hashing
 
-Follow the design of gdu (`pkg/analyze/parallel.go`, version 5.36.1): one
-goroutine per directory, limited by a semaphore of `2 * GOMAXPROCS`. Roots are
-scanned in parallel like any other directories.
+This section lists the system calls of the indexer. Section 4.6 says which
+threads run them.
 
 Descriptor-relative operations: apart from opening the roots, the SQLite file,
 and the `ssh` processes, every filesystem operation is relative to an open
 descriptor of a directory or a file. This removes the races of path-based
-traversal (renames, symlink swaps) and the cost of long path lookups.
+traversal (renames, symlink swaps) and the cost of long path lookups. The
+wrappers come from `rustix` and, for the few calls it lacks, from `libc`
+(section 9); all of them live in the `sys` module (section 11).
 
 - Directory: `openat(dirfd, name, O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC)`,
-  then `getdents64` on the descriptor (`(*os.File).ReadDir` on `os.NewFile(fd)`,
-  or `unix.Getdents`).
-- Every entry: `statx(dirfd, name, AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW,
+  then `getdents64` on the descriptor (`rustix::fs::RawDir` over a 64 KiB
+  buffer that the thread reuses). The entry type that `getdents64` returns
+  (`d_type`) decides without a `statx`: directories and regular files continue
+  below; symbolic links and everything else are skipped. A filesystem that
+  reports `DT_UNKNOWN` gets a `statx` for the type.
+- Every directory and every regular file:
+  `statx(dirfd, name, AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW,
   STATX_TYPE | STATX_SIZE | STATX_BLOCKS | STATX_CTIME | STATX_INO |
   STATX_MNT_ID_UNIQUE)`.
   Every `statx` call of the program uses these flags and this mask: with a name
   the call does not follow a final symlink, with an empty name it describes the
   descriptor itself, and `stx_mask` tells whether the kernel returned the unique
-  mount id. Skip everything that is not a directory or a regular file, regular
-  files smaller than `block_size`, and whatever `exclude` and `one_filesystem`
-  rule out.
+  mount id. Skip regular files smaller than `block_size`, and whatever
+  `exclude` and `one_filesystem` rule out.
 - Unchanged check for a regular file: `name_to_handle_at(dirfd, name, 0)` gives
-  the handle; look up `(fs_id, handle)` in the index; if `(size, ctime)` match,
-  record the path and stop. Optional shortcut: look the path up first and skip
-  the handle call when the path's inode row already matches.
+  the handle; look up `(fs_id, handle)` in the index through the thread's read
+  connection; if `(size, ctime)` match, send the path to the writer and stop.
 - Changed or new file: `openat(dirfd, name, O_RDONLY|O_NOFOLLOW|O_CLOEXEC)`, then
   `statx(fd, "", ...)` with the same flags and mask, and
-  `name_to_handle_at(fd, "", AT_EMPTY_PATH)` on the open descriptor, so that size, ctime, and handle
-  describe the object that is hashed. Read the file in `block_size` chunks with
-  `pread` into one reusable buffer per worker and compute the weak hash and
-  Blake3 for each block. A block whose bytes are all equal is skipped before
-  hashing (section 4.1); the check is a word-wise comparison against the first
-  byte.
+  `name_to_handle_at(fd, "", AT_EMPTY_PATH)` on the open descriptor, so that
+  size, ctime, and handle describe the object that is hashed. Read the file
+  with `pread` in chunks of up to 1 MiB into the thread's buffer (one system
+  call per 32 blocks instead of one per block) and compute the weak hash and
+  Blake3 of every complete block of the chunk. A block with a period of 1 to
+  16 bytes is skipped before hashing (section 4.1). The check for period `p`
+  is `block[p..] == block[..B - p]`, one vectorised `memcmp`; compare the
+  first 80 bytes first, so that the full comparisons run only on the rare
+  blocks whose prefix is periodic.
 - Sparse files: when `stx_blocks * 512 < size`, the file may have holes. Find
-  them with `lseek(SEEK_HOLE)` and `lseek(SEEK_DATA)` before reading. A hole
-  `[h0, h1)` makes the indexer skip every block `k` with `k * B >= h0` and
+  them with `lseek(SEEK_HOLE)` and `lseek(SEEK_DATA)` (`rustix::fs::seek` with
+  `SeekFrom::Hole` and `SeekFrom::Data`) before reading. A hole `[h0, h1)`
+  makes the indexer skip every block `k` with `k * B >= h0` and
   `(k + 1) * B <= h1`; these blocks get no rows. A block that overlaps a hole
   only partially is read in full, and the kernel returns zeros for the hole
   part. Example with `B` = 32 KiB: a hole from 10 KiB to 200 KiB skips blocks 1
@@ -311,28 +348,203 @@ traversal (renames, symlink swaps) and the cost of long path lookups.
   the procedure is safe everywhere.
 - Filesystem id: when an entry's `stx_mnt_id` differs from its parent's, call
   `FS_IOC_GETFSUUID` on the entry's descriptor (section 4.3).
-- Call `posix_fadvise(SEQUENTIAL)` before a file is read and
-  `POSIX_FADV_DONTNEED` after it is hashed. A full scan must not evict the page
-  cache of the whole machine.
+- Page cache: call `fadvise(SEQUENTIAL)` before a file is read. After a file is
+  hashed, call `fadvise(DONTNEED)` on it, unless the file was already fully in
+  the page cache before the read. A full scan must not evict the page cache of
+  the whole machine, but the files that a `run` will splice from (freshly built
+  outputs, for example) must not be evicted either. `cachestat` (Linux 6.5;
+  `libc::syscall(SYS_cachestat)`, no wrapper in `rustix` 1.1) counts the cached
+  pages of the file in one call; a file with all pages cached keeps them. When
+  the call fails with `ENOSYS`, always evict.
 
-Pipeline:
+### 4.6 I/O architecture
 
-- Directory walkers emit the regular files that need hashing.
-- Hashing workers (2 to 4 times `GOMAXPROCS`, bounded by `RLIMIT_NOFILE`
-  together with the walkers' directory descriptors) hash the files. SSDs profit
-  from this read parallelism.
-- One writer goroutine receives finished inodes and writes them in batched
-  transactions. SQLite allows one writer at a time; this design never contends
-  for the write lock.
-- Two in-memory sets per scan, both keyed by `(fs_id, inode number)`: visited
-  directories (cycle protection) and seen regular files (hard links).
+This section states how the indexer is parallelised and why. Constraints: no
+asynchronous runtime (no `async` functions, no executor, no futures); threads
+for parallelism; `io_uring` where it makes the program measurably faster.
+Asynchronous calls in the C sense (a function that runs on another thread and
+reports back, or a submission with a completion) are fine.
+
+#### Where the time goes
+
+Three kinds of work:
+
+1. **Metadata.** One `openat` and one `getdents64` per directory; one `statx`
+   per directory and per regular file; one `name_to_handle_at` and one index
+   lookup per regular file of at least `block_size`. With warm dentry and
+   inode caches this is 1 to 3 µs of kernel CPU per entry. With cold caches it
+   is disk latency: a directory costs a few reads of directory blocks, and a
+   group of neighbouring inodes costs one read of an inode-table block (ext4
+   and XFS read inodes in clusters). A read costs 50 to 200 µs on NVMe, so the
+   cold rate is the number of reads in flight divided by the latency.
+2. **Data.** For a new or changed file: open, `statx`, handle, reads, hashing,
+   close. Per core, Blake3 runs at 3 to 7 GB/s on 32 KiB inputs, the weak hash
+   at 1 to 4 GB/s (k streams, section 5.1), the constant-block check near
+   memory speed, and the copy out of the page cache at about 10 GB/s. All
+   together about 1 GB/s per core, up to 2 GB/s with AVX-512. An NVMe device
+   delivers 3 to 7 GB/s when it has 32 or more large requests in flight and
+   about 1 GB/s with one request in flight. From a warm page cache the machine
+   is CPU-bound; from disk it is disk-bound once 4 to 8 cores hash.
+3. **Rows.** The writer inserts one inode row and one path row per file and one
+   block row per 32 KiB. SQLite costs 1 to 2 µs per row with cached prepared
+   statements when the B-trees are in memory. Ten million rows cost 10 to 20 s
+   of one core: less than hashing 256 GiB from disk, about the same as hashing
+   it from the page cache on a machine with many cores. Section 4.4 gives the
+   rules that keep it there (large cache, deferred index). If the writer ever
+   is the bottleneck, the first lever is the 16-byte Blake3 (section 12), the
+   second is multi-row `INSERT` statements.
+
+In every case the unit of work is a file or a directory, and the work per unit
+is a few blocking system calls plus CPU time. A thread that blocks in the
+kernel costs nothing while it waits. This is why a pool of threads with plain
+blocking calls is the right tool; the rest of this section shapes that pool.
+
+#### The pool
+
+Follow the parallel walker of ripgrep and fd (`ignore::WalkParallel`, in
+`crates/ignore/src/walk.rs` of ripgrep 15.1.0):
+
+- A fixed number of threads. Each thread owns a LIFO deque of tasks
+  (`crossbeam_deque::Worker::new_lifo`) and steals the oldest task of another
+  thread when its own deque is empty. LIFO order makes each thread go
+  depth-first, so the number of pending tasks stays near `depth × fan-out`
+  instead of growing to the width of the tree; the comment in `ignore` calls a
+  breadth-first walk of a wide tree "disastrous". Stealing the oldest task
+  hands over a whole subtree, which keeps the threads balanced.
+- The per-file work runs on the same threads: ripgrep searches each file inside
+  the walk callback. fd sends its results to one output thread in batches over
+  a bounded `crossbeam-channel`.
+- The walk ends when every thread is idle at the same time (an active-thread
+  counter), not when a queue is empty, because a running task can still push
+  more tasks.
+
+hashsync applies this as follows:
+
+- One pool for walking and hashing. A task is either a directory or a file. A
+  directory task lists its entries and pushes one task per subdirectory and one
+  per file that needs hashing. Depth-first order hashes the files of a
+  directory right after listing it, while its inodes are hot in the cache.
+  Threads that wait for the disk and threads that hash overlap without any
+  scheduling logic.
+- A task carries the `Arc<OwnedFd>` of its parent directory and its name, and
+  opens its own descriptor when it runs. Queued tasks hold no descriptors; a parent's
+  descriptor lives until its last child task has opened its own. The open
+  descriptors are therefore bounded by the number of threads plus the parents
+  of the queued tasks, not by the queue length. The program raises the soft
+  `RLIMIT_NOFILE` to the hard limit at start anyway.
+- Thread count. ripgrep uses `available_parallelism` capped at 12 and fd caps
+  it at 64; both assume warm caches and CPU-bound work. hashsync's threads also
+  wait for the disk, and every waiting thread adds one request to the device
+  queue. Default: `4 × available_parallelism`, clamped to the range 16 to 64
+  (`threads` in the configuration, `-j` on the command line). More threads do
+  not help: a warm walk is CPU-bound, and an NVMe device reaches its rate at a
+  queue depth of 32 to 64.
+- Per-thread state, created once: a 64 KiB `getdents64` buffer, a 1 MiB read
+  buffer, a Blake3 hasher, and an SQLite read connection with cached prepared
+  statements (section 9). Readers never block the writer in WAL mode.
+- Two shared sets, keyed by `(fs_id, inode number)`: visited directories (cycle
+  protection) and seen regular files (hard links). Shard each into 64 mutexes
+  by inode number; there is no contention to speak of.
+- Implementation: a dedicated `rayon` pool (`ThreadPoolBuilder::num_threads`)
+  and `pool.scope` with one `spawn` per task. rayon's local deques are LIFO
+  (depth-first is its default; `breadth_first` is deprecated) and its stealers
+  take the oldest task, so it has exactly the schedule above, and it parks idle
+  threads on a futex where `ignore` polls every millisecond. Blocking system
+  calls inside the tasks are fine in a pool that runs nothing else. If rayon
+  ever gets in the way, the `Stack` of `ignore` on `crossbeam-deque` is about
+  150 lines.
+
+#### The writer
+
+One thread owns the write connection. It receives finished inodes and seen
+paths over a bounded channel (capacity in the thousands; when the writer lags,
+the pool blocks in `send`, which is the intended backpressure). It writes in
+`BEGIN IMMEDIATE` transactions and commits every few thousand inodes or every
+second, whichever comes first. Nothing else writes, so the write lock is never
+contended. Section 4.4 lists its pragmas.
+
+Deleted paths: for each mutable root of the current update, the writer keeps a
+set of 64-bit hashes of the relative paths it was told about. When the walk of
+the root ends, it streams the stored paths of the root and deletes the ones
+whose hash is not in the set. This costs 8 bytes per path and no write for an
+unchanged file. A hash collision keeps a stale path row, which costs efficiency
+only (section 3); `hashsync prune` removes it.
+
+#### io_uring: where it helps and where it does not
+
+Facts, checked against the Linux 6.18 headers and the `io-uring` crate 0.7.15:
+
+- `io_uring` has `openat2`, `statx`, `read` and `readv` (also with registered
+  buffers), `fadvise`, `madvise`, and `close`. It has no `getdents64`, no
+  `name_to_handle_at`, no `lseek` (`SEEK_HOLE`), no `ioctl` (only `uring_cmd`
+  for specific drivers), and no `cachestat`. The walk therefore cannot run on
+  `io_uring`; every directory needs a thread that blocks in `getdents64`.
+- `statx` always runs on io-wq, the kernel's own pool of worker threads
+  (bounded to the smaller of the queue depth and 4 × the CPU count), one
+  blocking call per worker; `openat2` completes inline only when the whole
+  lookup is cached and runs on io-wq otherwise. Submitting metadata calls
+  through a ring replaces a user thread pool by a kernel thread pool with fewer
+  knobs.
+- Buffered reads on ext4, XFS, btrfs, and the other filesystems with
+  asynchronous buffered reads are the real thing: cached pages complete inline
+  at submission; missing pages start readahead and complete later without
+  occupying any thread. This is the one place where a ring gives queue depth
+  without threads.
+- `io_uring` is often unavailable: the default seccomp profiles of container
+  runtimes block it, `kernel.io_uring_disabled` (Linux 6.6) turns it off, and
+  older kernels lack operations. A `pread` path must exist in any case.
+
+Against that, the blocking reader of this design keeps about two requests in
+flight per thread (`fadvise(SEQUENTIAL)` doubles the readahead window, and
+readahead is asynchronous), so 32 to 64 threads put a queue depth of 64 or more
+of 128 to 256 KiB requests on the device for files of a few hundred KiB and
+larger. Smaller files are bounded by their per-file metadata work, which
+`io_uring` cannot reduce. The expected gain of a ring-based reader is therefore
+small and confined to cold full rebuilds, and it costs a second code path.
+
+Decision: the first version reads with `pread` from the pool. The hashing stage
+keeps a narrow interface (a function that takes a directory descriptor and a
+name and returns the inode's rows), so a ring-based reader can replace its body
+later. Adopt one only if a measurement on a cold NVMe shows the blocking pool
+below about 70 % of the device's sequential rate (measure the device with `fio`
+at the same request size). The reader would look like this:
+
+- One ring per thread (`IoUring::builder()` with `setup_single_issuer`,
+  `setup_defer_taskrun`, and `setup_coop_taskrun`), 16 files in flight per
+  thread, 16 registered 1 MiB buffers (`register_buffers`).
+- Per file: `OpenAt2` with `RESOLVE_CACHED` (the walk just touched the dentry,
+  so it completes inline); then `statx`, `name_to_handle_at`, and the hole map
+  with plain calls on the returned descriptor (metadata, no disk read); then
+  `ReadFixed` chunks. On each completion the thread hashes the chunk and
+  submits the next one; at the end `Fadvise(DONTNEED)` and `Close`, linked.
+- Control flow: a loop over completions and a small state per file. This is
+  ordinary C-style asynchronous I/O, not an executor.
+
+#### Event loops and asynchronous runtimes
+
+Readiness notification (`epoll` through `mio` or `polling`, libevent-style)
+tells when a socket or a pipe can be read or written. Regular files are always
+ready, so it cannot express file I/O at all. Each side of a run owns two or
+three pipes and sockets; one blocking thread per direction serves them (section
+6.6). An asynchronous runtime is excluded by the constraints and would add
+nothing: its file I/O is a thread pool underneath.
+
+#### Refinements, not in the first version
+
+- Files larger than a few hundred MiB can be split into ranges that several
+  tasks hash in parallel; rows are per block, so the order does not matter, and
+  the inode is sent as one message after a join. This removes the tail where
+  one thread hashes a disk image while the others are idle.
+- Spinning disks want one reader per device with the files in inode order. A
+  per-root reader limit would be the knob (section 12).
 
 ## 5. Hashes, hash list, and hash table
 
 ### 5.1 Weak hash: mixed polynomial rolling hash modulo 2^64
 
 Both sides must compute identical values, so the definition is part of the
-protocol. All arithmetic is unsigned 64-bit, modulo 2^64.
+protocol. All arithmetic is unsigned 64-bit, modulo 2^64 (`wrapping_mul`,
+`wrapping_add`, `wrapping_sub`).
 
 - `a` is a fixed odd multiplier compiled into the binary, with `a ≡ 5 (mod 8)`.
   Example: `0x9E3779B97F4A7C15`. This class has the maximal multiplicative
@@ -360,6 +572,9 @@ Tout_m[b] = b * a^(B+k-1-m)        Tin_m[b] = b * a^(k-1-m)
 ```
 
 Only the multiply and one add stay on the chain; the table sums are independent.
+With k = 8 the multiplies pipeline at one per cycle. On x86_64 with AVX-512
+the eight streams fit one vector (`_mm512_mullo_epi64`; the AVX-512 intrinsics
+are stable since Rust 1.89), but the scalar version already reaches a few GB/s.
 
 Block hash in the indexer (no rolling): split the block into k parts of
 `B/k` bytes, run Horner's rule on each part, and combine with
@@ -388,14 +603,14 @@ It is the last step of the weak hash (section 5.1) and a protocol constant, like
 the multiplier `a`. The chosen function is the splitmix64 finaliser (Stafford's
 variant 13 of the MurmurHash3 `fmix64`):
 
-```go
-func mix64(z uint64) uint64 {
-	z ^= z >> 30
-	z *= 0xBF58476D1CE4E5B9
-	z ^= z >> 27
-	z *= 0x94D049BB133111EB
-	z ^= z >> 31
-	return z
+```rust
+fn mix64(mut z: u64) -> u64 {
+    z ^= z >> 30;
+    z = z.wrapping_mul(0xBF58476D1CE4E5B9);
+    z ^= z >> 27;
+    z = z.wrapping_mul(0x94D049BB133111EB);
+    z ^= z >> 31;
+    z
 }
 ```
 
@@ -427,9 +642,9 @@ roll and before the probe.
 
 ### 5.3 Blake3
 
-The 32-byte Blake3 hash identifies the content of a block.
-The local always recomputes it on the bytes it read from disk before it uses a
-block. Treat Blake3 equality as byte equality.
+The 32-byte Blake3 hash identifies the content of a block (`blake3::hash`,
+section 9). The local always recomputes it on the bytes it read from disk
+before it uses a block. Treat Blake3 equality as byte equality.
 
 ### 5.4 The hash list
 
@@ -437,8 +652,9 @@ The local exports the set of weak hashes of all indexed blocks as a sorted,
 compressed list:
 
 1. `SELECT DISTINCT weak FROM blocks` through the `blocks_by_weak` index.
-   Constant blocks have no rows (section 4.1), so their hashes are absent.
-2. Keep the top `W = 48` bits, sort, and remove duplicates.
+   Constant and short-period blocks have no rows (section 4.1), so their
+   hashes are absent.
+2. Keep the top `W = 48` bits, sort (`sort_unstable`), and remove duplicates.
 3. Encode the gaps between consecutive values with Golomb-Rice coding. Use the
    Rice parameter `k = floor(log2(2^W / N))`, so the average gap is between
    2^k and 2^(k+1). Each value then costs about `k + 2` bits.
@@ -459,8 +675,9 @@ for a 256 GiB tree (8M blocks of 32 KiB):
 | Raw sorted 64-bit values | 64 MiB | ~1 | ~3 |
 | Binary fuse filter, 32-bit fingerprints (rejected) | 36 MiB | 3 | 0.25 |
 
-A false hit costs one Blake3 of the window and one query of about 60 bytes, so
-even thousands per GiB would not matter. Decoding 8M values takes tens of
+A false hit costs one Blake3 of the window, one query of about 60 bytes, and
+the rescan of the window's offsets after the "no" (section 6.3, at most `B`
+probes), so even thousands per GiB would not matter. Decoding 8M values takes tens of
 milliseconds. Cache the encoded list next to the database together with
 `meta.generation` and rebuild it only when the generation changed. The sort of
 8M values costs well under a second.
@@ -468,10 +685,10 @@ milliseconds. Cache the encoded list next to the database together with
 ### 5.5 The remote hash table
 
 The remote decodes the hash list into a custom open-addressing table of 32-bit
-fingerprint slots. It is a flat `[]uint32` obtained from `mmap`, not a Go
-`map`: a `map[uint64]struct{}` needs about 10 to 12 bytes per key, hashes the
-key a second time, touches control bytes and slots, and gives no control over
-alignment, huge pages, or batching.
+fingerprint slots. It is a flat array of `u32` obtained from `mmap`, not a
+`HashSet<u64>`: hashbrown (the table behind `std::collections::HashSet`) needs
+about 9 to 12 bytes per key, hashes the key a second time, touches control
+bytes and slots, and gives no control over alignment, huge pages, or batching.
 
 - Layout: buckets of 16 slots, one bucket per 64-byte cache line.
   `buckets = ceil(N / (16 * 0.7))`; map a value to a bucket with multiply-shift
@@ -491,19 +708,29 @@ alignment, huge pages, or batching.
   probability about 4e-7.
 - Memory: about 5.7 bytes per key at load factor 0.7: 46 MiB for 8M keys
   (256 GiB), 183 MiB for 32M keys (1 TiB).
-- Allocate the table with `mmap` and `madvise(MADV_HUGEPAGE)`. With 4 KiB pages
-  every probe also misses the TLB.
-- Probe in batches. Go has no prefetch intrinsic. Compute the weak hashes and
-  bucket addresses for 32 consecutive offsets, load the first word of each
-  bucket into a small array in one simple loop (the loads are independent, so
-  the CPU overlaps the cache misses), then scan the buckets in a second loop.
+- Allocate the table with `rustix::mm::mmap_anonymous` and
+  `madvise(Advice::LinuxHugepage)`. With 4 KiB pages every probe also misses
+  the TLB.
+- Fill: the list is sorted and the bucket index is monotonic in the value, so
+  the fill writes the table sequentially.
+- Probe in batches. Compute the weak hashes and bucket addresses for 32
+  consecutive offsets, load the first word of each bucket into a small array in
+  one simple loop (the loads are independent, so the CPU overlaps the cache
+  misses), then scan the buckets in a second loop. On x86_64,
+  `core::arch::x86_64::_mm_prefetch` can issue the prefetches explicitly; on
+  other architectures the batched loads do the same job.
+- Scan a bucket with SIMD: two AVX2 compares (`_mm256_cmpeq_epi32` and
+  `_mm256_movemask_ps`) or four SSE2 compares cover the 16 slots; four
+  `vceqq_u32` on aarch64. Select the AVX2 version at run time with
+  `is_x86_feature_detected!` and `#[target_feature]`, or use the `wide`
+  crate's `u32x8` for a portable version.
 
 Why a table and not a filter: when the structure is larger than the last-level
 cache, throughput is bounded by memory-level parallelism, so it scales with the
 number of cache lines touched per lookup. A binary fuse filter touches 3
 independent lines per lookup; this table touches about 1. Expect 2 to 3 times
 the scan rate. Measure both with a microbenchmark before the first release; each
-is about 100 lines.
+is about 100 lines (`xorf` provides the filter, section 9).
 
 ## 6. The transfer protocol
 
@@ -536,7 +763,8 @@ appended last and unchanged, so `user@host` and `ssh_config` aliases work.
 Rendezvous:
 
 1. The local generates a random token `T` and starts two processes at the same
-   time (`SSH` stands for the configured command):
+   time with `std::process::Command` (stdin and stdout piped, stderr
+   inherited; `SSH` stands for the configured command):
    - data session: `SSH HOST hashsync serve --token T`
    - control session: `SSH HOST hashsync attach --token T`
 2. `serve` creates a Unix socket `$XDG_RUNTIME_DIR/hashsync/T.sock` (fallback: a
@@ -560,11 +788,11 @@ Notes:
   Document this for users.
 - Provide `--single-connection` as a fallback: one session, both logical streams
   multiplexed in the frame layer, and a remote writer that drains control frames
-  before data frames. `github.com/hashicorp/yamux` can also do this, but the
-  frame layer below is enough.
-- Run the remote shell as a subprocess. Do not use `golang.org/x/crypto/ssh`.
-  The subprocess honours the user's configuration, agent, `ProxyJump`, and host
-  key checks.
+  before data frames. No multiplexing library: the frame layer is enough, and
+  the Rust ones (`yamux`) are asynchronous.
+- Run the remote shell as a subprocess. Do not use an SSH library (`russh`,
+  `ssh2`). The subprocess honours the user's configuration, agent, `ProxyJump`,
+  and host key checks.
 - The remote host needs the same `hashsync` version in `PATH`, or the path given
   by `remote_command` in the configuration. Both sides check versions in HELLO.
 
@@ -576,7 +804,7 @@ Every frame is `type u8, length u32 (little endian), payload`. Suggested types:
 |---|---|---|
 | data | remote to local | HELLO, LIT (bytes), REF (qid), RLE (byte u8, length u64), END (exit status, error text) |
 | data | local to remote | HELLO, HASHLIST (encoded hash list, can span several frames) |
-| control | remote to local | HELLO, QUERY (qid u32, offset u64, weak u64, blake3 [32]byte) |
+| control | remote to local | HELLO, QUERY (qid u32, offset u64, weak u64, blake3 [u8; 32]) |
 | control | local to remote | HELLO, ANSWER (qid u32, found u8) |
 
 HELLO carries the protocol version, the block size, `weak_hash_id`, the hash
@@ -586,34 +814,40 @@ remote to use.
 
 Compression. After the HELLO exchange, the remote-to-local direction of the
 data session is one zstd stream, and all later frames (LIT, REF, END) travel
-inside it. Compression is done by libzstd (section 9). Rules:
+inside it. Compression is done by libzstd through the `zstd` crate (section 9).
+Rules:
 
-- The remote flushes the compressor (`ZSTD_e_flush`) whenever its outgoing
-  queue runs empty, so a pause in the command output or a wait for answers
-  never leaves frames stuck in the compressor. It ends the stream after END.
-  Flushes cost a little ratio and happen only when the stream is idle anyway.
+- The remote flushes the compressor (`ZSTD_e_flush`, `Encoder::flush`)
+  whenever its outgoing queue runs empty, so a pause in the command output or a
+  wait for answers never leaves frames stuck in the compressor. It ends the
+  stream after END (`Encoder::finish`). Flushes cost a little ratio and happen
+  only when the stream is idle anyway.
 - The level comes from `compression_level` in the local configuration (zstd
   scale 1 to 19, 0 disables). Default 9. Levels 6 to 9 keep most of the ratio
   gain over the zstd default of 3 at roughly 100 MB/s per thread on current x86
   cores; above 12 the ratio grows by a few percent for several times the CPU.
-  `compression_threads` sets libzstd's worker threads (default 0: half the
-  remote's cores, at least one), so the compressor keeps up with a gigabit link
-  at level 9 on a few cores. Lower the level when the remote's CPU, not the
-  network, is the bottleneck; raise it on slow links.
+  `compression_threads` sets libzstd's worker threads (`Encoder::multithread`;
+  default 0: half the remote's cores, at least one), so the compressor keeps up
+  with a gigabit link at level 9 on a few cores. Lower the level when the
+  remote's CPU, not the network, is the bottleneck; raise it on slow links.
 - Only literal bytes cost compression time. REF and RLE frames are a few bytes
   each. Runs shorter than `block_size` stay in the literals, where zstd encodes
   them cheaply.
 - Nothing else is compressed: the control session carries random hashes and
   one-byte answers, and the hash list is already entropy-coded.
-- The local decompresses with the streaming reader; it yields output block by
-  block, so frame parsing is not delayed by more than one zstd block.
+- The local decompresses with the streaming reader
+  (`zstd::stream::read::Decoder`); it yields output block by block, so frame
+  parsing is not delayed by more than one zstd block.
 
 ### 6.3 Remote scanner
 
 State: a ring buffer of command output with at least `lookahead + block_size`
 bytes (default `lookahead = 256 MiB`), a scan position, and an emit position.
 Everything between the emit position and the scan position is literal bytes or a
-pending window.
+pending window. The ring buffer is a `memfd` mapped twice back to back
+(`memfd_create`, then two `mmap` calls with `MAP_FIXED` into one reserved
+range), so every window is one contiguous slice and the wrap-around costs
+nothing.
 
 The scanner also tracks the start of the current run of identical bytes, with
 one comparison per byte as bytes enter the window.
@@ -627,11 +861,39 @@ Scan loop, at position `p` with window `[p, p + B)` available:
   as several RLE frames. After the run, compute the hash of the next window
   from scratch (Horner's rule over `B` bytes) and resume rolling.
 - Table miss: `p += 1`.
-- Table hit: compute the Blake3 hash of the window, send a QUERY, record the
-  pending window, and continue at `p + B`. This is optimistic: a hit is almost
-  always a real match, so the scanner does not evaluate the offsets inside the
-  window.
+- Table hit: compute the Blake3 hash of the window. If it is in the negative
+  cache (below), the hit is a miss: `p += 1`. Otherwise send a QUERY, record
+  the pending window, and continue at `p + B` with a hash computed from
+  scratch, as after a run. This is optimistic: a hit is almost always a real match, so the
+  scanner does not probe the offsets inside the window while the query is in
+  flight. A "no" brings it back to them (below).
 - Stop when `scan - emit >= lookahead`, and wait for answers.
+
+A "no" answer for the window at `p` means that the probe at `p` was wrong, and
+the scanner treats it that way: the byte at `p` is a literal, and the offsets
+from `p + 1` on are scanned as if there had been no hit. The pending entry
+becomes a gap `[p, r)`, where `r` is the offset of the next pending or resolved
+item, or the scan position when there is none. The scanner thread that owns the
+region runs the normal scan loop over the gap, from `p + 1`, with one extra
+rule: a window must end at or before `r`. When there is no later item and a
+window found in the gap ends after the scan position, the scan position moves
+to the end of that window. Hits in the gap become queries and pending windows
+like any other, at their offsets in the ordered pending list; bytes that no
+window covers are literal. The rescan runs on the scanner thread, so it cannot
+race with the forward scan; it costs at most `B` probes and happens once per
+"no". The emit loop waits for a gap as it waits for a pending window.
+
+Negative cache: the scanner keeps an LRU set of the Blake3 hashes whose
+queries got a "no" (64k entries, about 2 MiB). A table hit whose Blake3 is in
+the set is a miss: no query, no gap. The key is the Blake3 hash, not the weak
+hash: two windows with the same weak hash and different content are possible,
+and a "no" for one must not suppress the query for the other. The cache
+therefore saves the query but not the Blake3 computation of the window;
+content that repeats in the stream and is gone from the local disk costs one
+Blake3 per occurrence, like matched content. Without the cache, every such
+occurrence would also cost a query and open a gap. Periodic content never
+reaches this path: the index holds no short-period blocks (section 4.1), so
+its windows miss the table without a Blake3.
 
 Emit loop, in stream order:
 
@@ -639,10 +901,8 @@ Emit loop, in stream order:
 - RLE item: send RLE(byte, length) and advance the emit position by the length.
   It needs no answer and no pinned entry.
 - Answer "yes": send REF(qid) and advance the emit position by `B`.
-- Answer "no": send the window as LIT. Optional refinement: rescan from `p + 1`
-  instead. If you implement this, add a small LRU cache of recent negative
-  Blake3 answers. Without it, a run of constant bytes (all windows share one
-  Blake3 value) produces one query per offset.
+- Gap: wait until its rescan is done and its windows are answered, then emit
+  its literal bytes, REFs, and RLE items in order.
 
 Answers can arrive out of order; keep the pending list ordered by offset. The
 last bytes of the stream (fewer than `B`) are literal unless they belong to a
@@ -654,11 +914,11 @@ one table probe. The probe dominates when the table is larger than the
 last-level cache: about one cache line per byte, which gives roughly 120 to
 180 MB/s per core from DRAM and several hundred MB/s per core when the table
 fits in L3. Batch the probes as described in section 5.5, split the stream into
-segments with `B` bytes of overlap, and scan the segments on several cores.
-Compression (section 6.2) runs in libzstd's own threads and touches literal
-bytes only, so on a stream with a high deduplication ratio it costs little.
-Inside a run the scanner neither hashes nor probes, so a long run of one byte
-costs a memory scan only.
+segments with `B` bytes of overlap, and scan the segments on several cores
+(section 6.6). Compression (section 6.2) runs in libzstd's own threads and
+touches literal bytes only, so on a stream with a high deduplication ratio it
+costs little. Inside a run the scanner neither hashes nor probes, so a long run
+of one byte costs a memory scan only.
 
 ### 6.4 Local answering and reconstruction
 
@@ -667,14 +927,15 @@ For each QUERY:
 1. `SELECT inode_id, block_no FROM blocks WHERE weak = ? AND blake3 = ? LIMIT 128`.
    SQLite uses the `blocks_by_weak` index and filters the rows by Blake3. The
    candidates are checked in order until one verifies. A candidate costs one
-   `block_size` read and one Blake3, mostly from the page cache; a "no" costs
-   `block_size` bytes of network. The high limit skips over stale rows (deleted
-   or changed files).
+   `block_size` read and one Blake3, mostly from the page cache; a "no" costs a
+   rescan on the remote and up to `block_size` bytes of network (section 6.3).
+   The high limit skips over stale rows (deleted or changed files).
 2. For each candidate: take one `(root_id, rel_path)` of the inode and open it
    relative to the root's descriptor, which the run opens once and caches:
    `openat2(rootfd, rel_path, RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)`
-   (Linux 5.6 and newer; fall back to component-wise `openat` with
-   `O_NOFOLLOW`). Then `pread` `B` bytes at `block_no * B` and compute Blake3.
+   (`rustix::fs::openat2`, Linux 5.6 and newer; fall back to component-wise
+   `openat` with `O_NOFOLLOW`). Then `pread` `B` bytes at `block_no * B` and
+   compute Blake3.
 3. On the first match: pin the buffer, keyed by qid and tagged with the query
    offset, and answer "yes". If no candidate verifies, answer "no".
 
@@ -684,12 +945,12 @@ memory, so a concurrent change to the file cannot corrupt the output.
 Pinned entries are per query, not per content. A query id names exactly one
 entry, and the entry records the query offset. Several in-flight queries for the
 same Blake3 (a run of identical blocks, for example) produce several entries.
-They share one buffer through a reference count, so identical content is held
-once. An entry is released only by its own REF, or when the emitted stream
-position passes its offset without a REF (the remote resolved that region in
-another way). A buffer is freed when its last entry is released. A REF can
-therefore never find its bytes gone, whatever the order of the answers or the
-distance between identical blocks in the stream.
+They share one buffer through a reference count (`Arc`), so identical content
+is held once. An entry is released only by its own REF, or when the emitted
+stream position passes its offset without a REF (the remote resolved that
+region in another way). A buffer is freed when its last entry is released. A
+REF can therefore never find its bytes gone, whatever the order of the answers
+or the distance between identical blocks in the stream.
 
 Keep verified buffers in a small LRU cache keyed by Blake3 after their last
 entry is released. Blake3 equality is byte equality, so a later query for the
@@ -701,8 +962,9 @@ holds at most about `lookahead` bytes of pinned buffers (256 MiB by default)
 when all pending blocks are distinct. When the bound is reached, answer "no". A
 "no" is always safe.
 
-A small pool of lookup workers (4 to 8) keeps disk latency off the critical
-path. Answers may be sent out of order.
+A small pool of lookup workers (4 to 8 threads, each with its own read
+connection) keeps disk latency off the critical path. Answers may be sent out
+of order.
 
 An RLE frame makes the local write `length` copies of `byte` to its stdout from
 a static buffer and advance the stream position. It involves no query and no
@@ -723,6 +985,45 @@ emits runs of at least `block_size`.
 - Security: the hash list reveals the block hashes of all indexed files to the
   remote host. Use `hashsync` only with hosts the user trusts.
 
+### 6.6 Threads at run time
+
+Both roles use a few blocking threads and bounded channels, no event loop
+(section 4.6). Every hand-off is a channel; every shutdown is a closed channel
+or a closed descriptor.
+
+Remote, `serve`:
+
+- One reader thread reads the command's stdout pipe into the ring buffer. The
+  pipe is enlarged to 1 MiB with `F_SETPIPE_SZ`
+  (`rustix::pipe::fcntl_setpipe_size`), so the reads are large.
+- Scanner threads (as many as the local's HELLO asks for) take segments with
+  `B` bytes of overlap (section 6.3) and hand queries to the control writer.
+- One emit thread owns the zstd encoder and stdout. It sends the resolved items
+  in stream order and flushes when its queue is empty.
+- One control thread writes QUERY frames to the Unix socket; one reads ANSWER
+  frames from it and posts each answer to the scanner thread that owns the
+  window, which updates the pending entry and, for a "no", rescans the gap
+  (section 6.3).
+- The child command is a `std::process::Command` with stdin `/dev/null`,
+  stdout piped, and stderr inherited. `serve` waits for it after the END frame
+  and kills it when its own stdin closes.
+
+Local, `run`:
+
+- One data thread reads the data session through the streaming decoder, parses
+  frames, and writes to stdout: literals as they come, references from the
+  pinned buffers, runs from a static buffer. Blocking writes to stdout give
+  backpressure to the whole chain.
+- One control thread reads QUERY frames and dispatches them to the lookup pool
+  (section 6.4); one control thread writes ANSWER frames.
+- The pinned table and the LRU cache sit behind one mutex; they are touched
+  once per query and once per REF.
+- `signal-hook` sets a flag on SIGINT and SIGTERM; the main thread kills the
+  two `ssh` processes and exits.
+
+`attach` copies with two threads and `std::io::copy`, which uses `splice`
+between a pipe and a socket on Linux.
+
 ## 7. Configuration
 
 `$XDG_CONFIG_HOME/hashsync/config.toml`, or the path given by `--config`:
@@ -730,6 +1031,7 @@ emits runs of at least `block_size`.
 ```toml
 block_size     = "32KiB"   # 4 KiB or more; a change discards and rebuilds the index
 index_path     = "~/.local/state/hashsync/index.sqlite"
+threads        = 0         # indexer threads; 0 = 4 × cores, at least 16, at most 64
 lookahead      = "256MiB"  # remote scan-ahead; also bounds the pinned memory on the local
 compression_level   = 9    # zstd level for the data session, 1 to 19; 0 disables
 compression_threads = 0    # libzstd worker threads on the remote; 0 = half the cores
@@ -757,7 +1059,8 @@ constants, not configuration.
 
 ## 8. Command line
 
-- `hashsync update [--rebuild]`: update the index, or discard and rebuild it.
+- `hashsync update [--rebuild] [-j N]`: update the index, or discard and
+  rebuild it. `-j` overrides `threads`.
 - `hashsync run [--no-update] [--single-connection] [--ssh CMD] [USER@]HOST -- COMMAND ARGS...`:
   run COMMAND on HOST, write its stdout to the local stdout, and exit with the
   status of COMMAND. HOST is appended to the remote shell command unchanged, so
@@ -779,85 +1082,170 @@ hashsync run backup@nas -- tar -C /srv/data -cf - . | tar -C /srv/data -xf -
 
 ## 9. Libraries
 
-Versions checked against the Go module proxy on 2026-09-09.
+Versions checked against crates.io on 2026-09-10. The toolchain is stable Rust
+(1.98.1, released 2026-09-03), edition 2024. Three dependencies compile C
+sources through the `cc` crate: SQLite, libzstd, and the Blake3 SIMD kernels.
+The target's C compiler is needed at build time; there is no pure-Rust build
+and no need for one.
 
-| Need | Library | Version | Notes |
+| Need | Crate | Version | Notes |
 |---|---|---|---|
-| Weak hash | own code | | Section 5.1 and 5.2, about 50 lines. |
+| Weak hash | own code | | Sections 5.1 and 5.2, about 50 lines. |
 | Hash list coding | own code | | Golomb-Rice encoder and decoder, about 60 lines. |
-| Hash table | own code | | Section 5.5, about 100 lines. |
-| Blake3 | `lukechampine.com/blake3` | v1.4.1 (2025-05) | `blake3.Sum256`. AVX-512 and AVX2 assembly on amd64 (about 4 GB/s for 64 KiB inputs). Pure Go on other architectures. |
-| Blake3 (alternative) | `github.com/zeebo/blake3` | v0.2.4 (2024-08) | The tagged release has AVX2 and SSE4.1 on amd64. The main branch (2026-09) adds AVX-512 and arm64 NEON/SVE2 but has no tag yet. Pick it if arm64 speed matters and a pseudo-version is acceptable. |
-| SQLite | `zombiezen.com/go/sqlite` | v1.4.2 (2025-05) | Low-level API. See below. |
-| SQLite engine | `modernc.org/sqlite` | v1.58.0 (2026-09) | Pulled in by zombiezen. Bump it with `go get`; zombiezen pins v1.37.1. |
-| TOML | `github.com/BurntSushi/toml` | v1.6.0 (2025-12) | Alternative: `github.com/pelletier/go-toml/v2` v2.4.3. |
-| Syscalls | `golang.org/x/sys/unix` | v0.48.0 | `Statx` (with `Mnt_id`), `NameToHandleAt`, `Openat2` with `RESOLVE_BENEATH` and `RESOLVE_NO_SYMLINKS`, `Getdents`, `Fadvise`, `Mmap`, `Madvise`. It has no constant for `FS_IOC_GETFSUUID`; define it in the project (section 4.3). |
-| zstd | `github.com/DataDog/zstd` | v1.5.7 (2025-03) | cgo binding of libzstd 1.5.7 (embedded, or the system library with the `external_libzstd` build tag). Streaming writer with `Flush`, `Close`, `SetNbWorkers`; levels 1 to 22. |
-| zstd (fallback, `!cgo` builds) | `github.com/klauspost/compress/zstd` | v1.20.0 (2026-09) | Pure Go, same wire format. Maps zstd levels 1-2, 3-5, 6-9, 10+ onto four internal tiers (about zstd 1, 3, 7, 11). Slower and less flexible than libzstd; keep it behind a build tag so a static binary is still possible. |
-| Multiplexing (fallback mode only) | `github.com/hashicorp/yamux` | v0.1.2 (2024-09) | Optional. |
+| Remote hash table | own code | | Section 5.5, about 100 lines plus the SIMD bucket scan. |
+| Blake3 | `blake3` | 1.8.7 (2026-08) | `blake3::hash`. Assembly for SSE4.1, AVX2, and AVX-512 on x86_64 with run-time detection; NEON on aarch64 by default. See below. |
+| SQLite | `rusqlite` | 0.40.2 (2026-08) | Feature `bundled`: SQLite 3.53.2 through `libsqlite3-sys` 0.38.2. `prepare_cached`, `transaction_with_behavior`, `busy_timeout`, `pragma_update`. See below. |
+| System calls | `rustix` | 1.1.4 (2026-02) | `fs::{openat, openat2, statx, RawDir, fadvise, seek, memfd_create}`, `io::{pread, preadv2}`, `mm::{mmap, mmap_anonymous, madvise}`, `pipe::{splice, fcntl_setpipe_size}`, `process::setrlimit`, `ioctl::{Getter, opcode}`. Raw system calls on Linux (`linux_raw` backend). |
+| System calls, gaps | `libc` | 0.2.189 (2026-08) | `name_to_handle_at`, `file_handle`, `MAX_HANDLE_SZ`, `syscall(SYS_cachestat, ...)`. |
+| Kernel constants | `linux-raw-sys` | 0.12.1 (2025-12) | `general::{fsuuid2, cachestat, STATX_MNT_ID_UNIQUE}`. Already a dependency of `rustix`. |
+| Thread pool | `rayon` | 1.12.0 (2026-04) | A dedicated `ThreadPool`, `scope` and `spawn`. LIFO local deques, oldest-first stealing (section 4.6). |
+| Work stealing, alternative | `crossbeam-deque` | 0.8.8 (2026-09) | `Worker::new_lifo` and `Stealer`, as in `ignore`. Only if rayon is dropped. |
+| Channels | `crossbeam-channel` | 0.5.17 (2026-09) | Bounded channels to the writer and between the run-time threads; `select!`. `std::sync::mpsc::sync_channel` is enough where no `select!` is needed. |
+| io_uring, optional reader | `io-uring` | 0.7.15 (2026-09) | `IoUring`, `opcode::{OpenAt2, ReadFixed, Fadvise, Close}`, `submit_and_wait`, `register_buffers`, `setup_single_issuer`, `setup_defer_taskrun`, `setup_coop_taskrun`. Synchronous API, no runtime, no liburing. |
+| zstd | `zstd` | 0.14.0 (2026-09) | libzstd 1.5.7 through `zstd-sys` 2.1 (bundled; the `pkg-config` feature links the system library). See below. |
+| TOML | `toml` | 1.1.5 (2026-09) | With `serde` 1.0.229 derive. |
+| Command line | `clap` | 4.6.6 (2026-08) | Derive API. |
+| Globs | `glob` | 0.3.4 (2026-07) | `glob_with` for roots, `Pattern::matches_with` for `exclude`, options of section 4.2. |
+| Hash maps | `foldhash` | 0.2.0 (2025-08) | `foldhash::fast::RandomState` for `std::collections::HashMap`. Alternative: `rustc-hash` 2.1.3. See below. |
+| Identity hasher | `nohash-hasher` | 0.2.0 (2020-02) | For maps keyed by Blake3 or by the weak hash. Or 10 lines. |
+| LRU cache | `lru` | 0.18.4 (2026-09) | The verified-buffer cache of section 6.4. Or about 60 lines. |
+| Signals | `signal-hook` | 0.4.4 (2026-04) | SIGINT and SIGTERM flag. `ctrlc` 3.5.2 is the smaller alternative. |
+| Errors | `anyhow`, `thiserror` | 1.0.104, 2.0.20 | |
+| Logging | `log`, `env_logger` | 0.4.34, 0.11.11 | |
+| Property tests | `proptest` | 1.11.0 (2026-03) | |
+| Benchmarks | `criterion` or `divan` | 0.8.2, 0.1.21 | Table against filter; `xorf` 0.13.0 provides the binary fuse filter. |
+| Temporary trees in tests | `tempfile` | 3.27.0 (2026-03) | |
+| Portable SIMD, optional | `wide` | 1.7.0 (2026-08) | `u32x8` for the bucket scan if `core::arch` intrinsics are not wanted. |
 
-Everything the design needs exists in Go or is reachable through cgo. The one
-missing constant, the `FS_IOC_GETFSUUID` request number and its 17-byte struct,
-is a few lines. Raw syscalls are available through `unix.Syscall` for anything
-else that turns up. cgo is used for libzstd; a cross-compiled remote binary
-therefore needs a C cross toolchain (Nix provides one through `pkgsCross`), or
-the `!cgo` fallback. No filter library is needed. `github.com/FastFilter/xorfilter`
-was the candidate for the rejected binary fuse filter.
+### SQLite: `rusqlite`
 
-Compression alternatives, in order of preference if the cgo binding is not
-usable: pipe the data session through the `zstd` command (`zstd -T0 -<level>`
-on the remote, `zstd -d` on the local). It gives the real libzstd with
-multithreading and even `--adapt`, but the command has no idle flush, so frames
-can sit in its job buffer until the job fills or the stream ends, which delays
-output and holds pinned blocks longer; it also needs the command on both hosts.
-Last, the pure-Go library above.
-
-### SQLite driver: use `zombiezen.com/go/sqlite`
-
-It is a pure-Go port of the crawshaw API on top of the `modernc.org/sqlite`
-engine: `sqlitex.Pool`, transactions and savepoints, cached prepared statements
-through `conn.Prep`, and no `database/sql` layer.
-
-Reasons:
-
-- No cgo needed. The database engine is not a bottleneck (next point), so a
-  cgo engine would buy nothing, and one pure-Go dependency less keeps the build
-  and cross-compilation simple.
-- Fastest queries of all measured drivers. `cvilsmeier/go-sqlite-bench`, run of
-  2026-03-23, minimum of two runs, milliseconds:
-
-  | Driver | cgo | API | insert 1M rows | query 1M rows | 8 goroutines query |
-  |---|---|---|---|---|---|
-  | zombiezen.com/go/sqlite | no | low-level | 1746 | 263 | 1033 |
-  | modernc.org/sqlite | no | database/sql | 2419 | 758 | 2061 |
-  | github.com/ncruces/go-sqlite3 | no | database/sql | 2719 | 850 | 2355 |
-  | github.com/mattn/go-sqlite3 | yes | database/sql | 1480 | 871 | 2395 |
-  | crawshaw.io/sqlite (last commit 2022) | yes | low-level | 1035 | 429 | 1398 |
-  | github.com/bvinc/go-sqlite-lite (last commit 2019) | yes | low-level | 1021 | 438 | 1526 |
-
-  The insert column measures engine compute, where native C is about 1.7 times
-  faster than transpiled Go. The query column measures per-call overhead, where
-  `database/sql` costs about 2 times and each cgo transition costs more.
-- The database is not the bottleneck under any driver. A full index of 8M
-  blocks costs a few seconds of insert time against minutes of reading and
-  hashing 256 GiB. Copying 10 GiB of matched data costs about 320k point
-  lookups, each followed by a 32 KiB read and a Blake3 computation that cost
-  more than the lookup.
-- The maintained cgo option, `mattn/go-sqlite3`, is slower than zombiezen on
-  queries. The faster cgo wrappers are unmaintained. A separate cgo binary for
-  the local side would buy nothing.
+`rusqlite` is the binding to the C library; nothing else is in question. The
+`bundled` feature compiles SQLite into the binary, which keeps the build
+independent of the system and makes static builds simple; without it,
+`libsqlite3-sys` links the system library through `pkg-config`. A point lookup
+through a cached prepared statement costs 1 to 3 µs, about one `statx`. At run
+time, 10 GiB of matched data cost about 320k such lookups, each followed by a
+32 KiB read and a Blake3 computation that cost more than the lookup; the
+indexer's budget is in section 4.6.
 
 Usage rules:
 
 - Open with WAL mode, `synchronous=NORMAL`, and a `busy_timeout` of several
-  seconds.
-- Give the writer goroutine its own connection and start its transactions with
-  `BEGIN IMMEDIATE` (`sqlitex.ImmediateTransaction`), so a write transaction
-  never fails with `SQLITE_BUSY` halfway through. Readers use the pool.
-- Bind and step prepared statements directly; do not build SQL strings per row.
+  seconds. Open with `SQLITE_OPEN_NO_MUTEX`: a `Connection` is `Send` and not
+  `Sync`, and every connection belongs to one thread.
+- The writer thread owns its connection and starts transactions with
+  `transaction_with_behavior(TransactionBehavior::Immediate)`, so a write
+  transaction never fails with `SQLITE_BUSY` halfway through. Pool threads and
+  lookup workers own read connections.
+- `prepare_cached` for every statement; bind positionally; never build SQL
+  strings per row. Step the rows; do not collect them.
+- The pragmas of section 4.4: a large `cache_size` for the writer, a small one
+  for readers, and no `blocks_by_weak` during a rebuild.
+
+### System calls: `rustix` and `libc`
+
+`rustix` wraps the calls with `OwnedFd` and `BorrowedFd` and returns
+`io::Result`; on Linux its default `linux_raw` backend makes the system calls
+itself, without libc. It covers everything in section 4.5 except four items,
+which the `sys` module supplies (section 11):
+
+- `name_to_handle_at`: `libc::name_to_handle_at` with a `MAX_HANDLE_SZ` buffer
+  behind a `libc::file_handle` header.
+- `FS_IOC_GETFSUUID`: the opcode from
+  `rustix::ioctl::opcode::read::<fsuuid2>(0x15, 0)`, the struct from
+  `linux_raw_sys::general::fsuuid2`, the call through `rustix::ioctl::Getter`.
+- `STATX_MNT_ID_UNIQUE`:
+  `StatxFlags::from_bits_retain(linux_raw_sys::general::STATX_MNT_ID_UNIQUE)`;
+  `rustix` 1.1 only names `MNT_ID`.
+- `cachestat`: `libc::syscall(libc::SYS_cachestat, fd, &range, &result, 0)`
+  with the struct from `linux_raw_sys::general::cachestat`; `rustix` 1.1 lists
+  it as not implemented.
+
+### Threads: `rayon` and `crossbeam-channel`
+
+Section 4.6 gives the reasons for rayon. `std::thread::scope` and
+`std::sync::mpsc::sync_channel` are enough for the run-time threads of section
+6.6; `crossbeam-channel` adds `select!` and is faster under contention.
+
+### io_uring: the `io-uring` crate
+
+Only for the optional reader of section 4.6. It is a direct binding to the ring
+interface, needs no liburing, and has no executor: the caller pushes entries,
+calls `submit_and_wait`, and drains completions. `rustix::io_uring` exposes the
+raw `io_uring_setup` and `io_uring_enter` calls too, but the typed opcodes of
+the `io-uring` crate are worth the dependency.
+
+### Compression: the `zstd` crate
+
+Binds libzstd 1.5.7. `stream::write::Encoder::new(stdout, level)`,
+`multithread(n)` for `ZSTD_c_nbWorkers`, `flush()` for `ZSTD_e_flush`,
+`finish()` for `ZSTD_e_end`, and `set_parameter(CParameter::CompressionLevel)`
+during the stream (libzstd applies a new level to the next job of a
+multithreaded stream). `stream::read::Decoder` for the local. The pure-Rust
+`ruzstd` 0.9 has a complete decoder but only an uncompressed and a fastest
+level in its encoder, so it is not an option for the remote.
+
+### Blake3: the `blake3` crate
+
+`blake3::hash(&block)` returns 32 bytes. The crate carries assembly for SSE4.1,
+AVX2, and AVX-512 on x86_64 with run-time detection, and NEON C code that its
+build script enables by default on little-endian aarch64. 32 KiB inputs are 32
+chunks, enough to fill the widest vectors. Do not enable the `rayon` or `mmap`
+features: blocks are hashed in parallel by the pool, not inside one hash.
+
+### Hash maps and caches
+
+`std::collections::HashMap` is hashbrown; only its default hasher (SipHash-1-3)
+is slow. Use `foldhash::fast::RandomState` (hashbrown's own default) or
+`rustc_hash::FxHashMap` for the sets keyed by `(fs_id, inode number)`, the
+mount cache, and the pinned entries by query id. Keys that are already hashes
+(Blake3 in the LRU cache) get an identity hasher. The LRU cache of verified
+buffers (section 6.4) is `lru::LruCache` or about 60 lines. The remote table
+stays custom (section 5.5).
 
 ## 10. Alternatives considered
 
+- **Go as the implementation language.** Replaced by Rust on 2026-09-10 (user
+  decision). Rust gives direct access to SIMD and prefetch intrinsics, control
+  over memory layout, and threads without a scheduler in between; C libraries
+  (SQLite, libzstd) link without a cgo/pure split, so the build has one
+  configuration. The Go-era entries below are kept for the record.
+- **Asynchronous runtime (`tokio` and the like).** Rejected on 2026-09-10. A
+  constraint of the project, and no benefit: the file I/O of such runtimes is
+  a thread pool underneath, and the control flow of the program becomes hard
+  to follow.
+- **Readiness event loop (`mio`, `polling`, libevent-style).** Rejected on
+  2026-09-10. Regular files are always ready to `epoll`, and the program has
+  two or three pipes and sockets per side (section 4.6).
+- **`io_uring` for the directory walk.** Rejected on 2026-09-10. No
+  `getdents64`, no `name_to_handle_at`, no `ioctl`; `statx` and `openat2` run
+  on io-wq, which is a thread pool inside the kernel.
+- **`io_uring` for the file reads.** Deferred on 2026-09-10. Optional backend
+  of the hashing stage, adopted only after a measurement (section 4.6).
+- **`O_DIRECT` reads in the indexer.** Rejected on 2026-09-10. It avoids the
+  page cache copy, but files that are already cached (the common case after a
+  rebuild) would be read from the device again, buffers need alignment, and
+  btrfs falls back to buffered I/O for compressed extents.
+- **`mmap` for hashing.** Rejected on 2026-09-10. Page faults and TLB work
+  cost about as much as the copy of a `pread`, and a file truncated during the
+  scan raises `SIGBUS` in the thread that touches the mapping.
+- **`open_by_handle_at` for candidate reads (section 6.4).** Rejected on
+  2026-09-10. It would open the exact indexed inode without a path, but it
+  needs `CAP_DAC_READ_SEARCH`.
+- **Path-first lookup shortcut in the walker.** Dropped on 2026-09-10. It would
+  skip `name_to_handle_at` when the path's inode row already matches, but a
+  handle call costs about as much as the extra index lookup it saves.
+- **Sending a rejected window as literal bytes**, with the rescan from `p + 1`
+  as an optional refinement. Reverted on 2026-09-10. A "no" means that the
+  probe at `p` was wrong, so the scanner must continue at `p + 1` as after a
+  miss; otherwise a false hit just before a matched file loses that file's
+  first block. Section 6.3 makes the rescan and the negative cache mandatory.
+- **Negative cache keyed by the weak hash.** Rejected on 2026-09-10. It would
+  suppress the query for a different window with the same weak hash, a false
+  negative that the weak hash must never cause on its own. The key is the
+  Blake3 hash (section 6.3). Since the cache then no longer avoids the Blake3
+  computation, short-period blocks were removed from the index the same day
+  (section 4.1), so that periodic content misses the table instead.
 - **Binary fuse filter (32-bit fingerprints)** for the remote membership test.
   Rejected on 2026-09-09. It touches 3 cache lines per lookup against about 1
   for the fingerprint table, and its random fingerprints cannot be compressed,
@@ -871,7 +1259,10 @@ Usage rules:
   about twice the per-byte cost, which is irrelevant next to the table probe.
 - **Composite index `(weak, blake3)`**. Rejected on 2026-09-09. It was only a
   workaround for the buzhash collisions and adds about 33 bytes per block.
-- **cgo SQLite drivers**. Rejected on 2026-09-09; see section 9.
+- **cgo SQLite drivers** (Go era). Rejected on 2026-09-09 in favour of the
+  pure-Go `zombiezen.com/go/sqlite`. Moot since the switch to Rust: `rusqlite`
+  binds the C library, and the per-call overhead that made the pure-Go driver
+  competitive does not exist.
 - **Unmixed weak hash in the index** with mixing only at export and probe time.
   Reverted on 2026-09-10 in favour of storing the mixed value everywhere; one
   quantity is simpler.
@@ -889,8 +1280,9 @@ Usage rules:
   rows. The default block size went from 64 KiB to 32 KiB instead, which halves
   the unmatched tail of every file.
 - **Shell-style dot handling in globs** (`*` not matching a leading dot).
-  Considered and dropped on 2026-09-10. The program uses Go's `filepath.Glob`
-  as it is, and `exclude` handles entries such as `/nix/store/.links`.
+  Considered and dropped on 2026-09-10. The program uses the `glob` crate with
+  its default `require_literal_leading_dot = false` (Go's `filepath.Glob`
+  behaved the same), and `exclude` handles entries such as `/nix/store/.links`.
 - **Content-defined chunking** (as in casync, restic, and borg) on both sides
   would reduce the remote's lookups from one per byte to one per chunk. It was
   rejected: inside an archive stream, the chunk at the start and the chunk at
@@ -898,9 +1290,11 @@ Usage rules:
   are lost. Trees with many files between 10 KiB and 1 MiB lose a lot. Fixed
   local blocks with a rolling remote scan lose only the incomplete tail of each
   file.
-- **Pure-Go zstd as the default compressor**. Rejected on 2026-09-10 in favour
-  of libzstd through cgo: fewer levels, no worker threads, and a lower ratio at
-  the same CPU cost. Kept as the `!cgo` fallback.
+- **Pure-Go zstd as the default compressor** (Go era). Rejected on 2026-09-10
+  in favour of libzstd: fewer levels, no worker threads, and a lower ratio at
+  the same CPU cost. The Go design kept it as a `!cgo` fallback and the `zstd`
+  command as a second fallback; both are gone. The binary links libzstd, and
+  the pure-Rust `ruzstd` has no usable encoder (section 9).
 - **SSH transport compression**. Disabled on 2026-09-10 with
   `-o Compression=no`: zlib on top of zstd wastes CPU on both hosts and cannot
   compress the control session.
@@ -913,49 +1307,70 @@ Usage rules:
 
 ## 11. Repository conventions
 
-- One Go module, one binary: `go build ./cmd/hashsync`. cgo is used for
-  libzstd. A `CGO_ENABLED=0` build is not required, but the `!cgo` zstd fallback
-  keeps it possible at little cost; do not break it without a reason.
-- If `go` is not in `PATH`, use a Nix shell (`nix develop` once a flake exists,
-  or `nix shell nixpkgs#go`).
-- Suggested layout:
-  - `cmd/hashsync`: command-line entry point.
-  - `internal/weakhash`: multiplier, `Tout` tables, block hash, rolling hash,
+- One crate, one binary: `cargo build --release` produces
+  `target/release/hashsync`. `Cargo.lock` is committed. Edition 2024, current
+  stable toolchain.
+- If `cargo` is not in `PATH`, use a Nix shell (`nix develop` once a flake
+  exists, or `nix shell nixpkgs#cargo nixpkgs#rustc nixpkgs#gcc`; the C
+  compiler is needed for the bundled C sources).
+- Suggested layout of `src/`:
+  - `main.rs`: command-line entry point (`clap`).
+  - `weakhash.rs`: multiplier, `Tout` tables, block hash, rolling hash,
     `mix64`.
-  - `internal/hashset`: Golomb-Rice hash list encoder and decoder, fingerprint
-    table.
-  - `internal/scan`: descriptor-relative traversal, filesystem and inode
-    identities, mount tracking, hashing workers.
-  - `internal/index`: schema, migrations, writer, pruning, hash list export and
-    cache.
-  - `internal/proto`: frame types, encoding, HELLO handshake.
-  - `internal/remote`: `serve` (scanner) and `attach` (relay).
-  - `internal/local`: `run` (remote shell processes, answering, reconstruction).
-  - `internal/config`: `config.toml` and XDG paths.
-- Run `go vet ./...` and `go test -race ./...` before you finish a change.
-- Tests to keep: rolling hash equals direct hash (property test); the
+  - `hashset/`: Golomb-Rice hash list encoder and decoder, fingerprint table,
+    SIMD bucket scan.
+  - `scan/`: pool, directory and file tasks, filesystem and inode identities,
+    mount tracking, hashing; the optional `io_uring` reader.
+  - `index/`: schema, migrations, writer, pruning, hash list export and cache.
+  - `proto/`: frame types, encoding, HELLO handshake.
+  - `remote/`: `serve` (ring buffer, scanner, emitter) and `attach` (relay).
+  - `local/`: `run` (remote shell processes, answering, reconstruction).
+  - `config.rs`: `config.toml` and XDG paths.
+  - `sys/`: every `unsafe` FFI call (handles, ioctl, `cachestat`, the `statx`
+    bit, ring setup). The crate root has `#![deny(unsafe_code)]`; `sys`, the
+    SIMD bucket scan, and the `io_uring` reader carry `#![allow(unsafe_code)]`.
+- Run `cargo fmt`, `cargo clippy --all-targets`, and `cargo test` before you
+  finish a change.
+- Tests to keep: rolling hash equals direct hash (`proptest`); the
   interleaved k-stream hash and the split block hash equal the serial ones;
   Golomb-Rice round trip on random and adversarial gap patterns; the hash table
   never gives a false negative; traversal tests on a temporary tree (hard links,
   symlink loops, dot names and `exclude`, immutable roots, glob
   roots, ctime change, pruning, identity fallbacks when the ioctl or handles are
-  unsupported, sparse files with holes that start and end off block boundaries);
-  a fuzz test for the frame decoder; runs of one byte at arbitrary offsets,
-  crossing block boundaries and longer than the look-ahead, reproduced
-  byte-exact through RLE frames, and constant blocks absent from the index; a
-  compression round trip with flushes at arbitrary frame boundaries; the ssh argument order (`-o Compression=no` after
-  the configured command, HOST last); an end-to-end test that connects `serve`
-  and `attach` through in-process pipes without ssh.
+  unsupported, sparse files with holes that start and end off block boundaries,
+  descriptor count under a low `RLIMIT_NOFILE`); a fuzz target (`cargo fuzz`)
+  for the frame decoder; runs of one byte at arbitrary offsets, crossing block
+  boundaries and longer than the look-ahead, reproduced byte-exact through RLE
+  frames, and constant blocks absent from the index; a "no" answer after which
+  the scanner finds a block that starts inside the rejected window, with the
+  rescan bounded by a later pending window; a negative cache hit needs a Blake3
+  match, and a different window with the same weak hash is still queried;
+  blocks with periods 1 to 16 absent from the index and a block with period 17
+  present; a compression round trip
+  with flushes at arbitrary frame boundaries; the ssh argument order
+  (`-o Compression=no` after the configured command, HOST last); an end-to-end
+  test that connects `serve` and `attach` through in-process pipes without ssh.
 - Protocol constants (frame layout, multiplier `a`, `mix64`, hash list width,
   HELLO fields) are shared by both roles. A change to any of them needs a
   protocol version bump.
-- Nix: package with `buildGoModule` and keep `vendorHash` current.
+- Nix: package with `rustPlatform.buildRustPackage` and keep `cargoHash`
+  current. Cross builds for a remote of another architecture go through
+  `pkgsCross`; static builds through `pkgsStatic` (musl). The bundled C sources
+  build in both.
 
 ## 12. Open questions
 
 - **Stored Blake3 length.** 32 bytes as specified, or 16 bytes to save about
-  20 % of the index (section 4.4).
-- **Adaptive compression level.** libzstd allows changing the level during a
-  multithreaded stream (that is how `zstd --adapt` works). A small controller
-  could raise the level while the network is the bottleneck and lower it while
-  the compressor is. Needs a parameter setter that the current binding lacks.
+  20 % of the index and a fifth of the writer's work (section 4.4).
+- **Adaptive compression level.** The streaming encoder of the `zstd` crate
+  exposes `set_parameter(CParameter::CompressionLevel)`, and libzstd applies a
+  new level to the next job of a multithreaded stream, so the setter exists.
+  What remains is the controller: raise the level while the network is the
+  bottleneck, lower it while the compressor is.
+- **`io_uring` reader.** Adopt or drop after the measurement of section 4.6,
+  before the first release.
+- **Thread count default.** `4 × cores`, clamped to 16 to 64, assumes NVMe.
+  Measure a cold and a warm full build and an incremental update with 8, 16,
+  32, and 64 threads.
+- **Spinning disks.** A per-root limit on concurrent readers and reading in
+  inode order; not in the first version.
