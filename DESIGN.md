@@ -41,6 +41,9 @@ asynchronous runtime and no event loop (section 4.6).
   hold it.
 - **Root**: a configured path that the indexer scans recursively.
 - **Immutable root**: a root whose content never changes while the root exists.
+- **Identifier**: the string that names an immutable root in the index
+  (section 4.2). By default it is the root's path. Immutable roots with equal
+  identifiers are copies of one root, and only one copy is scanned.
 - **Filesystem id**: the persistent identity of a filesystem (section 4.3).
 - **Inode handle**: the persistent identity of an inode inside its filesystem,
   as returned by `name_to_handle_at` (section 4.3).
@@ -74,9 +77,10 @@ asynchronous runtime and no event loop (section 4.6).
    **control session** (section 6.1).
 4. The two sides exchange HELLO frames over the data session. The remote's
    HELLO names the hash list it kept from an earlier run with this index, if
-   any. The local sends the whole hash list, or only the changes since that
-   list (section 5.6). The remote applies the changes to its cached list,
-   stores the result for the next run, and builds its hash table.
+   any. The local sends the whole hash list, only the changes since that
+   list, or nothing when that list is current (section 5.6). The remote
+   applies the changes to its cached list, stores the result for the next
+   run, and builds its hash table.
 5. The remote starts the user command and reads its stdout.
 6. The remote computes the weak hash at every offset of the output and looks it
    up in its hash table.
@@ -145,7 +149,8 @@ collisions cost efficiency, never correctness.
 ### 4.2 Roots and change detection
 
 Roots come from `config.toml`. A root path can be a glob. Each match is its own
-root. The indexer expands globs at every update with the `glob` crate
+root, except that immutable matches with equal identifiers are one root
+(below). The indexer expands globs at every update with the `glob` crate
 (`glob::glob_with`, section 9). The match options are
 `require_literal_separator = true`, so that `*` and `?` never match a `/`, and
 the crate's default `require_literal_leading_dot = false`, so that `*` also
@@ -169,10 +174,17 @@ Mutable root (`immutable = false`, the default):
 
 Immutable root (`immutable = true`):
 
-- The indexer traverses the root once, when it first sees it.
-- While the root exists, the indexer never traverses it again and never stats
-  the files below it. It only checks that the root still exists (one open).
-- When the root disappears, its path rows are deleted.
+- The index knows the root by its identifier: a string that the `identifier`
+  option (below) derives from the path of the match or takes from the
+  configuration. By default it is the path itself.
+- The indexer traverses the root once, when it first sees its identifier.
+- While a match with that identifier exists, the indexer never traverses the
+  root again and never stats the files below it. It only checks that the
+  match still exists (one open).
+- Matches with equal identifiers are copies of one root. Only the first is
+  scanned; its rows serve all of them (below).
+- When no match of the update produces the identifier, the root's path rows
+  are deleted.
 - A file below an immutable root can also be reachable through a mutable root
   (for example through a hard link). It is then checked like any other file of
   that mutable root. If it changed, its block rows are replaced, and every path
@@ -200,6 +212,51 @@ Per-root options:
   entries and everything below them are skipped.
 - `one_filesystem`: do not cross mount points. An entry whose `stx_mnt_id`
   differs from its parent's is skipped, together with everything below it.
+- `identifier`: how the index names an immutable root. It is a configuration
+  error on a mutable root, which the index names by its path. The match can
+  be a directory or a single file. Forms:
+  - `"path"` (default): the absolute path of the match.
+  - `"name"`: the last component of the path of the match. With it,
+    `/nix/store/*` and `/mnt/disk/nix/store/*` give a store path the same
+    identifier on both disks.
+  - `{ strip_prefix = "/mnt/disk" }`: the absolute path of the match without
+    the leading `/mnt/disk`: `/mnt/disk/nix/store/x` gives `/nix/store/x`,
+    the default identifier of the same tree on the root filesystem. This
+    suits copies of trees whose names are not unique. A match that does not
+    start with the prefix is a configuration error.
+  - `{ literal = "photos-2019" }`: the string as given. The root keeps its
+    rows when the tree moves to another path.
+
+  Identifiers are compared as strings, whatever form and whatever `[[roots]]`
+  entry produced them. An empty identifier is a configuration error.
+
+Copies of an immutable root: matches of one update with equal identifiers are
+copies of one root, whether one glob or several entries produced them. The
+update handles them in this order:
+
+1. It expands every glob, derives the identifier of every match, and groups
+   the matches by identifier. Inside a group, the matches of an earlier
+   `[[roots]]` entry come first; the order of the matches of one glob is not
+   specified. Put the entry of the preferred copy first.
+2. A group whose identifier names an immutable root of the index keeps that
+   root and its rows. When the root's stored path is not one of the group's
+   paths, the first path of the group replaces it: the tree moved, or the
+   scanned copy is gone.
+3. Every other group gets a new root, with its first path as the stored path,
+   and the indexer scans that path. The other paths of the group are never
+   read. A change of the `identifier` option therefore rescans the root
+   under its new identifier.
+4. Immutable roots that no group kept lose their path rows.
+
+The rows of a root describe the copy that was scanned. Candidate reads
+(section 6.4) and `hashsync prune` open files below the root's stored path,
+which can be another copy. The design assumes that copies are equal. The
+Blake3 check of every spliced block (section 3) makes that assumption safe: a
+copy that differs costs "no" answers, nothing else. With
+`identifier = "name"` on two Nix stores, the second store costs one directory
+listing and one index lookup per store path instead of a read of every file,
+because two store paths with the same name almost always hold the same
+content.
 
 ### 4.3 Identity of filesystems and inodes
 
@@ -249,8 +306,11 @@ The index is one SQLite file, by default
 CREATE TABLE meta        (key TEXT PRIMARY KEY, value BLOB NOT NULL);
   -- keys: schema_version, block_size, weak_hash_id, generation, index_id
 CREATE TABLE filesystems (id INTEGER PRIMARY KEY, fsid BLOB NOT NULL UNIQUE);
-CREATE TABLE roots       (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE,
-                          immutable INTEGER NOT NULL);
+CREATE TABLE roots       (id INTEGER PRIMARY KEY, ident TEXT NOT NULL,
+                          immutable INTEGER NOT NULL, path TEXT NOT NULL,
+                          UNIQUE (ident, immutable));
+  -- ident: the path of a mutable root, the identifier of an immutable one;
+  -- path: where the root was last found (section 4.2)
 CREATE TABLE inodes      (id INTEGER PRIMARY KEY, fs_id INTEGER NOT NULL,
                           handle BLOB NOT NULL, size INTEGER NOT NULL,
                           ctime_ns INTEGER NOT NULL, UNIQUE (fs_id, handle));
@@ -800,10 +860,12 @@ Local side: the cache and the delta log live next to the database.
   changes take tens of milliseconds, on top of the export of section 5.4.
 
 Storage: the log is smaller than the full list, so the local holds at most two
-lists per index, whatever the number of peers. In a fleet of N hosts that all
-reach each other, the whole fleet stores N × (N − 1) cached lists on the remote
-sides plus two files per host. The remote-side copies are the cache itself;
-copies per peer on the local side are not needed (section 10).
+lists per index, whatever the number of peers. In a fleet of N hosts with one
+index each that all reach each other, the whole fleet stores N × (N − 1)
+cached lists on the remote sides plus two files per host; a second user of a
+host has a second index, which adds its own lists. The remote-side copies are
+the cache itself; copies per peer on the local side are not needed
+(section 10).
 
 Choice at run time: the remote's HELLO (section 6.2) carries the generation
 and the list hash of the list it holds for `index_id`; an all-zero hash means
@@ -812,7 +874,9 @@ that generation and ends at the current one, and checks that the `from_hash`
 of the first segment equals the remote's hash. If the chain exists, the local
 sends its segments, one after the other, as HASHDELTA; the pruning rule
 guarantees that they are smaller than the full list. Otherwise it sends
-HASHLIST. Every list a remote can hold was the local's cache at some time, so
+HASHLIST. A remote whose generation and hash equal the local's gets a
+HASHDELTA without segments: the chain is empty, and the remote's list is
+current. Every list a remote can hold was the local's cache at some time, so
 its generation is a segment boundary. The chain is missing when the remote's
 list is older than the log or when the local's cache was deleted by hand, and
 the hash check fails after a restore from a backup; in each case the remote
@@ -821,25 +885,57 @@ gets the full list and its cache is current again after the run.
 Remote side, in `serve` (section 6.1):
 
 - Cache directory: `$XDG_CACHE_HOME/hashsync/lists/` (fallback
-  `~/.cache/hashsync/lists/`), mode 0700. One file per `index_id`, mode 0600:
-  a header (generation, list hash, `block_size`, `weak_hash_id`, `W`) and the
-  encoded list. Files are written under a temporary name and renamed. When the
-  directory cannot be written, `serve` keeps the list in memory only and
-  reports none at the next run.
-- On the local's HELLO: read the file for `index_id` and report its generation
-  and hash when the header's parameters equal those of the HELLO; otherwise
-  report none. When the HELLO's `remote_cache` flag is false, report none and
-  store nothing.
+  `~/.cache/hashsync/lists/`) of the account that runs `serve`, mode 0700.
+  One file per `index_id`, named by the id in hexadecimal, mode 0600: a
+  header (generation, list hash, `block_size`, `weak_hash_id`, `W`) and the
+  encoded list. The file holds the newest list that a run of that index
+  delivered. When the directory cannot be written, `serve` keeps the list in
+  memory only and reports none at the next run.
+- One list per index. An `index_id` names one index file (section 4.4), and
+  each user of each local host has an index of their own (`index_path`,
+  section 7). A remote that serves two local hosts, or two users of one local
+  host, therefore keeps two lists, and the runs of one index never touch the
+  list of another. Two indexes with the same roots cost two files. A rebuilt
+  index has a new id; its old list stays until the expiry below removes it.
+- On the local's HELLO: open the file for `index_id`, read its header, and
+  report the generation and the hash when the header's parameters equal
+  those of the HELLO; otherwise report none. Keep the descriptor until the
+  list is no longer needed: a rename or a deletion by another `serve` (below)
+  then cannot take the list away. When the HELLO's `remote_cache` flag is
+  false, report none, store nothing, and delete the file of that index if
+  there is one.
 - On HASHLIST: build the table and store the payload as received.
 - On HASHDELTA: decode the cached list, apply the segments in order (one
   linear merge each: drop the removed values, insert the added ones), encode
   the result, and compare its Blake3 hash with the `to_hash` of the last
   segment. Equal: store the new list. Different: log a warning, delete the
   cache file, and continue with the table. This can only cost efficiency
-  (section 3); the next run gets a full list.
-- At start-up, delete cache files that no run has used for 30 days (`mtime`).
+  (section 3); the next run gets a full list. A HASHDELTA without segments
+  (the remote's list is current) builds the table from the cached list and
+  sets the file's timestamps to now (`futimens` on the open descriptor with
+  `UTIME_NOW`), so that the file records the use.
+- Stores, deletions, and the expiry below run under an exclusive `flock` on
+  the directory's descriptor. The lock is held for a header read and a
+  rename, never for a transfer. A store writes the new list under a
+  temporary name in the directory, takes the lock, and reads the header of
+  the current file. Then it renames the new file into place, unless the
+  current file changed since the HELLO and holds a generation that is not
+  lower: a concurrent run of the same index stored a newer list first, and
+  the new file is discarded. The deletion after a failed merge happens only
+  when the file did not change since the HELLO. The rule keeps the file at
+  the newest generation whatever the order of concurrent stores. An index
+  restored from a backup, whose generation went backwards, still replaces
+  the list that the HELLO reported, because that file did not change.
+- Expiry: at start-up, before it reads the HELLO, `serve` deletes every file
+  of the directory whose `ctime` is older than 3 months (90 days). Every use
+  renews the `ctime`: a store renames a new inode into place, and a run that
+  changes nothing touches the file. `ctime` and not `mtime`: only the kernel
+  sets `ctime`, so it always dates an event on this host, while `cp -p` or
+  `rsync -a` keeps an old `mtime`, which would make a restored list look
+  unused. The touch sets `mtime` too, so `ls -l` shows the last use. An
+  expired list costs the next run of its index one full transfer.
 - Cost: one decode, one merge per segment, one encode, and one Blake3 of the
-  encoded list; well under a second.
+  encoded list; well under a second. The expiry costs one `statx` per file.
 
 Sizes for the 8M-block example of section 5.4. A value of a sparse list costs
 about `W - log2(n) + 2` bits: 30 bits at 0.8M values.
@@ -929,7 +1025,7 @@ Every frame is `type u8, length u32 (little endian), payload`. Suggested types:
 | Session | Direction | Types |
 |---|---|---|
 | data | remote to local | HELLO, LIT (bytes), REF (qid), RLE (byte u8, length u64), END (exit status, error text) |
-| data | local to remote | HELLO, HASHLIST (encoded hash list, can span several frames), HASHDELTA (segments of the delta log, section 5.6, can span several frames) |
+| data | local to remote | HELLO, HASHLIST (encoded hash list, can span several frames), HASHDELTA (segments of the delta log, section 5.6, can span several frames; empty when the remote's list is current) |
 | control | remote to local | HELLO, QUERY (qid u32, offset u64, weak u64, blake3 [u8; 32]) |
 | control | local to remote | HELLO, ANSWER (qid u32, found u8) |
 
@@ -1062,7 +1158,8 @@ For each QUERY:
    rescan on the remote and up to `block_size` bytes of network (section 6.3).
    The high limit skips over stale rows (deleted or changed files).
 2. For each candidate: take one `(root_id, rel_path)` of the inode and open it
-   relative to the root's descriptor, which the run opens once and caches:
+   relative to the descriptor of the root's stored path (section 4.2), which
+   the run opens once and caches:
    `openat2(rootfd, rel_path, RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)`
    (`rustix::fs::openat2`, Linux 5.6 and newer; fall back to component-wise
    `openat` with `O_NOFOLLOW`). Then `pread` `B` bytes at `block_no * B` and
@@ -1115,9 +1212,11 @@ emits runs of at least `block_size`.
   its stdin closes.
 - Security: the hash list reveals the block hashes of all indexed files to the
   remote host, and with the cache of section 5.6 it stays on the remote's disk
-  between runs (mode 0600, under the remote user's cache directory). Use
-  `hashsync` only with hosts the user trusts. Set `remote_cache = false` for a
-  host that must not keep the list (section 7).
+  between runs and for 3 months after the last run (mode 0600, under the
+  remote user's cache directory). Use `hashsync` only with hosts the user
+  trusts. Set `remote_cache = false` for a host that must not keep the list
+  (section 7); the next run to that host deletes the list that an earlier run
+  left there.
 
 ### 6.6 Threads at run time
 
@@ -1182,7 +1281,16 @@ remote_cache   = false     # shared machine: do not leave the hash list on its d
 [[roots]]
 path = "/nix/store/*"      # glob: each match is its own root; also matches dot names
 immutable = true
+identifier = "name"        # the store path's name (section 4.2); default: the full path
 exclude = ["/nix/store/.links"]
+
+[[roots]]                  # a second Nix store, on a disk mounted at /mnt/disk
+path = "/mnt/disk/nix/store/*"
+immutable = true
+identifier = "name"        # a store path whose name is indexed already is not scanned;
+                           # { strip_prefix = "/mnt/disk" } with the default on the
+                           # first store would do the same
+exclude = ["/mnt/disk/nix/store/.links"]
 
 [[roots]]
 path = "/srv/data"
@@ -1228,11 +1336,11 @@ and no need for one.
 |---|---|---|---|
 | Weak hash | own code | | Sections 5.1 and 5.2, about 50 lines. |
 | Hash list coding | own code | | Golomb-Rice encoder and decoder, about 60 lines. |
-| Hash list cache and delta log | own code | | Section 5.6: diff of two sorted lists, segment files, pruning, the remote's cache and merge; about 150 lines over both roles. |
+| Hash list cache and delta log | own code | | Section 5.6: diff of two sorted lists, segment files, pruning, the remote's cache, merge, and expiry; about 150 lines over both roles. |
 | Remote hash table | own code | | Section 5.5, about 100 lines plus the SIMD bucket scan. |
 | Blake3 | `blake3` | 1.8.7 (2026-08) | `blake3::hash`. Assembly for SSE4.1, AVX2, and AVX-512 on x86_64 with run-time detection; NEON on aarch64 by default. See below. |
 | SQLite | `rusqlite` | 0.40.2 (2026-08) | Feature `bundled`: SQLite 3.53.2 through `libsqlite3-sys` 0.38.2. `prepare_cached`, `transaction_with_behavior`, `busy_timeout`, `pragma_update`. See below. |
-| System calls | `rustix` | 1.1.4 (2026-02) | `fs::{openat, openat2, statx, RawDir, fadvise, seek, memfd_create, flock}`, `io::{pread, preadv2}`, `mm::{mmap, mmap_anonymous, madvise}`, `pipe::{splice, fcntl_setpipe_size}`, `process::setrlimit`, `rand::getrandom`, `ioctl::{Getter, opcode}`. Raw system calls on Linux (`linux_raw` backend). |
+| System calls | `rustix` | 1.1.4 (2026-02) | `fs::{openat, openat2, statx, RawDir, fadvise, seek, memfd_create, flock, futimens}`, `io::{pread, preadv2}`, `mm::{mmap, mmap_anonymous, madvise}`, `pipe::{splice, fcntl_setpipe_size}`, `process::setrlimit`, `rand::getrandom`, `ioctl::{Getter, opcode}`. Raw system calls on Linux (`linux_raw` backend). |
 | System calls, gaps | `libc` | 0.2.189 (2026-08) | `name_to_handle_at`, `file_handle`, `MAX_HANDLE_SZ`, `syscall(SYS_cachestat, ...)`. |
 | Kernel constants | `linux-raw-sys` | 0.12.1 (2025-12) | `general::{fsuuid2, cachestat, STATX_MNT_ID_UNIQUE}`. Already a dependency of `rustix`. |
 | Thread pool | `rayon` | 1.12.0 (2026-04) | A dedicated `ThreadPool`, `scope` and `spawn`. LIFO local deques, oldest-first stealing (section 4.6). |
@@ -1407,6 +1515,20 @@ stays custom (section 5.5).
   Reverted on 2026-09-10. The `(size, ctime)` check is cheap and is now the
   single criterion for hashing a file again. Immutable roots alone give the
   saving: their files are never stat'ed unless a mutable root reaches them.
+- **One root row per copy of an immutable tree**, with the path rows copied
+  to every copy. Rejected on 2026-09-10. It multiplies the path rows of a
+  Nix store by the number of copies and needs a re-parenting of the rows
+  when the scanned copy disappears. The identifier of section 4.2 keeps one
+  root with one stored path instead.
+- **Identifier from the wildcard part of the glob** (the components that the
+  wildcards matched). Considered and dropped on 2026-09-10. It is ambiguous
+  with several wildcards and undefined for a literal path; `name` and
+  `strip_prefix` say the same thing explicitly.
+- **Renaming a root when its `identifier` option changes**, by finding the
+  stored path of an old root among the paths of a new identifier, so that the
+  rows survive without a rescan. Dropped on 2026-09-10 (user decision): not a
+  normal use, and it adds logic to the update. A change of the option
+  rescans the root (section 4.2).
 - **`(st_dev, st_ino)` as the inode identity**. Rejected on 2026-09-10.
   `st_dev` changes between boots on XFS and on btrfs subvolumes, which would
   rebuild the whole index; inode numbers are reused. Section 4.3 uses the
@@ -1478,6 +1600,16 @@ stays custom (section 5.5).
   pruning rule already caps a chain below the size of the full list. The local
   sends the segments as they are on disk, and the remote applies them in order
   (section 5.6).
+- **Expiry of the remote cache after 30 days of no use, by `mtime`.**
+  Replaced on 2026-09-10 (user decision) by 3 months, measured on `ctime`
+  (section 5.6). Any program can set `mtime`, and `cp -p` or `rsync -a` keeps
+  an old one, so a restored list would look unused; only the kernel sets
+  `ctime`. `atime` is out: `noatime` mounts never update it.
+- **Last writer wins for the remote cache file.** Rejected on 2026-09-10. Two
+  concurrent runs of one index store in either order, so the older list could
+  replace the newer one, and the next run would send the same segments again.
+  The store reads the header under the lock and keeps the newer file
+  (section 5.6).
 
 ## 11. Repository conventions
 
@@ -1514,9 +1646,16 @@ stays custom (section 5.5).
   a chain of several segments, the pruning rule, the choice between full list
   and chain from the remote's HELLO, a list hash mismatch on the remote that
   gets a full list at the next run, and an index restored from a backup (same
-  generation, different content) that the hash detects; the hash table
+  generation, different content) that the hash detects; the remote cache
+  (section 5.6): two indexes served from one directory, each with its own
+  file, a HASHDELTA without segments that touches the file, the expiry with
+  the current time as a parameter (tests cannot set `ctime`), and a store
+  that does not replace a newer generation; the hash table
   never gives a false negative; traversal tests on a temporary tree (hard links,
-  symlink loops, dot names and `exclude`, immutable roots, glob
+  symlink loops, dot names and `exclude`, immutable roots and their
+  identifiers (two copies under `name`, `strip_prefix`, and `literal`, as
+  directories and as single files, scanned once; the stored path moves when
+  the scanned copy disappears; `identifier` rejected on a mutable root), glob
   roots, ctime change, pruning, identity fallbacks when the ioctl or handles are
   unsupported, sparse files with holes that start and end off block boundaries,
   descriptor count under a low `RLIMIT_NOFILE`); a fuzz target (`cargo fuzz`)
