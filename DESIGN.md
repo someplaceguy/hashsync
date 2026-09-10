@@ -71,8 +71,9 @@ asynchronous runtime and no event loop (section 4.6).
 1. The local loads `config.toml`, opens the index, and updates it (section 4).
    `--no-update` skips the update.
 2. The local exports the hash list from the index, or loads the cached one
-   (section 5.4). When the index changed since the last export, it also
-   records the changes in the delta log (section 5.6).
+   (section 5.4). When the index changed since the last export, it first
+   checkpoints the database, so that the generation it publishes is durable
+   (section 4.4), and it records the changes in the delta log (section 5.6).
 3. The local opens two SSH sessions to the remote host: a **data session** and a
    **control session** (section 6.1).
 4. The two sides exchange HELLO frames over the data session. The remote's
@@ -82,24 +83,25 @@ asynchronous runtime and no event loop (section 4.6).
    applies the changes to its cached list, stores the result for the next
    run, and builds its hash table.
 5. The remote starts the user command and reads its stdout.
-6. The remote computes the weak hash at every offset of the output and looks it
-   up in its hash table.
-   - Table miss: the byte at this offset is a literal. Continue at the next
-     offset.
-   - Table hit: the remote computes the Blake3 hash of the window and sends a
-     query over the control session. It continues at the offset after the
-     window (section 6.3).
-   - Window of one repeated byte: the remote sends one RLE frame for the whole
-     run and continues after it, without a query (section 6.3).
+6. The remote scans the output (section 6.3). At every offset it computes the
+   weak hash of the window and looks it up in its hash table.
+   - Run of one byte value, at least `block_size` long: the remote records
+     it and continues after it, without a query.
+   - Table miss: continue at the next offset.
+   - Table hit: the remote computes the Blake3 hash of the window. When the
+     local said "no" to that hash earlier in this run, continue at the next
+     offset. Otherwise send a query over the control session, record the
+     window as a candidate, and continue at the next offset.
 7. The local answers each query. It looks the weak hash up in the index, keeps
    the candidates whose stored Blake3 equals the queried one, reads a candidate
    block from disk, verifies its Blake3 hash, and keeps the verified bytes in
    memory. It answers "yes" if a block verified and "no" otherwise
    (section 6.4).
-8. The remote sends the resolved output over the data session, in order: literal
-   runs, and one reference for each window that got a "yes". A window that got a
-   "no" is scanned again from its second byte (section 6.3); the bytes that no
-   later window covers are sent as literals.
+8. In a second pass, the remote resolves the recorded runs and candidates in
+   stream order (section 6.3): it waits for the answer of each candidate,
+   takes every candidate that got a "yes" and does not overlap an item taken
+   before it, and sends the output over the data session: literal bytes, one
+   reference per taken candidate, and one RLE frame per run.
 9. The local writes literal runs, pinned block bytes, and synthesized runs to
    its stdout, in order.
 10. When the command exits, the remote sends the exit status. The local exits
@@ -111,6 +113,17 @@ bytes it read from local disk, in memory, before it uses them. Stale index
 entries, files changed after indexing, stale cached lists, and weak hash
 collisions cost efficiency, never correctness.
 
+Design principle: no timeouts. The program never abandons an operation because
+it took longer than a fixed time. A slow disk, a slow link, or a loaded host
+must not turn into a failure, and a deadline chosen by a programmer is
+arbitrary for some system. When something is broken, the program hangs, and a
+debugger can be attached to it; it does not give up. A wait ends only when the
+awaited event happens or when the peer, descriptor, or process it waits for
+goes away (an error, an end of file, a closed channel). A fatal error ends the
+process, which is what makes every such end reach every thread
+(section 6.7). Poll intervals and cache expiry ages are not timeouts: they
+fail nothing.
+
 ## 4. The local index
 
 ### 4.1 What gets indexed
@@ -120,8 +133,8 @@ collisions cost efficiency, never correctness.
   (`O_NOFOLLOW`, `AT_SYMLINK_NOFOLLOW`). This rules out infinite recursion
   through symlink loops.
 - Each directory once per scan. The walker keeps the set of visited directories,
-  keyed by `(filesystem id, inode number)`, for the duration of the scan. This
-  stops the cycles that bind mounts can create.
+  keyed by `(filesystem id, inode handle)` (section 4.3), for the duration of
+  the scan. This stops the cycles that bind mounts can create.
 - Only complete blocks. A file of size S has `floor(S / block_size)` blocks.
   A file smaller than `block_size` has no blocks and is skipped entirely: it
   gets no inode row and no path row. Such files are stat'ed again at every scan
@@ -158,9 +171,11 @@ matches names that start with a dot: `/nix/store/*` matches
 `/nix/store/.links`. Use `exclude` for such entries. `**` matches any number of
 path components. A root that is a regular file is indexed as that single file.
 
-Roots are opened by path at every update. Together with the SQLite file and the
-`ssh` processes, this is the only path-based filesystem access of the program
-(section 4.5). Roots are scanned in parallel.
+Roots are opened by path: at every update, and at run time for every
+candidate read (section 6.4). Together with the SQLite file, the cache files,
+and the `ssh` processes, these are the only path-based filesystem accesses of
+the program (section 4.5). Roots are scanned in parallel, as tasks of the
+pool (section 4.6); they are not opened up front.
 
 Mutable root (`immutable = false`, the default):
 
@@ -178,9 +193,14 @@ Immutable root (`immutable = true`):
   option (below) derives from the path of the match or takes from the
   configuration. By default it is the path itself.
 - The indexer traverses the root once, when it first sees its identifier.
-- While a match with that identifier exists, the indexer never traverses the
-  root again and never stats the files below it. It only checks that the
-  match still exists (one open).
+  The root row is marked complete when the whole traversal has been
+  committed (section 4.4). A root whose traversal was interrupted (a crash,
+  a signal) stays marked incomplete, and the next update traverses it again,
+  in the way of a mutable root: files whose `(size, ctime)` match their rows
+  are not read again, so the second traversal costs one `statx` per file.
+- While a match with that identifier exists and the root is complete, the
+  indexer never traverses the root again and never stats the files below it.
+  It only checks that the match still exists (one open).
 - Matches with equal identifiers are copies of one root. Only the first is
   scanned; its rows serve all of them (below).
 - When no match of the update produces the identifier, the root's path rows
@@ -241,7 +261,8 @@ update handles them in this order:
 2. A group whose identifier names an immutable root of the index keeps that
    root and its rows. When the root's stored path is not one of the group's
    paths, the first path of the group replaces it: the tree moved, or the
-   scanned copy is gone.
+   scanned copy is gone. When the root is marked incomplete, the indexer
+   traverses the stored path once more (above).
 3. Every other group gets a new root, with its first path as the stored path,
    and the indexer scans that path. The other paths of the group are never
    read. A change of the `identifier` option therefore rescans the root
@@ -273,29 +294,47 @@ deletion. The index therefore identifies:
   Build the opcode in the project with
   `rustix::ioctl::opcode::read::<fsuuid2>(0x15, 0)` and call it through
   `rustix::ioctl::ioctl` with a `Getter` (section 9). A filesystem that does
-  not implement the ioctl (`ENOTTY`) falls back to its mount id from `statx`
-  (`stx_mnt_id`; the program requests `STATX_MNT_ID_UNIQUE`, and a kernel
-  before 6.8 returns the non-unique `STATX_MNT_ID` value and leaves the unique
-  bit clear in `stx_mask`), stored with a tag so that it cannot collide with a
-  UUID. A mount id is not stable across boots, so such a filesystem is indexed
-  again after a reboot.
+  not implement the ioctl (`ENOTTY`; btrfs does not, as of Linux 6.18) falls
+  back to the `f_fsid` value that `fstatfs` returns (`rustix::fs::fstatfs`),
+  stored with a tag so that it cannot collide with a UUID. Most filesystems
+  derive `f_fsid` from an on-disk identifier, so it is stable across boots;
+  btrfs also folds the id of the subvolume into it, so each subvolume gets its
+  own filesystem id. A filesystem whose `f_fsid` is not stable across boots is
+  indexed again after a reboot. The mount id (`stx_mnt_id`) is never an
+  identity: it is not stable across boots, and every subvolume of a btrfs
+  filesystem that is reached through one mount has the same mount id.
 - An **inode** by the file handle that `name_to_handle_at` returns
   (`libc::name_to_handle_at`; `rustix` has no wrapper). The handle is unique
   within its filesystem and persistent, and it includes the inode generation,
-  so a reused inode number gets a different handle. Handles are opaque byte
-  strings of up to 128 bytes (`MAX_HANDLE_SZ`), usually 8 to 40. If the
-  filesystem does not support handles (`EOPNOTSUPP`), fall back to the inode
-  number from `statx`, stored with a tag.
+  so a reused inode number gets a different handle. On btrfs the handle also
+  names the subvolume, so two subvolumes that reuse one inode number get
+  different handles. Handles are opaque byte strings of up to 128 bytes
+  (`MAX_HANDLE_SZ`), usually 8 to 40. If the filesystem does not support
+  handles (`EOPNOTSUPP`), fall back to the inode number from `statx`, stored
+  with a tag.
 
 The index assigns a 64-bit integer id to every filesystem and to every inode and
 uses these ids as foreign keys. The pair `(fs_id, handle)` is unique.
 
-Cost control: the ioctl runs once per mount seen in a scan, not once per inode.
-`statx`, which the walker needs anyway for size and ctime, returns `stx_mnt_id`
-for every entry. Only when it differs from the parent's does the walker resolve
-the mount to a filesystem id (or skip the entry, with `one_filesystem`). The
-walker caches `mount id -> fs_id` for the scan. `name_to_handle_at` runs once
-per regular file; it is a metadata-only call with no disk read.
+The pair `(fs_id, handle)` is the only identity of an inode in the program,
+in memory as well as in the index. The inode number alone is never a key: a
+filesystem reuses inode numbers after a deletion, and two btrfs subvolumes of
+one filesystem can hold different inodes with equal numbers. The in-memory
+sets of the walker (section 4.6) therefore hold the same `(fs_id, handle)`
+bytes that the index stores, and an inode that is met twice in one scan is
+found by them whatever happened to inode numbers in between.
+
+Cost control: the ioctl or `fstatfs` runs once per filesystem seen in a scan,
+not once per inode. `statx`, which the walker needs anyway for size and ctime,
+returns `stx_mnt_id`, `stx_dev_major`, and `stx_dev_minor` for every entry.
+Only when the triple `(stx_mnt_id, stx_dev_major, stx_dev_minor)` differs
+from the parent's does the walker resolve the entry to a filesystem id (or
+skip the entry, with `one_filesystem`, when the mount id differs). The walker
+caches `triple -> fs_id` for the scan. The mount id alone is not enough as the
+trigger: a btrfs subvolume below a mount keeps the mount id of that mount, but
+it has its own anonymous device number and its own `f_fsid`, so it must be
+resolved again. `name_to_handle_at` runs once per regular file and once per
+directory; it is a metadata-only call with no disk read.
 
 ### 4.4 Storage
 
@@ -308,12 +347,14 @@ CREATE TABLE meta        (key TEXT PRIMARY KEY, value BLOB NOT NULL);
 CREATE TABLE filesystems (id INTEGER PRIMARY KEY, fsid BLOB NOT NULL UNIQUE);
 CREATE TABLE roots       (id INTEGER PRIMARY KEY, ident TEXT NOT NULL,
                           immutable INTEGER NOT NULL, path TEXT NOT NULL,
-                          UNIQUE (ident, immutable));
+                          complete INTEGER NOT NULL, UNIQUE (ident, immutable));
   -- ident: the path of a mutable root, the identifier of an immutable one;
-  -- path: where the root was last found (section 4.2)
+  -- path: where the root was last found (section 4.2);
+  -- complete: 1 once a whole traversal of the root has been committed
 CREATE TABLE inodes      (id INTEGER PRIMARY KEY, fs_id INTEGER NOT NULL,
                           handle BLOB NOT NULL, size INTEGER NOT NULL,
                           ctime_ns INTEGER NOT NULL, UNIQUE (fs_id, handle));
+  -- size = -1 while the block rows of the inode are being written
 CREATE TABLE paths       (root_id INTEGER NOT NULL, rel_path TEXT NOT NULL,
                           inode_id INTEGER NOT NULL,
                           PRIMARY KEY (root_id, rel_path)) WITHOUT ROWID;
@@ -329,13 +370,54 @@ Rules:
 - `meta` stores `block_size` and `weak_hash_id` (algorithm name, multiplier,
   and mixer, section 5.1). If either differs from the configuration or from the
   binary, the program drops all tables and rebuilds the index.
-- Use WAL mode with `synchronous=NORMAL`. The database stays consistent after a
-  crash or a power loss. The last transactions can be lost, which is acceptable
-  for an index that can be rebuilt.
-- A transaction contains whole inodes only: the inode row, all its block rows,
-  and its path rows. Put many inodes into one transaction (commit every few
-  thousand files or every 30 seconds, whichever comes first) to amortise the commit
-  cost. A crash then leaves the index at a consistent earlier state.
+- Use WAL mode with `synchronous=NORMAL`. The database stays consistent after
+  a crash or a power loss, a commit costs no `fsync`, and the last
+  transactions can be lost, which is acceptable for an index that is a cache.
+  The publication contract below makes the transactions durable that
+  something outside the database depends on.
+- The writer commits every few thousand inodes or every 30 seconds, whichever
+  comes first, to amortise the commit cost. A transaction may cut through the
+  rows of a large file (below); every other inode is either wholly in a
+  transaction or wholly outside it. A crash leaves the index at a consistent
+  earlier state.
+- Recovery contract. The index never needs a repair step. Every committed
+  state is a valid index, because every row of it is a hint (section 3) and
+  because two markers tell the next update what was interrupted:
+  - `inodes.size = -1` marks an inode whose block rows are being written.
+    The writer sets it in the transaction that deletes the inode's old block
+    rows, and it stores the real size and ctime in the transaction that holds
+    the last block row. An inode left at `-1` by a crash matches no
+    `(size, ctime)` and is hashed again at the next update.
+  - `roots.complete = 0` marks a root whose traversal was not committed to
+    the end. The writer inserts the row with `0` in the first transaction that
+    references the root and sets `1` in the transaction that follows the end
+    of the root's walk. An immutable root left at `0` is traversed again at
+    the next update (section 4.2); a mutable root is traversed at every
+    update anyway.
+- Publication contract. `meta.generation` names the content of the `blocks`
+  table: the writer increments it inside every transaction that inserts or
+  deletes block rows, so two committed states with different block rows never
+  share a generation, and a crash can never leave changed rows behind an
+  unchanged generation. Transactions that touch only path or root rows leave
+  it alone, because the hash list does not depend on them. The generation
+  therefore moves several times during one update. That is intended: any
+  committed state may be exported as a hash list, by this process or by a
+  concurrent `hashsync run`, and the export (section 5.6) reads the generation
+  and the block rows in one read transaction, so the list it publishes
+  describes exactly the generation it is labelled with. Before a generation
+  is named outside the database, the export makes it durable: after it has
+  read the generation and the rows and has ended that read transaction, it
+  runs `PRAGMA main.wal_checkpoint(FULL)` in a loop until the first column of
+  the result (`busy`) is 0. A completed FULL checkpoint waits for the current
+  writer, syncs the WAL, copies its frames into the database file, and syncs
+  that too, so every transaction committed before it survives a power loss,
+  including the one that produced the exported generation. Only then does the
+  export write the segment and the cache file, and only then does the run
+  send the list or the delta. A generation that no export has published can
+  be lost with its transactions; nothing outside the database names it, so
+  nothing can reuse it. The read transaction must be over before the
+  checkpoint: FULL waits until every reader is on the newest snapshot, and a
+  reader that waits for its own checkpoint would wait forever.
 - Index the weak hash alone. The polynomial hash has no systematic collisions,
   so rows that share a weak value hold identical content, apart from stale
   entries. Identical blocks (for example zero blocks) legitimately share one
@@ -354,13 +436,19 @@ Rules:
 - `--rebuild` and the first build of an index insert the block rows without
   `blocks_by_weak` and create the index at the end. An index built over the
   finished table costs about a second per million rows; random inserts into a
-  B-tree that has outgrown the cache cost several microseconds each.
+  B-tree that has outgrown the cache cost several microseconds each. A rebuild
+  writes a new database file next to the old one and renames it into place
+  after its last commit, so a crash during the rebuild leaves the old index
+  in use and a stray file that the next rebuild deletes. Readers of the old
+  file (a concurrent `run`) keep their open descriptor and finish on the old
+  index.
 - Expected size: about 55 bytes per block row plus about 20 bytes per index
   entry, about 75 bytes per block, or 0.23 % of the indexed data at 32 KiB
   blocks. A 256 GiB tree (8M blocks) needs about 600 MB.
-- `generation` increments after every update that changed something. The cached
-  hash list file and the segments of the delta log record the generations they
-  were built from (section 5.6).
+- `generation` is a 64-bit counter that only grows (the publication contract
+  above). It starts at 1 when the tables are created; 0 means "no list" in
+  the protocol (section 6.2). The cached hash list file and the segments of
+  the delta log record the generations they were built from (section 5.6).
 - `index_id` is a random 128-bit value (`rustix::rand::getrandom`), written
   when the tables are created. `--rebuild`, and the rebuild after a parameter
   mismatch above, create a new one. It identifies the index towards remote
@@ -398,10 +486,16 @@ wrappers come from `rustix` and, for the few calls it lacks, from `libc`
 - Unchanged check for a regular file: `name_to_handle_at(dirfd, name, 0)` gives
   the handle; look up `(fs_id, handle)` in the index through the thread's read
   connection; if `(size, ctime)` match, send the path to the writer and stop.
-- Changed or new file: `openat(dirfd, name, O_RDONLY|O_NOFOLLOW|O_CLOEXEC)`, then
-  `statx(fd, "", ...)` with the same flags and mask, and
+- Changed or new file:
+  `openat(dirfd, name, O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_NOCTTY|O_CLOEXEC)`,
+  then `statx(fd, "", ...)` with the same flags and mask, and
   `name_to_handle_at(fd, "", AT_EMPTY_PATH)` on the open descriptor, so that
-  size, ctime, and handle describe the object that is hashed. Read the file
+  size, ctime, and handle describe the object that is hashed. The entry can
+  have been replaced since `getdents64` returned it: when `stx_mode` says that
+  the descriptor is not a regular file, close it and skip the entry.
+  `O_NONBLOCK` keeps the open of a FIFO from waiting for a writer, and
+  `O_NOCTTY` keeps a terminal from becoming the controlling terminal
+  (section 6.4). Read the file
   with `pread` in chunks of up to 1 MiB into the thread's buffer (one system
   call per 32 blocks instead of one per block) and compute the weak hash and
   Blake3 of every complete block of the chunk. A block with a period of 1 to
@@ -421,8 +515,12 @@ wrappers come from `rustix` and, for the few calls it lacks, from `libc`
   compressing filesystem can report a smaller allocation; that only costs the
   seek calls). A filesystem without hole support reports one data extent, so
   the procedure is safe everywhere.
-- Filesystem id: when an entry's `stx_mnt_id` differs from its parent's, call
-  `FS_IOC_GETFSUUID` on the entry's descriptor (section 4.3).
+- Filesystem id: when an entry's `(stx_mnt_id, stx_dev_major, stx_dev_minor)`
+  differs from its parent's, call `FS_IOC_GETFSUUID` on the entry's descriptor,
+  or `fstatfs` when the ioctl fails with `ENOTTY` (section 4.3).
+- Directory identity: `name_to_handle_at(dirfd, "", AT_EMPTY_PATH)` on the
+  open directory descriptor gives the key of the visited-directories set
+  (section 4.6).
 - Page cache: call `fadvise(SEQUENTIAL)` before a file is read. After a file is
   hashed, call `fadvise(DONTNEED)` on it, unless the file was already fully in
   the page cache before the read. A full scan must not evict the page cache of
@@ -502,11 +600,20 @@ hashsync applies this as follows:
   Threads that wait for the disk and threads that hash overlap without any
   scheduling logic.
 - A task carries the `Arc<OwnedFd>` of its parent directory and its name, and
-  opens its own descriptor when it runs. Queued tasks hold no descriptors; a parent's
-  descriptor lives until its last child task has opened its own. The open
-  descriptors are therefore bounded by the number of threads plus the parents
-  of the queued tasks, not by the queue length. The program raises the soft
-  `RLIMIT_NOFILE` to the hard limit at start anyway.
+  opens its own descriptor when it runs. Queued tasks hold no descriptors; a
+  parent's descriptor lives until its last child task has opened its own.
+  With depth-first order, the queued tasks of a thread are the unvisited
+  siblings along its current path, so the open descriptors are bounded by
+  `threads × depth`, not by the queue length or the size of the tree. Each
+  directory is opened once and never opened again. The roots are the initial
+  tasks, one per match, with no parent: a root task opens its path when a
+  thread takes it, so the number of roots (one per store path in a Nix store)
+  does not add open descriptors either. ripgrep and fd get a bound of
+  `threads` by queueing paths and opening a directory only while they read
+  it, at the price of one full path lookup per directory and per file;
+  hashsync keeps the parent's descriptor in the task instead and pays no
+  path lookup below a root. The program raises the soft `RLIMIT_NOFILE` to
+  the hard limit at start anyway.
 - Thread count. ripgrep uses `available_parallelism` capped at 12 and fd caps
   it at 64; both assume warm caches and CPU-bound work. hashsync's threads also
   wait for the disk, and every waiting thread adds one request to the device
@@ -517,9 +624,13 @@ hashsync applies this as follows:
 - Per-thread state, created once: a 64 KiB `getdents64` buffer, a 1 MiB read
   buffer, a Blake3 hasher, and an SQLite read connection with cached prepared
   statements (section 9). Readers never block the writer in WAL mode.
-- Two shared sets, keyed by `(fs_id, inode number)`: visited directories (cycle
-  protection) and seen regular files (hard links). Shard each into 64 mutexes
-  by inode number; there is no contention to speak of.
+- Two shared sets, keyed by `(fs_id, handle)` (section 4.3): visited
+  directories (cycle protection) and seen regular files (hard links). The
+  key holds the handle bytes as they are; the set of seen files therefore
+  costs about 64 bytes per regular file of the update, which is not a concern.
+  Shard each set into 64 mutexes by a hash of the key; there is no contention
+  to speak of. The handle of a directory costs one extra metadata call per
+  directory, next to its `openat`, `getdents64`, and `statx`.
 - Implementation: a dedicated `rayon` pool (`ThreadPoolBuilder::num_threads`)
   and `pool.scope` with one `spawn` per task. rayon's local deques are LIFO
   (depth-first is its default; `breadth_first` is deprecated) and its stealers
@@ -531,19 +642,48 @@ hashsync applies this as follows:
 
 #### The writer
 
-One thread owns the write connection. It receives finished inodes and seen
-paths over a bounded channel (capacity in the thousands; when the writer lags,
-the pool blocks in `send`, which is the intended backpressure). It writes in
-`BEGIN IMMEDIATE` transactions and commits every few thousand inodes or every
-second, whichever comes first. Nothing else writes, so the write lock is never
-contended. Section 4.4 lists its pragmas.
+One thread owns the write connection. It receives its work over a bounded
+channel and writes it in `BEGIN IMMEDIATE` transactions, committed every few
+thousand inodes or every 30 seconds, whichever comes first. Nothing else
+writes, so the write lock is never contended. Section 4.4 lists its pragmas.
 
-Deleted paths: for each mutable root of the current update, the writer keeps a
-set of 64-bit hashes of the relative paths it was told about. When the walk of
-the root ends, it streams the stored paths of the root and deletes the ones
-whose hash is not in the set. This costs 8 bytes per path and no write for an
-unchanged file. A hash collision keeps a stale path row, which costs efficiency
-only (section 3); `hashsync prune` removes it.
+Messages and their byte budget. Every message is at most 64 KiB, and the
+channel holds at most 4096 messages, so the queue never holds more than
+256 MiB; when the writer lags, the pool blocks in `send`, which is the
+intended backpressure. The block rows of a file are not one message: a 1 TiB
+file has 32M block rows, more than 1 GiB of hashes. The hashing thread
+streams them instead:
+
+- `Begin { fs_id, handle }`: the writer looks the inode up, inserts its row
+  with `size = -1` or sets `size = -1` on the existing row, and deletes its
+  old block rows.
+- `Blocks { rows }`: up to 1024 block rows (48 bytes each), sent as soon as
+  they are complete, while the file is still being read. The writer inserts
+  them into the current transaction.
+- `End { size, ctime, root_id, rel_path }`: the writer stores the real size
+  and ctime. The inode is now complete (section 4.4).
+- `Path { fs_id, handle, root_id, rel_path }`: a path of an inode that this
+  update did not hash (unchanged, or a hard link met a second time). The
+  writer resolves the handle to the inode id.
+- `RootDone { root_id }` after the walk of a root has ended (below).
+
+The messages of one file come from one thread, so the writer sees them in
+order, and a transaction that commits between two `Blocks` messages cuts
+through a file that is marked `size = -1` at that moment (section 4.4). A
+`Path` message can arrive before the `Begin` of its inode, when a thread met a
+hard link whose first path another thread is still hashing. The writer keeps
+such paths in a map keyed by `(fs_id, handle)` and inserts them when the
+inode's `End` arrives; entries whose inode never arrives (the file vanished
+while it was being read) are dropped at the end of the update.
+
+Deleted paths: for each mutable root of the current update, and for each
+immutable root that is traversed again because it was incomplete, the writer
+keeps a set of 64-bit hashes of the relative paths it was told about. On the
+root's `RootDone`, it streams the stored paths of the root and deletes the ones
+whose hash is not in the set, then sets `roots.complete = 1`, all in the same
+transaction. This costs 8 bytes per path and no write for an unchanged file. A
+hash collision keeps a stale path row, which costs efficiency only (section
+3); `hashsync prune` removes it.
 
 #### io_uring: where it helps and where it does not
 
@@ -730,10 +870,17 @@ compressed list:
    Constant and short-period blocks have no rows (section 4.1), so their
    hashes are absent.
 2. Keep the top `W = 48` bits, sort (`sort_unstable`), and remove duplicates.
-3. Encode the gaps between consecutive values with Golomb-Rice coding. Use the
-   Rice parameter `k = floor(log2(2^W / N))`, so the average gap is between
-   2^k and 2^(k+1). Each value then costs about `k + 2` bits.
-4. Prefix a header: format version, `W`, `N`, `k`.
+3. Encode the gaps with Golomb-Rice coding: `g_0 = v_0`, and
+   `g_i = v_i - v_(i-1) - 1` for `i >= 1` (the values are distinct, so the
+   `- 1` loses nothing). A gap `g` is coded as `g >> k` one bits, a zero bit,
+   and the low `k` bits of `g`. The bits are packed least significant first
+   into bytes, and the last byte is padded with zero bits. The Rice parameter
+   is `k = floor(log2(2^W / N)) = W - ceil(log2(N))`, so the average gap is
+   between 2^k and 2^(k+1) and each value costs about `k + 2` bits. For
+   `N = 0`, `k = 0` and no gap codes follow the header: the empty list is the
+   header alone. It occurs for an empty index and for a segment whose removed
+   or added list is empty (section 5.6).
+4. Prefix a header: `format_version u8`, `W u8`, `k u8`, `N u64`.
 
 Why this shape: sorted uniform values have gaps with about `W - log2(N) + 1.4`
 bits of entropy, so the sorted list compresses well while random fingerprints
@@ -750,9 +897,9 @@ for a 256 GiB tree (8M blocks of 32 KiB):
 | Raw sorted 64-bit values | 64 MiB | ~1 | ~3 |
 | Binary fuse filter, 32-bit fingerprints (rejected) | 36 MiB | 3 | 0.25 |
 
-A false hit costs one Blake3 of the window, one query of about 60 bytes, and
-the rescan of the window's offsets after the "no" (section 6.3, at most `B`
-probes), so even thousands per GiB would not matter. Decoding 8M values takes tens of
+A false hit costs one Blake3 of the window and one query of about 60 bytes;
+the scanner continues at the next offset in any case (section 6.3), so even
+thousands per GiB would not matter. Decoding 8M values takes tens of
 milliseconds. The sort of 8M values costs well under a second.
 
 The encoding is canonical: the values are sorted and deduplicated, and `k` is
@@ -850,6 +997,12 @@ Local side: the cache and the delta log live next to the database.
   When they differ, it exports the new sorted list, decodes the old cache,
   computes the removed and the added values in one merge pass over the two
   sorted arrays, writes the segment, and replaces the cache through a rename.
+  It reads `meta.generation` and the block rows in one read transaction (a
+  WAL snapshot), so a transaction that the writer commits meanwhile is either
+  wholly in the list, with its generation, or wholly out of it. Then it ends
+  the read transaction and runs the checkpoint loop of section 4.4, so that
+  the generation is durable before the segment and the cache file name it.
+  The `flock` is a blocking call without a timeout (section 3).
   Then it prunes the log: it keeps the newest segments while their total size
   stays below the size of the new full list, and deletes the older ones. A
   missing cache (first export, or deleted by hand) gives no segment. A cache
@@ -988,20 +1141,33 @@ Rendezvous:
    inherited; `SSH` stands for the configured command):
    - data session: `SSH HOST hashsync serve --token T`
    - control session: `SSH HOST hashsync attach --token T`
+   The user command and its arguments are not on the `ssh` command line; the
+   local's HELLO carries them (section 6.2).
 2. `serve` creates a Unix socket `$XDG_RUNTIME_DIR/hashsync/T.sock` (fallback: a
-   private directory under `/tmp`), mode 0600, and listens on it. It reads the
-   local's HELLO frame from stdin, looks up its cached hash list for the
-   local's index (section 5.6), writes its own HELLO frame to stdout, waits for
-   the `attach` connection (timeout 60 s), reads the hash list or the delta
-   from stdin, builds the hash table, and then starts the user command. It may
-   start the command earlier and buffer its output, up to the look-ahead size.
-3. `attach` connects to the socket. It retries until the socket exists or the
-   timeout expires. Then it copies its stdin to the socket and the socket to its
-   stdout. It has no other logic.
+   private directory under `/tmp`), mode 0600, and listens on it before it
+   reads anything. It reads the local's HELLO frame from stdin, looks up its
+   cached hash list for the local's index (section 5.6), writes its own HELLO
+   frame to stdout, accepts the `attach` connection, reads the hash list or
+   the delta from stdin, builds the hash table, and then starts the user
+   command. It may start the command earlier and buffer its output, up to the
+   look-ahead size. None of these waits has a timeout (section 3): when the
+   control session never arrives, `serve` waits until its stdin reaches end
+   of file, which happens when the local process ends (section 6.7).
+3. `attach` connects to the socket. When the socket does not exist yet
+   (`ENOENT`, or `ECONNREFUSED` before `listen`), it sleeps 10 ms and tries
+   again, for as long as its stdin has a writer: between two attempts it
+   polls stdin for `POLLHUP` and exits when the local's side of the session
+   is gone. Then it copies its stdin to the socket and the socket to its
+   stdout, and shuts down the socket's write side when stdin reaches end of
+   file. It has no other logic.
 4. The user command gets `/dev/null` as stdin. It inherits stderr, so `ssh`
-   forwards it to the local terminal.
-5. After the END frame, the local closes both sessions. `serve` kills the child
-   if it still runs and removes the socket.
+   forwards it to the local terminal. It runs in a process group of its own
+   (`CommandExt::process_group(0)`), so that `serve` can terminate it
+   together with its descendants (section 6.7).
+5. After the END frame, the local closes its stdin pipes of both sessions and
+   waits for the two `ssh` processes to exit. `serve` exits when its stdin
+   reaches end of file and removes the socket; `attach` exits when the socket
+   closes (section 6.7).
 
 Notes:
 
@@ -1020,29 +1186,79 @@ Notes:
 
 ### 6.2 Frames
 
-Every frame is `type u8, length u32 (little endian), payload`. Suggested types:
+Every frame is `type u8, length u32 (little endian), payload`. All integers
+are little endian; a string or a byte string is `length u32` followed by the
+bytes; a list is `count u32` followed by the items. Frame types:
 
 | Session | Direction | Types |
 |---|---|---|
-| data | remote to local | HELLO, LIT (bytes), REF (qid), RLE (byte u8, length u64), END (exit status, error text) |
-| data | local to remote | HELLO, HASHLIST (encoded hash list, can span several frames), HASHDELTA (segments of the delta log, section 5.6, can span several frames; empty when the remote's list is current) |
-| control | remote to local | HELLO, QUERY (qid u32, offset u64, weak u64, blake3 [u8; 32]) |
-| control | local to remote | HELLO, ANSWER (qid u32, found u8) |
+| data | local to remote | HELLO, HASHLIST, HASHDELTA, SEGMENT, LISTDATA |
+| data | remote to local | HELLO, LIT, REF, RLE, END |
+| control | remote to local | HELLO, QUERY |
+| control | local to remote | HELLO, ANSWER |
 
-HELLO carries the protocol version, the block size, `weak_hash_id`, the hash
-list width `W`, and the program version. Any mismatch is a fatal error. The
-local's HELLO also carries the compression level and thread count it wants the
-remote to use, `meta.index_id`, and the `remote_cache` flag (section 7). On the
-data session the local sends its HELLO first. The remote reads it, looks up its
-cache for that index, and answers with a HELLO that also carries the generation
-and the list hash of the cached hash list, or an all-zero hash when it has none
-(section 5.6). The local then sends HASHLIST or HASHDELTA. On the control
-session both sides send their HELLO at once.
+Payloads:
+
+- HELLO, local to remote (data session): `protocol_version u32`,
+  `program_version string`, `block_size u32`, `weak_hash_id string`, `W u8`,
+  `index_id [u8; 16]`, `remote_cache u8`, `lookahead u64`, `scan_threads u32`,
+  `compression_level i32`, `compression_threads u32`, `negative_cache u64`
+  (bytes), and `command`, a list of byte strings: the argument vector of the
+  user command, `argv[0]` first. The
+  remote runs it directly, without a shell, and finds `argv[0]` in `PATH` as
+  `execvp` does. A user who wants a shell names one:
+  `hashsync run host -- sh -c '...'`.
+- HELLO, remote to local (data session): `protocol_version u32`,
+  `program_version string`, `block_size u32`, `weak_hash_id string`, `W u8`,
+  `generation u64`, `list_hash [u8; 32]`: the cached hash list that the
+  remote holds for `index_id`, or generation 0 and an all-zero hash when it
+  holds none (section 5.6).
+- HELLO, both directions (control session): `protocol_version u32`,
+  `program_version string`. Both sides send it at once.
+- HASHLIST: `generation u64`, `list_hash [u8; 32]`, `length u64`. It announces
+  a full list (section 5.4) of `length` encoded bytes, which follow in
+  LISTDATA frames. The remote stores the list under `generation` and
+  `list_hash` (section 5.6).
+- HASHDELTA: `from_generation u64`, `to_generation u64`, `segments u32`. It
+  announces a chain of `segments` segments (section 5.6) from the remote's
+  list to the local's current one. `segments = 0` means that the remote's
+  list is current; then the two generations are equal and nothing follows.
+- SEGMENT: `from_generation u64`, `to_generation u64`, `from_hash [u8; 32]`,
+  `to_hash [u8; 32]`, `removed_length u64`, `added_length u64`. It announces
+  one segment: the encoded list of the removed values, then the encoded list
+  of the added values, `removed_length + added_length` bytes in LISTDATA
+  frames. The first SEGMENT's `from_generation` and `from_hash` equal what
+  the remote's HELLO reported, and each SEGMENT starts where the previous one
+  ended. The last one's `to_generation` equals the HASHDELTA's.
+- LISTDATA: a chunk of the announced bytes, at most 1 MiB per frame. The
+  remote counts the bytes: the transfer of a list or of a segment is complete
+  when exactly the announced length has arrived. A LISTDATA frame beyond that
+  length, or a frame of another type before it, is a protocol error. After a
+  full list, the remote checks that the Blake3 hash of the received bytes
+  equals `list_hash`; a mismatch is a protocol error.
+- LIT: the literal bytes. REF: `qid u32`. RLE: `byte u8`, `length u64`.
+- END: `status i32`, `error string`. `status` is the exit status of the user
+  command, `128 + signal` when a signal ended it, or 127 with an error text
+  when the command could not be started. Nothing follows END.
+- QUERY: `qid u32`, `offset u64`, `weak u64`, `blake3 [u8; 32]`. Query ids
+  start at 0 and grow by one per QUERY; `offset` is the stream offset of the
+  window.
+- ANSWER: `qid u32`, `found u8`. An ANSWER for an unknown qid is a protocol
+  error. Answers may arrive in any order.
+
+`protocol_version`, `block_size`, `weak_hash_id`, and `W` must be equal on
+both sides, and the program versions must be compatible; any mismatch is a
+fatal error before the command starts. On the data session the local sends
+its HELLO first. The remote reads it, looks up its cache for that index, and
+answers with its HELLO. The local then sends HASHLIST or HASHDELTA with the
+LISTDATA that they announce, after which it sends nothing more on this
+session; it closes its end after END (section 6.1). The remote starts the
+command only when the whole list or chain has arrived.
 
 Compression. After the HELLO exchange, the remote-to-local direction of the
-data session is one zstd stream, and all later frames (LIT, REF, END) travel
-inside it. Compression is done by libzstd through the `zstd` crate (section 9).
-Rules:
+data session is one zstd stream, and all later frames (LIT, REF, RLE, END)
+travel inside it. Compression is done by libzstd through the `zstd` crate
+(section 9). Rules:
 
 - The remote flushes the compressor (`ZSTD_e_flush`, `Encoder::flush`)
   whenever its outgoing queue runs empty, so a pause in the command output or a
@@ -1069,83 +1285,118 @@ Rules:
 ### 6.3 Remote scanner
 
 State: a ring buffer of command output with at least `lookahead + block_size`
-bytes (default `lookahead = 256 MiB`), a scan position, and an emit position.
-Everything between the emit position and the scan position is literal bytes or a
-pending window. The ring buffer is a `memfd` mapped twice back to back
-(`memfd_create`, then two `mmap` calls with `MAP_FIXED` into one reserved
-range), so every window is one contiguous slice and the wrap-around costs
-nothing.
+bytes (default `lookahead = 256 MiB`), a scan position (pass 1, below), and an
+emit position (pass 2). Everything between the emit position and the scan
+position is in the buffer: literal bytes and the bytes of the recorded items.
+The ring buffer is a `memfd` mapped twice back to back (`memfd_create`, then
+two `mmap` calls with `MAP_FIXED` into one reserved range), so every window is
+one contiguous slice and the wrap-around costs nothing.
 
-The scanner also tracks the start of the current run of identical bytes, with
-one comparison per byte as bytes enter the window.
+The scanner works in two passes that run at the same time on different
+threads. Pass 1 finds candidates and records them; it never waits for an
+answer. Pass 2 walks the records in stream order, waits for the answers it
+needs, and decides what to emit. The split keeps pass 1 a plain loop over the
+bytes, and it turns the choice among overlapping candidates into one rule of
+pass 2 instead of a rescan protocol between the two.
 
-Scan loop, at position `p` with window `[p, p + B)` available:
+Records: pass 1 appends items to an ordered list (a bounded queue between the
+passes, in increasing order of offset):
 
-- Constant window (the run that ends at the newest byte of the window started
-  at or before `p`): no hash and no probe. Record a resolved RLE item that
-  covers the run from `p` to its end and continue at the end of the run. The
-  run may grow as more output arrives; a run longer than the look-ahead is sent
-  as several RLE frames. After the run, compute the hash of the next window
-  from scratch (Horner's rule over `B` bytes) and resume rolling.
-- Table miss: `p += 1`.
-- Table hit: compute the Blake3 hash of the window. If it is in the negative
-  cache (below), the hit is a miss: `p += 1`. Otherwise send a QUERY, record
-  the pending window, and continue at `p + B` with a hash computed from
-  scratch, as after a run. This is optimistic: a hit is almost always a real match, so the
-  scanner does not probe the offsets inside the window while the query is in
-  flight. A "no" brings it back to them (below).
-- Stop when `scan - emit >= lookahead`, and wait for answers.
+- `Run { offset, len, byte }`: a run of at least `B` identical bytes. Pass 1
+  skips over it. While pass 1 is still inside the run, the item is open and
+  its length grows as bytes arrive; pass 2 can emit the known part before the
+  item closes.
+- `Query { offset, qid }`: a window whose Blake3 hash was sent as a QUERY.
 
-A "no" answer for the window at `p` means that the probe at `p` was wrong, and
-the scanner treats it that way: the byte at `p` is a literal, and the offsets
-from `p + 1` on are scanned as if there had been no hit. The pending entry
-becomes a gap `[p, r)`, where `r` is the offset of the next pending or resolved
-item, or the scan position when there is none. The scanner thread that owns the
-region runs the normal scan loop over the gap, from `p + 1`, with one extra
-rule: a window must end at or before `r`. When there is no later item and a
-window found in the gap ends after the scan position, the scan position moves
-to the end of that window. Hits in the gap become queries and pending windows
-like any other, at their offsets in the ordered pending list; bytes that no
-window covers are literal. The rescan runs on the scanner thread, so it cannot
-race with the forward scan; it costs at most `B` probes and happens once per
-"no". The emit loop waits for a gap as it waits for a pending window.
+Pass 1, at position `p` with the window `[p, p + B)` in the buffer:
 
-Negative cache: the scanner keeps an LRU set of the Blake3 hashes whose
-queries got a "no" (64k entries, about 2 MiB). A table hit whose Blake3 is in
-the set is a miss: no query, no gap. The key is the Blake3 hash, not the weak
-hash: two windows with the same weak hash and different content are possible,
-and a "no" for one must not suppress the query for the other. The cache
-therefore saves the query but not the Blake3 computation of the window;
-content that repeats in the stream and is gone from the local disk costs one
-Blake3 per occurrence, like matched content. Without the cache, every such
-occurrence would also cost a query and open a gap. Periodic content never
-reaches this path: the index holds no short-period blocks (section 4.1), so
-its windows miss the table without a Blake3.
+1. Run check. Pass 1 tracks the start of the current run of identical bytes
+   with one comparison per byte as bytes enter the window. When the run that
+   ends at the newest byte of the window started at or before `p`, the whole
+   window is one byte value: record a `Run` from `p` and continue at the end
+   of the run, which may still grow. After the run, compute the hash of the
+   next window from scratch (Horner's rule over `B` bytes) and resume rolling.
+2. Table probe. Miss: `p += 1`.
+3. Table hit: compute the Blake3 hash of the window. In the negative cache
+   (below): a false hit, `p += 1`. Otherwise send a QUERY, record a `Query`,
+   and `p += 1` as well. Pass 1 never skips a queried window: the offsets
+   inside it are probed like any other, so a match that starts inside a
+   rejected window is never missed, and no rescan exists.
+4. Back to step 1.
 
-Emit loop, in stream order:
+Pass 1 stops when `scan - emit >= lookahead` and continues when pass 2 has
+advanced. It ends when fewer than `B` bytes remain after `p` at the end of the
+stream; those bytes are literal unless they belong to a run.
 
-- Send LIT for the literal bytes before the next pending item.
-- RLE item: send RLE(byte, length) and advance the emit position by the length.
-  It needs no answer and no pinned entry.
-- Answer "yes": send REF(qid) and advance the emit position by `B`.
-- Gap: wait until its rescan is done and its windows are answered, then emit
-  its literal bytes, REFs, and RLE items in order.
+Cost: every offset outside a run costs one probe, whatever the answers. A
+stream whose content is all indexed is therefore scanned at the probe rate
+(below), about 150 MB/s per scanner thread from DRAM, not at the Blake3 rate.
+This is the price of a scanner that never skips a possible match; section 12
+records the measurement that decides whether the price matters. A window is
+not skipped on the strength of an earlier "yes" for the same content either:
+a REF can only name the block that the local pinned for that query, and an
+earlier answer guarantees nothing about a block that is not pinned
+(section 10).
 
-Answers can arrive out of order; keep the pending list ordered by offset. The
-last bytes of the stream (fewer than `B`) are literal unless they belong to a
-run.
+Negative cache: an LRU set of the Blake3 hashes whose queries got a "no",
+with a byte limit (`negative_cache` in the configuration, default 100 MiB,
+about 1.4M hashes; the local's HELLO carries the size). The thread that reads
+ANSWER frames maintains it: a "no" inserts the hash and a "yes" removes it.
+The key is the Blake3 hash, not the weak hash: two windows with the same weak
+hash and different content are possible, and a "no" for one must not suppress
+the query for the other. The cache therefore saves the query but not the
+Blake3 computation: content that repeats in the stream and is gone from the
+local disk costs one Blake3 per occurrence, like matched content. Periodic
+content never reaches this path: the index holds no short-period blocks
+(section 4.1), so its windows miss the table without a Blake3.
+
+Pass 2, with the emit position `e` (everything before `e` has been sent):
+
+- `Run`: send LIT for `[e, offset)` when `offset > e`, then RLE for
+  `[max(e, offset), offset + len)`, and set `e` to the run's end. A run is
+  never dropped, only clipped: a window can end inside a run (an indexed
+  block that ends in padding), but no window starts inside one, so the clipped
+  part is shorter than `B`. A run longer than the look-ahead, or one that is
+  still open, is sent as several RLE frames as its known length grows.
+- `Query` with `offset < e`: it overlaps something already sent. Drop it. Its
+  answer is ignored when it arrives, and the local releases the pinned buffer
+  when the stream passes the offset (section 6.4).
+- `Query` with `offset >= e`: wait for its answer. "yes": send LIT for
+  `[e, offset)`, then REF(qid), and set `e = offset + B`. "no": drop it; `e`
+  does not move, so the bytes from `e` on stay literal until the next item.
+- No item: when pass 1 has ended, send LIT for the rest, then END
+  (section 6.7); otherwise wait for the next item.
+
+This is greedy in stream order, and it is optimal here: all windows have the
+same length, so among overlapping windows the one that starts first also ends
+first, and taking it leaves the most room for the next one (interval
+scheduling by earliest end). Waiting for the earliest pending answer, instead
+of taking a later window whose "yes" arrived first, keeps the alignment: a
+false hit just before a sequence of matched blocks gets its "no", and the
+matched blocks after it are taken at their own offsets.
+
+Answers arrive in any order; pass 2 waits on a table keyed by qid. Its wait
+for one answer stalls the output, not pass 1, which continues until the
+look-ahead is full.
+
+Several scanner threads (`scan_threads`): split the stream into segments and
+let each thread run pass 1 over its own segment, with a hash computed from
+scratch at the segment start; a window that starts in a segment may extend
+into the next one. Pass 2 consumes the item lists of consecutive segments in
+order. Items of two adjacent segments can overlap by less than `B` bytes, and
+the greedy rule handles them like any other overlap; a run that crosses a
+segment boundary becomes two items and two RLE frames.
 
 CPU cost per byte: the rolling hash (4 to 5 cycles on the dependency chain),
 `mix64` (section 5.2) and the slot computation (independent of the chain), and
 one table probe. The probe dominates when the table is larger than the
 last-level cache: about one cache line per byte, which gives roughly 120 to
 180 MB/s per core from DRAM and several hundred MB/s per core when the table
-fits in L3. Batch the probes as described in section 5.5, split the stream into
-segments with `B` bytes of overlap, and scan the segments on several cores
-(section 6.6). Compression (section 6.2) runs in libzstd's own threads and
-touches literal bytes only, so on a stream with a high deduplication ratio it
-costs little. Inside a run the scanner neither hashes nor probes, so a long run
-of one byte costs a memory scan only.
+fits in L3. Batch the probes as described in section 5.5. Compression
+(section 6.2) runs in libzstd's own threads and touches literal bytes only, so
+on a stream with a high deduplication ratio it costs little. Inside a run the
+scanner neither hashes nor probes, so a long run of one byte costs a memory
+scan only.
 
 ### 6.4 Local answering and reconstruction
 
@@ -1154,16 +1405,34 @@ For each QUERY:
 1. `SELECT inode_id, block_no FROM blocks WHERE weak = ? AND blake3 = ? LIMIT 128`.
    SQLite uses the `blocks_by_weak` index and filters the rows by Blake3. The
    candidates are checked in order until one verifies. A candidate costs one
-   `block_size` read and one Blake3, mostly from the page cache; a "no" costs a
-   rescan on the remote and up to `block_size` bytes of network (section 6.3).
-   The high limit skips over stale rows (deleted or changed files).
-2. For each candidate: take one `(root_id, rel_path)` of the inode and open it
-   relative to the descriptor of the root's stored path (section 4.2), which
-   the run opens once and caches:
-   `openat2(rootfd, rel_path, RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)`
-   (`rustix::fs::openat2`, Linux 5.6 and newer; fall back to component-wise
-   `openat` with `O_NOFOLLOW`). Then `pread` `B` bytes at `block_no * B` and
-   compute Blake3.
+   `block_size` read and one Blake3, mostly from the page cache; a "no" leaves
+   the window's bytes literal unless a later candidate covers them
+   (section 6.3). The high limit skips over stale rows (deleted or changed
+   files).
+2. For each candidate: take one `(root_id, rel_path)` of the inode. Open the
+   root's stored path (section 4.2) with
+   `open(path, O_PATH | O_DIRECTORY | O_CLOEXEC)`, then the candidate with
+   `openat2(rootfd, rel_path, O_RDONLY | O_NONBLOCK | O_NOCTTY | O_CLOEXEC,
+   RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)` (`rustix::fs::openat2`, Linux 5.6
+   and newer; fall back to component-wise `openat` with `O_NOFOLLOW`, with the
+   same flags on the last component), and close the root descriptor. Then
+   `statx(fd, "", ...)` with the flags of section 4.5, and check `stx_mode`:
+   skip the candidate unless the descriptor is a regular file. Then `pread`
+   `B` bytes at `block_no * B` and compute Blake3.
+   Nothing is kept open between candidates, so the run holds at most one root
+   descriptor per lookup worker, whatever the number of roots (a Nix store
+   has one root per store path). A root descriptor kept across candidates
+   would be no more bound to the indexed tree than one opened now: both
+   resolve the stored path at some time, and the Blake3 check decides in
+   either case. The two opens cost a few microseconds next to the read and
+   the hash.
+   The path is stale whenever the file changed after the indexing, and it can
+   now name a FIFO, a device, or a socket. `O_NONBLOCK` makes the open of a
+   FIFO without a writer return at once instead of waiting for one,
+   `O_NOCTTY` keeps a terminal device from becoming the controlling terminal,
+   and the type check keeps the `pread` off anything that is not a regular
+   file. On a regular file `O_NONBLOCK` has no effect. The indexer opens
+   files with the same flags and the same check (section 4.5).
 3. On the first match: pin the buffer, keyed by qid and tagged with the query
    offset, and answer "yes". If no candidate verifies, answer "no".
 
@@ -1180,15 +1449,15 @@ region in another way). A buffer is freed when its last entry is released. A
 REF can therefore never find its bytes gone, whatever the order of the answers
 or the distance between identical blocks in the stream.
 
-Keep verified buffers in a small LRU cache keyed by Blake3 after their last
-entry is released. Blake3 equality is byte equality, so a later query for the
-same content is answered from the cache without a disk read or a hash
+Keep verified buffers in an LRU cache of 256 MiB keyed by Blake3 after their
+last entry is released. Blake3 equality is byte equality, so a later query for
+the same content is answered from the cache without a disk read or a hash
 computation; it only pins the cached buffer again.
 
-The pinned set is bounded by `lookahead` plus the answers in flight, so the local
-holds at most about `lookahead` bytes of pinned buffers (256 MiB by default)
-when all pending blocks are distinct. When the bound is reached, answer "no". A
-"no" is always safe.
+The pinned set has no limit. It grows with the queries in flight, which the
+remote's look-ahead and the in-flight command stream bound in practice, and
+the local never answers "no" for lack of memory. Memory is not a concern of
+this design, and the peer is trusted (section 6.5).
 
 A small pool of lookup workers (4 to 8 threads, each with its own read
 connection) keeps disk latency off the critical path. Answers may be sent out
@@ -1208,8 +1477,13 @@ emits runs of at least `block_size`.
   local exits with the same status after it has written all data.
 - The local gets EOF without END: exit with a non-zero status. Never report
   success for a truncated stream.
-- SIGINT on the local: close both sessions. `serve` kills the child command when
-  its stdin closes.
+- A broken session, a broken local stdout, or SIGINT or SIGTERM on the
+  local: the side that notices ends its process without a core dump
+  (section 6.7), the local with a non-zero status after it killed its `ssh`
+  processes, `serve` after it killed the command's process group.
+- A protocol error (a frame that does not parse, an unknown qid): a bug on
+  one side, since SSH guarantees the integrity of the stream. It is a panic
+  and leaves a core dump (section 6.7).
 - Security: the hash list reveals the block hashes of all indexed files to the
   remote host, and with the cache of section 5.6 it stays on the remote's disk
   between runs and for 3 months after the last run (mode 0600, under the
@@ -1221,41 +1495,146 @@ emits runs of at least `block_size`.
 ### 6.6 Threads at run time
 
 Both roles use a few blocking threads and bounded channels, no event loop
-(section 4.6). Every hand-off is a channel; every shutdown is a closed channel
-or a closed descriptor.
+(section 4.6). Every hand-off is a channel. Threads are never joined and never
+cancelled: the process ends when the run has ended or when a fatal error
+occurs (section 6.7).
 
 Remote, `serve`:
 
-- One reader thread reads the command's stdout pipe into the ring buffer. The
-  pipe is enlarged to 1 MiB with `F_SETPIPE_SZ`
-  (`rustix::pipe::fcntl_setpipe_size`), so the reads are large.
-- Scanner threads (as many as the local's HELLO asks for) take segments with
-  `B` bytes of overlap (section 6.3) and hand queries to the control writer.
-- One emit thread owns the zstd encoder and stdout. It sends the resolved items
-  in stream order and flushes when its queue is empty.
+- The main thread does the handshake of section 6.1, starts the command and
+  the threads below, and then blocks in `read` on its stdin until end of
+  file. That is how it learns that the local has closed the data session.
+  When the resolver has finished by then (the normal end), it removes the
+  socket file and exits 0; otherwise the local went away early, and it dies
+  (section 6.7).
+- One reader thread reads the command's stdout pipe into the ring buffer
+  until end of file. The pipe is enlarged to 1 MiB with `F_SETPIPE_SZ`
+  (`rustix::pipe::fcntl_setpipe_size`), so the reads are large. At end of
+  file it waits for the child (`Child::wait`) and hands the exit status to
+  the resolver. The child can exit before its stdout reaches end of file (a
+  descendant still holds the pipe) or after it (it closed stdout and went
+  on); the run has ended only when both have happened, and END is sent only
+  then.
+- Scanner threads (`scan_threads` from the local's HELLO) run pass 1 of
+  section 6.3 over segments of the stream and hand queries to the control
+  writer.
+- One resolver thread runs pass 2. It owns the zstd encoder and stdout, sends
+  the resolved items in stream order, and flushes when it has nothing to
+  send. After the last item and the exit status it sends END, ends the zstd
+  stream (`Encoder::finish`), flushes and closes stdout, and sets the
+  finished flag that the main thread reads.
 - One control thread writes QUERY frames to the Unix socket; one reads ANSWER
-  frames from it and posts each answer to the scanner thread that owns the
-  window, which updates the pending entry and, for a "no", rescans the gap
-  (section 6.3).
+  frames from it, updates the negative cache, and posts each answer to the
+  table that the resolver waits on (section 6.3).
 - The child command is a `std::process::Command` with stdin `/dev/null`,
-  stdout piped, and stderr inherited. `serve` waits for it after the END frame
-  and kills it when its own stdin closes.
+  stdout piped, stderr inherited, and a process group of its own
+  (section 6.1).
 
 Local, `run`:
 
-- One data thread reads the data session through the streaming decoder, parses
-  frames, and writes to stdout: literals as they come, references from the
-  pinned buffers, runs from a static buffer. Blocking writes to stdout give
-  backpressure to the whole chain.
-- One control thread reads QUERY frames and dispatches them to the lookup pool
-  (section 6.4); one control thread writes ANSWER frames.
+- The main thread starts the two `ssh` processes and the threads below, then
+  runs the data loop: it reads the data session through the streaming
+  decoder, parses frames, and writes to stdout: literals as they come,
+  references from the pinned buffers, runs from a static buffer. Blocking
+  writes to stdout give backpressure to the whole chain. After END it
+  flushes stdout, closes the stdin pipes of both sessions, waits for the two
+  `ssh` processes, and exits with the status from END.
+- One control thread reads QUERY frames and dispatches them to the lookup
+  workers over a channel (section 6.4); one control thread writes the ANSWER
+  frames that the workers put on another channel.
 - The pinned table and the LRU cache sit behind one mutex; they are touched
   once per query and once per REF.
-- `signal-hook` sets a flag on SIGINT and SIGTERM; the main thread kills the
-  two `ssh` processes and exits.
+- One signal thread blocks in `signal_hook::iterator::Signals` for SIGINT and
+  SIGTERM and dies (section 6.7) when one arrives, with status 128 plus the
+  signal number.
 
 `attach` copies with two threads and `std::io::copy`, which uses `splice`
-between a pipe and a socket on Linux.
+between a pipe and a socket on Linux. The thread that copies stdin to the
+socket shuts down the socket's write side when stdin reaches end of file; the
+other thread ends when the socket reaches end of file. When either copy fails
+(`EPIPE`, a reset), `attach` exits.
+
+### 6.7 Shutdown
+
+There is no in-process cancellation. A thread that is blocked in a system
+call cannot be woken reliably by another thread: `close` from another thread
+does not interrupt a `read` or `write` that is blocked on that descriptor,
+`pthread_cancel` is not usable from Rust, and a wake-up signal (`pthread_kill`
+with a handler that does nothing, so that the call returns `EINTR`) races
+with the entry into the call and is swallowed by every helper that retries
+`EINTR` (section 10). The program needs none of it. Everything it keeps
+outside memory is crash-safe by construction: the index is an SQLite database
+in WAL mode, the cache files and the segments are written under a temporary
+name and renamed, and the remote stores its list the same way. A run that
+fails has nothing to hand over. So every fatal condition ends the process,
+and the kernel closes its descriptors, which ends every peer through end of
+file and `EPIPE`.
+
+Two exits exist, chosen by the root cause. A condition that is not a fault
+of the program (a network failure, a consumer that closed the local's
+stdout, a signal) ends the process without a core dump. A fault of the
+program or of the machine (a bug, an invalid frame, a database error, an
+I/O error) aborts and leaves a core dump.
+
+`die(status, message)` is the first kind, one function per role, callable
+from any thread. It prints the message to stderr, does the cleanup that the
+kernel would not do, and exits with `status` without unwinding
+(`std::process::exit`; no destructor needs to run) and without a core dump:
+a network error is not a fault of the program, and its core dump would show
+nothing. A second caller blocks until the process is gone. The cleanup is:
+
+- remote: kill the command's process group (`kill(-pgid, SIGKILL)`) and remove
+  the socket file. A temporary cache file (section 5.6) is left to the expiry
+  pass of the next `serve`.
+- local: kill both `ssh` processes with SIGKILL. The kernel then closes their
+  descriptors, the remote's `serve` gets end of file on stdin and dies in
+  turn, and `attach` ends with its socket.
+
+Everything else is the second kind, a panic: the crate builds with
+`panic = "abort"` (section 11), and a panic hook installed at start runs the
+same cleanup before the abort, so a bug leaves neither a running command nor
+a stray socket, and the abort produces a core dump. An invalid frame on any
+session is a panic, not a `die()`: SSH guarantees the integrity of the
+stream, so a frame that does not parse is a bug on one side. Errors during
+indexing (a database error, a read error other than a vanished file) are
+panics too: the index is a cache and recovers at the next update
+(section 4.4).
+
+Who calls `die()`:
+
+| Event | Noticed by | Role |
+|---|---|---|
+| stdout is broken (`EPIPE`) or fails | main thread | local |
+| The data session reaches end of file before END | main thread | local |
+| The control session reaches end of file | control reader | local |
+| SIGINT or SIGTERM | signal thread | local |
+| stdin reaches end of file before the resolver has finished | main thread | remote |
+| stdout is broken (`EPIPE`) | resolver | remote |
+| The control socket reaches end of file before the resolver has finished | control reader | remote |
+
+A command that cannot be started is not a failure of the run: `serve` sends
+END with status 127 and the error text, and the normal end follows.
+
+Normal end, in order:
+
+1. The reader thread of `serve` gets end of file on the command's stdout and
+   the exit status from `Child::wait`.
+2. The resolver sends the last literal bytes, then END with the status, ends
+   the zstd stream, flushes and closes stdout, and sets the finished flag.
+   `serve` writes nothing more.
+3. The local's main thread receives END, writes the last bytes to stdout and
+   flushes it, and closes the stdin pipes of both sessions.
+4. The main thread of `serve` gets end of file on stdin, sees the finished
+   flag, removes the socket file, and exits 0. The kernel closes the socket;
+   `attach` gets end of file on stdin and on the socket and exits.
+5. Both `ssh` processes exit; the local waits for them and exits with the
+   status from END.
+
+Every step waits for a definite event, and none has a deadline (section 3). A
+descendant of the command that keeps its stdout open keeps the run going, as
+it would under plain `ssh`. A descendant that left the process group
+(`setsid`) survives `die()`, as it would under plain `ssh`, and gets `EPIPE`
+at its next write.
 
 ## 7. Configuration
 
@@ -1265,7 +1644,9 @@ between a pipe and a socket on Linux.
 block_size     = "32KiB"   # 4 KiB or more; a change discards and rebuilds the index
 index_path     = "~/.local/state/hashsync/index.sqlite"
 threads        = 0         # indexer threads; 0 = 4 × cores, at least 16, at most 64
-lookahead      = "256MiB"  # remote scan-ahead; also bounds the pinned memory on the local
+lookahead      = "256MiB"  # how far the remote scanner runs ahead of the output
+scan_threads   = 0         # remote scanner threads; 0 = half the cores
+negative_cache = "100MiB"  # remote LRU of Blake3 hashes answered "no" (6.3)
 compression_level   = 9    # zstd level for the data session, 1 to 19; 0 disables
 compression_threads = 0    # libzstd worker threads on the remote; 0 = half the cores
 ssh            = "ssh"     # remote shell command, split like a shell would (rsync's --rsh);
@@ -1308,10 +1689,12 @@ constants, not configuration.
 - `hashsync run [--no-update] [--single-connection] [--ssh CMD] [USER@]HOST -- COMMAND ARGS...`:
   run COMMAND on HOST, write its stdout to the local stdout, and exit with the
   status of COMMAND. HOST is appended to the remote shell command unchanged, so
-  `user@host` and `ssh_config` aliases work. `--ssh` overrides the configured
-  remote shell command for this run. At the end it prints one summary line to
-  stderr: output bytes, literal bytes, referenced bytes, run bytes, bytes on
-  the wire, and the bytes of the hash list or delta that was sent.
+  `user@host` and `ssh_config` aliases work. COMMAND and ARGS travel in the
+  HELLO frame (section 6.2) and run on the remote without a shell. `--ssh`
+  overrides the configured remote shell command for this run. At the end it
+  prints one summary line to stderr: output bytes, literal bytes, referenced
+  bytes, run bytes, bytes on the wire, and the bytes of the hash list or delta
+  that was sent.
 - `hashsync serve --token T` and `hashsync attach --token T`: internal. The
   local runs them on the remote through the remote shell.
 - `hashsync stats`: show index statistics.
@@ -1339,7 +1722,7 @@ and no need for one.
 | Hash list cache and delta log | own code | | Section 5.6: diff of two sorted lists, segment files, pruning, the remote's cache, merge, and expiry; about 150 lines over both roles. |
 | Remote hash table | own code | | Section 5.5, about 100 lines plus the SIMD bucket scan. |
 | Blake3 | `blake3` | 1.8.7 (2026-08) | `blake3::hash`. Assembly for SSE4.1, AVX2, and AVX-512 on x86_64 with run-time detection; NEON on aarch64 by default. See below. |
-| SQLite | `rusqlite` | 0.40.2 (2026-08) | Feature `bundled`: SQLite 3.53.2 through `libsqlite3-sys` 0.38.2. `prepare_cached`, `transaction_with_behavior`, `busy_timeout`, `pragma_update`. See below. |
+| SQLite | `rusqlite` | 0.40.2 (2026-08) | Feature `bundled`: SQLite 3.53.2 through `libsqlite3-sys` 0.38.2. `prepare_cached`, `transaction_with_behavior`, `busy_handler`, `pragma_update`. See below. |
 | System calls | `rustix` | 1.1.4 (2026-02) | `fs::{openat, openat2, statx, RawDir, fadvise, seek, memfd_create, flock, futimens}`, `io::{pread, preadv2}`, `mm::{mmap, mmap_anonymous, madvise}`, `pipe::{splice, fcntl_setpipe_size}`, `process::setrlimit`, `rand::getrandom`, `ioctl::{Getter, opcode}`. Raw system calls on Linux (`linux_raw` backend). |
 | System calls, gaps | `libc` | 0.2.189 (2026-08) | `name_to_handle_at`, `file_handle`, `MAX_HANDLE_SZ`, `syscall(SYS_cachestat, ...)`. |
 | Kernel constants | `linux-raw-sys` | 0.12.1 (2025-12) | `general::{fsuuid2, cachestat, STATX_MNT_ID_UNIQUE}`. Already a dependency of `rustix`. |
@@ -1375,9 +1758,16 @@ indexer's budget is in section 4.6.
 
 Usage rules:
 
-- Open with WAL mode, `synchronous=NORMAL`, and a `busy_timeout` of several
-  seconds. Open with `SQLITE_OPEN_NO_MUTEX`: a `Connection` is `Send` and not
-  `Sync`, and every connection belongs to one thread.
+- Open with WAL mode and `synchronous=NORMAL`. The export runs
+  `PRAGMA main.wal_checkpoint(FULL)` through `query_row` in a loop until the
+  first column is 0, before it publishes a generation (section 4.4). Install
+  a busy handler that retries without limit (`Connection::busy_handler` with
+  a callback that sleeps for a millisecond and returns `true`); never
+  `busy_timeout`, which is a deadline (section 3). A second process on the
+  same index (`hashsync update` next to `hashsync run`) then waits for the
+  write lock as long as it takes. Open with `SQLITE_OPEN_NO_MUTEX`: a
+  `Connection` is `Send` and not `Sync`, and every connection belongs to one
+  thread.
 - The writer thread owns its connection and starts transactions with
   `transaction_with_behavior(TransactionBehavior::Immediate)`, so a write
   transaction never fails with `SQLITE_BUSY` halfway through. Pool threads and
@@ -1442,11 +1832,11 @@ features: blocks are hashed in parallel by the pool, not inside one hash.
 
 `std::collections::HashMap` is hashbrown; only its default hasher (SipHash-1-3)
 is slow. Use `foldhash::fast::RandomState` (hashbrown's own default) or
-`rustc_hash::FxHashMap` for the sets keyed by `(fs_id, inode number)`, the
-mount cache, and the pinned entries by query id. Keys that are already hashes
-(Blake3 in the LRU cache) get an identity hasher. The LRU cache of verified
-buffers (section 6.4) is `lru::LruCache` or about 60 lines. The remote table
-stays custom (section 5.5).
+`rustc_hash::FxHashMap` for the sets keyed by `(fs_id, handle)`, the
+filesystem cache of the walker, and the pinned entries by query id. Keys that
+are already hashes (Blake3 in the LRU cache) get an identity hasher. The LRU
+cache of verified buffers (section 6.4) is `lru::LruCache` or about 60 lines.
+The remote table stays custom (section 5.5).
 
 ## 10. Alternatives considered
 
@@ -1484,7 +1874,9 @@ stays custom (section 5.5).
   as an optional refinement. Reverted on 2026-09-10. A "no" means that the
   probe at `p` was wrong, so the scanner must continue at `p + 1` as after a
   miss; otherwise a false hit just before a matched file loses that file's
-  first block. Section 6.3 makes the rescan and the negative cache mandatory.
+  first block. The rescan itself was replaced later the same day by the
+  two-pass scanner (below), which probes every offset once; the negative
+  cache stays mandatory.
 - **Negative cache keyed by the weak hash.** Rejected on 2026-09-10. It would
   suppress the query for a different window with the same weak hash, a false
   negative that the weak hash must never cause on its own. The key is the
@@ -1533,6 +1925,20 @@ stays custom (section 5.5).
   `st_dev` changes between boots on XFS and on btrfs subvolumes, which would
   rebuild the whole index; inode numbers are reused. Section 4.3 uses the
   filesystem UUID and the file handle instead.
+- **`(fs_id, inode number)` as the key of the walker's in-memory sets.**
+  Replaced on 2026-09-10 by `(fs_id, handle)`, the same identity that the
+  index uses. Inode numbers are reused inside one scan when files are
+  deleted and created, and two btrfs subvolumes of one filesystem can hold
+  different inodes with one number. An integer id assigned by the index was
+  considered too: the walker's threads would have to ask the writer for it
+  before they can test a file, which puts the writer on the path of every
+  file. The handle bytes need no round trip.
+- **The mount id as the filesystem identity when the ioctl is unsupported.**
+  Replaced on 2026-09-10 by `f_fsid` from `fstatfs`. The mount id changes at
+  every boot and is shared by all btrfs subvolumes below one mount; `f_fsid`
+  is stable on most filesystems and differs per subvolume on btrfs. The
+  triple `(stx_mnt_id, stx_dev_major, stx_dev_minor)` replaced the mount id
+  alone as the trigger for resolving the filesystem id for the same reason.
 - **Indexing incomplete blocks** (the shorter tail of each file). Considered
   and dropped on 2026-09-10. The remote scan uses windows of exactly
   `block_size` bytes and could never find them, so they would only cost index
@@ -1611,11 +2017,75 @@ stays custom (section 5.5).
   The store reads the header under the lock and keeps the newer file
   (section 5.6).
 
+- **Optimistic skip after a query, with a rescan of the window after a
+  "no".** Replaced on 2026-09-10 (user decision) by the two-pass scanner of
+  section 6.3. The rescan was bounded by the next pending window, so a real
+  match that started inside a rejected window and ended after the next
+  candidate was lost when that candidate was rejected too, and an unbounded
+  rescan would have needed a record of which offsets were probed. Pass 1 now
+  probes every offset once and continues at the next offset after a query.
+  The cost is one probe per byte outside runs (section 12).
+- **A memory limit on the pinned set**, with "no" answers once it was
+  reached. Removed on 2026-09-10 (user decision). Memory is not a concern of
+  the project; the look-ahead and the in-flight stream bound the set in
+  practice, and the peer is trusted. The negative cache of the remote keeps
+  a limit because it is a cache, at 100 MiB instead of the earlier 2 MiB.
+- **Timeouts**: 60 s for the `attach` connection, a deadline on the retries
+  of `attach`, and `busy_timeout` in SQLite. Removed on 2026-09-10 (user
+  decision) in favour of the design principle of section 3 and the
+  end-of-file chain of section 6.7. A program that gives up after a fixed
+  time fails on a
+  system that is slower than the programmer expected; a program that hangs
+  can be inspected with a debugger.
+- **`synchronous=FULL`** for the index, so that every commit is durable.
+  Adopted on 2026-09-10 because cache files and segments record generations,
+  and a generation that a power loss takes back would be used again for
+  different rows. Replaced on 2026-09-11 (user decision) by `NORMAL` with a
+  FULL checkpoint at publication (section 4.4): the `fsync` per commit was
+  paid at every batch for a guarantee that only the export needs, and a
+  generation that no export has published can be lost without harm.
+- **A positive cache** of the Blake3 hashes answered "yes", with a skip over
+  the window at a cache hit. Added on 2026-09-10 and removed on 2026-09-11
+  (user decision). An unpinned block is not guaranteed, so the skip still
+  needed a query and saved probes only, and it brought back a window whose
+  inside is not probed. Pass 1 now advances by one at every offset outside a
+  run (section 6.3). The negative cache grew from 50 MiB to 100 MiB with the
+  removal.
+- **An LRU of open root descriptors at run time** (1024 entries). Added on
+  2026-09-10 and rejected on 2026-09-11 (user decision). A descriptor that is
+  closed and opened again by path can name another inode, and a cache of
+  descriptors is not needed at all: the run opens the root for each candidate
+  read and closes it afterwards (section 6.4). During indexing, the roots are
+  pool tasks, opened when a thread takes them, so they never hold descriptors
+  all at once (section 4.6).
+- **In-process cancellation with per-thread wake-ups** (`pthread_kill` with
+  a handler that does nothing, `shutdown` on sockets, notified condition
+  variables, and joins). Designed on 2026-09-10 and replaced on 2026-09-11
+  (user decision) by ending the process (section 6.7). The wake-up signal
+  races with the entry into the system call and is swallowed by every helper
+  that retries `EINTR`, `pthread_cancel` was never an option in Rust, and
+  nothing in the program needs an orderly stop, because all persistent state
+  is crash-safe. Network errors end the process the same way, without a core
+  dump (user decision); bugs, protocol errors, and errors during indexing are
+  panics and leave one.
+- **One generation per update**, incremented after the last commit. Replaced
+  on 2026-09-10 by an increment inside every transaction that changes block
+  rows. A crash between the last commit and the increment left changed rows
+  under an unchanged generation, so the cached hash list looked current and
+  was stale (section 4.4).
+- **Whole inodes per transaction and per channel message.** Replaced on
+  2026-09-10 by streamed block rows with a byte budget (section 4.6). One
+  1 TiB file has more than 1 GiB of hashes, which no message-count bound
+  contains. The `size = -1` marker keeps a cut inode safe (section 4.4).
+- **Waiting for the child after END.** Reversed on 2026-09-10: END carries
+  the exit status, so the child is waited for first (section 6.6).
+
 ## 11. Repository conventions
 
 - One crate, one binary: `cargo build --release` produces
   `target/release/hashsync`. `Cargo.lock` is committed. Edition 2024, current
-  stable toolchain.
+  stable toolchain. Every profile sets `panic = "abort"`, and `main` installs
+  the panic hook of section 6.7 before it starts any thread.
 - If `cargo` is not in `PATH`, use a Nix shell (`nix develop` once a flake
   exists, or `nix shell nixpkgs#cargo nixpkgs#rustc nixpkgs#gcc`; the C
   compiler is needed for the bundled C sources).
@@ -1630,8 +2100,8 @@ stays custom (section 5.5).
   - `index/`: schema, migrations, writer, pruning, hash list export, cache, and
     delta log.
   - `proto/`: frame types, encoding, HELLO handshake.
-  - `remote/`: `serve` (hash list cache, ring buffer, scanner, emitter) and
-    `attach` (relay).
+  - `remote/`: `serve` (hash list cache, ring buffer, scanner, resolver,
+    shutdown) and `attach` (relay).
   - `local/`: `run` (remote shell processes, answering, reconstruction).
   - `config.rs`: `config.toml` and XDG paths.
   - `sys/`: every `unsafe` FFI call (handles, ioctl, `cachestat`, the `statx`
@@ -1661,10 +2131,26 @@ stays custom (section 5.5).
   descriptor count under a low `RLIMIT_NOFILE`); a fuzz target (`cargo fuzz`)
   for the frame decoder; runs of one byte at arbitrary offsets, crossing block
   boundaries and longer than the look-ahead, reproduced byte-exact through RLE
-  frames, and constant blocks absent from the index; a "no" answer after which
-  the scanner finds a block that starts inside the rejected window, with the
-  rescan bounded by a later pending window; a negative cache hit needs a Blake3
-  match, and a different window with the same weak hash is still queried;
+  frames, and constant blocks absent from the index; the two-pass scanner
+  (section 6.3): a rejected candidate just before a sequence of matched
+  blocks keeps their alignment, overlapping candidates with "yes" answers
+  resolve to the earliest, and a run clipped by a preceding window is sent
+  in full from the clip on; a negative cache hit needs a Blake3 match, and a
+  different window with the same weak hash is still queried; the empty list
+  (`N = 0`) and a segment with an empty removed or added list round-trip; a
+  list sent over several LISTDATA frames, and a transfer whose bytes do not
+  match the announced length or hash is rejected; an interrupted update
+  (section 4.4): an immutable root left incomplete is traversed again and
+  then marked complete, an inode left at `size = -1` is hashed again, block
+  rows of one file spread over several transactions, a `Path` message that
+  arrives before the `Begin` of its inode, the generation read in one
+  snapshot with the rows it describes, and the checkpoint before publication
+  (after an export, `wal_checkpoint` reports no frames left in the WAL); an
+  indexed file replaced by a FIFO or
+  a directory gets a "no" without blocking, at run time and in the indexer;
+  every event of the table in section 6.7 ends both roles, including a
+  command whose descendant keeps stdout open, and the command's process group
+  is gone afterwards;
   blocks with periods 1 to 16 absent from the index and a block with period 17
   present; a compression round trip
   with flushes at arbitrary frame boundaries; the ssh argument order
@@ -1700,3 +2186,11 @@ stays custom (section 5.5).
   `log2(N / n_removed) + 2` bits, 5 to 6 bits at 10 % churn. This cuts the
   10 % delta of section 5.6 from about 6 MiB to about 3.5 MiB for about 20
   lines on each side. Decide after the first measurements on a real tree.
+- **Scan rate on matched streams.** Pass 1 probes every offset outside a
+  run, even inside windows that the local will confirm (section 6.3), so a
+  stream whose content is all indexed is scanned at about 150 MB/s per
+  scanner thread from DRAM. Measure a stream whose content is all indexed
+  against the local's disk rate and the link. Only if the remote's scanner
+  bounds the throughput is a skip after a query worth its complexity: it
+  needs a record of the offsets that were not probed and a rescan of them
+  after a "no", which is what the two-pass design removed (section 10).
