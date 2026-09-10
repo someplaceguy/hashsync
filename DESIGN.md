@@ -45,8 +45,11 @@ asynchronous runtime and no event loop (section 4.6).
 - **Inode handle**: the persistent identity of an inode inside its filesystem,
   as returned by `name_to_handle_at` (section 4.3).
 - **Hash list**: the sorted, compressed list of the weak hashes of all indexed
-  blocks (section 5.4). The local sends it to the remote at the start
-  of each run.
+  blocks (section 5.4). The remote keeps it between runs. At the start of each
+  run the local sends it in full, or sends only its changes (section 5.6).
+- **Delta log**: the local's record of the changes of the hash list from one
+  export to the next, as segments. A segment lists the removed and the added
+  hashes (section 5.6).
 - **Hash table**: the in-memory fingerprint table that the remote builds from
   the hash list (section 5.5).
 - **Window**: the `block_size` bytes of command output that start at a given
@@ -65,11 +68,15 @@ asynchronous runtime and no event loop (section 4.6).
 1. The local loads `config.toml`, opens the index, and updates it (section 4).
    `--no-update` skips the update.
 2. The local exports the hash list from the index, or loads the cached one
-   (section 5.4).
+   (section 5.4). When the index changed since the last export, it also
+   records the changes in the delta log (section 5.6).
 3. The local opens two SSH sessions to the remote host: a **data session** and a
    **control session** (section 6.1).
-4. The local sends the hash list over the data session. The remote decodes it
-   and builds its hash table.
+4. The two sides exchange HELLO frames over the data session. The remote's
+   HELLO names the hash list it kept from an earlier run with this index, if
+   any. The local sends the whole hash list, or only the changes since that
+   list (section 5.6). The remote applies the changes to its cached list,
+   stores the result for the next run, and builds its hash table.
 5. The remote starts the user command and reads its stdout.
 6. The remote computes the weak hash at every offset of the output and looks it
    up in its hash table.
@@ -94,10 +101,11 @@ asynchronous runtime and no event loop (section 4.6).
 10. When the command exits, the remote sends the exit status. The local exits
     with the same status.
 
-Design principle: the index, the hash list, and the hash table are hints. The
-local verifies every spliced block with Blake3 against bytes it read from local
-disk, in memory, before it uses them. Stale index entries, files changed after
-indexing, and weak hash collisions cost efficiency, never correctness.
+Design principle: the index, the hash list, its cached copies, and the hash
+table are hints. The local verifies every spliced block with Blake3 against
+bytes it read from local disk, in memory, before it uses them. Stale index
+entries, files changed after indexing, stale cached lists, and weak hash
+collisions cost efficiency, never correctness.
 
 ## 4. The local index
 
@@ -239,7 +247,7 @@ The index is one SQLite file, by default
 
 ```sql
 CREATE TABLE meta        (key TEXT PRIMARY KEY, value BLOB NOT NULL);
-  -- keys: schema_version, block_size, weak_hash_id, generation
+  -- keys: schema_version, block_size, weak_hash_id, generation, index_id
 CREATE TABLE filesystems (id INTEGER PRIMARY KEY, fsid BLOB NOT NULL UNIQUE);
 CREATE TABLE roots       (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE,
                           immutable INTEGER NOT NULL);
@@ -291,7 +299,14 @@ Rules:
   entry, about 75 bytes per block, or 0.23 % of the indexed data at 32 KiB
   blocks. A 256 GiB tree (8M blocks) needs about 600 MB.
 - `generation` increments after every update that changed something. The cached
-  hash list file records the generation it was built from.
+  hash list file and the segments of the delta log record the generations they
+  were built from (section 5.6).
+- `index_id` is a random 128-bit value (`rustix::rand::getrandom`), written
+  when the tables are created. `--rebuild`, and the rebuild after a parameter
+  mismatch above, create a new one. It identifies the index towards remote
+  hosts, which key their cached hash lists by it (section 5.6). An index
+  restored from a backup keeps its id and reuses generation numbers; the list
+  hash of section 5.6 covers that case.
 
 ### 4.5 Traversal and hashing
 
@@ -678,9 +693,15 @@ for a 256 GiB tree (8M blocks of 32 KiB):
 A false hit costs one Blake3 of the window, one query of about 60 bytes, and
 the rescan of the window's offsets after the "no" (section 6.3, at most `B`
 probes), so even thousands per GiB would not matter. Decoding 8M values takes tens of
-milliseconds. Cache the encoded list next to the database together with
-`meta.generation` and rebuild it only when the generation changed. The sort of
-8M values costs well under a second.
+milliseconds. The sort of 8M values costs well under a second.
+
+The encoding is canonical: the values are sorted and deduplicated, and `k` is
+a function of `N`, so equal sets give equal bytes. The Blake3 hash of the
+encoded list therefore identifies the set; section 5.6 uses it as the list
+hash. Cache the encoded list next to the database together with
+`meta.generation`, `meta.index_id`, and the list hash, and rebuild it only when
+the generation changed. Section 5.6 describes the cache file and the delta log
+that every rebuild extends.
 
 ### 5.5 The remote hash table
 
@@ -732,6 +753,110 @@ independent lines per lookup; this table touches about 1. Expect 2 to 3 times
 the scan rate. Measure both with a microbenchmark before the first release; each
 is about 100 lines (`xorf` provides the filter, section 9).
 
+### 5.6 The hash list cache and the delta log
+
+The hash list costs about 27 MiB for 8M blocks: about 11 s on a 20 Mbit/s
+link, at every run. Between two runs most of the index stays the same; the
+working assumption is that about 90 % of the hashes are shared. So the remote
+keeps the list between runs, and the local sends only the changes.
+
+What keeps this simple: the list on the remote is always an earlier export of
+the local's own list. The two sides never reconcile two independent sets
+(section 10). The remote names the list it holds; the local replays the
+changes from its own history. The local keeps no state per peer, and the
+remote is the only authority on what it holds, so an interrupted run needs no
+repair.
+
+Three values identify a list:
+
+- `meta.index_id` (section 4.4). The remote keys its cache by it.
+- The generation (`meta.generation`) the list was exported from.
+- The list hash: the Blake3 hash of the encoded list (section 5.4). It guards
+  against an index restored from a backup, which reuses generation numbers
+  for different content, and against a damaged cache file.
+
+Local side: the cache and the delta log live next to the database.
+
+- `hashlist`: the encoded list, behind a header with `index_id`, the
+  generation, and the list hash. This is the cache file of section 5.4.
+- `deltas/<from_gen>-<to_gen>`: one segment per export that found a new
+  generation. A segment is a header (`index_id`, `from_gen`, `to_gen`,
+  `from_hash`, `to_hash`) followed by two lists in the format of section 5.4:
+  the removed values and the added values, each sorted, each with its own `k`.
+  A segment is exactly one HASHDELTA payload; the export writes it once, and
+  every later run sends it unchanged.
+- The export (step 2 of section 3) takes an exclusive `flock` on
+  `hashlist.lock` and compares `meta.generation` with the cached generation.
+  When they differ, it exports the new sorted list, decodes the old cache,
+  computes the removed and the added values in one merge pass over the two
+  sorted arrays, writes the segment, and replaces the cache through a rename.
+  Then it prunes the log: it keeps the newest segments while their total size
+  stays below the size of the new full list, and deletes the older ones. A
+  missing cache (first export, or deleted by hand) gives no segment. A cache
+  or a segment whose `index_id` differs from `meta.index_id` (after
+  `--rebuild`) is deleted. The lock is released after the pruning, so two
+  concurrent runs from one index write one chain of segments.
+- Cost: the merge pass over two lists of 8M values and the encoding of the
+  changes take tens of milliseconds, on top of the export of section 5.4.
+
+Storage: the log is smaller than the full list, so the local holds at most two
+lists per index, whatever the number of peers. In a fleet of N hosts that all
+reach each other, the whole fleet stores N × (N − 1) cached lists on the remote
+sides plus two files per host. The remote-side copies are the cache itself;
+copies per peer on the local side are not needed (section 10).
+
+Choice at run time: the remote's HELLO (section 6.2) carries the generation
+and the list hash of the list it holds for `index_id`; an all-zero hash means
+that it holds none. The local looks for the chain of segments that starts at
+that generation and ends at the current one, and checks that the `from_hash`
+of the first segment equals the remote's hash. If the chain exists, the local
+sends its segments, one after the other, as HASHDELTA; the pruning rule
+guarantees that they are smaller than the full list. Otherwise it sends
+HASHLIST. Every list a remote can hold was the local's cache at some time, so
+its generation is a segment boundary. The chain is missing when the remote's
+list is older than the log or when the local's cache was deleted by hand, and
+the hash check fails after a restore from a backup; in each case the remote
+gets the full list and its cache is current again after the run.
+
+Remote side, in `serve` (section 6.1):
+
+- Cache directory: `$XDG_CACHE_HOME/hashsync/lists/` (fallback
+  `~/.cache/hashsync/lists/`), mode 0700. One file per `index_id`, mode 0600:
+  a header (generation, list hash, `block_size`, `weak_hash_id`, `W`) and the
+  encoded list. Files are written under a temporary name and renamed. When the
+  directory cannot be written, `serve` keeps the list in memory only and
+  reports none at the next run.
+- On the local's HELLO: read the file for `index_id` and report its generation
+  and hash when the header's parameters equal those of the HELLO; otherwise
+  report none. When the HELLO's `remote_cache` flag is false, report none and
+  store nothing.
+- On HASHLIST: build the table and store the payload as received.
+- On HASHDELTA: decode the cached list, apply the segments in order (one
+  linear merge each: drop the removed values, insert the added ones), encode
+  the result, and compare its Blake3 hash with the `to_hash` of the last
+  segment. Equal: store the new list. Different: log a warning, delete the
+  cache file, and continue with the table. This can only cost efficiency
+  (section 3); the next run gets a full list.
+- At start-up, delete cache files that no run has used for 30 days (`mtime`).
+- Cost: one decode, one merge per segment, one encode, and one Blake3 of the
+  encoded list; well under a second.
+
+Sizes for the 8M-block example of section 5.4. A value of a sparse list costs
+about `W - log2(n) + 2` bits: 30 bits at 0.8M values.
+
+| Sent | Size | At 20 Mbit/s |
+|---|---|---|
+| Full list | 27 MiB | 11 s |
+| Delta, 0.8M removed and 0.8M added (10 % churn) | ~6 MiB | 2.5 s |
+| Delta, 80k removed and 80k added (1 % churn) | ~0.7 MiB | 0.3 s |
+
+Removals cost as much as additions in this format; section 12 lists the
+cheaper encoding as positions in the old list.
+
+`remote_cache` in the configuration (default `true`, per-host override,
+section 7) tells the remote through HELLO whether it may keep the list on
+disk. The list reveals the hashes of every indexed block (section 6.5).
+
 ## 6. The transfer protocol
 
 ### 6.1 Transport: two SSH sessions
@@ -768,11 +893,12 @@ Rendezvous:
    - data session: `SSH HOST hashsync serve --token T`
    - control session: `SSH HOST hashsync attach --token T`
 2. `serve` creates a Unix socket `$XDG_RUNTIME_DIR/hashsync/T.sock` (fallback: a
-   private directory under `/tmp`), mode 0600, and listens on it. It writes a
-   HELLO frame to stdout, waits for the `attach` connection (timeout 60 s), reads
-   the hash list from stdin, builds the hash table, and then starts the user
-   command. It may start the command earlier and buffer its output, up to the
-   look-ahead size.
+   private directory under `/tmp`), mode 0600, and listens on it. It reads the
+   local's HELLO frame from stdin, looks up its cached hash list for the
+   local's index (section 5.6), writes its own HELLO frame to stdout, waits for
+   the `attach` connection (timeout 60 s), reads the hash list or the delta
+   from stdin, builds the hash table, and then starts the user command. It may
+   start the command earlier and buffer its output, up to the look-ahead size.
 3. `attach` connects to the socket. It retries until the socket exists or the
    timeout expires. Then it copies its stdin to the socket and the socket to its
    stdout. It has no other logic.
@@ -803,14 +929,19 @@ Every frame is `type u8, length u32 (little endian), payload`. Suggested types:
 | Session | Direction | Types |
 |---|---|---|
 | data | remote to local | HELLO, LIT (bytes), REF (qid), RLE (byte u8, length u64), END (exit status, error text) |
-| data | local to remote | HELLO, HASHLIST (encoded hash list, can span several frames) |
+| data | local to remote | HELLO, HASHLIST (encoded hash list, can span several frames), HASHDELTA (segments of the delta log, section 5.6, can span several frames) |
 | control | remote to local | HELLO, QUERY (qid u32, offset u64, weak u64, blake3 [u8; 32]) |
 | control | local to remote | HELLO, ANSWER (qid u32, found u8) |
 
 HELLO carries the protocol version, the block size, `weak_hash_id`, the hash
 list width `W`, and the program version. Any mismatch is a fatal error. The
 local's HELLO also carries the compression level and thread count it wants the
-remote to use.
+remote to use, `meta.index_id`, and the `remote_cache` flag (section 7). On the
+data session the local sends its HELLO first. The remote reads it, looks up its
+cache for that index, and answers with a HELLO that also carries the generation
+and the list hash of the cached hash list, or an all-zero hash when it has none
+(section 5.6). The local then sends HASHLIST or HASHDELTA. On the control
+session both sides send their HELLO at once.
 
 Compression. After the HELLO exchange, the remote-to-local direction of the
 data session is one zstd stream, and all later frames (LIT, REF, END) travel
@@ -983,7 +1114,10 @@ emits runs of at least `block_size`.
 - SIGINT on the local: close both sessions. `serve` kills the child command when
   its stdin closes.
 - Security: the hash list reveals the block hashes of all indexed files to the
-  remote host. Use `hashsync` only with hosts the user trusts.
+  remote host, and with the cache of section 5.6 it stays on the remote's disk
+  between runs (mode 0600, under the remote user's cache directory). Use
+  `hashsync` only with hosts the user trusts. Set `remote_cache = false` for a
+  host that must not keep the list (section 7).
 
 ### 6.6 Threads at run time
 
@@ -1038,10 +1172,12 @@ compression_threads = 0    # libzstd worker threads on the remote; 0 = half the 
 ssh            = "ssh"     # remote shell command, split like a shell would (rsync's --rsh);
                            # the program appends -o Compression=no
 remote_command = "hashsync"  # path of hashsync on the remote host
+remote_cache   = true      # the remote may keep the hash list between runs (section 5.6)
 
 [hosts.builder]            # optional overrides, keyed by the HOST argument of `hashsync run`
 ssh            = "ssh -p 2222 -i ~/.ssh/builder"
 remote_command = "/run/current-system/sw/bin/hashsync"
+remote_cache   = false     # shared machine: do not leave the hash list on its disk
 
 [[roots]]
 path = "/nix/store/*"      # glob: each match is its own root; also matches dot names
@@ -1066,8 +1202,8 @@ constants, not configuration.
   status of COMMAND. HOST is appended to the remote shell command unchanged, so
   `user@host` and `ssh_config` aliases work. `--ssh` overrides the configured
   remote shell command for this run. At the end it prints one summary line to
-  stderr: output bytes, literal bytes, referenced bytes, run bytes, and bytes on
-  the wire.
+  stderr: output bytes, literal bytes, referenced bytes, run bytes, bytes on
+  the wire, and the bytes of the hash list or delta that was sent.
 - `hashsync serve --token T` and `hashsync attach --token T`: internal. The
   local runs them on the remote through the remote shell.
 - `hashsync stats`: show index statistics.
@@ -1092,10 +1228,11 @@ and no need for one.
 |---|---|---|---|
 | Weak hash | own code | | Sections 5.1 and 5.2, about 50 lines. |
 | Hash list coding | own code | | Golomb-Rice encoder and decoder, about 60 lines. |
+| Hash list cache and delta log | own code | | Section 5.6: diff of two sorted lists, segment files, pruning, the remote's cache and merge; about 150 lines over both roles. |
 | Remote hash table | own code | | Section 5.5, about 100 lines plus the SIMD bucket scan. |
 | Blake3 | `blake3` | 1.8.7 (2026-08) | `blake3::hash`. Assembly for SSE4.1, AVX2, and AVX-512 on x86_64 with run-time detection; NEON on aarch64 by default. See below. |
 | SQLite | `rusqlite` | 0.40.2 (2026-08) | Feature `bundled`: SQLite 3.53.2 through `libsqlite3-sys` 0.38.2. `prepare_cached`, `transaction_with_behavior`, `busy_timeout`, `pragma_update`. See below. |
-| System calls | `rustix` | 1.1.4 (2026-02) | `fs::{openat, openat2, statx, RawDir, fadvise, seek, memfd_create}`, `io::{pread, preadv2}`, `mm::{mmap, mmap_anonymous, madvise}`, `pipe::{splice, fcntl_setpipe_size}`, `process::setrlimit`, `ioctl::{Getter, opcode}`. Raw system calls on Linux (`linux_raw` backend). |
+| System calls | `rustix` | 1.1.4 (2026-02) | `fs::{openat, openat2, statx, RawDir, fadvise, seek, memfd_create, flock}`, `io::{pread, preadv2}`, `mm::{mmap, mmap_anonymous, madvise}`, `pipe::{splice, fcntl_setpipe_size}`, `process::setrlimit`, `rand::getrandom`, `ioctl::{Getter, opcode}`. Raw system calls on Linux (`linux_raw` backend). |
 | System calls, gaps | `libc` | 0.2.189 (2026-08) | `name_to_handle_at`, `file_handle`, `MAX_HANDLE_SZ`, `syscall(SYS_cachestat, ...)`. |
 | Kernel constants | `linux-raw-sys` | 0.12.1 (2025-12) | `general::{fsuuid2, cachestat, STATX_MNT_ID_UNIQUE}`. Already a dependency of `rustix`. |
 | Thread pool | `rayon` | 1.12.0 (2026-04) | A dedicated `ThreadPool`, `scope` and `spawn`. LIFO local deques, oldest-first stealing (section 4.6). |
@@ -1304,6 +1441,43 @@ stays custom (section 5.5).
   64-byte anchor context is shared by many distinct blocks (zero padding, common
   file headers), so each hit would need several candidates resolved. Not
   pursued. Revisit if the remote scan rate turns out to be the bottleneck.
+- **Per-peer copies of the hash list on the local**, so that the local can
+  compute the delta for each remote itself. Rejected on 2026-09-10. It costs
+  one list per peer on every host (about 2 × N² lists in a fleet of N hosts
+  instead of N × (N − 1)), needs a peer identity and a cleanup of stale
+  copies, and leaves the local unsure of what the remote holds after an
+  interrupted transfer. The remote reports the generation and hash of the
+  list it holds, and the local replays its own delta log (section 5.6). The
+  local keeps no state per peer.
+- **Set reconciliation sketches** (IBLT, rateless IBLT, minisketch), to find
+  the difference without history on the local. Rejected on 2026-09-10. An
+  IBLT costs at least 11 bytes per cell (a count, a 48-bit key sum, and a
+  32-bit check sum) and about 1.3 to 1.5 cells per differing key: 22 to 38 MiB
+  for the 1.6M differing keys of the 10 % case, against 27 MiB for the full
+  list and about 6 MiB for the delta. At any churn it costs about four times
+  the delta, and it needs an estimate of the difference (or a rateless scheme)
+  and a fallback for a failed decode. Minisketch is optimal in size but decodes
+  in O(d²), for thousands of differences, not millions. The delta log costs
+  about 4 bytes per changed key, and the local already holds the list it diffs
+  against.
+- **Range fingerprint reconciliation** (Merkle-style recursion over the sorted
+  key space, as in negentropy). Rejected on 2026-09-10. The weak hashes are
+  uniform, so 10 % churn touches every range at every level, and the recursion
+  sends about as much as the full list.
+- **Bloom filter exchange** (each side sends a filter of its set). Rejected on
+  2026-09-10. Two filters at 1 % false positives cost about 10 MiB each for 8M
+  keys, and a false positive drops a new hash from the remote's table.
+- **Deltas with additions only**, never removals. Rejected on 2026-09-10. The
+  remote's table would grow by the churn at every run, and a stale hash whose
+  content still appears in the output costs one query per occurrence until the
+  negative cache learns it. Removals cost half of the delta as values and much
+  less as positions (section 12).
+- **Composing a chain of segments into one net delta** before sending it.
+  Considered and dropped on 2026-09-10. It only saves bytes when a hash leaves
+  and returns within the chain, which is rare for build outputs, and the
+  pruning rule already caps a chain below the size of the full list. The local
+  sends the segments as they are on disk, and the remote applies them in order
+  (section 5.6).
 
 ## 11. Repository conventions
 
@@ -1317,13 +1491,15 @@ stays custom (section 5.5).
   - `main.rs`: command-line entry point (`clap`).
   - `weakhash.rs`: multiplier, `Tout` tables, block hash, rolling hash,
     `mix64`.
-  - `hashset/`: Golomb-Rice hash list encoder and decoder, fingerprint table,
-    SIMD bucket scan.
+  - `hashset/`: Golomb-Rice hash list encoder and decoder, diff and merge of
+    sorted lists, fingerprint table, SIMD bucket scan.
   - `scan/`: pool, directory and file tasks, filesystem and inode identities,
     mount tracking, hashing; the optional `io_uring` reader.
-  - `index/`: schema, migrations, writer, pruning, hash list export and cache.
+  - `index/`: schema, migrations, writer, pruning, hash list export, cache, and
+    delta log.
   - `proto/`: frame types, encoding, HELLO handshake.
-  - `remote/`: `serve` (ring buffer, scanner, emitter) and `attach` (relay).
+  - `remote/`: `serve` (hash list cache, ring buffer, scanner, emitter) and
+    `attach` (relay).
   - `local/`: `run` (remote shell processes, answering, reconstruction).
   - `config.rs`: `config.toml` and XDG paths.
   - `sys/`: every `unsafe` FFI call (handles, ioctl, `cachestat`, the `statx`
@@ -1333,7 +1509,12 @@ stays custom (section 5.5).
   finish a change.
 - Tests to keep: rolling hash equals direct hash (`proptest`); the
   interleaved k-stream hash and the split block hash equal the serial ones;
-  Golomb-Rice round trip on random and adversarial gap patterns; the hash table
+  Golomb-Rice round trip on random and adversarial gap patterns; the delta log
+  (section 5.6): the diff of two lists applied to the first gives the second,
+  a chain of several segments, the pruning rule, the choice between full list
+  and chain from the remote's HELLO, a list hash mismatch on the remote that
+  gets a full list at the next run, and an index restored from a backup (same
+  generation, different content) that the hash detects; the hash table
   never gives a false negative; traversal tests on a temporary tree (hard links,
   symlink loops, dot names and `exclude`, immutable roots, glob
   roots, ctime change, pruning, identity fallbacks when the ioctl or handles are
@@ -1374,3 +1555,9 @@ stays custom (section 5.5).
   32, and 64 threads.
 - **Spinning disks.** A per-root limit on concurrent readers and reading in
   inode order; not in the first version.
+- **Removals as positions in the delta.** A segment encodes removed hashes as
+  48-bit values, about 30 bits each. The remote holds the old list, so a
+  removal could be its rank in that list: the gaps between ranks cost about
+  `log2(N / n_removed) + 2` bits, 5 to 6 bits at 10 % churn. This cuts the
+  10 % delta of section 5.6 from about 6 MiB to about 3.5 MiB for about 20
+  lines on each side. Decide after the first measurements on a real tree.
