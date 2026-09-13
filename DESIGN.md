@@ -219,9 +219,9 @@ Mutable root (`immutable = false`, the default):
 
 Immutable root (`immutable = true`):
 
-- The index knows the root by its identifier: a string that the `identifier`
-  option (below) derives from the path of the match or takes from the
-  configuration. By default it is the path itself.
+- The index knows the root by its identifier: a byte string that the
+  `identifier` option (below) derives from the path of the match or takes
+  from the configuration. By default it is the path itself.
 - The indexer traverses the root once, when it first sees its identifier.
   The root row is marked complete when the whole traversal has been
   committed (section 4.4). A root whose traversal was interrupted (a crash,
@@ -285,8 +285,9 @@ Per-root options:
   - `{ literal = "photos-2019" }`: the string as given. The root keeps its
     rows when the tree moves to another path.
 
-  Identifiers are compared as strings, whatever form and whatever `[[roots]]`
-  entry produced them. An empty identifier is a configuration error.
+  Identifiers are compared as byte strings, whatever form and whatever
+  `[[roots]]` entry produced them. An empty identifier is a configuration
+  error.
 
 Copies of an immutable root: matches of one update with equal identifiers are
 copies of one root, whether one glob or several entries produced them. The
@@ -396,18 +397,19 @@ The index is one SQLite file, by default
 CREATE TABLE meta        (key TEXT PRIMARY KEY, value BLOB NOT NULL);
   -- keys: schema_version, block_size, weak_hash_id, generation, index_id
 CREATE TABLE filesystems (id INTEGER PRIMARY KEY, fsid BLOB NOT NULL UNIQUE);
-CREATE TABLE roots       (id INTEGER PRIMARY KEY, ident TEXT NOT NULL,
-                          immutable INTEGER NOT NULL, path TEXT NOT NULL,
+CREATE TABLE roots       (id INTEGER PRIMARY KEY, ident BLOB NOT NULL,
+                          immutable INTEGER NOT NULL, path BLOB NOT NULL,
                           complete INTEGER NOT NULL, UNIQUE (ident, immutable));
   -- ident: the path of a mutable root, the identifier of an immutable one;
   -- path: where the root was last found; distinct across rows, because
   --   the update stores only its matches (section 4.2)
   -- complete: 1 once a whole traversal of the root has been committed
 CREATE TABLE inodes      (id INTEGER PRIMARY KEY, fs_id INTEGER NOT NULL,
-                          handle BLOB NOT NULL, size INTEGER NOT NULL,
+                          handle BLOB NOT NULL, size INTEGER,
                           ctime_ns INTEGER NOT NULL, UNIQUE (fs_id, handle));
-  -- size = -1 while the block rows of the inode are being written
-CREATE TABLE paths       (root_id INTEGER NOT NULL, rel_path TEXT NOT NULL,
+  -- size: NULL while the block rows of the inode are being written;
+  --   otherwise stx_size as the signed integer with the same bits (below)
+CREATE TABLE paths       (root_id INTEGER NOT NULL, rel_path BLOB NOT NULL,
                           inode_id INTEGER NOT NULL,
                           PRIMARY KEY (root_id, rel_path)) WITHOUT ROWID;
 CREATE INDEX paths_by_inode ON paths (inode_id);
@@ -423,6 +425,18 @@ Rules:
 - `meta` stores `block_size` and `weak_hash_id` (algorithm name, multiplier,
   and mixer, section 5.1). If either differs from the configuration or from the
   binary, the program drops all tables and rebuilds the index.
+- Paths and identifiers (`roots.ident`, `roots.path`, `paths.rel_path`) are
+  `BLOB` columns. A path is a byte string that need not be valid UTF-8, and
+  `TEXT` is for text in the database encoding. The program keeps a path as
+  bytes (`OsStr`) from the directory listing to the database and back
+  (section 9).
+- `inodes.size` holds `stx_size`, an unsigned 64-bit value; a sparse file can
+  reach the top of that range. SQLite integers are signed 64-bit, so the
+  column holds the signed integer with the same bits, and the program converts
+  at the database boundary (section 9). SQL compares the column for equality
+  only; it never orders it and never computes with it. NULL marks an inode
+  whose block rows are being written (below); no integer value is free for
+  that.
 - Use WAL mode with `synchronous=NORMAL`. The database stays consistent after
   a crash or a power loss, a commit costs no `fsync`, and the last
   transactions can be lost, which is acceptable for an index that is a cache.
@@ -436,11 +450,12 @@ Rules:
 - Recovery contract. The index never needs a repair step. Every committed
   state is a valid index, because every row of it is a hint (section 3) and
   because two markers tell the next update what was interrupted:
-  - `inodes.size = -1` marks an inode whose block rows are being written.
+  - `inodes.size IS NULL` marks an inode whose block rows are being written.
     The writer sets it in the transaction that deletes the inode's old block
     rows, and it stores the real size and ctime in the transaction that holds
-    the last block row. An inode left at `-1` by a crash matches no
-    `(size, ctime)` and is hashed again at the next update.
+    the last block row. An inode left at NULL by a crash matches no
+    `(size, ctime)`, because `NULL = x` is never true, and is hashed again at
+    the next update.
   - `roots.complete = 0` marks a root whose traversal was not committed to
     the end. The reconciliation transaction of the update inserts the row
     with `0` (section 4.2), and the writer sets `1` in the transaction that
@@ -596,9 +611,8 @@ wrappers come from `rustix` and, for the few calls it lacks, from `libc`
 
 This section states how the indexer is parallelised and why. Constraints: no
 asynchronous runtime (no `async` functions, no executor, no futures); threads
-for parallelism; `io_uring` where it makes the program measurably faster.
-Asynchronous calls in the C sense (a function that runs on another thread and
-reports back, or a submission with a completion) are fine.
+for parallelism. Asynchronous calls in the C sense (a function that runs on
+another thread and reports back, or a submission with a completion) are fine.
 
 #### Where the time goes
 
@@ -721,8 +735,8 @@ file has 32M block rows, more than 1 GiB of hashes. The hashing thread
 streams them instead:
 
 - `Begin { fs_id, handle }`: the writer looks the inode up, inserts its row
-  with `size = -1` or sets `size = -1` on the existing row, and deletes its
-  old block rows.
+  with `size = NULL` or sets `size = NULL` on the existing row, and deletes
+  its old block rows.
 - `Blocks { rows }`: up to 1024 block rows (48 bytes each), sent as soon as
   they are complete, while the file is still being read. The writer inserts
   them into the current transaction.
@@ -735,7 +749,7 @@ streams them instead:
 
 The messages of one file come from one thread, so the writer sees them in
 order, and a transaction that commits between two `Blocks` messages cuts
-through a file that is marked `size = -1` at that moment (section 4.4). A
+through a file whose `size` is NULL at that moment (section 4.4). A
 `Path` message can arrive before the `Begin` of its inode, when a thread met a
 hard link whose first path another thread is still hashing. The writer keeps
 such paths in a map keyed by `(fs_id, handle)` and inserts them when the
@@ -759,55 +773,18 @@ end of the update. An update that dies before that leaves inodes without a
 path; they serve no candidate read (section 6.4), and `hashsync prune`
 removes them.
 
-#### io_uring: where it helps and where it does not
+#### The reader
 
-Facts, checked against the Linux 6.18 headers and the `io-uring` crate 0.7.15:
-
-- `io_uring` has `openat2`, `statx`, `read` and `readv` (also with registered
-  buffers), `fadvise`, `madvise`, and `close`. It has no `getdents64`, no
-  `name_to_handle_at`, no `lseek` (`SEEK_HOLE`), no `ioctl` (only `uring_cmd`
-  for specific drivers), and no `cachestat`. The walk therefore cannot run on
-  `io_uring`; every directory needs a thread that blocks in `getdents64`.
-- `statx` always runs on io-wq, the kernel's own pool of worker threads
-  (bounded to the smaller of the queue depth and 4 × the CPU count), one
-  blocking call per worker; `openat2` completes inline only when the whole
-  lookup is cached and runs on io-wq otherwise. Submitting metadata calls
-  through a ring replaces a user thread pool by a kernel thread pool with fewer
-  knobs.
-- Buffered reads on ext4, XFS, btrfs, and the other filesystems with
-  asynchronous buffered reads are the real thing: cached pages complete inline
-  at submission; missing pages start readahead and complete later without
-  occupying any thread. This is the one place where a ring gives queue depth
-  without threads.
-- `io_uring` is often unavailable: the default seccomp profiles of container
-  runtimes block it, `kernel.io_uring_disabled` (Linux 6.6) turns it off, and
-  older kernels lack operations. A `pread` path must exist in any case.
-
-Against that, the blocking reader of this design keeps about two requests in
-flight per thread (`fadvise(SEQUENTIAL)` doubles the readahead window, and
-readahead is asynchronous), so 32 to 64 threads put a queue depth of 64 or more
-of 128 to 256 KiB requests on the device for files of a few hundred KiB and
-larger. Smaller files are bounded by their per-file metadata work, which
-`io_uring` cannot reduce. The expected gain of a ring-based reader is therefore
-small and confined to cold full rebuilds, and it costs a second code path.
-
-Decision: the first version reads with `pread` from the pool. The hashing stage
-keeps a narrow interface (a function that takes a directory descriptor and a
-name and returns the inode's rows), so a ring-based reader can replace its body
-later. Adopt one only if a measurement on a cold NVMe shows the blocking pool
-below about 70 % of the device's sequential rate (measure the device with `fio`
-at the same request size). The reader would look like this:
-
-- One ring per thread (`IoUring::builder()` with `setup_single_issuer`,
-  `setup_defer_taskrun`, and `setup_coop_taskrun`), 16 files in flight per
-  thread, 16 registered 1 MiB buffers (`register_buffers`).
-- Per file: `OpenAt2` with `RESOLVE_CACHED` (the walk just touched the dentry,
-  so it completes inline); then `statx`, `name_to_handle_at`, and the hole map
-  with plain calls on the returned descriptor (metadata, no disk read); then
-  `ReadFixed` chunks. On each completion the thread hashes the chunk and
-  submits the next one; at the end `Fadvise(DONTNEED)` and `Close`, linked.
-- Control flow: a loop over completions and a small state per file. This is
-  ordinary C-style asynchronous I/O, not an executor.
+The pool reads with `pread` (section 4.5). A blocking reader keeps about two
+requests in flight per thread: `fadvise(SEQUENTIAL)` doubles the readahead
+window, and readahead is asynchronous. So 32 to 64 threads put a queue depth
+of 64 or more of 128 to 256 KiB requests on the device for files of a few
+hundred KiB and larger, which is where an NVMe device reaches its rate
+(above). Smaller files are bounded by their per-file metadata work, not by
+their reads. The hashing stage keeps a narrow interface, a function that
+takes a directory descriptor and a name and returns the inode's rows, so a
+different reader (below, spinning disks) can replace its body without a
+change to the pool or the writer.
 
 #### Event loops and asynchronous runtimes
 
@@ -2067,7 +2044,6 @@ and no need for one.
 | Thread pool | `rayon` | 1.12.0 (2026-04) | A dedicated `ThreadPool`, `scope` and `spawn`. LIFO local deques, oldest-first stealing (section 4.6). |
 | Work stealing, alternative | `crossbeam-deque` | 0.8.8 (2026-09) | `Worker::new_lifo` and `Stealer`, as in `ignore`. Only if rayon is dropped. |
 | Channels | `crossbeam-channel` | 0.5.17 (2026-09) | Bounded channels to the writer and between the run-time threads; `select!`. `std::sync::mpsc::sync_channel` is enough where no `select!` is needed. |
-| io_uring, optional reader | `io-uring` | 0.7.15 (2026-09) | `IoUring`, `opcode::{OpenAt2, ReadFixed, Fadvise, Close}`, `submit_and_wait`, `register_buffers`, `setup_single_issuer`, `setup_defer_taskrun`, `setup_coop_taskrun`. Synchronous API, no runtime, no liburing. |
 | zstd | `zstd` | 0.14.0 (2026-09) | libzstd 1.5.7 through `zstd-sys` 2.1 (bundled; the `pkg-config` feature links the system library). See below. |
 | TOML | `toml` | 1.1.5 (2026-09) | With `serde` 1.0.229 derive. |
 | Command line | `clap` | 4.6.6 (2026-08) | Derive API. |
@@ -2112,6 +2088,13 @@ Usage rules:
   lookup workers own read connections.
 - `prepare_cached` for every statement; bind positionally; never build SQL
   strings per row. Step the rows; do not collect them.
+- Paths and root identifiers are `BLOB` columns (section 4.4). Bind them as
+  `&[u8]` (`OsStrExt::as_bytes`) and read them as `Vec<u8>`
+  (`OsStringExt::from_vec`); never as `String`, which fails on bytes that are
+  not UTF-8.
+- `inodes.size` crosses the boundary as `Option<i64>`: `Some(size as i64)`
+  when binding, `as u64` when reading, `None` for the NULL marker
+  (section 4.4).
 - The pragmas of section 4.4: a large `cache_size` for the writer, a small one
   for readers, and no secondary indexes on `blocks` during a rebuild.
 
@@ -2139,14 +2122,6 @@ which the `sys` module supplies (section 11):
 Section 4.6 gives the reasons for rayon. `std::thread::scope` and
 `std::sync::mpsc::sync_channel` are enough for the run-time threads of section
 6.6; `crossbeam-channel` adds `select!` and is faster under contention.
-
-### io_uring: the `io-uring` crate
-
-Only for the optional reader of section 4.6. It is a direct binding to the ring
-interface, needs no liburing, and has no executor: the caller pushes entries,
-calls `submit_and_wait`, and drains completions. `rustix::io_uring` exposes the
-raw `io_uring_setup` and `io_uring_enter` calls too, but the typed opcodes of
-the `io-uring` crate are worth the dependency.
 
 ### Compression: the `zstd` crate
 
@@ -2191,11 +2166,16 @@ The sender's table stays custom (section 5.5).
 - **Readiness event loop (`mio`, `polling`, libevent-style).** Rejected on
   2026-09-10. Regular files are always ready to `epoll`, and the program has
   two or three pipes and sockets per side (section 4.6).
-- **`io_uring` for the directory walk.** Rejected on 2026-09-10. No
-  `getdents64`, no `name_to_handle_at`, no `ioctl`; `statx` and `openat2` run
-  on io-wq, which is a thread pool inside the kernel.
-- **`io_uring` for the file reads.** Deferred on 2026-09-10. Optional backend
-  of the hashing stage, adopted only after a measurement (section 4.6).
+- **`io_uring`.** Rejected on 2026-09-13 (user decision). The directory walk
+  was rejected on 2026-09-10: no `getdents64`, no `name_to_handle_at`, no
+  `ioctl`; `statx` and `openat2` run on io-wq, a thread pool inside the
+  kernel. The file reads were deferred the same day as an optional backend of
+  the hashing stage, to be adopted after a measurement, and are now rejected
+  too: `io_uring` is often unavailable (the seccomp profiles of container
+  runtimes, `kernel.io_uring_disabled`, older kernels), so the `pread` reader
+  is needed in any case, and no gain in this architecture is established: the
+  blocking pool already keeps a queue depth of 64 or more on the device, and
+  small files are bounded by metadata work (section 4.6).
 - **`O_DIRECT` reads in the indexer.** Rejected on 2026-09-10. It avoids the
   page cache copy, but files that are already cached (the common case after a
   rebuild) would be read from the device again, buffers need alignment, and
@@ -2290,6 +2270,9 @@ The sender's table stays custom (section 5.5).
   nullable `path` set to NULL first, or a delete and a reinsert of the row):
   SQLite checks a UNIQUE constraint at every row it writes and cannot defer
   it to the commit.
+- **`TEXT` columns for paths and root identifiers.** Replaced on 2026-09-13
+  (user decision) by `BLOB`. A path is a byte string that need not be valid
+  UTF-8, and `TEXT` is for text in the database encoding (section 4.4).
 - **`(st_dev, st_ino)` as the inode identity**. Rejected on 2026-09-10.
   `st_dev` changes between boots on XFS and on btrfs subvolumes, which would
   rebuild the whole index; inode numbers are reused. Section 4.3 uses the
@@ -2475,7 +2458,13 @@ The sender's table stays custom (section 5.5).
 - **Whole inodes per transaction and per channel message.** Replaced on
   2026-09-10 by streamed block rows with a byte budget (section 4.6). One
   1 TiB file has more than 1 GiB of hashes, which no message-count bound
-  contains. The `size = -1` marker keeps a cut inode safe (section 4.4).
+  contains. The NULL `size` marker keeps a cut inode safe (section 4.4).
+- **`size = -1` as the marker of an inode whose block rows are being
+  written.** Replaced on 2026-09-13 (user decision) by NULL in a nullable
+  `size` column. `stx_size` is an unsigned 64-bit value, and a sparse file can
+  use the whole range, so no integer value is free for a marker: `-1` is the
+  bit pattern of the size `2^64 - 1`. The program converts between `u64` and
+  the signed SQLite integer at the database boundary (section 4.4).
 - **Waiting for the child after END.** Reversed on 2026-09-10: END carries
   the exit status, so the child is waited for first (section 6.6).
 
@@ -2495,7 +2484,7 @@ The sender's table stays custom (section 5.5).
   - `hashset/`: Golomb-Rice hash list encoder and decoder, diff and merge of
     sorted lists, fingerprint table, SIMD bucket scan.
   - `scan/`: pool, directory and file tasks, filesystem and inode identities,
-    mount tracking, hashing; the optional `io_uring` reader.
+    mount tracking, hashing.
   - `index/`: schema, migrations, writer, pruning, hash list export, cache, and
     delta log.
   - `proto/`: frame types, encoding, HELLO handshake.
@@ -2504,8 +2493,8 @@ The sender's table stays custom (section 5.5).
   - `receiver/`: `run` (SSH processes, answering, reconstruction).
   - `config.rs`: `config.toml` and XDG paths.
   - `sys/`: every `unsafe` FFI call (handles, ioctl, `cachestat`, the `statx`
-    bit, ring setup). The crate root has `#![deny(unsafe_code)]`; `sys`, the
-    SIMD bucket scan, and the `io_uring` reader carry `#![allow(unsafe_code)]`.
+    bit). The crate root has `#![deny(unsafe_code)]`; `sys` and the SIMD
+    bucket scan carry `#![allow(unsafe_code)]`.
 - Run `cargo fmt`, `cargo clippy --all-targets`, and `cargo test` before you
   finish a change.
 - Tests to keep: rolling hash equals direct hash (`proptest`); the
@@ -2556,12 +2545,14 @@ The sender's table stays custom (section 5.5).
   list sent over several LISTDATA frames, and a transfer whose bytes do not
   match the announced length or hash is rejected; an interrupted update
   (section 4.4): an immutable root left incomplete is traversed again and
-  then marked complete, an inode left at `size = -1` is hashed again, block
-  rows of one file spread over several transactions, a `Path` message that
-  arrives before the `Begin` of its inode, the generation read in one
+  then marked complete, an inode left with a NULL `size` is hashed again,
+  block rows of one file spread over several transactions, a `Path` message
+  that arrives before the `Begin` of its inode, the generation read in one
   snapshot with the rows it describes, and the checkpoint before publication
-  (after an export, `wal_checkpoint` reports no frames left in the WAL); an
-  indexed file replaced by a FIFO or
+  (after an export, `wal_checkpoint` reports no frames left in the WAL); the
+  database boundary (section 4.4): a size of `2^63` or more and a path that
+  is not valid UTF-8 round-trip through the index, and the run opens that
+  path; an indexed file replaced by a FIFO or
   a directory gets a "no" without blocking, at run time and in the indexer;
   every event of the table in section 6.7 ends both roles, including a
   command whose descendant keeps stdout open, and the command's process group
@@ -2589,8 +2580,6 @@ The sender's table stays custom (section 5.5).
   new level to the next job of a multithreaded stream, so the setter exists.
   What remains is the controller: raise the level while the network is the
   bottleneck, lower it while the compressor is.
-- **`io_uring` reader.** Adopt or drop after the measurement of section 4.6,
-  before the first release.
 - **Thread count default.** `4 × cores`, clamped to 16 to 64, assumes NVMe.
   Measure a cold and a warm full build and an incremental update with 8, 16,
   32, and 64 threads.
