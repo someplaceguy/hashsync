@@ -39,7 +39,8 @@ asynchronous runtime or event loop.
 - **Query / answer**: a request for a window's full strong hash at an output
   offset, and the receiver's yes/no response. Each offset is queried at most
   once per run.
-- **Pin**: verified block bytes retained by the receiver for a query offset.
+- **Pin**: a query offset's verified block, retained in an open, unlinked
+  receiver file and identified by its offset in that file.
 - **Record**: a sender-side description of scanned but un-emitted output:
   a Literal, Run, Query, or Ref.
 
@@ -48,25 +49,29 @@ asynchronous runtime or event loop.
 1. The receiver resolves configured roots and updates the index.
    `--no-update` skips the update and acquires read-only access. Index access
    is held throughout the run.
-2. It exports the hash list from one database snapshot and starts data and
-   control SSH sessions to the sender.
+2. It exports the hash list from one database snapshot, prepares the temporary
+   pin file, and starts data and control SSH sessions to the sender.
 3. HELLO negotiates parameters and cached lists. The receiver durably
    publishes its target list, then sends a full list, a delta, or confirmation
    that the sender's list is current. The sender verifies it, builds its
    table, and reports whether it stored the list.
 4. The sender starts the command. Its scanner sends literals for misses,
    runs for repeated bytes, and queries for possible block matches.
-5. The receiver reads and verifies candidates, pinning bytes before answering
-   yes. The sender emits references for yes answers and rescans rejected
-   windows from the next byte. Output is always emitted in order.
+5. The receiver reads and verifies candidates, appending their bytes to its
+   temporary pin file before answering yes. The sender emits references for
+   yes answers and rescans rejected windows from the next byte. Output is
+   always emitted in order; releasing a pin punches a hole in its file range.
 6. The receiver reconstructs stdout. After all command output and the
-   command's exit status are available, the sender sends END; the receiver
-   exits with that status.
+   command's exit status are available, the sender sends END. The receiver
+   validates stream completion and flushes stdout before sending END_ACK.
+   Both SSH sessions must exit successfully before it returns the command's
+   status.
 
 **Verification is authoritative.** The index, hash lists, caches, and weak
-hash table are hints. Every referenced block must match the full strong
-hash of bytes already read into memory. Stale files and collisions can
-reduce deduplication, never change the reconstructed output.
+hash table are hints. Verify candidates before writing pins and verify the
+exact buffer read back from a pin before writing it to stdout. Both checks
+use the query's full strong hash. Stale files and collisions can reduce
+deduplication, never change the reconstructed output.
 
 **No timeouts.** Waits end when the expected event occurs or a peer,
 descriptor, or process goes away. Slow systems must not fail because of a
@@ -78,9 +83,15 @@ operations and are not timeouts.
 
 ### 4.1 What gets indexed
 
-- Only regular files, without following symlinks. Visit directories once
-  per scan using `(filesystem id, inode handle)` to prevent bind-mount cycles.
-- Hash each inode once per scan; additional hard links add paths.
+- Only regular files, without following symlinks. Repeated directory
+  identities, including bind-mount cycles and aliases, end the update with
+  `die`; traversal never silently skips them.
+- Traversal into another configured root calls `die`, including when reached
+  through a mount alias. Copies sharing an immutable identifier are one
+  logical root.
+- Hash each inode once per scan; additional hard links add paths, including
+  links across different roots. Sharing a regular-file inode is supported
+  and is not itself a traversal conflict.
 - Index only complete blocks. Files smaller than `block_size` have no inode
   or path rows, but mutable scans check them again. Remove indexed inodes
   that shrink below that size.
@@ -101,8 +112,9 @@ matches `/nix/store/.links`.
 
 Resolve roots for every update, run (including `--no-update`), and prune.
 After exclusions, reject duplicate or nested absolute paths before changing
-the index. This check is lexical; inode identities detect aliases through
-hard links and mounts.
+the index. This check is lexical; traversal also detects entry into another
+configured root through mount aliases (section 4.5). Hard links across
+otherwise separate roots are allowed.
 
 Mutable roots are traversed on every update. Reuse complete inode rows when
 `(size, ctime)` from the open file matches; otherwise rehash. Use kernel
@@ -135,6 +147,17 @@ Per-root options:
 
 Identifiers are nonempty byte strings with the same comparison rules for all
 forms. They are allowed only on immutable roots.
+
+All configured copies sharing an identifier must have the same indexing
+policy: identical `exclude` pattern sets, ignoring order and duplicates,
+and equal `one_filesystem` values after applying defaults. Compare the
+configured patterns, without attempting to prove glob equivalence.
+Conflicting policies are a configuration error, including for completed
+groups and `--no-update` runs; reject them before changing the index.
+
+Policy changes do not invalidate completed immutable groups automatically.
+After changing exclusions or `one_filesystem`, the user must run
+`hashsync update --rebuild` to apply the new policy to those groups.
 
 Before scanning, reconcile roots in one transaction:
 
@@ -234,11 +257,13 @@ separate lock file:
   its writer through `unix-excl`, with no existing connections. Execute a
   real schema read to acquire the process lock before opening worker readers
   or changing the schema; opening a connection alone is insufficient.
-- After successful initialization, configure WAL and open same-process
-  read-only connections through the normal Unix VFS. All connections use
-  one SQLite library instance, preserving normal WAL snapshots within the
-  process. Do not use `locking_mode=EXCLUSIVE`, `immutable=1`, or
-  `nolock=1`.
+- After successful initialization, configure WAL. Every connection in this
+  modifying process, including worker readers, opens read/write through
+  `unix-excl`, using one SQLite library instance. Set `query_only=ON` on
+  worker connections before use. Opening a connection read-only, or through
+  the normal Unix VFS, can downgrade the process lock; neither is allowed
+  in this process. Normal WAL snapshots still coordinate its connections.
+  Do not use `locking_mode=EXCLUSIVE`, `immutable=1`, or `nolock=1`.
 - Keep the writer alive through the run's use of the index; close worker
   readers first. There must be no gap in exclusion between update and use.
 - Read-only processes (`run --no-update`, `stats`) use normal read-only
@@ -295,10 +320,33 @@ other than a regular file or directory. Directory-entry types are only hints.
 Obtain `statx` metadata and inode handles from the descriptor, checking which
 metadata fields were returned.
 
+Before traversal, register current root locations and their logical owners,
+including locations of completed immutable groups. Recognize directory
+roots by directory identity; registering that identity for different logical
+roots is fatal. Recognize single-file root locations by the
+actual directory entry: parent directory identity plus basename. Do not use
+the file inode alone to identify a root location, since another hard link
+to it is allowed. Registration of several copies in one immutable group is
+allowed. Close the registration descriptors; root tasks reopen their entries
+and require the registered location and object identity to be unchanged,
+otherwise abandoning that root. This avoids retaining a descriptor for
+every configured root.
+
 A directory task queues relevant children with its shared parent descriptor.
+Before descending into a child, reject entry into another logical root's
+registered location with `die`, reporting both paths. This also catches
+roots whose own tasks have not started or whose immutable index is reused.
 Atomically claim directory and file identities in separate visited sets.
-Repeated directories stop traversal; repeated files add paths to the first
-task's result.
+A second traversal of a directory identity calls `die`, including within
+the same root. Repeated regular files add paths to the first task's result
+regardless of root, preserving all dependent roots and hard-link paths.
+Claims include small files and files without useful blocks.
+
+These are fatal configuration/traversal errors, without a core dump; do not
+skip the conflicting branch or mark its traversal complete. Completed
+immutable groups and `--no-update` runs are not traversed solely to discover
+hidden overlap. Every conflict that is detected is fatal; interrupted-update
+recovery handles any work committed before detection.
 
 For a new or changed regular file, read with `pread`, accumulating short
 reads, and hash useful complete blocks. Unexpected EOF within the initial
@@ -318,7 +366,8 @@ them, abandon the entry, and continue. A directory failure also skips unread
 descendants. Mark the root unsuccessful so an immutable traversal is retried.
 If inode work has begun, remove its partial result through the writer.
 Supported identity and hole-seeking fallbacks are not failures. Database
-failures and invariant violations are fatal.
+failures and invariant violations are fatal. The traversal conflicts above
+also end the process instead of abandoning a single entry.
 
 ### 4.6 I/O architecture
 
@@ -410,8 +459,9 @@ HELLO requires agreement on the algorithm; changing it rebuilds the index.
 
 Treat full strong-hash equality as byte equality. Only the index stores
 16-byte prefixes. Queries, content caches, and list IDs use full digests.
-Candidate verification hashes the exact buffer that will be pinned and used
-for output.
+Candidate verification hashes the exact buffer written to the pin file.
+Reconstruction verifies the buffer read from that file before using it for
+output.
 
 ### 5.4 The hash list
 
@@ -568,15 +618,17 @@ the command. Flush setup responses before waiting.
 
 `attach` retries a not-yet-listening socket while its stdin remains open,
 with no deadline. It relays stdin to the socket and the socket to stdout,
-half-closing the socket on stdin EOF and exiting on relay failure.
+half-closing the socket on stdin EOF. Socket EOF or a peer-closed socket
+error (`EPIPE` or `ECONNRESET`) ends the relay successfully after flushing
+stdout, without waiting for stdin EOF or joining the other relay thread.
+Either direction may observe closure first. The receiver decides whether
+that closure was expected from its completion state; other relay failures
+end the relay unsuccessfully.
 Rendezvous waits must also observe receiver disappearance (section 6.7).
 
 The command's argv travels in HELLO, not on the SSH command line. Start it
 without a shell, with stdin from `/dev/null`, piped stdout, inherited stderr,
 and its own process group for cleanup.
-
-`--single-connection` is a fallback that multiplexes both logical streams
-in the frame layer; its writer prioritizes control frames.
 
 ### 6.2 Frames
 
@@ -591,7 +643,7 @@ supported strong algorithms.
 
 | Session | Direction | Types |
 |---|---|---|
-| data | receiver to sender | HELLO, HASHLIST, HASHDELTA, HASHKEEP, LISTDATA |
+| data | receiver to sender | HELLO, HASHLIST, HASHDELTA, HASHKEEP, LISTDATA, END_ACK |
 | data | sender to receiver | HELLO, HASHFULL, CACHE_RESULT, LIT, REF, RLE, END |
 | control | sender to receiver | HELLO, QUERY |
 | control | receiver to sender | HELLO, ANSWER |
@@ -632,7 +684,11 @@ Payloads:
 - REF: empty; use the pin at the current output offset.
 - RLE: `byte u8, length u64`.
 - END: `status i32, error string`. Status is the command's exit status,
-  `128 + signal`, or 127 plus error text if startup failed. Nothing follows.
+  `128 + signal`, or 127 plus error text if startup failed. No further
+  sender-to-receiver data frames follow.
+- END_ACK: empty. The receiver has validated END and compression completion
+  and flushed reconstructed stdout. Send exactly once on the data session;
+  it is the receiver's last data-session frame. Section 6.7 defines shutdown.
 - QUERY: `offset u64, strong [u8; S]`. At most one per offset; offsets may
   go backwards after rescanning.
 - ANSWER: `offset u64, found u8` (0 or 1). Answers may arrive out of order.
@@ -645,12 +701,13 @@ lengths.
 The data handshake is receiver HELLO, sender HELLO, durable receiver
 publication, then HASHLIST/HASHDELTA/HASHKEEP and its data. The sender replies
 with CACHE_RESULT, possibly after one HASHFULL fallback. The receiver handles
-the result and cache cleanup before entering its output loop. It sends no
-more data-session frames and leaves that session's stdin open until END.
+the result and cache cleanup before entering its output loop. Its only
+remaining data-session frame is END_ACK; it keeps both session stdin pipes
+open until the sender and relay exit.
 
 After HELLO, all sender-to-receiver data-session frames share one zstd stream,
 unless compression is disabled. This includes HASHFULL and CACHE_RESULT.
-Control traffic and receiver-to-sender list traffic are uncompressed.
+Control traffic and all receiver-to-sender traffic are uncompressed.
 The data writer flushes setup responses and, when requested by the scanner,
 flushes compression after its queue drains. Finish the stream after END.
 These flushes ensure that waiting for answers or command output cannot trap
@@ -755,31 +812,72 @@ and map entries below `e`.
 
 Outgoing data is bounded. Queueing it must not block the scanner from
 processing answers. Outgoing QUERY messages use an unbounded, nonblocking
-queue and remain ordered even when offsets go backwards. Lookahead limits
-outstanding work indirectly; discarded records can leave obsolete requests,
-so there is no simple one-query-per-buffered-block bound.
+queue and remain ordered even when offsets go backwards. Discarded records
+can leave obsolete requests; lookahead is not a bound on all outstanding
+queries or receiver pins.
 
 When progress requires input, answers, or data-queue space, first emit ready
 short literals and request a compressor flush after the queue drains. Wait
 on notifications for those events, continuing to prioritize answers.
 Backpressure propagates from the data writer through the lookahead buffer
-to the command.
+to the command. Pin allocation and release are entirely receiver-local.
 
 Finish only after EOF, `p = r`, and no Query records remain. Drain all
 records so `e = p = r`, wait for the exit status, then queue END. Obsolete
-unanswered requests do not delay completion.
+unanswered requests do not delay completion. Enter the Ending state before
+queueing END, as specified in section 6.7.
 
 ### 6.4 The receiver's answering and reconstruction
 
-The receiver tracks output offset `c` and a map of pins by query offset.
-Identical content can share immutable buffers, but each offset needs its own
-pin. When a buffer's last pin is released, retain it in a 256 MiB LRU cache
-keyed by full strong hash. One lock protects `c`, pins, and this cache;
-disk reads and stdout writes occur outside it.
+The receiver keeps pin payloads in one open, unlinked temporary file per
+run. Its map from query offsets contains only pin-file offsets and full
+strong hashes. File offsets are independent of command-output offsets.
+Each pin has its own file range, including pins with identical content.
+
+**Pin storage.**
+
+Before command startup, create the file in `pin_directory`, defaulting to
+`$XDG_CACHE_HOME/hashsync/pins/` (fallback `~/.cache/hashsync/pins/`). Use a
+private directory (0700), a read/write file (0600), and close-on-exec.
+Prefer `O_TMPFILE`; otherwise create a unique file securely and unlink it
+before writing any payload. Keep the descriptor open through the run.
+Choose a disk-backed directory to move payload storage out of RAM; a tmpfs
+directory would store it in memory or swap instead.
+
+Append verified blocks at monotonically increasing offsets. Give each pin
+an extent aligned to the filesystem's block allocation granularity, with
+`stride = round_up(B, granularity)`. The first `B` bytes contain the block;
+any padding belongs exclusively to that pin. Releasing it punches the whole
+extent using `fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)`. This
+frees its `[offset, offset + B)` data and padding without moving other pins.
+Alignment matters because partial filesystem blocks are zeroed rather than
+deallocated (see [fallocate(2)](https://man7.org/linux/man-pages/man2/fallocate.2.html)).
+Do not reuse released extents during the run; the logical file length grows
+with appends while holes reclaim allocated storage.
+
+Require hole-punch support and probe it on a written range during setup.
+Pin-file creation, append, read, or hole-punch failures, including exhaustion
+of space or file-size limits, end the run with `die` without a core dump.
+If writing a pin runs out of disk space, fail the run. No fsync or crash
+recovery is required for this transient file; closing its last
+descriptor reclaims all remaining storage.
+
+The receiver tracks output offset `c`, its pin map, and the next append
+offset. A bounded 256 MiB LRU cache of verified buffers, keyed by full strong
+hash, can serve candidate lookups. Populate it on verified reads; its
+eviction is independent of pin lifetimes. Pins never retain those buffers.
+One lock protects this state and the completion state. Source reads, pin-file
+I/O, and stdout writes occur outside the lock. In-memory payload storage is
+limited to the cache and worker/reconstruction buffers; pin metadata and
+queued requests still scale with outstanding work. The filesystem manages
+reclaimable page-cache pages and backing storage for pin payloads.
 
 A pool of 4–8 lookup workers, each with a reader connection, answers queries
-out of order. Pins have no memory cap; the receiver never answers no merely
-for lack of pin space.
+out of order. The receiver does not reject a match merely because many pins
+exist, and pin release requires no protocol message.
+Queue all answers nonblockingly under the shared lock, checking the
+completion state before publication. Completing suppresses new work and
+answers, including no answers from obsolete lookups.
 
 For `QUERY { offset: x, strong: h }`:
 
@@ -802,29 +900,51 @@ For `QUERY { offset: x, strong: h }`:
    Verify the full digest of that buffer. Errors, early EOF, and mismatches
    try the next candidate; filesystem failures are misses, not fatal.
    Alternate copies need not share the indexed inode identity.
-6. Reacquire the lock and recheck `x < c`. If now obsolete, answer no
-   without a pin. Otherwise pin verified bytes at `x` before answering yes,
-   or answer no if nothing verified.
+6. If nothing verified, answer no. Otherwise recheck `c` under the lock. If
+   `x < c`, answer no without appending. If still needed, allocate a distinct
+   append extent by advancing the file's append offset under the lock.
+   Check file-offset arithmetic before allocating it.
+7. Outside the lock, write the verified buffer's `B` bytes with `pwrite`,
+   accumulating short writes. Open the file without `O_APPEND`; concurrent
+   workers write only their assigned, nonoverlapping extents. Finish every
+   write before publishing the pin or answering yes.
+8. Reacquire the lock and recheck `x < c`. If now obsolete, leave the extent
+   unpublished, punch it outside the lock, and answer no. Otherwise publish
+   `{ file_offset, strong: h }` at `x` and queue yes nonblockingly under the
+   lock. Release the worker's buffer. The Completing state prevents new
+   appends or pin publication; late workers discard their results and the
+   unlinked file is reclaimed at process exit (section 6.7).
 
-A yes is binding because its bytes are already in memory. A later file change
-cannot affect REF. Output may pass `x` and release the pin before the answer
-is sent; the sender then discards that obsolete answer.
+A yes is binding because the receiver owns an independent copy of the
+verified bytes in its pin file. A later source-file change cannot affect
+REF. Output may pass `x` and release its extent before the answer is sent;
+the sender then discards that obsolete answer.
 
 Process data frames in order at `c`:
 
 - LIT writes its payload; RLE writes the repeated byte. Accept any positive
   RLE length, though the sender emits runs of at least `B`.
-- REF takes the pin at `c` under the lock, retains its buffer while writing,
-  and writes exactly `B` bytes. A missing pin is a protocol error.
-- After each frame's output is written, advance `c` under the lock and
-  release every pin whose start offset is below it, including pins covered
-  by literals or runs. Do this even if no further frame arrives.
-- END completes output and carries the command status into shutdown.
-  EOF without END is failure.
+- REF obtains the pin at `c` under the lock. Outside it, read exactly `B`
+  bytes from the pin-file offset with `pread`, accumulating short reads,
+  and verify the full digest against the pin's stored hash before writing
+  that buffer to stdout. Keep the extent live until the write completes and
+  `c` advances. A missing pin is a protocol error; pin-file EOF, read errors,
+  or a digest mismatch end the run unsuccessfully without emitting that
+  block or attempting to reread the source file.
+- After each frame's output is written, advance `c` under the lock. In
+  bounded batches, detach pins whose query offsets are below it and punch
+  their extents outside the lock, including pins covered by literals or
+  runs. Finish this reclamation before processing the next frame, even if
+  no further frame arrives. An unpublished write that becomes obsolete is
+  cleaned up by its lookup worker after that write finishes.
+- END carries the command status into shutdown. Validate compression
+  completion and flush stdout before END_ACK (section 6.7). EOF without
+  END or before the compressed stream is complete is failure.
 
 The shared lock makes pin publication and output advancement atomic relative
 to each other: a lookup either publishes before the offset passes and has its
-pin released, or observes the obsolete offset and creates none.
+extent released, or observes the obsolete offset and discards its extent.
+No extent is punched while its append or REF read is still using it.
 
 ### 6.5 Failures and trust
 
@@ -833,10 +953,15 @@ pin released, or observes the obsolete offset and creates none.
   Startup failure sends status 127 and error text.
 - Truncated streams, broken sessions or receiver stdout, and receiver
   SIGINT/SIGTERM end the run unsuccessfully without a core dump.
-- Invalid frames, unexpected answers, missing pins, arithmetic overflow,
-  database errors, and invariant violations are bugs: panic and abort.
+- Invalid frames, unexpected answers, missing pins, protocol arithmetic
+  overflow, database errors, and invariant violations are bugs: panic and
+  abort.
+- Conflicting immutable-copy policies, repeated directory identities, and
+  traversal into another configured root call `die` without a core dump.
 - Filesystem failures during indexing abandon entries; during lookup they
-  reject candidates. Sender cache-store failures allow transfer with
+  reject source candidates. Pin-file setup, I/O, reclamation, or verification
+  failures end the run with `die` without a core dump; a yes answer cannot
+  be retracted. Sender cache-store failures allow transfer with
   `stored: 0`; failure to persist the receiver's target ends setup without
   a core dump.
 
@@ -851,15 +976,15 @@ cancelled or joined; normal and fatal shutdown end the process.
 
 | Role | Responsibilities |
 |---|---|
-| Sender main | Handshake, command startup, then monitor stdin for receiver disappearance. |
+| Sender main | Handshake, command startup, then receive END_ACK or detect receiver disappearance. |
 | Sender reader | Fill lookahead until stdout EOF, then wait for the command and publish its status. |
 | Sender scanner | Own records and query states; queue queries and output. |
-| Sender data writer | Drain output in order, compress, flush, and finish after END. |
+| Sender data writer | Drain output in order, compress, flush, and publish data completion after END. |
 | Sender control reader/writer | Receive answers and send queries promptly, independently of data output. |
-| Receiver main | Start SSH sessions, decode frames, reconstruct stdout, and handle END. |
-| Receiver control reader/writer | Dispatch queries to lookup workers and send their answers promptly. |
+| Receiver main | Start SSH sessions, reconstruct stdout, validate completion, and send END_ACK. |
+| Receiver control reader/writer | Dispatch queries to lookup workers and send answers promptly. |
 | Receiver signal thread | Handle SIGINT/SIGTERM with status `128 + signal`. |
-| Attach relay | Copy both directions, half-closing the socket on stdin EOF. |
+| Attach relay | Copy both directions; half-close on stdin EOF, exit after flushing on socket EOF. |
 
 Command exit and stdout EOF can occur in either order, for example when a
 descendant retains stdout. END requires both. Blocking output provides
@@ -878,6 +1003,8 @@ callers wait for that cleanup rather than exiting ahead of it:
 
 - Sender: SIGKILL the command's process group and remove the rendezvous socket.
 - Receiver: SIGKILL both SSH processes, causing sender stdin EOF and cleanup.
+- Process exit closes the receiver's unlinked pin file, reclaiming all
+  remaining extents without a separate cleanup pass.
 - Abandoned cache temporaries remain for expiry.
 
 Build with `panic = "abort"`; install a panic hook that performs the same
@@ -885,20 +1012,51 @@ cleanup before aborting. External failures use `die` without a core dump;
 bugs and database errors abort. Per-entry failures remain local.
 
 The receiver monitors stdout, both sessions, and termination signals.
-The sender monitors stdin, stdout, and the control socket. EOF before expected
-completion is fatal; a finished flag distinguishes normal receiver departure
-from loss of the session. This monitoring also applies during rendezvous and
-setup, when no command output is flowing.
+The sender monitors stdin, stdout, and the control socket. Unexpected EOF or
+session loss is fatal. Monitoring also applies during rendezvous and setup,
+when no command output is flowing. Normal shutdown uses END_ACK, not stdin
+EOF, to establish receiver completion.
+
+The sender has a shared completion state protected by one lock. The scanner
+enters Ending before queueing END. The data writer records `data_finished`
+only after finishing compression and flushing all output. The main thread
+records `ack_received` on END_ACK; an acknowledgement outside Ending or a
+duplicate is a protocol error. Either event may happen first. Normal exit
+requires both, and the thread observing the second event performs normal
+cleanup once. Keep stdout open until process exit. Neither event alone
+permits another thread to exit the process.
 
 Normal completion:
 
 1. The sender obtains command-output EOF and the exit status.
-2. The scanner queues final data and END. The data writer finishes the zstd
-   stream, flushes and closes stdout, and marks itself finished.
-3. On END, the receiver flushes its stdout and closes both session stdin pipes.
-4. Sender stdin EOF now means normal completion: remove the socket and exit
-   zero. The relay ends as its stdin and socket close.
-5. The receiver waits for both SSH processes and exits with END's status.
+2. The scanner enters Ending and queues final data and END. The data writer
+   finishes the zstd stream, flushes stdout, and records `data_finished`.
+3. After END, the receiver consumes the rest of that zstd frame, checking its
+   trailer and rejecting any further decoded bytes. Stop at frame completion
+   without waiting for transport EOF; when compression is disabled END is
+   sufficient framing. Flush reconstructed stdout.
+4. The receiver enters Completing before sending and flushing END_ACK on
+   the data session. It stops admitting lookups and publishing control
+   replies; queued replies and late control traffic can be discarded. It
+   keeps both session stdin pipes open while awaiting peer exit. Workers
+   returning later discard their results, including results of unfinished
+   pin-file writes; process exit reclaims the unlinked file. Control EOF,
+   broken pipes, and a partial final control frame in Completing are expected
+   closure, not failures. No blocked lookup or control thread is joined.
+5. Once both sender completion events have occurred, remove the rendezvous
+   socket and exit zero. Closing the control socket lets `attach` flush and
+   exit zero even though its stdin is still open.
+6. The receiver drains data-session stdout to transport EOF, rejecting any
+   trailing bytes, and waits for both SSH processes. Both must exit zero;
+   otherwise the transfer failed even if END was received. After success it
+   closes the session pipes and exits with END's command status.
+
+The receiver's Completing transition uses the same lock as pin allocation
+and response publication. This prevents late lookup completion from trying
+to prolong the exchange. Sender stdin or control EOF before its normal exit
+remains a failure: the receiver never closes those pipes to acknowledge
+success. Failures during stream validation, stdout flushing, or sending
+END_ACK take the fatal cleanup path.
 
 No step has a deadline. A descendant retaining command stdout keeps the run
 open, as under plain SSH. A descendant that leaves the process group can
@@ -916,6 +1074,7 @@ hashlist_max_age = "90d"
 index_path     = "~/.local/state/hashsync/index.sqlite"
 threads        = 0         # 0 = 4 × cores, clamped to 16–64
 lookahead      = "256MiB"  # at least block_size
+pin_directory  = "~/.cache/hashsync/pins"  # receiver file storage; supports hole punching
 negative_cache = "100MiB"
 compression_level   = 9    # zstd 1–19; 0 disables
 compression_threads = 0    # 0 = half the sender's cores, at least one
@@ -932,13 +1091,13 @@ sender_cache   = false
 path = "/nix/store/*"      # each match is a root; includes dot names
 immutable = true
 identifier = "name"
-exclude = ["/nix/store/.links"]
+exclude = [".links"]
 
 [[roots]]                 # copies of the first store share identifiers
 path = "/mnt/disk/nix/store/*"
 immutable = true
 identifier = "name"
-exclude = ["/mnt/disk/nix/store/.links"]
+exclude = [".links"]
 
 [[roots]]
 path = "/srv/data"
@@ -952,8 +1111,9 @@ are persistent state, not TOML options.
 ## 8. Command line
 
 - `hashsync update [--rebuild] [-j N]`: update or rebuild the index;
-  `-j` overrides the configured thread count.
-- `hashsync run [--no-update] [--single-connection] [--ssh CMD] [USER@]HOST -- COMMAND ARGS...`:
+  `-j` overrides the configured thread count. Use `--rebuild` after changing
+  the indexing policy of completed immutable roots.
+- `hashsync run [--no-update] [--ssh CMD] [USER@]HOST -- COMMAND ARGS...`:
   run the remote command, reproduce stdout, and return its status.
   Normal runs hold exclusive index access through update and transfer.
   `--no-update` shares read-only access and still resolves current roots.
@@ -983,6 +1143,7 @@ SIMD support require a target C compiler. There is no separate pure-Rust build.
 | System calls | `rustix`; `libc` and `linux-raw-sys` for missing wrappers/constants |
 | Indexing pool and channels | `rayon`, `crossbeam-channel`; blocking standard threads for transfer |
 | Compression | `zstd` binding libzstd with worker-thread support |
+| Anonymous pin files | `tempfile`; hole punching through `rustix` |
 | Configuration and CLI | `serde`, `toml`, `clap`, `glob` |
 | Maps and caches | Standard maps with a fast hasher; `lru` for bounded caches |
 | Signals | `signal-hook` |
@@ -1011,6 +1172,10 @@ decision history is in version control.
 - **Independent scanner segments:** skipped windows can cross a reference
   chosen by another segment and leave possible matches unexamined. One
   scanner owns all offset decisions.
+- **A separate index lock file:** possible, but all read/write `unix-excl`
+  connections with `query_only` worker readers preserve process exclusion
+  without a second persistent locking object. Mixing VFSes or read-only
+  connections inside that process does not preserve this guarantee.
 - **Async runtimes and `io_uring`:** the blocking pool already serves the
   file-oriented workload, and `io_uring` availability would require a
   fallback. Keep one I/O model.
@@ -1032,10 +1197,17 @@ decision history is in version control.
   implementation changes.
 - Validate hashing/encoding properties and absence of table false negatives;
   byte-exact reconstruction under rescans, late answers, and backpressure;
-  filesystem races, aliases, and sparse files; crash recovery and SQLite
-  process exclusion; cache publication and cleanup races; and shutdown on
-  session loss. Use separate processes for locking tests and fuzz protocol
-  decoding.
+  pin-file appends and reclamation with slow stdout, concurrent lookups,
+  rejected-query rescans, and late answers; obsolete writes, unaligned block
+  sizes, neighbor preservation during hole punching, pin-file failures,
+  corruption detection, and cleanup on exit; filesystem races and sparse
+  files; fatal cycles and descent into another root; hard links within and
+  across roots (including links to a single-file root); conflicting copy policies;
+  crash recovery and SQLite process exclusion and snapshots after worker
+  connections open; cache publication and cleanup races; both END_ACK/data
+  completion orderings, truncated compression trailers, late lookups, relay
+  closure with control writes in flight, and shutdown on session loss. Use
+  separate processes for locking tests and fuzz protocol decoding.
 - Package with Nix `rustPlatform.buildRustPackage`, including support for
   cross and static builds.
 
