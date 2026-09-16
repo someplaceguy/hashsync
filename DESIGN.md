@@ -4,8 +4,8 @@ This file is the design specification of `hashsync`. Contributors and AI agents
 follow it and update it when the design changes. Section 10 logs rejected and
 reverted decisions; section 12 lists the open questions.
 
-Status (2026-09-10): design stage. No code exists yet. The implementation
-language is Rust. An earlier version of this document, from the same day,
+Status (2026-09-17): design stage. No code exists yet. The implementation
+language is Rust. An earlier version of this document, from 2026-09-10,
 targeted Go (section 10).
 
 ## 1. Purpose
@@ -38,8 +38,8 @@ runtime or event loop (section 4.6).
   of a block or window (section 5.1). It selects candidates. It does not prove
   equality.
 - **Index**: an SQLite database on the receiver. It has one row per block with
-  the block's weak hash, its Blake3 hash, and the inode and block number that
-  hold it.
+  the block's weak hash, the first 16 bytes of its strong hash, and the inode
+  and block number that hold it.
 - **Root**: a configured path that the indexer scans recursively.
 - **Immutable root**: a root whose content never changes while the root exists.
 - **Identifier**: the string that names an immutable root in the index
@@ -51,9 +51,13 @@ runtime or event loop (section 4.6).
 - **Hash list**: the sorted, compressed list of the weak hashes of all indexed
   blocks (section 5.4). The sender keeps it between runs. At the start of each
   run the receiver sends it in full, or sends only its changes (section 5.6).
-- **Delta log**: the receiver's record of the changes of the hash list from one
-  export to the next, as segments. A segment lists the removed and the added
-  hashes (section 5.6).
+- **Strong hash**: the configured cryptographic hash, with a fixed output
+  length of at least 16 bytes (section 5.3). Full digests verify content; the
+  index stores only 16-byte prefixes.
+- **List ID**: a strong-hash algorithm name and the full digest of a canonical
+  encoded hash list. It identifies content independently of an index or peer.
+- **Delta**: the removed and added weak hashes between two full hash lists
+  (section 5.6).
 - **Hash table**: the in-memory fingerprint table that the sender builds from
   the hash list (section 5.5).
 - **Offset**: a position in the command's output, counted in bytes from 0.
@@ -68,8 +72,8 @@ runtime or event loop (section 4.6).
 - **Run**: a stretch of at least `block_size` identical bytes in the output.
   The sender sends it as RLE frames (byte value and length) instead of
   literals or references, and the receiver synthesizes it.
-- **Query**: a QUERY frame. It names the offset of a window and the Blake3
-  hash of the window, and asks: "do you have a block with this Blake3 hash?"
+- **Query**: a QUERY frame. It names the offset of a window and its full
+  strong hash, and asks: "do you have a block with this strong hash?"
   The sender sends at most one query per offset during a run.
 - **Answer**: an ANSWER frame: the receiver's "yes" or "no" to the query at an
   offset.
@@ -81,24 +85,27 @@ runtime or event loop (section 4.6).
 
 ## 3. One run, step by step
 
-1. The receiver loads `config.toml`, opens the index, and updates it (section
-   4). `--no-update` skips the update.
-2. The receiver exports the hash list or loads its cache, makes any new
-   generation durable, and records its changes in the delta log (sections
-   4.4 and 5.6).
+1. The receiver loads `config.toml`, resolves roots and immutable groups,
+   acquires access to the index, and updates it (section 4). `--no-update`
+   acquires read-only access and skips the update. The connections keep
+   other processes from updating the index until this run finishes using it.
+2. The receiver exports and encodes the full hash list from one database
+   snapshot and computes its list ID (sections 5.4 and 5.6).
 3. The receiver opens two SSH sessions to the sender host: a **data session**
    and a **control session** (section 6.1).
 4. The two sides exchange HELLO frames. The sender names its cached hash
    list; the receiver sends the full list, its changes, or nothing when it
-   is current. The sender updates its cache and builds its hash table
-   (section 5.6).
+   is current. Before sending list data, the receiver durably publishes
+   its full list in its local cache for this peer. The sender verifies the
+   result, builds its hash table, and reports whether it durably stored the
+   list. Both sides clean up their caches (section 5.6).
 5. The sender starts the user command and reads its stdout.
 6. One scanner thread scans the output (section 6.3). A window of one
    repeated byte becomes a run. Otherwise, a miss in the hash table records
-   one literal byte. A hit computes Blake3: a cached "no" records one
+   one literal byte. A hit computes the strong hash: a cached "no" records one
    literal byte; otherwise the sender queries over the control session.
    A literal advances the scan one byte; a run or query advances it one window.
-7. The receiver looks up each queried Blake3 hash, reads and verifies a
+7. The receiver looks up each queried strong hash, reads and verifies a
    candidate block, and pins its bytes under the query offset before
    answering "yes". If no block verifies, it answers "no" (section 6.4).
 8. The sender resolves records in offset order. A "yes" turns the Query
@@ -113,9 +120,9 @@ runtime or event loop (section 4.6).
     data frame. The receiver exits with the same status.
 
 Design principle: the index, the hash list, its cached copies, and the hash
-table are hints. The receiver verifies every spliced block with Blake3 against
-bytes it read from its own disk, in memory, before it uses them. Stale index
-entries, files changed after indexing, stale cached lists, and weak hash
+table are hints. The receiver verifies every spliced block with the full
+strong hash of bytes it read from its own disk, in memory, before using them.
+Stale index entries, files changed after indexing, stale cached lists, and weak hash
 collisions cost efficiency, never correctness.
 
 Design principle: no timeouts. A slow disk, a slow link, or a loaded host must
@@ -139,9 +146,9 @@ intervals and cache expiry ages are not timeouts: they fail nothing.
   the scan. This stops the cycles that bind mounts can create.
 - Only complete blocks. A file of size S has `floor(S / block_size)` blocks.
   A file smaller than `block_size` has no blocks and is skipped entirely: it
-  gets no inode row and no path row, but is stat'ed again at every scan of a
-  mutable root. The sender's fixed-size windows cannot match a shorter tail
-  (section 10). An indexed inode that shrinks below `block_size` is deleted
+  gets no inode row and no path row, but is opened and stat'ed again at
+  every scan of a mutable root. The sender's fixed-size windows cannot match
+  a shorter tail (section 10). An inode that shrinks below `block_size` is deleted
   at the next scan.
 - Each inode once per scan. When a scan meets an inode a second time (a hard
   link), it only records the new path.
@@ -149,11 +156,15 @@ intervals and cache expiry ages are not timeouts: they fail nothing.
   a run of one byte value as RLE frames (section 6.3), so such blocks never
   need a lookup. This also removes the many rows that zero padding would
   produce.
-- Blocks with a short period are not stored either: a block whose bytes repeat
-  with a period `p` of 1 to 16 bytes (`block[p..] == block[..B - p]`; period 1
-  is the constant block above). zstd encodes such a window in a few bytes,
+- Blocks with a short period are not stored either. With `B = block_size`,
+  a block has period `p` when `block[i] == block[i - p]` for every
+  `p <= i < B`: equivalently, `block[p..B] == block[0..B-p]`, comparing two
+  slices of length `B-p` with exclusive upper bounds. For example,
+  `abcabcab` has period 3; the final repetition may be partial. Skip blocks
+  with any period from 1 to 16; period 1 is the constant block above. zstd
+  encodes such a window in a few bytes,
   about the cost of a reference and without a query, so matching it gains
-  nothing. It also keeps periodic windows out of the sender's Blake3
+  nothing. It also keeps periodic windows out of the sender's strong hash
   computation: without such rows they miss the table (section 6.3). The bound
   of 16 covers the usual fill patterns; it is an efficiency choice, not a
   protocol constant.
@@ -162,142 +173,121 @@ intervals and cache expiry ages are not timeouts: they fail nothing.
 
 ### 4.2 Roots and change detection
 
-Roots come from `config.toml`. A root path can be a glob. Each match is its own
-root, except that immutable matches with equal identifiers are one root
-(below). The indexer expands globs at every update with the `glob` crate
-(`glob::glob_with`, section 9). The match options are
-`require_literal_separator = true`, so that `*` and `?` never match a `/`, and
-the crate's default `require_literal_leading_dot = false`, so that `*` also
-matches names that start with a dot: `/nix/store/*` matches
-`/nix/store/.links`. Use `exclude` for such entries. `**` matches any number of
-path components. A root that is a regular file is indexed as that single file.
+Roots come from `config.toml`. A root path can be a glob; a match can be a
+directory or a single regular file. Expand globs with `glob::glob_with`
+(section 9), with `require_literal_separator = true` and the default
+`require_literal_leading_dot = false`. Thus `/nix/store/*` also matches
+`/nix/store/.links`; use `exclude` for such entries. `**` matches any number
+of path components.
 
-The matches of one update that `exclude` (below) does not skip are distinct
-paths, and no match lies below another: `/a` cannot be a match twice, and
-`/a` and `/a/b` cannot both be matches, whatever entries or globs produced
-them (`/data/**` produces such pairs). The update rejects them as a
-configuration error before it touches the index. The check is lexical, one
-set lookup per match and per ancestor directory of a match. It does not
-resolve symbolic links or bind mounts, so two roots can still reach one
-inode; the hard link rule of section 4.1 handles that. Every path is
-therefore the path of at most one root, in the configuration and, because
-the index stores only matches of the last update (below), in the index.
+Resolve the configuration for every update, run (including `--no-update`),
+and prune. After exclusions, matched paths must be distinct and none may
+lie below another: `/a` cannot occur twice, and `/a` and `/a/b` cannot both
+occur. Reject violations before changing the index. This is a lexical check
+on absolute paths, using a set lookup per match and ancestor; it does not
+resolve symlinks or bind mounts. Different paths can still reach one inode,
+which the handle-based visited sets detect (sections 4.1 and 4.6).
 
-Roots are opened by path at every update and every candidate read (section
-6.4). The pool scans them in parallel and opens each when its task runs
-(section 4.6); section 4.5 gives the descriptor-relative rules below a root.
+Mutable roots (`immutable = false`, the default) are traversed on every
+update. For each regular file, compare `(size, ctime)` from its open
+descriptor with its inode row. Equal values reuse the complete block rows;
+otherwise hash the file again. Use `ctime`, not `mtime`: programs can set
+`mtime`, while the kernel maintains `ctime`. Every update reconstructs the
+paths under mutable roots, including paths of unchanged files.
 
-Mutable root (`immutable = false`, the default):
+Immutable matches (`immutable = true`) are grouped by their configured
+identifier. One group has one root row and one set of relative paths, from
+one scanned copy. A non-NULL `roots.identifier` means that the group was
+completely indexed. While that identifier still has a configured match,
+the update reuses its rows without traversing or stat'ing files below it.
+NULL means a mutable root or an unfinished immutable traversal; these roots
+are reconstructed at the next update. File and directory errors leave an
+immutable traversal unfinished (section 4.5).
 
-- Every update traverses the root recursively.
-- For each regular file, the indexer compares `(size, ctime)` with the stored
-  inode row. If both are equal, the file is not read again. Otherwise the
-  indexer hashes the whole file and replaces all its block rows. This is the
-  only criterion for hashing a file again.
-- Path rows under the root that the traversal did not see are deleted
-  (section 4.6).
+No separate root-kind flag is stored. The configuration supplies each scan
+task's intended identifier: absent for a mutable root, present for an
+immutable group. Only successful immutable completion publishes that value.
+Recovery treats both kinds of NULL-identifier row identically.
 
-Immutable root (`immutable = true`):
-
-- The index knows the root by the byte string given by `identifier` (below),
-  by default its path.
-- The indexer traverses the root once, when it first sees its identifier.
-  The root row is marked complete when the whole traversal has been
-  committed (section 4.4). A root whose traversal was interrupted (a crash,
-  a signal) stays marked incomplete, and the next update traverses it again,
-  in the way of a mutable root: files whose `(size, ctime)` match their rows
-  are not read again, so the second traversal costs one `statx` per file.
-- While a match with that identifier exists and the root is complete, the
-  indexer never traverses the root again and never stats the files below it.
-  It only checks that the match still exists (one open).
-- Matches with equal identifiers share one root and one scan (below).
-- A file below an immutable root can also be reachable through a mutable root
-  (through a hard link or a bind mount). It is then checked like any other
-  file of that mutable root. If it changed, its block rows are replaced, and
-  every path of the inode sees the new rows.
-
-Reconciliation deletes roots that the update does not keep, with their
-paths, at its start (below); orphaned inodes and their blocks stay until its
-end (section 4.6).
-A tree traversed under another root (a changed `identifier`, a rename, or a
-mutable root that became immutable) can therefore reuse the inodes by
-`(fs_id, handle)` and unchanged `(size, ctime)`: one `statx` per file, new
-paths, and no read. A vanished or temporarily unavailable root, such as an
-unmounted filesystem, loses its rows at the next update and is indexed again
-when it returns. This costs one extra scan.
-
-Use `ctime`, not `mtime`. Programs can set `mtime`. Only the kernel changes
-`ctime`.
-
-An immutable root that is scanned while it is still being written is indexed in
-an incomplete state and never scanned again. This costs efficiency only (see the
-design principle in section 3). Choose immutable roots accordingly.
+All locations of each immutable group are retained in memory only. Earlier
+`[[roots]]` entries have priority; the order within one glob is unspecified.
+The index stores one representative `roots.path`, normally the scanned
+copy. Candidate reads enumerate the group's current locations from memory
+(section 6.4). No table of copies is needed. For `--no-update`, map complete
+immutable rows to the current groups by identifier; map NULL rows by their
+stored path and current configuration. Rows without a current match have
+no usable location. A group that now exists at a different path can thus
+serve candidates without modifying the index. A single-file root uses an
+empty `rel_path`, meaning the root file itself.
 
 Per-root options:
 
-- `exclude`: glob patterns in the same syntax and with the same match options
-  (`glob::Pattern::matches_with`). A pattern that starts with `/` is matched
-  against the absolute path of an entry, including the glob matches of `path`
-  themselves; any other pattern is matched against the base name. Matching
-  entries and everything below them are skipped.
-- `one_filesystem`: do not cross mount points. An entry whose `stx_mnt_id`
-  differs from its parent's is skipped, together with everything below it.
-- `identifier`: how the index names an immutable root. It is a configuration
-  error on a mutable root, which the index names by its path. The match can
-  be a directory or a single file. Forms:
+- `exclude`: glob patterns with the same syntax and match options
+  (`glob::Pattern::matches_with`). A pattern starting with `/` matches the
+  absolute path, including root matches themselves; other patterns match
+  the base name. Matching entries and their descendants are skipped.
+- `one_filesystem`: skip an entry and its descendants when its `stx_mnt_id`
+  differs from its parent's.
+- `identifier`: allowed only on immutable roots. Forms:
   - `"path"` (default): the absolute path of the match.
-  - `"name"`: the last component of the path of the match. With it,
-    `/nix/store/*` and `/mnt/disk/nix/store/*` give a store path the same
-    identifier on both disks.
-  - `{ strip_prefix = "/mnt/disk" }`: the absolute path of the match without
-    the leading `/mnt/disk`: `/mnt/disk/nix/store/x` gives `/nix/store/x`,
-    the default identifier of the same tree on the root filesystem. This
-    suits copies of trees whose names are not unique. A match that does not
-    start with the prefix is a configuration error.
-  - `{ literal = "photos-2019" }`: the string as given. The root keeps its
-    rows when the tree moves to another path.
+  - `"name"`: its last path component. `/nix/store/*` and
+    `/mnt/disk/nix/store/*` can then share identifiers.
+  - `{ strip_prefix = "/mnt/disk" }`: remove this prefix from the absolute
+    match, so `/mnt/disk/nix/store/x` becomes `/nix/store/x`. A match without
+    the prefix is a configuration error.
+  - `{ literal = "photos-2019" }`: use this byte string, preserving the
+    group's identity when the tree moves.
 
-  Identifiers are compared as byte strings, whatever form and whatever
-  `[[roots]]` entry produced them. An empty identifier is a configuration
-  error.
+Identifiers are nonempty byte strings, compared identically regardless of
+which form or configuration entry produced them. The intended identifier
+of an unfinished traversal lives in memory until it can be committed.
 
-The update reconciles roots and their copies in this order:
+An update reconciles roots before starting the pool, in one transaction:
 
-1. It expands every glob, drops the matches that `exclude` skips, checks the
-   paths (above), derives the identifier of every immutable match, and groups
-   the immutable matches by identifier. Inside a group, the matches of an
-   earlier `[[roots]]` entry come first; the order of the matches of one glob
-   is not specified. Put the entry of the preferred copy first.
-2. It reconciles the `roots` table with the result in one transaction on the
-   write connection, before the pool starts (section 4.6):
-   - A root that the update does not keep is deleted with its path rows: an
-     immutable root whose identifier no group produced, or a mutable root
-     whose path is not a mutable match.
-   - A group whose identifier names an immutable root of the index keeps that
-     root and its rows. When the root's stored path is not one of the group's
-     paths, the tree moved or the scanned copy is gone, and the first path of
-     the group replaces the stored path.
-   - Every other group gets a new row, with its first path as the stored
-     path, and so does every mutable match without a row; both with
-     `complete = 0`.
+1. Find all incomplete inodes (`size IS NULL`). Before removing any of their
+   paths, set `identifier = NULL` on every root referencing them. Mutable
+   roots already have NULL; completed immutable roots now require rescanning.
+2. Delete the paths of all roots with NULL identifiers and all roots no
+   longer kept by the configuration. Delete those root rows afterwards.
+   Delete any remaining paths of incomplete inodes, then their blocks and
+   inode rows. Keep complete inodes and blocks, including orphans, for reuse.
+3. Keep completed immutable groups still present, with their path rows.
+   Plan their final representative paths in memory: retain a path still in
+   its group, otherwise choose the first current location. Plan new rows
+   for all other groups and mutable matches, with NULL identifiers.
+4. Before assigning final paths or inserting new rows, stage changing retained
+   rows at distinct NUL-prefixed BLOBs derived from their root IDs. Then apply
+   all planned paths and insertions. This respects `UNIQUE(path)` even when
+   roots exchange paths. A real path cannot contain NUL; no temporary value
+   may be committed or used for I/O. New scan tasks carry the resulting root
+   IDs and intended immutable identifiers.
 
-   After the transaction every stored path is a match of the update, so the
-   stored paths are distinct and none lies below another (above). The root
-   tasks of the pool carry the ids of this transaction.
-3. The pool traverses every mutable root, every new immutable root, and every
-   immutable root that is marked incomplete (above), at its stored path. The
-   other paths of a group are never read. A changed `identifier` therefore
-   rescans the root and reuses its inodes as described above.
+The pool scans one chosen location per unfinished immutable group and every
+mutable root. It opens each root when its task starts, with the same
+descriptor lifetime rules as other entries (section 4.5). A failure at that
+location leaves the group unfinished for the next update; other copies
+remain available for candidate reads. `RootDone` publishes an immutable
+identifier only after all work and dependent inode results have succeeded
+and been committed (section 4.6). Mutable identifiers remain NULL.
 
-The rows of a root describe the copy that was scanned. Candidate reads
-(section 6.4) and `hashsync prune` open files below the root's stored path,
-which can be another copy. The design assumes that copies are equal. The
-Blake3 check of every spliced block (section 3) makes that assumption safe: a
-copy that differs costs "no" answers, nothing else. With
-`identifier = "name"` on two Nix stores, the second store costs one directory
-listing and one index lookup per store path instead of a read of every file,
-because two store paths with the same name almost always hold the same
-content.
+This recovery runs at every update, including after a crash. A changed
+identifier, rename, or discarded unfinished root reuses complete inodes by
+`(fs_id, handle)` and unchanged `(size, ctime)`: metadata calls and new paths,
+without rereading contents. After the pool and writer finish, remove all
+unreferenced inodes and their blocks (section 4.6).
+
+A file below an immutable root can also be reached through a mutable root.
+The mutable traversal checks it normally, and replacing its block rows
+affects every path. If that work is interrupted or abandoned, its immutable
+roots become unfinished before any dependent paths are removed. A complete
+immutable root scanned while content was still being added can still omit
+later files; the immutability promise remains the user's responsibility.
+
+Copies are assumed to have equal content, but may have different filesystem
+and inode identities. Full strong-hash verification makes an unequal copy
+cost a failed candidate read rather than incorrect output. `prune` checks
+all current locations before removing a path as absent; an inaccessible
+location is not proof of absence. It performs no file hashing.
 
 ### 4.3 Identity of filesystems and inodes
 
@@ -357,203 +347,216 @@ The index is one SQLite file, by default
 
 ```sql
 CREATE TABLE meta        (key TEXT PRIMARY KEY, value BLOB NOT NULL);
-  -- keys: schema_version, block_size, weak_hash_id, generation, index_id
+  -- keys: schema_version, block_size, weak_hash_id, strong_hash_id, index_id
 CREATE TABLE filesystems (id INTEGER PRIMARY KEY, fsid BLOB NOT NULL UNIQUE);
-CREATE TABLE roots       (id INTEGER PRIMARY KEY, ident BLOB NOT NULL,
-                          immutable INTEGER NOT NULL, path BLOB NOT NULL,
-                          complete INTEGER NOT NULL, UNIQUE (ident, immutable));
-  -- ident: the path of a mutable root, the identifier of an immutable one;
-  -- path: where the root was last found; distinct across rows, because
-  --   the update stores only its matches (section 4.2)
-  -- complete: 1 once a whole traversal of the root has been committed
-CREATE TABLE inodes      (id INTEGER PRIMARY KEY, fs_id INTEGER NOT NULL,
+CREATE TABLE roots       (id INTEGER PRIMARY KEY, identifier BLOB UNIQUE,
+                          path BLOB NOT NULL UNIQUE);
+  -- identifier: non-NULL only for a completely indexed immutable group
+  -- path: one representative location; other copies live only in memory
+CREATE TABLE inodes      (id INTEGER PRIMARY KEY,
+                          fs_id INTEGER NOT NULL REFERENCES filesystems(id)
+                            ON DELETE RESTRICT,
                           handle BLOB NOT NULL, size INTEGER,
                           ctime_ns INTEGER NOT NULL, UNIQUE (fs_id, handle));
-  -- size: NULL while the block rows of the inode are being written;
-  --   otherwise stx_size as the signed integer with the same bits (below)
-CREATE TABLE paths       (root_id INTEGER NOT NULL, rel_path BLOB NOT NULL,
-                          inode_id INTEGER NOT NULL,
+  -- size: NULL while block rows are incomplete; otherwise stx_size bits
+CREATE TABLE paths       (root_id INTEGER NOT NULL REFERENCES roots(id)
+                            ON DELETE RESTRICT,
+                          rel_path BLOB NOT NULL,
+                          inode_id INTEGER NOT NULL REFERENCES inodes(id)
+                            ON DELETE RESTRICT,
                           PRIMARY KEY (root_id, rel_path)) WITHOUT ROWID;
 CREATE INDEX paths_by_inode ON paths (inode_id);
-CREATE TABLE blocks      (inode_id INTEGER NOT NULL, block_no INTEGER NOT NULL,
-                          weak INTEGER NOT NULL, blake3 BLOB NOT NULL,
+CREATE TABLE blocks      (inode_id INTEGER NOT NULL REFERENCES inodes(id)
+                            ON DELETE RESTRICT,
+                          block_no INTEGER NOT NULL, weak INTEGER NOT NULL,
+                          strong BLOB NOT NULL CHECK (length(strong) = 16),
                           PRIMARY KEY (inode_id, block_no)) WITHOUT ROWID;
 CREATE INDEX blocks_by_weak   ON blocks (weak);
-CREATE INDEX blocks_by_blake3 ON blocks (blake3);
+CREATE INDEX blocks_by_strong ON blocks (strong);
 ```
 
-Rules:
+Connections and process exclusion:
 
-- `meta` stores `block_size` and `weak_hash_id` (algorithm name, multiplier,
-  and mixer, section 5.1). If either differs from the configuration or from the
-  binary, the program drops all tables and rebuilds the index.
-- Paths and identifiers (`roots.ident`, `roots.path`, `paths.rel_path`) are
-  `BLOB` columns. A path is a byte string that need not be valid UTF-8, and
-  `TEXT` is for text in the database encoding. The program keeps a path as
-  bytes (`OsStr`) from the directory listing to the database and back
-  (section 9).
-- `inodes.size` holds `stx_size`, an unsigned 64-bit value; a sparse file can
-  reach the top of that range. SQLite integers are signed 64-bit, so the
-  column holds the signed integer with the same bits, and the program converts
-  at the database boundary (section 9). SQL compares the column for equality
-  only; it never orders it and never computes with it. NULL marks an inode
-  whose block rows are being written (below); no integer value is free for
-  that.
-- Use WAL mode with `synchronous=NORMAL`. The database stays consistent after
-  a crash or a power loss, a commit costs no `fsync`, and the last
-  transactions can be lost, which is acceptable for an index that is a cache.
-  The publication contract below makes the transactions durable that
-  something outside the database depends on.
-- The writer commits every few thousand inodes or every 30 seconds, whichever
-  comes first, to amortise the commit cost. A transaction may cut through the
-  rows of a large file (below); every other inode is either wholly in a
-  transaction or wholly outside it. A crash leaves the index at a consistent
-  earlier state.
-- Recovery contract. The index never needs a repair step. Every committed
-  state is a valid index, because every row of it is a hint (section 3) and
-  because two markers tell the next update what was interrupted:
-  - `inodes.size IS NULL` marks an inode whose block rows are being written.
-    The writer sets it in the transaction that deletes the inode's old block
-    rows, and it stores the real size and ctime in the transaction that holds
-    the last block row. An inode left at NULL by a crash matches no
-    `(size, ctime)`, because `NULL = x` is never true, and is hashed again at
-    the next update.
-  - `roots.complete = 0` marks a root whose traversal was not committed to
-    the end. The reconciliation transaction of the update inserts the row
-    with `0` (section 4.2), and the writer sets `1` in the transaction that
-    follows the end of the root's walk. An immutable root left at `0` is
-    traversed again at the next update (section 4.2); a mutable root is
-    traversed at every update anyway.
-- Publication contract. The writer increments `meta.generation` inside
-  every transaction that inserts or deletes block rows; transactions that
-  change only paths or roots leave it alone. Thus changed blocks never keep
-  an old generation, even after a crash. Any committed state may be exported,
-  including by a concurrent `hashsync run`: the export reads the generation
-  and blocks in one read transaction, then ends it and runs
-  `PRAGMA main.wal_checkpoint(FULL)` until the first column (`busy`) is 0.
-  A completed FULL checkpoint waits for the writer, syncs the WAL, copies
-  its frames into the database, and syncs that too. All earlier commits,
-  including the exported generation, then survive power loss. Only after
-  this checkpoint may the export write its segment and cache file or send
-  the list or delta (section 5.6). An unpublished generation may be lost
-  with its transactions because nothing outside the database names it.
-  End the read transaction before checkpointing: FULL waits for every
-  reader to reach the newest snapshot, so a reader awaiting its own
-  checkpoint would wait forever.
-- Two secondary indexes. `blocks_by_weak` serves the export of the distinct
-  weak hashes (section 5.4). `blocks_by_blake3` serves the lookup of a query,
-  which carries the Blake3 hash only (section 6.4):
-  `SELECT inode_id, block_no FROM blocks WHERE blake3 = ? LIMIT 128`. With
-  `WITHOUT ROWID`, secondary indexes include the table's primary-key columns,
-  so `blocks_by_blake3` alone supplies the candidates. Identical blocks may
-  share a hash; `LIMIT` bounds the lookup, which stops at the first
-  candidate whose bytes verify (section 6.4).
-- Store `weak` as the `i64` bit pattern of the `u64` value (`weak as i64`).
-- Only inodes with at least one stored block have rows (sections 4.1 and 4.5).
-- Store the full 32-byte Blake3 hash in the row and in `blocks_by_blake3`.
-  The 16-byte option (section 12) would store and index only a prefix;
-  candidate verification would still use the query's full 32-byte hash.
-- Give the writer's connection a large page cache (`PRAGMA cache_size`, about
-  256 MiB). The keys of both secondary indexes are random, so every insert
-  touches a random page of each B-tree; once a tree outgrows the cache, every
-  insert costs a page read. Reader connections (section 4.6) keep a small
-  cache; the OS page cache holds the file for them.
-- `--rebuild` and the first build of an index insert the block rows without
-  the two secondary indexes and create both after the last block row. An
-  index built over the finished table costs about a second per million rows;
-  random inserts into a B-tree that has outgrown the cache cost several
-  microseconds each. A rebuild writes a new database file next to the old one
-  and renames it into place after its last commit, so a crash during the
-  rebuild leaves the old index in use and a stray file that the next rebuild
-  deletes. Readers of the old file (a concurrent `run`) keep their open
-  descriptor and finish on the old index.
-- Expected size: about 55 bytes per block row, about 20 bytes per entry of
-  `blocks_by_weak`, and about 45 bytes per entry of `blocks_by_blake3`: about
-  120 bytes per block, or 0.37 % of the indexed data at 32 KiB blocks. A
-  256 GiB tree (8M blocks) needs about 1 GB. The 16-byte option above saves
-  about 30 bytes per block.
-- `generation` is a growing 64-bit counter, starting at 1 when the tables
-  are created; 0 means "no list" in the protocol (section 6.2).
-- `index_id` is a random 128-bit value (`rustix::rand::getrandom`), written
-  when the tables are created. `--rebuild`, and the rebuild after a parameter
-  mismatch above, create a new one. It identifies the index towards sender
-  hosts, which key their cached hash lists by it (section 5.6). An index
-  restored from a backup keeps its id and reuses generation numbers; the list
-  hash of section 5.6 covers that case.
+- Every connection executes `PRAGMA foreign_keys = ON` immediately after
+  opening, before any transaction. Use foreign keys with `ON DELETE RESTRICT`
+  everywhere: delete referencing rows before their parent, in the same
+  transaction. Install the unlimited busy handler of section 9.
+- A process that may modify the index (`update`, `prune`, or a normal `run`)
+  starts with no other connections to that database. Open its writer with
+  `file:<escaped-path>?mode=rw&vfs=unix-excl`; use `mode=rwc` when creation is
+  allowed. Enable URI processing. Execute and finish a real read such as
+  `SELECT count(*) FROM sqlite_schema` before opening any other connection.
+  Opening alone does not acquire the process lock. The successful read
+  establishes `unix-excl`'s exclusive process lock; on lock contention wait
+  and retry, and on any other initialization failure open no worker readers.
+- Only after that read succeeds, open same-process readers with
+  `file:<escaped-path>?mode=ro` through the normal Unix VFS. Use normal
+  locking mode, not `PRAGMA locking_mode=EXCLUSIVE`, and never `immutable=1`
+  or `nolock=1`. All connections use the same SQLite library instance.
+  `unix-excl` coordinates those connections through its shared in-process
+  inode state and WAL index, so readers and the writer retain normal WAL
+  snapshot isolation while other processes cannot access the database.
+- Keep the writer connection alive after indexing and throughout a normal
+  run's use of the index. Close worker readers before the writer, or let
+  process exit close everything. There is no interval between update and
+  use during which another process can update or rebuild the index.
+- A read-only process (`run --no-update` or `stats`) opens only normal
+  `mode=ro` connections. Before using the index, a keeper connection begins
+  a read transaction and executes the real read above; keep it and its
+  transaction alive until all index use ends. Several such processes can
+  coexist. A `unix-excl` writer waits for them to release access, and they
+  wait for an existing writer. `--no-update` never rebuilds or repairs a
+  missing or incompatible index: report that an update is required.
+
+This uses SQLite's Unix VFS locks, not a separate lock file. A real read is
+the initialization barrier on either path. Use fresh connections for a new
+access mode rather than upgrading a process with existing readers. SQLite's
+[VFS documentation](https://sqlite.org/vfs.html) describes `unix-excl`;
+the initialization order also ensures that the first WAL-index attachment
+uses the process-exclusive state.
+
+Storage and recovery rules:
+
+- Store `block_size`, `weak_hash_id` (algorithm, multiplier, mixer), and
+  `strong_hash_id` (algorithm with its fixed output length). An updating
+  process rebuilds when any parameter or the schema version is incompatible.
+- Paths and identifiers are `BLOB`s, preserving arbitrary non-UTF-8 bytes
+  from `OsStr` through the database and back. SQLite permits multiple NULL
+  values under `UNIQUE(identifier)`; completed immutable groups are unique.
+- Store `weak` as the `i64` bit pattern of the `u64` value. Likewise,
+  `inodes.size` holds `stx_size` as the signed integer with the same bits;
+  compare sizes for equality only, never order or calculate with them.
+  NULL marks an incomplete inode, so no integer is reserved as a sentinel.
+- Use WAL mode with `synchronous=NORMAL`. A crash leaves a consistent
+  database, though power loss may discard recent commits. This is acceptable
+  for the index. Hash lists identify their own content and are independently
+  persisted (section 5.6); exporting requires no forced FULL checkpoint.
+- The writer commits every few thousand completed inode operations or every
+  30 seconds, whichever comes first. A transaction can cut through block
+  batches of any number of interleaved files. Each remains `size = NULL`
+  until its terminal success is stored with its last block rows.
+- Before replacing an inode's blocks, set `size = NULL` and delete the old
+  blocks in the same transaction. Successful completion stores the real
+  size and ctime. Recovery first invalidates immutable roots referencing
+  incomplete inodes, then discards incomplete inodes and unfinished roots
+  in child-first order (section 4.2). Complete inodes survive for reuse.
+- An immutable root's identifier stays NULL until the whole traversal and
+  every pending inode dependency succeeded. Publish it in the transaction
+  that finishes that work. There is no separate `complete` column.
+- `blocks.strong` and `blocks_by_strong` contain only the first 16 bytes of
+  the strong digest. Lookup uses
+  `SELECT inode_id, block_no FROM blocks WHERE strong = ?`, binding that
+  prefix. `WITHOUT ROWID` secondary indexes include the primary-key
+  columns, so this index supplies candidates without reading the block
+  table. Stream candidates and their paths under the overall attempt limit
+  of section 6.4. Full digest comparison, never prefix equality, verifies a
+  block. `blocks_by_weak` serves distinct weak-hash export (section 5.4).
+- Only complete inodes with stored blocks need persistent rows; temporary
+  incomplete rows are allowed while streaming. A successful scan finding
+  no useful blocks deletes the old inode's paths, blocks, and inode row.
+- Give the writer about 256 MiB of SQLite page cache; readers use small
+  caches and share the OS page cache. The secondary keys are random, so
+  their B-tree working sets dominate insert cost.
+- Rebuild in place under process-exclusive access. Drop child tables before
+  parents and recreate the schema and metadata in one transaction with
+  foreign keys enabled. Never replace the database file by rename. Populate
+  it in normal batches, then create both secondary block indexes. Before
+  every update, create either missing index left by an interrupted build;
+  a read-only run requiring missing indexes reports that an update is needed.
+  A crash after the reset leaves a partial index recoverable by the same
+  rules, rather than retaining the previous complete index.
+- Expected storage is roughly 90 bytes per block across the table and its
+  two secondary indexes, about 0.27 % of indexed data at 32 KiB blocks:
+  around 750 MB for 8M blocks. The 16-byte prefix saves about 32 bytes per
+  block compared with storing a 32-byte digest in both places.
+- `index_id` is a random 128-bit value from `getrandom`, created with the
+  schema. A rebuild creates a new one. It partitions peer cache directories
+  together with account IDs (section 5.6); it is not the identity of a list.
+  There is no index generation counter.
 
 ### 4.5 Traversal and hashing
 
-This section lists the system calls of the indexer. Section 4.6 says which
-threads run them.
+Apart from configured root paths, SQLite and cache files, and `ssh`, every
+filesystem access is relative to an open descriptor. A task opens its entry
+before retrieving metadata or identity and keeps that descriptor throughout
+processing. It never checks an object by name and later opens that name for
+hashing. Each encounter opens once; a hard link or directory loop is detected
+after retrieving the identity of the newly opened descriptor.
 
-Descriptor-relative operations: apart from the roots, SQLite file, cache
-files, and `ssh` processes, every filesystem access is relative to an open
-descriptor. This removes path-based traversal races (renames, symlink swaps)
-and the cost of long path lookups. The wrappers come from `rustix` and, for
-the few calls it lacks, from `libc` (section 9); all of them live in the
-`sys` module (section 11).
+- Open: for an expected directory use
+  `openat(parentfd, name, O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC)`.
+  `O_DIRECTORY` rejects FIFOs and sockets without waiting for their I/O.
+  For a regular-file hint, an unknown entry type, or a root whose type is
+  unknown, use `O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_NOCTTY|O_CLOEXEC`, then inspect
+  the descriptor. `O_NONBLOCK` prevents waiting for a FIFO writer and
+  `O_NOCTTY` avoids acquiring a controlling terminal. Skip every opened
+  object that is neither a regular file nor a directory.
+- Metadata: `statx(fd, "", AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW,
+  STATX_TYPE | STATX_SIZE | STATX_CTIME | STATX_INO | STATX_MNT_ID_UNIQUE)`.
+  These calls describe the open object, not a directory entry. Check
+  `stx_mask` for returned fields. Apply `one_filesystem` using this metadata;
+  apply name-based exclusions before queueing/opening when possible.
+- Filesystem identity: when `(stx_mnt_id, stx_dev_major, stx_dev_minor)`
+  differs from the parent's, resolve the filesystem using the open fd's
+  ioctl or `fstatfs` and the cache of section 4.3.
+- Inode identity: `name_to_handle_at(fd, "", AT_EMPTY_PATH)` on every
+  directory and regular file, with the fallback of section 4.3. Atomically
+  claim `(fs_id, handle)` in the corresponding visited set. A repeated
+  directory is closed without descending; a repeated file records its
+  additional path without rehashing. Its first task owns the result.
+- Directory: after metadata and identity checks, use `getdents64`
+  (`rustix::fs::RawDir`, with a reusable 64 KiB buffer). `d_type` is a hint
+  for filtering and selecting open flags, never proof of the opened type.
+  Queue directories, regular files, and `DT_UNKNOWN` entries as tasks; skip
+  symlink and other known special-file hints. Children carry the parent's
+  `Arc<OwnedFd>` until they open their entries. The directory is not reopened.
+- Regular file: if smaller than `block_size`, report that it has no indexed
+  blocks. Otherwise look up `(fs_id, handle)` through the worker's reader.
+  Equal stored `(size, ctime)` reports an unchanged inode. A changed or new
+  file streams `Begin`, `Blocks`, and its terminal result to the writer
+  (section 4.6), while reading this same fd with `pread` in chunks up to
+  1 MiB. Compute the weak and full strong hash of every useful complete
+  block, storing only the strong prefix. Skip short-period blocks first:
+  compare `block[p..B]` with `block[0..B-p]` for `p` from 1 to 16, testing
+  the first 80 bytes before a full vectorised comparison (section 4.1).
+  Accumulate short reads until the requested bytes are filled or EOF is
+  reached. Unexpected EOF within the initial full-block range abandons the
+  file. Recheck size and ctime on the same fd after hashing; a change also
+  abandons it for this update. An open descriptor fixes identity and type,
+  not contents, size, or the entries of a directory.
+- Holes: for every file being hashed, attempt `lseek(SEEK_DATA)` and
+  `lseek(SEEK_HOLE)` to enumerate data and holes before reading their blocks.
+  Do not infer absence of holes from `stx_blocks`: allocation rounding,
+  metadata, and ZFS `copies=2` or `copies=3` can mask sparseness. A hole
+  `[h0, h1)` skips blocks `k` with `k*B >= h0` and `(k+1)*B <= h1`.
+  Read partially overlapping blocks in full; the hole portion reads as
+  zeros. With `B = 32 KiB`, a hole from 10 KiB to 200 KiB skips blocks 1
+  through 5. `SEEK_DATA` returning `ENXIO` means no more data before EOF;
+  account for concurrent truncation with the final metadata check. When
+  hole seeking is unsupported (`EINVAL` or `EOPNOTSUPP`), read normally.
+  A filesystem may also conservatively report all bytes as data. Other
+  seek errors abandon this file, like read errors.
+- Cache advice: before reading, make separate calls
+  `posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL)` and
+  `posix_fadvise(fd, 0, 0, POSIX_FADV_NOREUSE)` (or the corresponding
+  `rustix::fs::fadvise` wrappers). The advice values are not a bitmask.
+  NOREUSE influences Linux page replacement starting with 6.3 and is a
+  no-op on several older versions. These are hints, not a guarantee against
+  eviction of useful cache. Unsupported advice does not fail the scan.
 
-- Directory: `openat(dirfd, name, O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC)`,
-  then `getdents64` on the descriptor (`rustix::fs::RawDir` over a 64 KiB
-  buffer that the thread reuses). The entry type that `getdents64` returns
-  (`d_type`) decides without a `statx`: directories and regular files continue
-  below; symbolic links and everything else are skipped. A filesystem that
-  reports `DT_UNKNOWN` gets a `statx` for the type.
-- Every directory and every regular file:
-  `statx(dirfd, name, AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW,
-  STATX_TYPE | STATX_SIZE | STATX_BLOCKS | STATX_CTIME | STATX_INO |
-  STATX_MNT_ID_UNIQUE)`.
-  Every `statx` call of the program uses these flags and this mask: with a name
-  the call does not follow a final symlink, with an empty name it describes the
-  descriptor itself, and `stx_mask` tells whether the kernel returned the unique
-  mount id. Skip regular files smaller than `block_size`, and whatever
-  `exclude` and `one_filesystem` rule out.
-- Unchanged check for a regular file: `name_to_handle_at(dirfd, name, 0)` gives
-  the handle; look up `(fs_id, handle)` in the index through the thread's read
-  connection; if `(size, ctime)` match, send the path to the writer and stop.
-- Changed or new file:
-  `openat(dirfd, name, O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_NOCTTY|O_CLOEXEC)`,
-  then `statx(fd, "", ...)` with the same flags and mask, and
-  `name_to_handle_at(fd, "", AT_EMPTY_PATH)` on the open descriptor, so that
-  size, ctime, and handle describe the object that is hashed. The entry can
-  have been replaced since `getdents64` returned it: when `stx_mode` says that
-  the descriptor is not a regular file, close it and skip the entry.
-  `O_NONBLOCK` keeps the open of a FIFO from waiting for a writer, and
-  `O_NOCTTY` keeps a terminal from becoming the controlling terminal
-  (section 6.4). Read the file
-  with `pread` in chunks of up to 1 MiB into the thread's buffer (one system
-  call per 32 blocks instead of one per block) and compute the weak hash and
-  Blake3 of every complete block of the chunk. A block with a period of 1 to
-  16 bytes is skipped before hashing (section 4.1). The check for period `p`
-  is `block[p..] == block[..B - p]`, one vectorised `memcmp`; compare the
-  first 80 bytes first, so that the full comparisons run only on the rare
-  blocks whose prefix is periodic.
-- Sparse files: when `stx_blocks * 512 < size`, the file may have holes. Find
-  them with `lseek(SEEK_HOLE)` and `lseek(SEEK_DATA)` (`rustix::fs::seek` with
-  `SeekFrom::Hole` and `SeekFrom::Data`) before reading. A hole `[h0, h1)`
-  makes the indexer skip every block `k` with `k * B >= h0` and
-  `(k + 1) * B <= h1`; these blocks get no rows. A block that overlaps a hole
-  only partially is read in full, and the kernel returns zeros for the hole
-  part. Example with `B` = 32 KiB: a hole from 10 KiB to 200 KiB skips blocks 1
-  to 5 (32 KiB to 192 KiB); blocks 0 and 6 are read. When the allocated size
-  covers the file size there are no holes and no seek calls are made (a
-  compressing filesystem can report a smaller allocation; that only costs the
-  seek calls). A filesystem without hole support reports one data extent, so
-  the procedure is safe everywhere.
-- Filesystem id: when an entry's `(stx_mnt_id, stx_dev_major, stx_dev_minor)`
-  differs from its parent's, call `FS_IOC_GETFSUUID` on the entry's descriptor,
-  or `fstatfs` when the ioctl fails with `ENOTTY` (section 4.3).
-- Directory identity: `name_to_handle_at(dirfd, "", AT_EMPTY_PATH)` on the
-  open directory descriptor gives the key of the visited-directories set
-  (section 4.6).
-- Page cache: call `fadvise(SEQUENTIAL)` before a file is read. After a file is
-  hashed, call `fadvise(DONTNEED)` on it, unless the file was already fully in
-  the page cache before the read. A full scan must not evict the page cache of
-  the whole machine, but the files that a `run` will splice from (freshly built
-  outputs, for example) must not be evicted either. `cachestat` (Linux 6.5;
-  `libc::syscall(SYS_cachestat)`, no wrapper in `rustix` 1.1) counts the cached
-  pages of the file in one call; a file with all pages cached keeps them. When
-  the call fails with `ENOSYS`, always evict.
+Opening, metadata, directory-listing, and reading errors are local to the
+entry: log the error, stop processing that entry, and continue the update.
+A directory error also prevents visiting its unread descendants. Mark its
+root's traversal unsuccessful so an immutable root is retried next time.
+If the worker already began an inode, send `Abandon` so partial block rows
+are removed without leaving paths attached to an incomplete result. The
+supported identity and hole-seeking fallbacks above are not failures.
+
+An entry may disappear before open. After a local file is open, unlink or
+rename does not invalidate the descriptor; reading can continue. Truncation,
+concurrent modification, or an actual I/O error can still abandon the file.
+Database failures and programming errors are fatal, unlike these per-entry
+filesystem failures (section 6.7).
 
 ### 4.6 I/O architecture
 
@@ -566,16 +569,18 @@ another thread and reports back, or a submission with a completion) are fine.
 
 Three kinds of work:
 
-1. **Metadata.** One `openat` and one `getdents64` per directory; one `statx`
-   per directory and per regular file; one `name_to_handle_at` and one index
-   lookup per regular file of at least `block_size`. With warm dentry and
+1. **Metadata.** One open per directory and regular file, one
+   `getdents64` per directory, and one initial `statx` and handle retrieval
+   per opened entry. Regular files large enough to index also get an inode
+   lookup; hashed files get a final `statx`. With warm dentry and
    inode caches this is 1 to 3 µs of kernel CPU per entry. With cold caches it
    is disk latency: a directory costs a few reads of directory blocks, and a
    group of neighbouring inodes costs one read of an inode-table block (ext4
    and XFS read inodes in clusters). A read costs 50 to 200 µs on NVMe, so the
    cold rate is the number of reads in flight divided by the latency.
-2. **Data.** For a new or changed file: open, `statx`, handle, reads, hashing,
-   close. Per core, Blake3 runs at 3 to 7 GB/s on 32 KiB inputs, the weak hash
+2. **Data.** For a new or changed file: hole discovery, reads, hashing,
+   final metadata check, and close on the existing descriptor. Per core,
+   BLAKE3 runs at 3 to 7 GB/s on 32 KiB inputs, the weak hash
    at 1 to 4 GB/s (k streams, section 5.1), the constant-block check near
    memory speed, and the copy out of the page cache at about 10 GB/s. All
    together about 1 GB/s per core, up to 2 GB/s with AVX-512. An NVMe device
@@ -590,10 +595,10 @@ Three kinds of work:
    place (section 4.4). Ten million rows of a rebuild cost 10 to 20 s of one
    core plus about 20 s for the two indexes: less than hashing 256 GiB from
    disk, about the same as hashing it from the page cache on a machine with
-   many cores. An update inserts rows only for changed files. Section 4.4
-   gives the rules that keep it there (large cache, deferred indexes). If the
-   writer ever is the bottleneck, the first lever is the 16-byte Blake3
-   (section 12), the second is multi-row `INSERT` statements.
+   many cores. An update replaces block rows only for changed files, but
+   rewrites paths for all traversed roots. Section 4.4 gives the cache and
+   deferred-index rules. The strong prefix is already 16 bytes; if the
+   writer becomes the bottleneck, measure multi-row `INSERT` statements.
 
 In every case the unit of work is a file or a directory, and the work per unit
 is a few blocking system calls plus CPU time. A thread that blocks in the
@@ -616,20 +621,21 @@ bounded channel. hashsync uses the same division:
 - The walk ends when every thread is idle at the same time (an active-thread
   counter), not when a queue is empty, because a running task can still push
   more tasks.
-- A task is either a directory or a file. A directory task lists its entries
-  and pushes one task per subdirectory and one per file that needs hashing.
+- A task is an entry to open and inspect. A directory task lists entries
+  and pushes one task for each potentially relevant child, including files
+  that may prove unchanged. The child task owns all metadata and hashing.
   Depth-first order hashes the files of a directory right after listing it,
   while its inodes are hot in the cache.
   Threads that wait for the disk and threads that hash overlap without any
   scheduling logic.
 - A task carries the `Arc<OwnedFd>` of its parent directory and its name, and
-  opens its own descriptor when it runs. Queued tasks hold no descriptors; a
-  parent's descriptor lives until its last child task has opened its own.
+  opens its own descriptor when it runs. Queued tasks hold no descriptor
+  for their entry, but retain the shared parent descriptor until open.
   With depth-first order, the queued tasks of a thread are the unvisited
   siblings along its current path, so the open descriptors are bounded by
   `threads × depth`, not by the queue length or the size of the tree. Each
-  directory is opened once and never opened again. The roots are the initial
-  tasks, one per root that the update traverses (section 4.2), with no
+  entry is opened once per encounter and stays open throughout processing.
+  The roots are the initial tasks, one per traversed root (section 4.2), with no
   parent: a root task opens its path when a thread takes it, so the number of
   roots adds no descriptors. ripgrep and fd bound descriptors by `threads`
   by queueing paths, but pay a full path lookup per directory and file;
@@ -643,8 +649,9 @@ bounded channel. hashsync uses the same division:
   not help: a warm walk is CPU-bound, and an NVMe device reaches its rate at a
   queue depth of 32 to 64.
 - Per-thread state, created once: a 64 KiB `getdents64` buffer, a 1 MiB read
-  buffer, a Blake3 hasher, and an SQLite read connection with cached prepared
-  statements (section 9). Readers never block the writer in WAL mode.
+  buffer, the configured strong hasher, and an SQLite read connection with
+  cached prepared statements (section 9). Readers do not block ordinary
+  writer commits in WAL mode.
 - Two shared sets, keyed by `(fs_id, handle)` (section 4.3): visited
   directories (cycle protection) and seen regular files (hard links). The
   key holds the handle bytes as they are; the set of seen files therefore
@@ -664,54 +671,63 @@ bounded channel. hashsync uses the same division:
 #### The writer
 
 One thread owns the write connection and receives work over a bounded
-channel. It uses `BEGIN IMMEDIATE` transactions with the commit schedule and
-pragmas of section 4.4. No other thread writes.
+channel. It uses `BEGIN IMMEDIATE` transactions and the commit schedule of
+section 4.4. No other thread writes. After indexing, keep that connection
+alive until the run stops using the index, preserving process exclusion.
 
-Messages and their byte budget. Every message is at most 64 KiB, and the
-channel holds at most 4096 messages, so the queue never holds more than
-256 MiB; when the writer lags, the pool blocks in `send`, which is the
-intended backpressure. The block rows of a file are not one message: a 1 TiB
-file has 32M block rows, more than 1 GiB of hashes. The hashing thread
-streams them instead:
+Every message is at most 64 KiB and the channel holds at most 4096 messages,
+bounding queued data to 256 MiB. A slow writer blocks worker sends. Stream
+large files: a 1 TiB file has 32M blocks even with 16-byte stored digests.
+Every file message carries `key = (fs_id, handle)`; the writer maps it to an
+inode ID and per-file state. Messages from different workers may interleave.
+Messages from the one owner of a key arrive in that owner's send order.
 
-- `Begin { fs_id, handle }`: the writer looks the inode up, inserts its row
-  with `size = NULL` or sets `size = NULL` on the existing row, and deletes
-  its old block rows.
-- `Blocks { rows }`: up to 1024 block rows (48 bytes each), sent as soon as
-  they are complete, while the file is still being read. The writer inserts
-  them into the current transaction.
-- `End { size, ctime, root_id, rel_path }`: the writer stores the real size
-  and ctime. The inode is now complete (section 4.4).
-- `Path { fs_id, handle, root_id, rel_path }`: a path of an inode that this
-  update did not hash (unchanged, or a hard link met a second time). The
-  writer resolves the handle to the inode id.
-- `RootDone { root_id }` after the walk of a root has ended (below).
+- `Begin { key }`: insert an incomplete inode or set its size to NULL, and
+  delete its old blocks, in the same transaction. Initialize required ctime
+  storage for a new incomplete row; only terminal success makes it reusable.
+- `Blocks { key, rows }`: up to 1024 rows, each containing block number,
+  weak hash, and 16-byte strong prefix (32 bytes before message overhead).
+  Insert them for this key into the current transaction.
+- `End { key, size, ctime, root_id, rel_path }`: complete a successful hash,
+  store size and ctime with its last rows, and record the owner's path. If
+  no blocks survived filtering, remove its paths, blocks, and inode instead.
+- `Unchanged { key, root_id, rel_path }`: the owner reused complete rows;
+  record its path and mark the key successful without changing its blocks.
+- `Omit { key }`: the owner's regular file is too small to index. Remove
+  any old paths, blocks, and inode for this key; it has no useful content.
+- `Path { key, root_id, rel_path }`: a second encounter with this inode.
+  Hold the path until its owner's terminal result is known, even if an old
+  complete inode row exists. Insert it only for a successful, indexed result.
+- `Abandon { key }`: the owner failed after claiming the key. Before
+  deleting any existing paths, set identifiers of all referencing roots
+  to NULL. Then remove its paths, partial blocks, and inode row in
+  child-first order, and discard pending paths for the key. Those roots and
+  roots of pending paths cannot be marked complete by this update.
+- `RootDone { root_id, success }`: this root's task and descendants have
+  finished sending work. `success` is false if any entry failed. The writer
+  also waits for terminal results of pending hardlink paths from other roots
+  before publishing this root's intended immutable identifier.
 
-The messages of one file come from one thread, so the writer sees them in
-order, and a transaction that commits between two `Blocks` messages cuts
-through a file whose `size` is NULL at that moment (section 4.4). A
-`Path` message can arrive before the `Begin` of its inode, when a thread met a
-hard link whose first path another thread is still hashing. The writer keeps
-such paths in a map keyed by `(fs_id, handle)` and inserts them when the
-inode's `End` arrives; entries whose inode never arrives (the file vanished
-while it was being read) are dropped at the end of the update.
+Every claimed regular file produces exactly one terminal result: `End`,
+`Unchanged`, `Omit`, or `Abandon`. Only hashed files send `Begin` and
+`Blocks`. A `Path` may arrive before its owner's `Begin`; buffer it by key.
+A later path consults the remembered terminal result; a failed result also
+marks that path's root unsuccessful. An abandoned key is not retried
+through another hardlink in the same update. Unexpected missing
+terminal results are bugs, not files that vanished while open.
 
-Deleted paths: for each mutable root of the current update, and for each
-immutable root that is traversed again because it was incomplete, the writer
-keeps a set of 64-bit hashes of the relative paths it was told about. On the
-root's `RootDone`, it streams the stored paths of the root and deletes the ones
-whose hash is not in the set, then sets `roots.complete = 1`, all in the same
-transaction. This costs 8 bytes per path and no write for an unchanged file. A
-hash collision keeps a stale path row, which costs efficiency only (section
-3); `hashsync prune` removes it.
+The writer remembers failed root IDs even after their `RootDone`, so a
+later abandonment cannot be overwritten by a completion marker. Root
+completion is stored after all its dependent inode and path work, in the
+same transaction or a later one. An interrupted transaction leaves a NULL
+identifier or NULL inode size for recovery (sections 4.2 and 4.4).
 
-Deleted inodes: the writer remembers the inode id of every path row it
-deletes, in the reconciliation transaction (section 4.2) and at `RootDone`.
-After the last `RootDone` it deletes those among them that have no path row
-left, with their block rows, in transactions of the usual size; this is the
-end of the update. An update that dies before that leaves inodes without a
-path; they serve no candidate read (section 6.4), and `hashsync prune`
-removes them.
+Paths under traversed roots were deleted at reconciliation and are now
+reinserted; there are no seen-path hash sets. After every root and inode
+result has been processed, delete blocks of all inodes with no path rows,
+then delete those inodes, in bounded transactions. Search all orphans, not
+only IDs noticed during this update, so an earlier interrupted cleanup is
+also completed. A crash can leave harmless unreferenced rows for next time.
 
 #### The reader
 
@@ -722,7 +738,7 @@ of 64 or more of 128 to 256 KiB requests on the device for files of a few
 hundred KiB and larger, which is where an NVMe device reaches its rate
 (above). Smaller files are bounded by their per-file metadata work, not by
 their reads. The hashing stage keeps a narrow interface, a function that
-takes a directory descriptor and a name and returns the inode's rows, so a
+takes an already-open regular file and streams its rows and result, so a
 different reader (below, spinning disks) can replace its body without a
 change to the pool or the writer.
 
@@ -738,8 +754,9 @@ nothing: its file I/O is a thread pool underneath.
 #### Refinements, not in the first version
 
 - Files larger than a few hundred MiB can be split into ranges that several
-  tasks hash in parallel; rows are per block, so the order does not matter, and
-  the inode is sent as one message after a join. This removes the tail where
+  tasks hash in parallel; rows are per block, so their order does not
+  matter. One coordinator streams batches under the same key and sends the
+  terminal result only after all ranges finish. This removes the tail where
   one thread hashes a disk image while the others are idle.
 - Spinning disks want one reader per device with the files in inode order. A
   per-root reader limit would be the knob (section 12).
@@ -843,11 +860,21 @@ Properties:
 It affects efficiency only. Rolling operates on the unmixed `P` as specified
 in section 5.1; `mix64` is not rolling-compatible.
 
-### 5.3 Blake3
+### 5.3 Strong hashes
 
-The 32-byte Blake3 hash identifies the content of a block (`blake3::hash`,
-section 9). The receiver always recomputes it on the bytes it read from disk
-before it uses a block. Treat Blake3 equality as byte equality.
+`strong_hash` selects a supported cryptographic hash algorithm. Initially
+support `blake3` (the default, its standard 32-byte output) and `sha256`
+(32 bytes). Every supported algorithm has one fixed output length of at
+least 128 bits (16 bytes); configuration cannot select a shorter digest or
+an arbitrary BLAKE3 XOF length. The algorithm ID determines the full length
+`S`, and HELLO requires both sides to use that algorithm.
+
+The full digest identifies block content. The receiver hashes the exact
+bytes read into its candidate buffer and compares all `S` bytes with the
+query before pinning. Treat full strong-hash equality as byte equality.
+Only the index uses 16-byte prefixes; queries, the negative cache, the
+verified-buffer cache, and list IDs use full digests. Changing the strong
+algorithm rebuilds the index. Section 9 gives the implementations.
 
 ### 5.4 The hash list
 
@@ -867,7 +894,7 @@ compressed list:
    is `k = floor(log2(2^W / N)) = W - ceil(log2(N))`, so the average gap is
    between 2^k and 2^(k+1) and each value costs about `k + 2` bits. For
    `N = 0`, `k = 0` and no gap codes follow the header: the empty list is the
-   header alone. It occurs for an empty index and for a segment whose removed
+   header alone. It occurs for an empty index and for a delta whose removed
    or added list is empty (section 5.6). For `N = 1`, `k = 64`: the code is
    one zero bit followed by the 64 bits of the value, and the implementation
    must not shift a `u64` by 64 (`checked_shr`).
@@ -886,15 +913,17 @@ Sizes and false-hit rates for a 256 GiB tree (8M blocks of 32 KiB):
 | Raw sorted 64-bit values | 64 MiB | ~1 | ~3 |
 | Binary fuse filter, 32-bit fingerprints (rejected) | 36 MiB | 3 | 0.25 |
 
-A false hit costs one Blake3, a query of about 45 bytes, and a restart that
-repeats one round trip of scanning (section 6.3). This cost ruled out 48-bit
+A false hit costs one strong hash, a query of `13 + S` bytes (45 bytes
+with the initial algorithms), and a restart that repeats one round trip
+of scanning (section 6.3). This cost ruled out 48-bit
 prefixes (section 10). Decoding 8M values takes tens of milliseconds;
 sorting them takes well under a second.
 
 The encoding is canonical: the values are sorted and deduplicated, and `k` is
-a function of `N`, so equal sets give equal bytes. The Blake3 hash of the
-encoded list therefore identifies the set. Section 5.6 describes the cache,
-refreshed when the generation changes, and its use of this list hash.
+a function of `N`, so equal sets give equal bytes. The strong hash of the
+encoded list, together with the hash algorithm ID, identifies the set.
+Every run exports the current list; there is no generation-based shortcut.
+Section 5.6 describes its independent persistence, caches, and direct deltas.
 
 ### 5.5 The sender's hash table
 
@@ -948,113 +977,119 @@ independent lines per lookup; this table touches about 1. Expect 2 to 3 times
 the scan rate. Measure both with a microbenchmark before the first release; each
 is about 100 lines (`xorf` provides the filter, section 9).
 
-### 5.6 The hash list cache and the delta log
+### 5.6 The hash list cache and direct deltas
 
-The sender keeps the list between runs, on the assumption that about 90 %
-of the hashes stay the same; the table below gives the transfer savings.
-Its list is always an earlier export of the receiver's own list, so the
-receiver can replay its history without reconciling independent sets
-(section 10). The receiver keeps no state per peer. The sender names what
-it holds, so an interrupted run needs no repair.
+Each full list is the canonical encoding of section 5.4, identified by
+`(strong_hash_id, full_digest)`. The index and account IDs organize cache
+directories but do not identify list content. There is no generation,
+delta log, or segment chain. Compute a direct delta from any available base.
 
-Three values identify a list:
+Account and directory identities:
 
-- `meta.index_id` (section 4.4). The sender keys its cache by it.
-- The generation (`meta.generation`) the list was exported from.
-- The list hash: the Blake3 hash of the encoded list (section 5.4). It guards
-  against an index restored from a backup, which reuses generation numbers
-  for different content, and against a damaged cache file.
+- Each UNIX account creates one random 128-bit `account_id`, stored as hex
+  in `$XDG_CONFIG_HOME/hashsync/account-id` (fallback
+  `~/.config/hashsync/account-id`), independently of `--config`. Publish it
+  once from a complete, fsynced temporary file using an atomic no-replace
+  operation, then fsync the directory. Concurrent initializers use the
+  winning file's ID; never overwrite an existing ID. Missing directories
+  are created privately and their publication is also made durable.
+- HELLO exchanges account IDs; the receiver also supplies its `index_id`.
+  `serve` needs an account ID but does not open or create its own index.
+- Let `A` be the receiver account ID, `B` the sender account ID, and `I` the
+  receiver index ID, all encoded as fixed-width lowercase hex. Under
+  `$XDG_CACHE_HOME/hashsync/` (fallback `~/.cache/hashsync/`), the receiver
+  stores `local-hashlists/B-I/<algorithm>-<digest>.cache`, and the sender
+  stores `remote-hashlists/A-I/<algorithm>-<digest>.cache`. Thus neither
+  hostnames nor SSH aliases are identities, and indexes of one account are
+  separate. Both sides use the receiver's index ID; no sender index exists.
+- Directories have mode 0700 and files mode 0600. A file has a versioned
+  cache header with its list ID, `block_size`, `weak_hash_id`, and encoded
+  length, followed by the encoded full list. Hash only the canonical list
+  bytes, not account IDs, index IDs, timestamps, or the cache wrapper.
 
-Receiver side: the cache and the delta log live next to the database.
+Exchange:
 
-- `hashlist`: the encoded list, behind a header with `index_id`, the
-  generation, and the list hash.
-- `deltas/<from_gen>-<to_gen>`: one segment per export that found a new
-  generation. A segment is a header (`index_id`, `from_gen`, `to_gen`,
-  `from_hash`, `to_hash`) followed by two lists in the format of section 5.4:
-  the removed values and the added values, each sorted, each with its own `k`.
-  A segment is exactly one HASHDELTA payload; the export writes it once, and
-  every later run sends it unchanged.
-- The export (step 2 of section 3) takes an exclusive `flock` on
-  `hashlist.lock` and compares `meta.generation` with the cached generation.
-  When they differ, it exports the new sorted list, decodes the old cache,
-  and computes removals and additions in one merge pass. It follows the
-  publication contract of section 4.4: read generation and rows in one
-  snapshot, end the read transaction, and complete the checkpoint before
-  writing the segment and replacing the cache through a rename.
-  Then it prunes the log: it keeps the newest segments while their total size
-  stays below the size of the new full list, and deletes the older ones. A
-  missing cache (first export, or deleted by hand) gives no segment. A cache
-  or a segment whose `index_id` differs from `meta.index_id` (after
-  `--rebuild`) is deleted. The lock is released after the pruning, so two
-  concurrent runs from one index write one chain of segments.
-- Cost: the merge pass over two lists of 8M values and the encoding of the
-  changes take tens of milliseconds, on top of the export of section 5.4.
+1. The receiver exports, encodes, and hashes its current list in one stable
+   database snapshot. After HELLO supplies the sender's account ID, it
+   durably publishes this target in `local-hashlists/B-I/` before sending
+   any list or delta. Retain the encoded bytes or an open descriptor for
+   the exchange. Failure to persist on the receiver ends setup with an error.
+2. The sender examines its receiver directory and selects the compatible,
+   valid full list with greatest `ctime`; ties use the filename's byte
+   order. Open and verify candidates, skipping unreadable, missing, or
+   damaged files. Compatibility requires a supported encoding and matching
+   block size and weak-hash parameters; the base's strong algorithm may differ.
+   Advertise the selected list ID or an explicit absence,
+   and retain its fd or decoded values until no longer needed. Selection
+   need not represent a globally newest snapshot; any valid base works.
+3. If base and target IDs match, send HASHKEEP with no list data. Otherwise
+   search all `local-hashlists/*/*.cache` on the receiver for the advertised
+   ID, including other peers and indexes. Open and verify any candidate
+   before using it. A missing or damaged base causes a full HASHLIST.
+   With a base, merge the sorted lists to compute removed and added values,
+   encode each as in section 5.4, and send HASHDELTA only if smaller than
+   the full-list transfer. Lists from unrelated histories may have large
+   deltas. The base and target algorithms may differ; each ID identifies
+   how its own bytes are verified.
+4. The sender decodes a full list or applies the delta to its retained base,
+   re-encodes canonically, and verifies the full target digest. A failed
+   delta verification requests a full list once with HASHFULL; it never
+   publishes the failed result. A full-list digest mismatch is a protocol
+   error. HASHKEEP also uses the verified retained base.
+5. Build the hash table and durably publish the verified target in the
+   sender's receiver directory. Send `CACHE_RESULT { target, stored: 1 }`
+   only after publication succeeds. Then remove the advertised old file
+   from that directory if its ID differs from the target's. An inability
+   to store gives `stored: 0`, logs a warning, and still permits the command
+   transfer; retain the old cache. `sender_cache = false` advertises no
+   base, stores nothing, and removes earlier files of this receiver/index
+   directory; it also reports `stored: 0`.
+6. On `stored: 1`, the receiver can remove that exchange's old list from
+   `local-hashlists/B-I/`, if present and different from the target. It does
+   not delete the same ID from another peer or index directory. With
+   `stored: 0` or a lost acknowledgement, retain the old file until expiry.
+   Both sides then expire old caches as described below.
 
-Storage: the cache and log together cost less than two full lists per index,
-whatever the number of peers. A fleet of N hosts with one index each, all
-reaching each other, keeps N × (N − 1) sender caches plus this receiver
-storage. Another user's index adds its own lists (below).
+Publication and concurrency:
 
-Choice at run time: the receiver looks for a chain from the generation in
-the sender's HELLO to the current one, with the first `from_hash` equal to
-the sender's list hash (section 6.2). If found, it sends the segments in
-order as HASHDELTA; pruning guarantees that they cost less than HASHLIST.
-Equal generations and hashes give a HASHDELTA without segments. Otherwise
-it sends HASHLIST: the sender has no list, its list predates the log, the
-receiver's cache was deleted, or a backup restore broke the hash match.
-Every cached generation is an export and therefore a segment boundary.
+- Write a unique hidden temporary file in the destination directory, fsync
+  the file, rename it over its final content-derived filename, then fsync
+  the parent directory. Also fsync parent directories when newly creating
+  the directory hierarchy. Publish a complete file even when the target ID
+  already exists; this avoids trusting a stale, deleted, or corrupt copy.
+  HASHKEEP may use the bytes of its retained descriptor for this publication.
+- No cache locks are needed. Different IDs have different filenames; equal
+  IDs designate equal verified list bytes. Published files are never edited
+  in place. A concurrent replacement or unlink cannot change bytes held by
+  an open fd or in memory. A directory scan is not a snapshot: tolerate
+  disappearance between listing and open, and fall back to a full transfer.
+- Cleanup or expiry can race with a store or touch and remove a recently
+  used filename. This is allowed: it can lose a future delta opportunity,
+  not corrupt a current transfer. An acknowledgement reports completed
+  durable publication, not a promise against later deletion. There is no
+  mutable "current list" pointer or generation ordering to protect.
+- Touch verified files after successful use (`futimens` with `UTIME_NOW`),
+  on the open descriptor. A successful store also renews `ctime`. The
+  sender's current target is used once verified and accepted; the receiver
+  renews its target and any base used after successful CACHE_RESULT receipt.
+  `ctime` is the cache's use/renewal marker, not a creation timestamp.
+  It also advances on other metadata changes, which can delay expiry.
+- After the exchange, each side scans both
+  `local-hashlists/*/*.cache` and `remote-hashlists/*/*.cache`, deleting
+  entries whose `ctime` is older than `hashlist_max_age` (default 90 days
+  since last successful use/renewal). The receiver sends this setting to
+  `serve` in HELLO. Missing files and failed cleanup are nonfatal. Old
+  hidden temporary files from interrupted publication can be removed using
+  the same age bound; newly written temporaries are not normal cache entries.
+  Expiry may trigger a later full transfer. Never delete the target merely
+  because it equals the advertised old ID.
 
-Sender side, in `serve` (section 6.1):
+Cache storage grows with peers and retained versions; there is no two-list
+bound per index. Lost acknowledgements leave harmless extra files. Restoring
+an older database or rebuilding it needs no cache repair: each list still
+names its own content. The database need not be checkpointed before export.
 
-- Cache directory: `$XDG_CACHE_HOME/hashsync/lists/` (fallback
-  `~/.cache/hashsync/lists/`) of the account that runs `serve`, mode 0700.
-  One file per `index_id`, named by the id in hexadecimal, mode 0600: a
-  header (generation, list hash, `block_size`, `weak_hash_id`, `W`) and the
-  encoded list. The file holds the newest list that a run of that index
-  delivered. When the directory cannot be written, `serve` keeps the list in
-  memory only and reports none at the next run.
-- Each receiver host and user has its own index (`index_path`, section 7),
-  hence its own sender cache, even with the same roots. Runs of one index
-  never touch another's list. A rebuild gives a new id; the old list stays
-  until expiry.
-- On the receiver's HELLO: open the file for `index_id`, read its header, and
-  report the generation and the hash when the header's parameters equal
-  those of the HELLO; otherwise report none. Keep the descriptor until the
-  list is no longer needed: a rename or a deletion by another `serve` (below)
-  then cannot take the list away. When the HELLO's `sender_cache` flag is
-  false, report none, store nothing, and delete the file of that index if
-  there is one.
-- On HASHLIST: build the table and store the payload as received.
-- On HASHDELTA: decode the cached list, apply the segments in order (one
-  linear merge each: drop the removed values, insert the added ones), encode
-  the result, and compare its Blake3 hash with the `to_hash` of the last
-  segment. Equal: store the new list. Different: log a warning, delete the
-  cache file, and continue with the table; the next run gets a full list.
-  A HASHDELTA without segments (the sender's list is current) builds the
-  table from the cached list and sets the file's timestamps to now
-  (`futimens` on the open descriptor with `UTIME_NOW`), so that the file
-  records the use.
-- Stores, deletions, and the expiry below run under an exclusive `flock` on
-  the directory's descriptor. The lock is held for a header read and a
-  rename, never for a transfer. A store writes the new list under a
-  temporary name in the directory, takes the lock, and reads the header of
-  the current file. Then it renames the new file into place, unless the
-  current file changed since the HELLO and holds a generation that is not
-  lower; in that case discard the new file. Delete after a failed merge only
-  when the file did not change since the HELLO. This keeps concurrent stores
-  from replacing a newer generation, but lets a restored index whose
-  generation went backwards replace the unchanged file it reported.
-- Expiry: at start-up, before it reads the HELLO, `serve` deletes every file
-  of the directory whose `ctime` is older than 3 months (90 days). Stores
-  and touches renew `ctime`, which only the kernel sets; `cp -p` or
-  `rsync -a` can preserve an old `mtime` and make a restored list look
-  unused. The touch sets `mtime` too, so `ls -l` shows the last use. Expiry
-  costs the next run of that index one full transfer.
-- Cost: one decode, one merge per segment, one encode, and one Blake3 of the
-  encoded list; well under a second. The expiry costs one `statx` per file.
-
-Sizes for the 8M-block example of section 5.4. A value of a sparse list costs
+Sizes for the 8M-block example of section 5.4. A sparse list value costs
 about `W - log2(n) + 2` bits: 46 bits at 0.8M values.
 
 | Sent | Size | At 20 Mbit/s |
@@ -1063,12 +1098,11 @@ about `W - log2(n) + 2` bits: 46 bits at 0.8M values.
 | Delta, 0.8M removed and 0.8M added (10 % churn) | ~9 MiB | 3.7 s |
 | Delta, 80k removed and 80k added (1 % churn) | ~0.9 MiB | 0.4 s |
 
-Removals cost as much as additions in this format; section 12 lists the
-cheaper encoding as positions in the old list.
-
-`sender_cache` in the configuration (default `true`, per-host override,
-section 7) tells the sender through HELLO whether it may keep the list on
-disk. The list reveals the hashes of every indexed block (section 6.5).
+Each exchange costs export and encoding of the target, and optionally one
+linear merge for the delta; section 12 considers encoding removals as ranks.
+`sender_cache` (default true, with per-host overrides) controls whether the
+sender may retain a list. The weak hashes reveal indexed content hints, so
+use trusted peers (section 6.5).
 
 ## 6. The transfer protocol
 
@@ -1110,9 +1144,11 @@ Rendezvous:
    reads anything. It reads the receiver's HELLO frame from stdin, looks up its
    cached hash list for the receiver's index (section 5.6), writes its own HELLO
    frame to stdout, accepts the `attach` connection, reads the hash list or
-   the delta from stdin, builds the hash table, and then starts the user
-   command. It may start the command earlier and buffer its output, up to the
-   lookahead size. None of these waits has a timeout (section 3): when the
+   the delta from stdin, verifies it and builds the hash table, reports
+   CACHE_RESULT after attempting cache publication, and then starts the user
+   command. HASHFULL can request a full list after a failed delta (section
+   6.2). Flush each handshake response before waiting or starting the command.
+   None of these waits has a timeout (section 3): when the
    control session never arrives, `serve` waits until its stdin reaches end
    of file, which happens when the receiver process ends (section 6.7).
 3. `attach` connects to the socket. When the socket does not exist yet
@@ -1146,88 +1182,95 @@ Notes:
 
 ### 6.2 Frames
 
-Every frame is `type u8, length u32 (little endian), payload`. All integers
-are little endian; a string or a byte string is `length u32` followed by the
-bytes; a list is `count u32` followed by the items. Offsets and lengths of
-the output are `u64`; every sum of an offset and a length is checked, and an
-overflow is a protocol error (section 6.5). Frame types:
+Every frame is `type u8, length u32 (little endian), payload`. Integers are
+little endian. A string or byte string is `length u32` followed by its bytes;
+a list is `count u32` followed by its items. Output offsets and lengths are
+`u64`, with checked arithmetic; overflow is a protocol error.
+
+`S` is the fixed full digest length of the negotiated strong algorithm
+(section 5.3). A `list_id` encodes `algorithm string` followed by that
+algorithm's fixed-length full digest. A base list may use a different
+supported algorithm from the target. An optional list ID has a `present u8`
+(0 or 1), followed by the ID only when present; no digest value is a sentinel.
 
 | Session | Direction | Types |
 |---|---|---|
-| data | receiver to sender | HELLO, HASHLIST, HASHDELTA, SEGMENT, LISTDATA |
-| data | sender to receiver | HELLO, LIT, REF, RLE, END |
+| data | receiver to sender | HELLO, HASHLIST, HASHDELTA, HASHKEEP, LISTDATA |
+| data | sender to receiver | HELLO, HASHFULL, CACHE_RESULT, LIT, REF, RLE, END |
 | control | sender to receiver | HELLO, QUERY |
 | control | receiver to sender | HELLO, ANSWER |
 
 Payloads:
 
-- HELLO, receiver to sender (data session): `protocol_version u32`,
-  `program_version string`, `block_size u32`, `weak_hash_id string`, `W u8`,
-  `index_id [u8; 16]`, `sender_cache u8`, `lookahead u64`,
+- HELLO, receiver to sender (data): `protocol_version u32`,
+  `program_version string`, `block_size u32`, `weak_hash_id string`,
+  `strong_hash_id string`, `W u8`, `account_id [u8; 16]`,
+  `index_id [u8; 16]`, `target list_id`, `sender_cache u8`,
+  `hashlist_max_age u64` (seconds), `lookahead u64`,
   `compression_level i32`, `compression_threads u32`, `negative_cache u64`
-  (bytes), and `command`, a list of byte strings: the argument vector of the
-  user command, `argv[0]` first. The
-  sender runs it directly, without a shell, and finds `argv[0]` in `PATH` as
-  `execvp` does. A user who wants a shell names one:
-  `hashsync run host -- sh -c '...'`.
-- HELLO, sender to receiver (data session): `protocol_version u32`,
-  `program_version string`, `block_size u32`, `weak_hash_id string`, `W u8`,
-  `generation u64`, `list_hash [u8; 32]`: the cached hash list that the
-  sender holds for `index_id`, or generation 0 and an all-zero hash when it
-  holds none (section 5.6).
-- HELLO, both directions (control session): `protocol_version u32`,
+  (bytes), and `command`, a list of byte strings containing argv. Run argv
+  directly without a shell, finding argv[0] in PATH as `execvp` does. To
+  request a shell, use `hashsync run host -- sh -c '...'`.
+- HELLO, sender to receiver (data): `protocol_version u32`,
+  `program_version string`, `block_size u32`, `weak_hash_id string`,
+  `strong_hash_id string`, `W u8`, `account_id [u8; 16]`,
+  `base optional_list_id`. The base is selected by ctime and retained as
+  described in section 5.6. `serve` has no index ID of its own.
+- HELLO, both directions (control): `protocol_version u32`,
   `program_version string`. Both sides send it at once.
-- HASHLIST: `generation u64`, `list_hash [u8; 32]`, `length u64`. It announces
-  a full list (section 5.4) of `length` encoded bytes, which follow in
-  LISTDATA frames. The sender stores the list under `generation` and
-  `list_hash` (section 5.6).
-- HASHDELTA: `from_generation u64`, `to_generation u64`, `segments u32`. It
-  announces a chain of `segments` segments (section 5.6) from the sender's
-  list to the receiver's current one. `segments = 0` means that the sender's
-  list is current; then the two generations are equal and nothing follows.
-- SEGMENT: `from_generation u64`, `to_generation u64`, `from_hash [u8; 32]`,
-  `to_hash [u8; 32]`, `removed_length u64`, `added_length u64`. It announces
-  one segment: the encoded list of the removed values, then the encoded list
-  of the added values, `removed_length + added_length` bytes in LISTDATA
-  frames. The first SEGMENT's `from_generation` and `from_hash` equal what
-  the sender's HELLO reported, and each SEGMENT starts where the previous one
-  ended. The last one's `to_generation` equals the HASHDELTA's.
-- LISTDATA: a chunk of the announced bytes, at most 1 MiB per frame. The
-  sender counts the bytes: the transfer of a list or of a segment is complete
-  when exactly the announced length has arrived. A LISTDATA frame beyond that
-  length, or a frame of another type before it, is a protocol error. After a
-  full list, the sender checks that the Blake3 hash of the received bytes
-  equals `list_hash`; a mismatch is a protocol error.
-- LIT: the literal bytes. RLE: `byte u8`, `length u64`. REF: an empty
-  payload (`length = 0`). It names the pin at the receiver's current output
-  offset (section 6.4).
-- END: `status i32`, `error string`. `status` is the exit status of the user
-  command, `128 + signal` when a signal ended it, or 127 with an error text
-  when the command could not be started. Nothing follows END.
-- QUERY: `offset u64`, `blake3 [u8; 32]`. `offset` is the offset of the
-  window in the command's output (section 6.3). The sender sends at most one
-  QUERY per offset during a run, so the offset identifies the query on both
-  sides. Query offsets need not increase: a restart after a "no" can reach an
-  earlier offset after a later query was sent.
-- ANSWER: `offset u64`, `found u8`, 0 or 1. It carries no hash; the sender
-  keeps the hash of every query in its query-state map (section 6.3). Answers
-  may arrive in any order. An ANSWER for an offset below the sender's emit
-  position is a normal late answer, and the sender discards it. Every other
-  ANSWER must name a query that waits for an answer; otherwise it is a
-  protocol error.
+- HASHLIST: `target list_id`, `length u64`, followed by exactly that many
+  encoded full-list bytes in LISTDATA frames.
+- HASHDELTA: `base list_id`, `target list_id`, `removed_length u64`,
+  `added_length u64`, followed by the encoded removed list and encoded added
+  list in LISTDATA frames. The base must equal the sender's advertised ID;
+  the target must equal the receiver's HELLO target. No segments follow.
+- HASHKEEP: `target list_id`. It must equal both the advertised base and
+  target; no LISTDATA follows. Verify and use the already-open full list.
+- LISTDATA: at most 1 MiB of the announced bytes. Count exact lengths;
+  excess bytes or an unexpected frame before completion are protocol errors.
+  Full lists and reconstructed delta results must match the target's full
+  digest. Enforce the canonical encoding, including padding and ordering.
+- HASHFULL: `target list_id`. Sent once if delta reconstruction fails digest
+  verification, before any command output. The receiver answers with
+  HASHLIST and its bytes for that target. A full-list mismatch is a protocol
+  error; a failed delta is never published or used to build the final table.
+- CACHE_RESULT: `target list_id`, `stored u8`. A single response after
+  successful target verification: 1 means durable cache publication
+  succeeded; 0 means disabled or failed sender caching. Both allow command
+  transfer. A wrong target or repeated result is a protocol error. Flush
+  this frame before starting the command; it must precede all output frames.
+- LIT: literal bytes. RLE: `byte u8`, `length u64`. REF: empty payload,
+  naming the pin at the receiver's current output offset (section 6.4).
+- END: `status i32`, `error string`. Status is the command's exit status,
+  `128 + signal`, or 127 with an error when the command cannot start.
+  Nothing follows END.
+- QUERY: `offset u64`, `strong [u8; S]`, the full digest of that window.
+  There is at most one QUERY per offset during a run. Offsets need not
+  increase, because a restart can reach an earlier window.
+- ANSWER: `offset u64`, `found u8` (0 or 1). Answers can arrive in any order.
+  The sender discards answers below its emit position; every other answer
+  must name a waiting query. Its query-state map holds the full digest.
 
-`protocol_version`, `block_size`, `weak_hash_id`, and `W` must be equal on
-both sides, and the program versions must be compatible; any mismatch is a
-fatal error before the command starts. The data handshake follows section
-6.1: receiver HELLO, sender HELLO, then HASHLIST or HASHDELTA and their
-announced frames. The receiver sends nothing more on this session and
-closes it after END. The sender starts the command only when the whole list
-or chain has arrived.
+Protocol and program versions must be compatible, and `block_size`,
+`weak_hash_id`, `strong_hash_id`, and `W` must agree. Unsupported algorithms,
+wrong digest lengths, or parameter mismatches fail before command startup.
+The receiver's target uses its negotiated strong algorithm. These changed
+frames require a protocol version bump; generations and SEGMENT are absent.
+
+The data handshake is receiver HELLO, sender HELLO, durable receiver cache
+publication, then HASHLIST/HASHDELTA/HASHKEEP and any announced bytes. The
+sender either requests the full-list fallback or replies CACHE_RESULT. The
+receiver processes that result and cache cleanup before entering its output
+loop. After the successful exchange it sends no further data-session frames
+and leaves stdin open until END, as required by the shutdown protocol.
 
 Compression. After the HELLO exchange, the sender-to-receiver direction of the
-data session is one zstd stream, and all later frames (LIT, REF, RLE, END)
-travel inside it. Compression is done by libzstd through the `zstd` crate
-(section 9). Rules:
+data session is one zstd stream. All later sender-to-receiver frames,
+including HASHFULL and CACHE_RESULT before LIT, REF, RLE, and END, travel
+inside it. Setup responses are explicitly flushed before either side waits.
+Compression is done by libzstd through the `zstd` crate (section 9). The
+main thread hands its encoder to the data writer after the handshake, so
+setup and command output share one stream. Rules:
 
 - The sender's data writer flushes the compressor (`ZSTD_e_flush`,
   `Encoder::flush`) when its queue runs empty after the scanner asked for a
@@ -1312,15 +1355,15 @@ Rules:
   for end of file. The emission rules (E1 to E4) control the size of the
   outgoing frames.
 
-**The query-state map.** A map indexed by offset. An entry holds the Blake3
-hash of the window at that offset and one of four states:
+**The query-state map.** A map indexed by offset. An entry holds the full
+strong hash of the window at that offset and one of four states:
 
 - `Not_sent`: the hash was computed, but no QUERY was queued or sent.
 - `Waiting`: exactly one QUERY was queued or sent, and no answer has arrived.
 - `Yes`: that QUERY got a "yes".
 - `No`: that QUERY got a "no".
 
-The map also caches computed Blake3 hashes, with entries only at offsets
+The map also caches computed strong hashes, with entries only at offsets
 where one was computed. Entries stay until their offsets are below `e`
 (E4), including when a "no" deletes their records.
 
@@ -1329,17 +1372,17 @@ scanner reaches that offset again, it appends a new Query record for the
 same request; it does not send another QUERY. A queued QUERY is not
 cancelled when its record is deleted.
 
-**The negative cache.** An LRU set of Blake3 hashes with a byte limit
+**The negative cache.** An LRU set of strong hashes with a byte limit
 (`negative_cache` in the configuration, default 100 MiB, about 1.4M hashes;
 the receiver's HELLO carries the size). A "no" inserts its hash, and a "yes"
 removes it. Answers for offsets below `e` do not change it (A1). The cache
 avoids a query for content that got a "no" at another offset. Its key is the
-Blake3 hash, not the weak hash: two windows with the same weak hash and
+strong hash, not the weak hash: two windows with the same weak hash and
 different content are possible, and a "no" for one must not suppress the
-query for the other. The cache therefore saves the query but not the Blake3
+query for the other. The cache therefore saves the query but not the strong hash
 computation. Periodic content never reaches this path: the index holds no
 short-period blocks (section 4.1), so its windows miss the table without a
-Blake3. The size limit of the cache has no effect on the lifetime of the
+strong hash. The size limit of the cache has no effect on the lifetime of the
 entries of the query-state map.
 
 **The queues.** Three queues connect the scanner to the other threads
@@ -1436,7 +1479,7 @@ The scanner repeats these steps:
 
 8. Probe the hash table with the weak hash of the window at `p`:
    - Miss: record the one byte at `p` as literal and return to step 1.
-   - Hit: compute the Blake3 hash of the window, store it in the map at `p`
+   - Hit: compute the strong hash of the window, store it in the map at `p`
      with state `Not_sent`, and continue with step 9.
 
 9. Use the map entry at `p`:
@@ -1447,7 +1490,7 @@ The scanner repeats these steps:
    - `Not_sent`: look the stored hash up in the negative cache. On a hit,
      record the one byte at `p` as literal and return to step 1; the entry
      keeps its hash and its state `Not_sent`. Otherwise queue
-     `QUERY { offset: p, blake3: hash }`, set the entry to `Waiting`, append
+     `QUERY { offset: p, strong: hash }`, set the entry to `Waiting`, append
      `Query { p }`, and return to step 1. Complete these three changes
      before the scanner processes any answer.
 
@@ -1524,7 +1567,7 @@ initializes both for the new position: Horner's rule over the window for the
 hash and one pass over the window for the run check. It never uses a hash or
 a run start left over from another window.
 
-**Blake3.** The map avoids a second Blake3 computation at the same offset, also
+**Strong hashing.** The map avoids a second hash computation at the same offset, also
 when the negative cache prevented the query, and it avoids a duplicate query
 after a restart. Entries exist only for the buffered part of the stream, but
 in a bad case there is one entry per byte, not one per block.
@@ -1537,7 +1580,7 @@ list (section 12).
 
 **Dense hits.** On dense positive matches the scanner hashes and queries one
 window per `B` bytes, and the probe rate no longer bounds the throughput.
-Dense false weak hits at distinct offsets can still cost a Blake3
+Dense false weak hits at distinct offsets can still cost a strong hash
 computation per byte; the map only avoids a second computation at the same
 offset. A stale hash list can produce such false hits even when accidental
 weak collisions are rare. Neither case changes the reconstructed bytes.
@@ -1561,7 +1604,7 @@ hashes nor probes, so a long run of one byte costs a memory scan only.
 - **The output offset `c`**: the offset of the next byte that the receiver
   writes to its stdout. It starts at 0.
 - **The pin map**: a map from query offsets to pinned, verified block bytes.
-  A pin holds the `B` bytes of a block that verified against the Blake3 hash
+  A pin holds the `B` bytes of a block that verified against the strong hash
   of the query at that offset. Pins for identical content can share one
   immutable buffer (`Arc`), but each query offset has its own pin. A pin is
   released when `c` passes its offset (D3).
@@ -1569,8 +1612,8 @@ hashes nor probes, so a long run of one byte costs a memory scan only.
   below. Every access holds it, twice per query and up to twice per frame.
   Slow disk reads and output writes do not hold it.
 - **The verified-buffer cache**: an LRU cache of 256 MiB of verified block
-  bytes, keyed by Blake3 hash. A buffer enters it when its last pin is
-  released. Blake3 equality is byte equality, so a later query for the same
+  bytes, keyed by the full strong hash. A buffer enters it when its last pin
+  is released. Full strong-hash equality is byte equality, so a later query for the same
   content is answered from the cache without a disk read or a hash
   computation; it only creates a new pin on the cached buffer.
 - **The lookup workers**: a pool of 4 to 8 threads, each with its own read
@@ -1584,42 +1627,50 @@ design, and the peer is trusted (section 6.5).
 
 #### Answering a QUERY
 
-- **L1.** Receive `QUERY { offset: x, blake3: h }`. Read `c` under the lock. If
+- **L1.** Receive `QUERY { offset: x, strong: h }`. Read `c` under the lock. If
   `x < c`, the bytes at `x` were already reconstructed: send
   `ANSWER { offset: x, found: 0 }` and create no pin. The sender discards this
   obsolete answer (A1 in section 6.3).
 
-- **L2.** Otherwise look for verified bytes with hash `h` in the verified-buffer
-  cache. If there are none, select candidate blocks from the index with
-  `SELECT inode_id, block_no FROM blocks WHERE blake3 = ? LIMIT 128` (section
-  4.4). The high limit skips over stale rows (deleted or changed files). Check
-  the candidates in order until one verifies. For each candidate:
-  1. Take one `(root_id, rel_path)` of the inode; skip the candidate when the
-     inode has none. Open the root's stored path (section 4.2) with
-     `open(path, O_PATH | O_DIRECTORY | O_CLOEXEC)`, then the candidate with
-     `openat2(rootfd, rel_path, O_RDONLY | O_NONBLOCK | O_NOCTTY | O_CLOEXEC,
-     RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)` (`rustix::fs::openat2`, Linux 5.6
-     and newer; fall back to component-wise `openat` with `O_NOFOLLOW`, with
-     the same flags on the last component), and close the root descriptor.
-  2. Call `statx(fd, "", ...)` with the flags of section 4.5 and check
-     `stx_mode`: skip the candidate unless the descriptor is a regular file.
-  3. `pread` `B` bytes at `block_no * B` and compute their Blake3 hash. The
-     candidate verifies when the read returned exactly `B` bytes and the hash
-     equals `h`. A stored hash alone never justifies a "yes".
+- **L2.** Otherwise look for bytes with full hash `h` in the verified-buffer
+  cache. If absent, select block rows whose stored strong prefix equals
+  `h[0..16]` through `blocks_by_strong` (section 4.4). For each block,
+  enumerate all indexed `(root_id, rel_path)` paths and all current root
+  locations from the in-memory configuration map (section 4.2). Prefer the
+  configured location order. Identical location/offset pairs need only one
+  attempt; an alternate copy need not have the scanned inode's identity.
 
-  A candidate costs one `B`-byte read, mostly from the page cache, and one
-  Blake3 computation. The two opens add a few microseconds. Nothing stays
-  open between candidates, so each worker holds at most one root descriptor
-  whatever the number of roots. Keeping a descriptor would not bind it to
-  the indexed tree: it too resolves a path at some time, and Blake3 decides.
+  Stop on success, exhaustion, or `candidate_attempts` attempts (default
+  128, configurable, positive). The budget is per query across all blocks,
+  paths, and copies, not per block. Failed opens and reads count; a block
+  with no usable path/location also consumes an attempt. Never exhaust an
+  unbounded collection of stale rows before charging the budget.
 
-  The path is stale whenever the file changed after the indexing, and it can now
-  name a FIFO, a device, or a socket. `O_NONBLOCK` makes the open of a FIFO
-  without a writer return at once instead of waiting for one, `O_NOCTTY` keeps a
-  terminal device from becoming the controlling terminal, and the type check
-  keeps the `pread` off anything that is not a regular file. On a regular file
-  `O_NONBLOCK` has no effect. The indexer opens files with the same flags and
-  the same check (section 4.5).
+  For each attempted location:
+
+  1. If `rel_path` is empty, this is a single-file root: open the root file
+     itself with `O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_NOCTTY|O_CLOEXEC`.
+     Do not require `O_DIRECTORY`. Otherwise open the root with
+     `O_PATH|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC`, then open the relative path
+     with `openat2` using `O_RDONLY|O_NONBLOCK|O_NOCTTY|O_CLOEXEC` and
+     `RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS`. On older kernels, use
+     component-wise `openat` with `O_NOFOLLOW`, directory flags on ancestors,
+     and the file flags on the final component. Close ancestor descriptors
+     once the next descriptor has opened; nothing stays open between attempts.
+  2. `statx(fd, "", ...)` on the opened candidate must identify a regular
+     file. Otherwise close it and continue. A stale path may now name a
+     FIFO, socket, directory, or device; its type is never trusted from the
+     index. The flags and checks have the same purpose as in section 4.5.
+  3. Read exactly `B` bytes at `block_no * B` with `pread`, accumulating
+     short reads as needed. Hash those bytes with the negotiated algorithm
+     and compare the entire digest with `h`. Error, EOF before `B` bytes,
+     or mismatch continues to the next attempt. The stored prefix alone
+     never justifies a "yes". Successful bytes stay in their immutable buffer.
+
+  A successful disk candidate costs a block read and one strong hash. All
+  filesystem failures are candidate misses; they do not terminate the run.
+  The full hash, rather than a path or inode identity check, authorizes the
+  bytes. Already-verified cached buffers likewise use the full digest key.
 
 - **L3.** When the lookup has ended, take the lock and compare `x` with `c`
   again. If `x < c`, create no pin and answer "no" as in L1. Otherwise, if
@@ -1748,16 +1799,17 @@ interrupt a blocked `read` or `write`; `pthread_cancel` is unusable from
 Rust; and `pthread_kill` with an empty handler races with entry into the
 call, while helpers that retry `EINTR` swallow the interruption (section
 10). Persistent state needs no orderly stop: the index uses WAL, and both
-roles write cache files and segments under temporary names and rename them.
-Every fatal condition
-therefore ends the process. The kernel closes its descriptors, ending peers
-through end of file and `EPIPE`.
+roles publish complete cache files under temporary names and rename them
+(section 5.6). Interrupted files are ignored until expiry. Every fatal
+condition therefore ends the process. The kernel closes its descriptors,
+ending peers through end of file and `EPIPE`.
 
 Two exits exist, chosen by the root cause. A condition that is not a fault
 of the program (a network failure, a consumer that closed the receiver's
 stdout, a signal) ends the process without a core dump. A fault of the
-program or of the machine (a bug, an invalid frame, a database error, an
-I/O error) aborts and leaves a core dump.
+program or a failure of its database (a bug, an invalid frame, a database
+error) aborts and leaves a core dump. Per-entry filesystem failures are
+handled locally, as specified in section 4.5.
 
 `die(status, message)` is the first kind, one function per role, callable
 from any thread. It prints the message to stderr, does the cleanup that the
@@ -1774,9 +1826,12 @@ until the process is gone. The cleanup is:
 
 Everything else panics. The crate builds with `panic = "abort"` (section
 11); a panic hook runs the same cleanup before leaving a core dump. Invalid
-frames are bugs because SSH guarantees stream integrity. Indexing errors
-(database errors, read errors other than vanished files) panic too; the
-index recovers at the next update (section 4.4).
+frames are bugs because SSH guarantees stream integrity. Database errors
+and indexing invariant violations panic too; the index recovers at the next
+update (section 4.4). Filesystem errors opening or reading an indexed entry
+only abandon that entry and leave its root eligible for retry (section 4.5).
+Cache store failures on the sender report `stored: 0`; inability to persist
+the receiver's target ends setup with an error, without a core dump.
 
 Who calls `die()`:
 
@@ -1820,11 +1875,14 @@ at its next write.
 `$XDG_CONFIG_HOME/hashsync/config.toml`, or the path given by `--config`:
 
 ```toml
-block_size     = "32KiB"   # 4 KiB or more; a change discards and rebuilds the index
+block_size     = "32KiB"   # 4 KiB or more; a change rebuilds the index
+strong_hash    = "blake3"  # blake3 or sha256; fixed full output >= 16 bytes
+candidate_attempts = 128  # total block/path/copy attempts per query, at least 1
+hashlist_max_age = "90d"  # expire caches after this much time without renewal
 index_path     = "~/.local/state/hashsync/index.sqlite"
 threads        = 0         # indexer threads; 0 = 4 × cores, at least 16, at most 64
 lookahead      = "256MiB"  # how far the sender's scanner runs ahead of the output
-negative_cache = "100MiB"  # the sender's LRU of Blake3 hashes answered "no" (6.3)
+negative_cache = "100MiB"  # the sender's LRU of strong hashes answered "no" (6.3)
 compression_level   = 9    # zstd level for the data session, 1 to 19; 0 disables
 compression_threads = 0    # libzstd worker threads on the sender; 0 = half the cores
 ssh            = "ssh"     # SSH command, split like a shell would (rsync's --rsh);
@@ -1857,16 +1915,21 @@ exclude = ["*.tmp", ".cache"]
 one_filesystem = true
 ```
 
-The hash list width `W` (64), the multiplier `a`, and `mix64` are protocol
-constants, not configuration.
+The hash list width `W` (64), multiplier `a`, and `mix64` are protocol
+constants. A change to `strong_hash` rebuilds the index; the stored prefix
+length remains 16 bytes for every algorithm. Account IDs are persistent
+state under the XDG configuration directory (section 5.6), not TOML options.
 
 ## 8. Command line
 
 - `hashsync update [--rebuild] [-j N]`: update the index, or discard and
   rebuild it. `-j` overrides `threads`.
 - `hashsync run [--no-update] [--single-connection] [--ssh CMD] [USER@]HOST -- COMMAND ARGS...`:
-  run COMMAND on HOST, write its stdout to the receiver's stdout, and exit with
-  the status of COMMAND. HOST is appended to the SSH command unchanged, so
+  run COMMAND on HOST, write its stdout to the receiver's stdout, and exit
+  with its status. Normal runs hold process-exclusive index access through
+  update and transfer. `--no-update` shares read-only access with other such
+  runs, still loads all configured root locations, and waits for any writer.
+  HOST is appended to the SSH command unchanged, so
   `user@host` and `ssh_config` aliases work. COMMAND and ARGS travel in the
   HELLO frame (section 6.2) and run on the sender without a shell. `--ssh`
   overrides the configured SSH command for this run. At the end it prints one
@@ -1876,8 +1939,10 @@ constants, not configuration.
 - `hashsync serve --token T` and `hashsync attach --token T`: internal. The
   receiver runs them on the sender through the SSH command.
 - `hashsync stats`: show index statistics.
-- `hashsync prune`: remove path rows whose files no longer exist (also under
-  immutable roots) and the orphaned inodes.
+- `hashsync prune`: under process-exclusive access, remove paths absent
+  from every configured copy of their root, and all orphaned inodes and
+  blocks, in foreign-key-safe order. Inaccessible locations are not proof
+  of absence. It also loads the root configuration without storing copies.
 
 Example:
 
@@ -1887,7 +1952,8 @@ hashsync run backup@nas -- tar -C /srv/data -cf - . | tar -C /srv/data -xf -
 
 ## 9. Libraries
 
-Versions checked against crates.io on 2026-09-10. The toolchain is stable Rust
+Versions checked against crates.io on 2026-09-10; SHA-256 support added
+and its crate checked on 2026-09-17. The toolchain is stable Rust
 (1.98.1, released 2026-09-03), edition 2024. Three dependencies compile C
 sources through the `cc` crate: SQLite, libzstd, and the Blake3 SIMD kernels.
 The target's C compiler is needed at build time; there is no pure-Rust build
@@ -1897,13 +1963,14 @@ and no need for one.
 |---|---|---|---|
 | Weak hash | own code | | Sections 5.1 and 5.2, about 50 lines. |
 | Hash list coding | own code | | Golomb-Rice encoder and decoder, about 60 lines. |
-| Hash list cache and delta log | own code | | Section 5.6: diff of two sorted lists, segment files, pruning, the sender's cache, merge, and expiry; about 150 lines over both roles. |
+| Hash list cache and deltas | own code | | Section 5.6: canonical full lists, direct diff/merge, atomic publication, acknowledgements, and expiry. |
 | Sender's hash table | own code | | Section 5.5, about 100 lines plus the SIMD bucket scan. |
-| Blake3 | `blake3` | 1.8.7 (2026-08) | `blake3::hash`. Assembly for SSE4.1, AVX2, and AVX-512 on x86_64 with run-time detection; NEON on aarch64 by default. See below. |
+| Strong hash: BLAKE3 | `blake3` | 1.8.7 (2026-08) | `blake3::hash`. Assembly for SSE4.1, AVX2, and AVX-512 on x86_64 with run-time detection; NEON on aarch64 by default. See below. |
+| Strong hash: SHA-256 | `sha2` | 0.11.0 | `Sha256` with the `Digest` trait; fixed 32-byte output. |
 | SQLite | `rusqlite` | 0.40.2 (2026-08) | Feature `bundled`: SQLite 3.53.2 through `libsqlite3-sys` 0.38.2. `prepare_cached`, `transaction_with_behavior`, `busy_handler`, `pragma_update`. See below. |
-| System calls | `rustix` | 1.1.4 (2026-02) | `fs::{openat, openat2, statx, RawDir, fadvise, seek, memfd_create, flock, futimens}`, `io::{pread, preadv2}`, `mm::{mmap, mmap_anonymous, madvise}`, `pipe::{splice, fcntl_setpipe_size}`, `process::setrlimit`, `rand::getrandom`, `ioctl::{Getter, opcode}`. Raw system calls on Linux (`linux_raw` backend). |
-| System calls, gaps | `libc` | 0.2.189 (2026-08) | `name_to_handle_at`, `file_handle`, `MAX_HANDLE_SZ`, `syscall(SYS_cachestat, ...)`. |
-| Kernel constants | `linux-raw-sys` | 0.12.1 (2025-12) | `general::{fsuuid2, cachestat, STATX_MNT_ID_UNIQUE}`. Already a dependency of `rustix`. |
+| System calls | `rustix` | 1.1.4 (2026-02) | `fs::{openat, openat2, statx, RawDir, fadvise, seek, memfd_create, futimens}`, `io::{pread, preadv2}`, `mm::{mmap, mmap_anonymous, madvise}`, `pipe::{splice, fcntl_setpipe_size}`, `process::setrlimit`, `rand::getrandom`, `ioctl::{Getter, opcode}`. Raw system calls on Linux (`linux_raw` backend). |
+| System calls, gaps | `libc` | 0.2.189 (2026-08) | `name_to_handle_at`, `file_handle`, `MAX_HANDLE_SZ`. |
+| Kernel constants | `linux-raw-sys` | 0.12.1 (2025-12) | `general::{fsuuid2, STATX_MNT_ID_UNIQUE}`. Already a dependency of `rustix`. |
 | Thread pool | `rayon` | 1.12.0 (2026-04) | A dedicated `ThreadPool`, `scope` and `spawn`. LIFO local deques, oldest-first stealing (section 4.6). |
 | Work stealing, alternative | `crossbeam-deque` | 0.8.8 (2026-09) | `Worker::new_lifo` and `Stealer`, as in `ignore`. Only if rayon is dropped. |
 | Channels | `crossbeam-channel` | 0.5.17 (2026-09) | Bounded channels to the writer and between the run-time threads; `select!`. `std::sync::mpsc::sync_channel` is enough where no `select!` is needed. |
@@ -1912,7 +1979,7 @@ and no need for one.
 | Command line | `clap` | 4.6.6 (2026-08) | Derive API. |
 | Globs | `glob` | 0.3.4 (2026-07) | `glob_with` for roots, `Pattern::matches_with` for `exclude`, options of section 4.2. |
 | Hash maps | `foldhash` | 0.2.0 (2025-08) | `foldhash::fast::RandomState` for `std::collections::HashMap`. Alternative: `rustc-hash` 2.1.3. See below. |
-| Identity hasher | `nohash-hasher` | 0.2.0 (2020-02) | For maps keyed by Blake3 or by the weak hash. Or 10 lines. |
+| Identity hasher | `nohash-hasher` | 0.2.0 (2020-02) | For maps keyed by full strong hashes or the weak hash. Or 10 lines. |
 | LRU cache | `lru` | 0.18.4 (2026-09) | The verified-buffer cache of section 6.4. Or about 60 lines. |
 | Signals | `signal-hook` | 0.4.4 (2026-04) | SIGINT and SIGTERM flag. `ctrlc` 3.5.2 is the smaller alternative. |
 | Errors | `anyhow`, `thiserror` | 1.0.104, 2.0.20 | |
@@ -1930,21 +1997,29 @@ independent of the system and makes static builds simple; without it,
 `libsqlite3-sys` links the system library through `pkg-config`. A point lookup
 through a cached prepared statement costs 1 to 3 µs, about one `statx`. At run
 time, 10 GiB of matched data cost about 320k such lookups, each followed by a
-32 KiB read and a Blake3 computation that cost more than the lookup; the
+32 KiB read and a strong-hash computation that cost more than the lookup; the
 indexer's budget is in section 4.6.
 
 Usage rules:
 
-- Open with WAL mode and `synchronous=NORMAL`. The export runs
-  `PRAGMA main.wal_checkpoint(FULL)` through `query_row` in a loop until the
-  first column is 0, before it publishes a generation (section 4.4). Install
-  a busy handler that retries without limit (`Connection::busy_handler` with
-  a callback that sleeps for a millisecond and returns `true`); never
-  `busy_timeout`, which is a deadline (section 3). A second process on the
-  same index (`hashsync update` next to `hashsync run`) then waits for the
-  write lock as long as it takes. Open with `SQLITE_OPEN_NO_MUTEX`: a
-  `Connection` is `Send` and not `Sync`, and every connection belongs to one
-  thread.
+- Follow the connection ordering and lifetime protocol of section 4.4.
+  `Connection::open_with_flags` needs `SQLITE_OPEN_URI` for URI filenames;
+  percent-encode the filesystem path rather than interpolating URI syntax.
+  Alternatively, `open_with_flags_and_vfs` selects `unix-excl` directly.
+  Use `SQLITE_OPEN_NO_MUTEX`: each connection belongs to one thread;
+  `Connection` is Send but not Sync. Keep SQLite's library-wide mutexes.
+- Enable `foreign_keys` immediately on every connection. Install
+  `Connection::busy_handler` with a callback that sleeps a millisecond and
+  returns true indefinitely, replacing rusqlite's default busy timeout.
+  If a lock acquisition still returns `SQLITE_BUSY` without invoking the
+  handler, retry initialization with fresh connections before opening any
+  worker readers. Non-contention failures do not count as acquiring access.
+- Acquire the process lock by a real schema read before opening readers or
+  changing the schema. Configure WAL and `synchronous=NORMAL` on the writer
+  after exclusive initialization and before spawning reader connections.
+  Read-only connections do not attempt to set the journal mode. There is
+  no publication checkpoint or index generation counter.
+
 - The writer thread owns its connection and starts transactions with
   `transaction_with_behavior(TransactionBehavior::Immediate)`, so a write
   transaction never fails with `SQLITE_BUSY` halfway through. Pool threads and
@@ -1965,7 +2040,7 @@ Usage rules:
 
 `rustix` wraps the calls with `OwnedFd` and `BorrowedFd` and returns
 `io::Result`; on Linux its default `linux_raw` backend makes the system calls
-itself, without libc. It covers everything in section 4.5 except four items,
+itself, without libc. It covers everything in section 4.5 except three items,
 which the `sys` module supplies (section 11):
 
 - `name_to_handle_at`: `libc::name_to_handle_at` with a `MAX_HANDLE_SZ` buffer
@@ -1976,9 +2051,6 @@ which the `sys` module supplies (section 11):
 - `STATX_MNT_ID_UNIQUE`:
   `StatxFlags::from_bits_retain(linux_raw_sys::general::STATX_MNT_ID_UNIQUE)`;
   `rustix` 1.1 only names `MNT_ID`.
-- `cachestat`: `libc::syscall(libc::SYS_cachestat, fd, &range, &result, 0)`
-  with the struct from `linux_raw_sys::general::cachestat`; `rustix` 1.1 lists
-  it as not implemented.
 
 ### Threads: `rayon` and `crossbeam-channel`
 
@@ -1996,7 +2068,7 @@ multithreaded stream). `stream::read::Decoder` for the receiver. The pure-Rust
 `ruzstd` 0.9 has a complete decoder but only an uncompressed and a fastest
 level in its encoder, so it is not an option for the sender.
 
-### Blake3: the `blake3` crate
+### Strong hashes: `blake3` and `sha2`
 
 `blake3::hash(&block)` returns 32 bytes. The crate carries assembly for SSE4.1,
 AVX2, and AVX-512 on x86_64 with run-time detection, and NEON C code that its
@@ -2004,18 +2076,44 @@ build script enables by default on little-endian aarch64. 32 KiB inputs are 32
 chunks, enough to fill the widest vectors. Do not enable the `rayon` or `mmap`
 features: blocks are hashed in parallel by the pool, not inside one hash.
 
+For SHA-256, use `sha2::{Digest, Sha256}` and `Sha256::digest(&block)`,
+which also produces 32 bytes ([crate documentation](https://docs.rs/sha2/0.11.0/sha2/)).
+Select the implementation through one strong-hash abstraction shared by
+indexing, queries, candidate verification, and hash-list persistence. Its
+algorithm ID fixes the full length; index truncation is a storage decision.
+
 ### Hash maps and caches
 
 `std::collections::HashMap` is hashbrown; only its default hasher (SipHash-1-3)
 is slow. Use `foldhash::fast::RandomState` (hashbrown's own default) or
 `rustc_hash::FxHashMap` for the sets keyed by `(fs_id, handle)`, the
 filesystem cache of the walker, the query-state map (section 6.3), and the
-pin map (section 6.4). Keys that are already hashes (Blake3 in the negative
-cache and in the verified-buffer cache) get an identity hasher. The
+pin map (section 6.4). Keys that are already hashes (full strong hashes in
+the negative and verified-buffer caches) get an identity hasher. The
 verified-buffer cache (section 6.4) is `lru::LruCache` or about 60 lines.
 The sender's table stays custom (section 5.5).
 
 ## 10. Alternatives considered
+
+- **BLAKE3-only hashing and full digests in the index.** Replaced on
+  2026-09-17 (user decision) by configured BLAKE3 or SHA-256, each with a
+  fixed full output of at least 16 bytes, and 16-byte indexed prefixes.
+  Verification and cache keys retain full digests (sections 4.4 and 5.3).
+- **Rebuild by replacing the database file, and concurrent external reads
+  during updates.** Replaced on 2026-09-17 (user decision) by in-place schema
+  reset and the SQLite `unix-excl` connection protocol. Independent read-only
+  runs can coexist while no updating process holds the index (section 4.4).
+- **Path-based metadata checks before opening a file.** Replaced on
+  2026-09-17 by opening first and using that fd for type, identity, metadata,
+  and contents. Directory-entry replacement cannot switch the object midway.
+- **Allocated-size gate for sparse-file discovery.** Removed on 2026-09-17:
+  allocation counts, notably with ZFS copies, cannot prove absence of holes.
+- **`cachestat` plus `fadvise(DONTNEED)`.** Removed on 2026-09-17 (user
+  decision). Separate SEQUENTIAL and NOREUSE advice simplifies the policy.
+- **Root completion flag and seen-path hash sets.** Replaced on 2026-09-17
+  by a nullable immutable identifier, deletion/reconstruction of scanned
+  paths, and cleanup of all orphaned inodes. Recovery invalidates immutable
+  roots referencing incomplete inodes before deleting those inodes.
 
 - **Go as the implementation language.** Replaced by Rust on 2026-09-10 (user
   decision). Rust gives direct access to SIMD and prefetch intrinsics, control
@@ -2063,7 +2161,7 @@ The sender's table stays custom (section 5.5).
 - **Binary fuse filter (32-bit fingerprints)** for the sender's membership test.
   Rejected on 2026-09-09. It touches 3 cache lines per lookup against about 1
   for the fingerprint table, its random fingerprints cannot be compressed, and
-  a filter cannot be patched with the segments of section 5.6. Its size,
+  a filter cannot be directly patched with the set deltas of section 5.6. Its size,
   between the old 48-bit list and the current 64-bit list (section 5.4),
   was never decisive.
 - **48-bit prefixes in the hash list** (`W = 48`). Adopted on 2026-09-09 and
@@ -2111,11 +2209,12 @@ The sender's table stays custom (section 5.5).
   roots duplicated path rows. A mutable ancestor also stat'ed an immutable
   tree at every update. Rejecting these pairs permits reconciliation before
   traversal (section 4.2), replacing insertion by the writer on first use.
-- **`UNIQUE (path)` on the `roots` table**, to enforce the rule above in the
-  index. Considered and dropped on 2026-09-11. Reconciliation already
-  guarantees distinct paths (section 4.2). SQLite checks UNIQUE per row and
-  cannot defer it to commit, so exchanging two roots' paths would require
-  temporary NULLs or deletion and reinsertion for no extra guarantee.
+- **Relying on reconciliation alone for root-path uniqueness.** Replaced on
+  2026-09-17 by `UNIQUE(path)` (user decision). The earlier rejection of
+  2026-09-11 avoided transient path-swap conflicts. Reconciliation now
+  stages changing paths inside its transaction before assigning final paths
+  (section 4.2); alternate immutable locations remain only in memory.
+
 - **`TEXT` columns for paths and root identifiers.** Replaced on 2026-09-13
   (user decision) by `BLOB` to preserve non-UTF-8 paths (section 4.4).
 - **`(st_dev, st_ino)` as the inode identity**. Rejected on 2026-09-10.
@@ -2159,12 +2258,11 @@ The sender's table stays custom (section 5.5).
   64-byte anchor context is shared by many distinct blocks (zero padding, common
   file headers), so each hit would need several candidates resolved. Not
   pursued. Revisit if the sender's scan rate turns out to be the bottleneck.
-- **Per-peer copies of the hash list on the receiver**, so that the receiver can
-  compute the delta for each sender itself. Rejected on 2026-09-10. It costs
-  one list per peer on every host (about 2 × N² lists in a fleet of N hosts
-  instead of N × (N − 1)), needs a peer identity and a cleanup of stale
-  copies, and leaves the receiver unsure of the sender's state after an
-  interrupted transfer. The delta log avoids this (section 5.6).
+- **Per-peer full hash lists on the receiver.** Rejected on 2026-09-10,
+  adopted on 2026-09-17 (user decision). The extra storage is acceptable.
+  Content-derived IDs, account/index directories, and store acknowledgements
+  replace the delta log and its generation/history bookkeeping (section 5.6).
+
 - **Set reconciliation sketches** (IBLT, rateless IBLT, minisketch), to find the
   difference without history on the receiver. Rejected on 2026-09-10. An IBLT
   costs at least 13 bytes per cell (a count, a 64-bit key sum, and a 32-bit
@@ -2173,9 +2271,9 @@ The sender's table stays custom (section 5.5).
   about 9 MiB for the delta. At any churn it costs three to four times the
   delta, and it needs an estimate of the difference (or a rateless scheme) and
   a fallback for a failed decode. Minisketch is optimal in size but decodes in
-  O(d²), for thousands of differences, not millions. The delta log costs about
-  6 bytes per changed key, and the receiver already holds the list it diffs
-  against.
+  O(d²), for thousands of differences, not millions. Direct list deltas
+  cost about 6 bytes per changed key; a missing receiver-side base simply
+  causes a full-list transfer.
 - **Range fingerprint reconciliation** (Merkle-style recursion over the sorted
   key space, as in negentropy). Rejected on 2026-09-10. The weak hashes are
   uniform, so 10 % churn touches every range at every level, and the recursion
@@ -2188,17 +2286,19 @@ The sender's table stays custom (section 5.5).
   content still appears in the output costs one query per occurrence until the
   negative cache learns it. Removals cost half of the delta as values and much
   less as positions (section 12).
-- **Composing a chain of segments into one net delta** before sending it.
-  Considered and dropped on 2026-09-10. It only saves bytes when a hash leaves
-  and returns within the chain, which is rare for build outputs, and the pruning
-  rule already caps a chain below the full list's size (section 5.6).
+- **Delta-log segments and generation counters.** Replaced on 2026-09-17
+  (user decision) by canonical full lists identified by their strong hash
+  and one directly computed delta. The former design rejected composing
+  segment chains on 2026-09-10; there are now no chains to compose.
+
 - **Expiry of the sender's cache after 30 days of no use, by `mtime`.**
   Replaced on 2026-09-10 (user decision) by 3 months, measured on `ctime`
   so restored timestamps do not cause expiry (section 5.6). `atime` is out:
   `noatime` mounts never update it.
-- **Last writer wins for the sender's cache file.** Rejected on 2026-09-10. Two
-  concurrent runs could replace a newer list with an older one and transfer
-  the same segments again. The locked header check prevents this (section 5.6).
+- **One mutable cache file per index, with generation ordering and locks.**
+  Replaced on 2026-09-17 (user decision) by immutable content-named files.
+  Concurrent stores cannot replace different content under one name; a
+  cleanup race may lose a future cache hit and needs no lock (section 5.6).
 
 - **Optimistic skip after a query, with a rescan of the window after a
   "no".** Replaced on 2026-09-10 (user decision) by a two-pass scanner that
@@ -2225,8 +2325,10 @@ The sender's table stays custom (section 5.5).
   no payload (section 6.4). QUERY also lost its weak hash (below).
 - **Lookup by weak hash with a Blake3 filter** (`WHERE weak = ? AND
   blake3 = ?` through `blocks_by_weak`). Replaced on 2026-09-13 by the lookup
-  through `blocks_by_blake3` (section 4.4), so that a QUERY carries the
-  Blake3 hash only. `blocks_by_weak` stays for hash list export.
+  through `blocks_by_blake3`, so a QUERY carried only the strong digest.
+  On 2026-09-17 the index became `blocks_by_strong`, storing a 16-byte prefix
+  while queries retain the full configured hash. `blocks_by_weak` stays for
+  hash-list export (section 4.4).
 - **A memory limit on the pinned set**, with "no" answers once it was
   reached. Removed on 2026-09-10 (user decision). Memory is not a concern of
   the project, and in-flight queries bound the set in practice (section
@@ -2239,8 +2341,9 @@ The sender's table stays custom (section 5.5).
 - **`synchronous=FULL`** for the index, so that every commit is durable.
   Adopted on 2026-09-10 to prevent reuse of published generations after
   power loss. Replaced on 2026-09-11 (user decision) by `NORMAL` with a
-  FULL checkpoint at publication (section 4.4): only exports need the
-  durability that every batch paid an `fsync` for.
+  FULL checkpoint at publication. The checkpoint was removed on
+  2026-09-17: full lists are independently durable and identify their own
+  content, so database rollback cannot reuse an external list identity.
 - **A positive cache** of the Blake3 hashes answered "yes", with a skip over
   the window at a cache hit. Added on 2026-09-10 and removed on 2026-09-11
   (user decision). An unpinned block is not guaranteed, so the skip still
@@ -2259,11 +2362,14 @@ The sender's table stays custom (section 5.5).
   (user decision) by ending the process. Wake-ups are unreliable, and all
   persistent state is crash-safe (section 6.7). Network errors exit without
   a core dump (user decision); bugs, protocol errors, and indexing errors
-  panic and leave one.
+  panic and leave one. Since 2026-09-17, per-entry filesystem failures
+  abandon that entry without aborting the update; database errors remain
+  fatal (section 6.7).
 - **One generation per update**, incremented after the last commit. Replaced
   on 2026-09-10 by an increment inside every transaction that changes block
-  rows. A crash before the increment made a stale hash list look current
-  (section 4.4).
+  rows. A crash before the increment made a stale hash list look current.
+  All index generations were removed on 2026-09-17 with content-identified
+  full lists (section 5.6).
 - **Whole inodes per transaction and per channel message.** Replaced on
   2026-09-10 by streamed block rows with a byte budget (section 4.6). One
   large inode defeats a message-count bound. The NULL `size` marker makes
@@ -2292,31 +2398,32 @@ The sender's table stays custom (section 5.5).
     sorted lists, fingerprint table, SIMD bucket scan.
   - `scan/`: pool, directory and file tasks, filesystem and inode identities,
     mount tracking, hashing.
-  - `index/`: schema, migrations, writer, pruning, hash list export, cache, and
-    delta log.
+  - `strong.rs`: supported algorithms, fixed output lengths, full hashing.
+  - `index/`: schema, process access, writer, recovery, pruning, and export.
+  - `hashlists/`: content-named caches, diff/merge, publication, and expiry.
   - `proto/`: frame types, encoding, HELLO handshake.
   - `sender/`: `serve` (hash list cache, lookahead buffer, scanner, data
     writer, shutdown) and `attach` (relay).
   - `receiver/`: `run` (SSH processes, answering, reconstruction).
   - `config.rs`: `config.toml` and XDG paths.
-  - `sys/`: every `unsafe` FFI call (handles, ioctl, `cachestat`, the `statx`
-    bit). The crate root has `#![deny(unsafe_code)]`; `sys` and the SIMD
+  - `sys/`: every `unsafe` FFI call (handles, ioctl, the `statx` bit). The
+    crate root has `#![deny(unsafe_code)]`; `sys` and the SIMD
     bucket scan carry `#![allow(unsafe_code)]`.
 - Run `cargo fmt`, `cargo clippy --all-targets`, and `cargo test` before you
   finish a change.
 - Tests to keep: rolling hash equals direct hash (`proptest`); the
   interleaved k-stream hash and the split block hash equal the serial ones;
-  Golomb-Rice round trip on random and adversarial gap patterns; the delta log
-  (section 5.6): the diff of two lists applied to the first gives the second,
-  a chain of several segments, the pruning rule, the choice between full list
-  and chain from the sender's HELLO, a list hash mismatch on the sender that
-  gets a full list at the next run, and an index restored from a backup (same
-  generation, different content) that the hash detects; the sender's cache
-  (section 5.6): two indexes served from one directory, each with its own
-  file, a HASHDELTA without segments that touches the file, the expiry with
-  the current time as a parameter (tests cannot set `ctime`), and a store
-  that does not replace a newer generation; the hash table
-  never gives a false negative; traversal tests on a temporary tree (hard links,
+  Golomb-Rice round trip on random and adversarial gap patterns; direct
+  deltas (section 5.6): applying a diff produces its target, choosing a full
+  list when smaller, HASHKEEP for equal IDs, fallback after a bad delta, and
+  content identity after database restore; hash-list caches: separate account
+  and index directories, concurrent account-ID initialization, newest-ctime
+  base selection, receiver lookup across peer directories, verified target
+  publication before acknowledgements, lost acknowledgements, disabled and
+  unwritable sender caches, same-ID cleanup, simultaneous stores and deletion
+  with retained fds, and expiry with an injected clock (ctime cannot be set);
+  the hash table never gives a false negative; traversal tests on a temporary
+  tree (hard links,
   symlink loops, dot names and `exclude`, immutable roots and their
   identifiers (two copies under `name`, `strip_prefix`, and `literal`, as
   directories and as single files, scanned once; the stored path moves when
@@ -2346,21 +2453,32 @@ The sender's table stays custom (section 5.5).
   offset, a REF without a pin at `c` rejected as a protocol error, pins
   released after the last data frame, and identical content queried at
   several offsets that shares one buffer with one pin per offset; a negative
-  cache hit needs a Blake3 match, and a
-  different window with the same weak hash is still queried; the empty list
-  (`N = 0`) and a segment with an empty removed or added list round-trip; a
+  cache hit needs a full strong-hash match, and a different window with the
+  same weak hash is still queried; the empty list
+  (`N = 0`) and a delta with an empty removed or added list round-trip; a
   list sent over several LISTDATA frames, and a transfer whose bytes do not
   match the announced length or hash is rejected; an interrupted update
   (section 4.4): an immutable root left incomplete is traversed again and
-  then marked complete, an inode left with a NULL `size` is hashed again,
-  block rows of one file spread over several transactions, a `Path` message
-  that arrives before the `Begin` of its inode, the generation read in one
-  snapshot with the rows it describes, and the checkpoint before publication
-  (after an export, `wal_checkpoint` reports no frames left in the WAL); the
+  then assigned its identifier; NULL-sized inodes invalidate referring
+  immutable roots before recovery removes them; complete inodes survive path
+  reconstruction; interleaved block batches span transactions safely; paths
+  arriving before Begin await End, Unchanged, Omit, or Abandon; RootDone
+  cannot precede a pending inode result; per-file read/open failures leave
+  other files indexed; stale orphans are removed after any successful update;
+  and an in-place rebuild interrupted before secondary-index creation recovers.
+  SQLite process access: the schema read acquires exclusion, same-process
+  normal readers retain WAL snapshots, external readers/writers wait, and
+  independent read-only processes coexist while excluding a writer. Test
+  with the bundled SQLite build, separate processes, and fresh connections; the
   database boundary (section 4.4): a size of `2^63` or more and a path that
   is not valid UTF-8 round-trip through the index, and the run opens that
-  path; an indexed file replaced by a FIFO or
-  a directory gets a "no" without blocking, at run time and in the indexer;
+  path; FIFO/socket rejection by O_DIRECTORY, descriptor-based identity
+  after pathname replacement or unlink, and nonblocking rejection of special
+  file candidates; single-file roots; alternate hardlink paths and immutable
+  copies; one configurable attempt budget across all locations; a forced
+  16-byte-prefix collision rejected by full hash verification; both strong
+  algorithms and a rebuild on algorithm change; sparse files whose allocated
+  size exceeds logical size, unsupported hole seeking, and trailing holes;
   every event of the table in section 6.7 ends both roles, including a
   command whose descendant keeps stdout open, and the command's process group
   is gone afterwards;
@@ -2379,9 +2497,6 @@ The sender's table stays custom (section 5.5).
 
 ## 12. Open questions
 
-- **Stored Blake3 length.** 32 bytes as specified, or 16 bytes in the row and
-  in `blocks_by_blake3`, to save about a quarter of the index and of the
-  writer's work (section 4.4).
 - **Adaptive compression level.** The streaming encoder of the `zstd` crate
   exposes `set_parameter(CParameter::CompressionLevel)`, and libzstd applies a
   new level to the next job of a multithreaded stream, so the setter exists.
@@ -2392,7 +2507,7 @@ The sender's table stays custom (section 5.5).
   32, and 64 threads.
 - **Spinning disks.** A per-root limit on concurrent readers and reading in
   inode order; not in the first version.
-- **Removals as positions in the delta.** A segment encodes removed hashes as
+- **Removals as positions in the delta.** The delta encodes removed hashes as
   64-bit values, about 46 bits each. The sender holds the old list, so a
   removal could be its rank in that list: the gaps between ranks cost about
   `log2(N / n_removed) + 2` bits, 5 to 6 bits at 10 % churn. This cuts the
@@ -2409,11 +2524,11 @@ The sender's table stays custom (section 5.5).
   length of the rescans on a real tree and a slow link before adding them.
 - **Dense false weak hits.** A stale hash list, or content that the table
   still names but the receiver no longer holds, can hit the table at many
-  distinct offsets, and each hit costs a Blake3 computation; the query-state
+  distinct offsets, and each hit costs a strong hash computation; the query-state
   map avoids only a second computation at the same offset (section 6.3).
   Measure whether this happens on real streams.
 - **Throughput on matched streams.** The scanner skips every queried window,
-  so a stream whose content is all indexed costs one Blake3 and one query
+  so a stream whose content is all indexed costs one strong hash and one query
   per block on the sender, and the throughput is bounded by
   `lookahead / query_latency` (section 6.1) and by the receiver's disk. Measure
   such a stream against the receiver's disk rate and the link.
