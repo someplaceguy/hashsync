@@ -106,9 +106,19 @@ operations and are not timeouts.
 ### 4.2 Roots and change detection
 
 Roots come from `config.toml`; a glob match can be a directory or a single
-regular file. Globs use `glob` with literal path separators and matching of
-leading dots enabled; `**` spans path components. Thus `/nix/store/*` also
-matches `/nix/store/.links`.
+regular file. Root and exclusion globs use `gix-glob`'s raw `wildmatch`
+interface in pathname mode, with case-sensitive matching and leading dots
+included. `*`, `?`, and bracket classes cannot match `/`; `**` spans path
+components. Matching operates on bytes, including `?` and bracket ranges.
+Both patterns and filenames may contain non-UTF-8 bytes; never reject them
+for that reason or convert them lossily. Section 7 defines how to spell
+those bytes in configuration. Thus `/nix/store/*` also matches
+`/nix/store/.links` and non-UTF-8 names.
+
+`gix-glob` supplies matching, not filesystem expansion. Expand root patterns
+with descriptor-relative directory walking using the no-symlink rules of
+section 4.5. Detect directory cycles during recursive expansion, before
+index traversal begins.
 
 Resolve roots for every update, run (including `--no-update`), and prune.
 After exclusions, reject duplicate or nested absolute paths before changing
@@ -151,7 +161,8 @@ forms. They are allowed only on immutable roots.
 All configured copies sharing an identifier must have the same indexing
 policy: identical `exclude` pattern sets, ignoring order and duplicates,
 and equal `one_filesystem` values after applying defaults. Compare the
-configured patterns, without attempting to prove glob equivalence.
+patterns after byte-escape decoding and glob quoting, without attempting
+to prove glob equivalence.
 Conflicting policies are a configuration error, including for completed
 groups and `--no-update` runs; reject them before changing the index.
 
@@ -487,6 +498,8 @@ generation-based shortcut.
 
 Use a custom open-addressing table of 32-bit fingerprints in a flat array:
 
+- For `N = 0`, allocate no buckets and return a miss for every lookup,
+  without computing a bucket address. The remaining rules apply to `N > 0`.
 - A bucket contains 16 slots, occupying one cache line.
   `buckets = ceil(N / (16 * 0.7))`.
 - Map `v` to `high64(v * buckets)` using a 128-bit product.
@@ -977,7 +990,7 @@ cancelled or joined; normal and fatal shutdown end the process.
 | Role | Responsibilities |
 |---|---|
 | Sender main | Handshake, command startup, then receive END_ACK or detect receiver disappearance. |
-| Sender reader | Fill lookahead until stdout EOF, then wait for the command and publish its status. |
+| Sender reader | Fill lookahead until stdout EOF, then observe command exit without reaping and publish its status. |
 | Sender scanner | Own records and query states; queue queries and output. |
 | Sender data writer | Drain output in order, compress, flush, and publish data completion after END. |
 | Sender control reader/writer | Receive answers and send queries promptly, independently of data output. |
@@ -989,6 +1002,14 @@ cancelled or joined; normal and fatal shutdown end the process.
 Command exit and stdout EOF can occur in either order, for example when a
 descendant retains stdout. END requires both. Blocking output provides
 backpressure; it must not prevent independent control traffic.
+
+Keep successfully spawned children unreaped until their owning `hashsync`
+process exits. Obtain command and SSH exit statuses with
+`waitid(P_PID, pid, WEXITED | WNOWAIT)`; do not use reaping waits such as
+`Child::wait` or `Child::try_wait`. Before spawning, set `SIGCHLD` to
+`SIG_DFL` with `SA_NOCLDWAIT` clear. Retaining the command's group leader
+reserves its process-group ID, and retaining the SSH children reserves their
+PIDs, so late cleanup cannot signal an unrelated process after ID reuse.
 
 ### 6.7 Shutdown
 
@@ -1047,9 +1068,9 @@ Normal completion:
    socket and exit zero. Closing the control socket lets `attach` flush and
    exit zero even though its stdin is still open.
 6. The receiver drains data-session stdout to transport EOF, rejecting any
-   trailing bytes, and waits for both SSH processes. Both must exit zero;
-   otherwise the transfer failed even if END was received. After success it
-   closes the session pipes and exits with END's command status.
+   trailing bytes, and observes both SSH exits without reaping. Both must
+   exit zero; otherwise the transfer failed even if END was received. After
+   success it closes the session pipes and exits with END's command status.
 
 The receiver's Completing transition uses the same lock as pin allocation
 and response publication. This prevents late lookup completion from trying
@@ -1108,6 +1129,49 @@ one_filesystem = true
 Width, weak-hash multiplier, and mixer are protocol constants. Account IDs
 are persistent state, not TOML options.
 
+**Byte strings.** TOML strings contain Unicode characters, not arbitrary
+bytes. Even TOML 1.1's `"\xFF"` denotes U+00FF, whose UTF-8 bytes are
+`C3 BF`, not the single byte `FF`. After TOML parsing, `hashsync` interprets
+the following syntax in `index_path`, `pin_directory`, `sender_command`,
+root `path` and `exclude` values, and identifier `literal` and `strip_prefix`
+values. For `ssh`, shell-split first, then decode each argv word.
+
+| Text after TOML parsing | Meaning |
+|---|---|
+| `\xHH` | One byte; exactly two hexadecimal digits, with either letter case. |
+| `\\` | One literal backslash byte. |
+| Ordinary Unicode text | Its UTF-8 bytes, without normalization. |
+
+Decode once, from left to right; never interpret decoded bytes as another
+escape. A trailing backslash, malformed hex escape, or unsupported escape
+is a configuration error. Octal escapes are not supported. NUL is invalid
+in paths, path patterns, and process arguments; literal identifiers may
+contain it. Non-UTF-8 bytes are valid in all these byte-string fields.
+Other configuration fields retain their ordinary TOML meanings. Do not
+apply configuration escapes to names read from the filesystem or to CLI
+arguments.
+
+In globs, byte escapes produce literal bytes, not glob operators:
+`\x2A` matches a literal `*`, while an unescaped `*` is a wildcard.
+Also allow `\*`, `\?`, `\[`, `\]`, `\-`, `\!`, and `\^` to quote those
+characters in glob patterns. Preserve this quoting when producing the raw
+byte pattern for `gix-glob`; a decoded backslash must not introduce a second
+glob escape. A decoded `/` remains a path separator. Use the raw matcher
+without Git ignore-file negation or repository-relative path rewriting.
+
+Prefer single-quoted TOML literal strings so TOML preserves the backslashes.
+In double-quoted TOML strings, double each backslash for the TOML layer:
+`'/srv/\xFF/*'` and `"/srv/\\xFF/*"` specify the same pattern.
+
+```toml
+[[roots]]
+path = '/srv/archive-\xFF'  # byte FF in the root directory name
+immutable = true
+identifier = { literal = 'archive-\xFF' }
+exclude = ['*.tmp', 'literal\x2Aname', 'back\\slash']
+# The last two exclusions match the literal names "literal*name" and "back\slash".
+```
+
 ## 8. Command line
 
 - `hashsync update [--rebuild] [-j N]`: update or rebuild the index;
@@ -1144,7 +1208,7 @@ SIMD support require a target C compiler. There is no separate pure-Rust build.
 | Indexing pool and channels | `rayon`, `crossbeam-channel`; blocking standard threads for transfer |
 | Compression | `zstd` binding libzstd with worker-thread support |
 | Anonymous pin files | `tempfile`; hole punching through `rustix` |
-| Configuration and CLI | `serde`, `toml`, `clap`, `glob` |
+| Configuration and CLI | `serde`, `toml`, `clap`; `gix-glob` for byte patterns and paths |
 | Maps and caches | Standard maps with a fast hasher; `lru` for bounded caches |
 | Signals | `signal-hook` |
 | Tests | `proptest`, `tempfile`, and frame-decoder fuzzing |
@@ -1195,18 +1259,23 @@ decision history is in version control.
   bump.
 - Run `cargo fmt`, `cargo clippy --all-targets`, and `cargo test` for
   implementation changes.
-- Validate hashing/encoding properties and absence of table false negatives;
+- Validate hashing/encoding properties, empty-table misses, and absence of
+  table false negatives;
   byte-exact reconstruction under rescans, late answers, and backpressure;
   pin-file appends and reclamation with slow stdout, concurrent lookups,
   rejected-query rescans, and late answers; obsolete writes, unaligned block
   sizes, neighbor preservation during hole punching, pin-file failures,
   corruption detection, and cleanup on exit; filesystem races and sparse
-  files; fatal cycles and descent into another root; hard links within and
-  across roots (including links to a single-file root); conflicting copy policies;
+  files; configuration byte escapes, TOML quoting, literal glob metacharacters,
+  and non-UTF-8 root, exclusion, and identifier values; symlinks and cycles
+  during root expansion; fatal cycles and descent into another root; hard links
+  within and across roots (including links to a single-file root); conflicting
+  copy policies;
   crash recovery and SQLite process exclusion and snapshots after worker
   connections open; cache publication and cleanup races; both END_ACK/data
   completion orderings, truncated compression trailers, late lookups, relay
-  closure with control writes in flight, and shutdown on session loss. Use
+  closure with control writes in flight, shutdown on session loss, and fatal
+  cleanup after a child's exit status has been collected without reaping. Use
   separate processes for locking tests and fuzz protocol decoding.
 - Package with Nix `rustPlatform.buildRustPackage`, including support for
   cross and static builds.
