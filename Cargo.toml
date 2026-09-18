@@ -1,0 +1,36 @@
+[package]
+name = "hashsync"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+blake3 = "1.8.7"
+bstr = "1.13.1"
+clap = { version = "4.6.7", features = ["derive"] }
+crossbeam-channel = "0.5.17"
+foldhash = "0.2.0"
+gix-glob = "0.27.1"
+libc = "0.2.189"
+linux-raw-sys = { version = "0.12.1", features = ["ioctl", "general"] }
+rayon = "1.12.0"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+rustix = { version = "1.1.5", features = ["fs", "process", "rand"] }
+serde = { version = "1.0.229", features = ["derive"] }
+sha2 = "0.11.0"
+toml = "1.1.6"
+
+[dev-dependencies]
+proptest = "1.11.0"
+tempfile = "3.27.0"
+
+[lints.rust]
+# Only `src/sys.rs` may use unsafe code (DESIGN.md §11).
+unsafe_code = "deny"
+
+# All profiles abort on panic (DESIGN.md §11). Cargo ignores the setting for
+# the test profile, which needs unwinding for the test harness.
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

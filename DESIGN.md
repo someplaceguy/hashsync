@@ -1,7 +1,7 @@
 # hashsync
 
 This document specifies the purpose and design of `hashsync`. Update it when
-the design changes. The project is at the design stage; no code exists yet.
+the design changes. `PLAN.md` orders the implementation.
 
 ## 1. Purpose
 
@@ -403,7 +403,9 @@ no further data before EOF. Unsupported seeking (`EINVAL` or
 file. Use separate SEQUENTIAL and NOREUSE cache-advice calls as optional hints.
 
 Opening, metadata, directory-listing, and reading errors are local: log
-them, abandon the entry, and continue. A directory failure also skips unread
+them, abandon the entry, and continue. An entry that vanishes before it is
+opened is skipped silently. Entries that are not indexed are normal and do
+not change the exit status. A directory failure also skips unread
 descendants. Mark the root unsuccessful so an immutable traversal is retried.
 If inode work has begun, remove its partial result through the writer.
 Supported identity and hole-seeking fallbacks are not failures. Database

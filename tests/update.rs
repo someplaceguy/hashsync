@@ -1,0 +1,376 @@
+//! Behavioral tests of `hashsync update` and `hashsync stats` through the
+//! binary.
+
+mod common;
+
+use std::os::unix::ffi::OsStringExt;
+use std::os::unix::fs::symlink;
+use std::process::Command;
+
+use common::*;
+
+#[test]
+fn indexes_complete_useful_blocks() {
+    let env = Env::new();
+    env.write("tree/empty", &[]);
+    env.write("tree/small", &random(BLOCK - 1, 1));
+    env.write("tree/one_block", &random(BLOCK, 2));
+    env.write("tree/two_and_half", &random(BLOCK * 2 + BLOCK / 2, 3));
+    env.write("tree/zeros", &vec![0u8; BLOCK * 3]);
+    env.write("tree/pattern16", &pattern16(BLOCK * 2));
+    let mut mixed = random(BLOCK * 3, 4);
+    mixed[BLOCK..2 * BLOCK].fill(7);
+    env.write("tree/sub/dir/mixed", &mixed);
+    env.configure(&env.root("tree", ""));
+
+    let stderr = env.update();
+    // Periodic-only files are hashed too; they just add no rows.
+    assert!(stderr.contains("5 files hashed"), "{stderr}");
+    assert!(stderr.contains("6 periodic"), "{stderr}");
+
+    assert_eq!(env.count("SELECT count(*) FROM inodes"), 3);
+    assert_eq!(
+        env.count("SELECT count(*) FROM inodes WHERE size IS NULL"),
+        0
+    );
+    assert_eq!(env.count("SELECT count(*) FROM blocks"), 1 + 2 + 2);
+    assert_eq!(env.count("SELECT count(*) FROM roots"), 1);
+    assert_eq!(env.count("SELECT count(*) FROM filesystems"), 1);
+    assert_eq!(
+        env.tree_paths(),
+        vec!["one_block", "sub/dir/mixed", "two_and_half"]
+    );
+    assert_eq!(env.block_numbers("sub/dir/mixed"), vec![0, 2]);
+    assert_eq!(env.block_numbers("two_and_half"), vec![0, 1]);
+
+    // Stored strong prefixes are the first 16 bytes of BLAKE3.
+    let expected = blake3::hash(&random(BLOCK, 2)).as_bytes()[..16].to_vec();
+    assert_eq!(env.strong_prefixes("one_block"), vec![expected]);
+    let sizes: i64 = env.count("SELECT sum(size) FROM inodes");
+    assert_eq!(sizes as usize, BLOCK + (BLOCK * 2 + BLOCK / 2) + BLOCK * 3);
+
+    // Secondary indexes exist after the update.
+    assert_eq!(
+        env.count("SELECT count(*) FROM sqlite_master WHERE name IN ('blocks_by_weak', 'blocks_by_strong')"),
+        2
+    );
+}
+
+#[test]
+fn sha256_strong_hash() {
+    let env = Env::new();
+    env.write("tree/f", &random(BLOCK, 9));
+    env.configure(&format!(
+        "strong_hash = \"sha256\"\n{}",
+        env.root("tree", "")
+    ));
+    env.update();
+    let expected = <sha2::Sha256 as sha2::Digest>::digest(random(BLOCK, 9))[..16].to_vec();
+    assert_eq!(env.strong_prefixes("f"), vec![expected]);
+    assert!(env.stats().contains("strong hash:      sha256"));
+}
+
+#[test]
+fn exclusions_by_name_and_path() {
+    let env = Env::new();
+    env.write("tree/keep", &random(BLOCK, 1));
+    env.write("tree/skip.tmp", &random(BLOCK, 2));
+    env.write("tree/.cache/f", &random(BLOCK, 3));
+    env.write("tree/deep/.cache/g", &random(BLOCK, 4));
+    env.write("tree/absolute/f", &random(BLOCK, 5));
+    env.write("tree/other/absolute/f", &random(BLOCK, 6));
+    let absolute = format!("{}/absolute", env.tree().display());
+    env.configure(&env.root(
+        "tree",
+        &format!("exclude = ['*.tmp', '.cache', '{absolute}']"),
+    ));
+    env.update();
+    assert_eq!(env.tree_paths(), vec!["keep", "other/absolute/f"]);
+}
+
+#[test]
+fn hard_links_within_and_across_roots() {
+    let env = Env::new();
+    env.write("tree/a/one", &random(BLOCK * 2, 1));
+    env.mkdir("tree/b");
+    std::fs::hard_link(env.path("tree/a/one"), env.path("tree/a/two")).unwrap();
+    std::fs::hard_link(env.path("tree/a/one"), env.path("tree/b/three")).unwrap();
+    // A link to a single-file root outside the directory root.
+    env.mkdir("elsewhere");
+    std::fs::hard_link(env.path("tree/a/one"), env.path("elsewhere/root-file")).unwrap();
+    // A small file with two links has no rows.
+    env.write("tree/a/small", &random(10, 2));
+    std::fs::hard_link(env.path("tree/a/small"), env.path("tree/b/small")).unwrap();
+    env.configure(&format!(
+        "{}{}",
+        env.root("tree", ""),
+        env.root("elsewhere/root-file", "")
+    ));
+    let stderr = env.update();
+    assert!(stderr.contains("1 files hashed"), "{stderr}");
+    assert!(stderr.contains("3 hard links"), "{stderr}");
+
+    assert_eq!(env.count("SELECT count(*) FROM inodes"), 1);
+    assert_eq!(env.count("SELECT count(*) FROM blocks"), 2);
+    assert_eq!(env.count("SELECT count(*) FROM roots"), 2);
+    let paths = env.paths();
+    assert_eq!(paths.len(), 4);
+    assert_eq!(env.tree_paths(), vec!["a/one", "a/two", "b/three"]);
+    let root_file = paths
+        .iter()
+        .find(|(root, _)| root.ends_with(b"root-file"))
+        .unwrap();
+    assert!(
+        root_file.1.is_empty(),
+        "a single-file root has an empty rel_path"
+    );
+}
+
+#[test]
+fn symlinks_and_special_files_are_skipped() {
+    let env = Env::new();
+    env.write("tree/real", &random(BLOCK, 1));
+    env.write("outside/target", &random(BLOCK, 2));
+    symlink(env.path("outside/target"), env.path("tree/link")).unwrap();
+    symlink(env.path("outside"), env.path("tree/dirlink")).unwrap();
+    symlink("nowhere", env.path("tree/dangling")).unwrap();
+    let status = Command::new("mkfifo")
+        .arg(env.path("tree/fifo"))
+        .status()
+        .unwrap();
+    assert!(status.success());
+    env.configure(&env.root("tree", ""));
+    env.update();
+    assert_eq!(env.tree_paths(), vec!["real"]);
+}
+
+#[test]
+fn sparse_file_holes_are_skipped() {
+    use std::io::{Seek, SeekFrom, Write};
+    let env = Env::new();
+    env.mkdir("tree");
+    let mut file = std::fs::File::create(env.path("tree/sparse")).unwrap();
+    file.set_len((BLOCK * 10) as u64).unwrap();
+    file.write_all(&random(BLOCK, 1)).unwrap();
+    file.seek(SeekFrom::Start((BLOCK * 7) as u64)).unwrap();
+    file.write_all(&random(BLOCK, 2)).unwrap();
+    // A partial overlap with the hole is still read in full.
+    file.seek(SeekFrom::Start((BLOCK * 9 + 100) as u64))
+        .unwrap();
+    file.write_all(&random(100, 3)).unwrap();
+    drop(file);
+    env.configure(&env.root("tree", ""));
+    env.update();
+    assert_eq!(env.block_numbers("sparse"), vec![0, 7, 9]);
+}
+
+#[test]
+fn non_utf8_names_and_literal_metacharacters() {
+    let env = Env::new();
+    let dir = env.path(os(b"tree/arch-\xff"));
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(dir.join(os(b"f\xfe")), random(BLOCK, 1)).unwrap();
+    std::fs::write(dir.join("literal*name"), random(BLOCK, 2)).unwrap();
+    std::fs::write(dir.join("literalXname"), random(BLOCK, 3)).unwrap();
+    std::fs::write(dir.join("back\\slash"), random(BLOCK, 4)).unwrap();
+    std::fs::write(dir.join("[x]"), random(BLOCK, 5)).unwrap();
+    std::fs::write(dir.join("x"), random(BLOCK, 6)).unwrap();
+    let mut root = env.tree().into_os_string().into_vec();
+    root.extend_from_slice(b"/arch-\\xFF");
+    env.configure_with(&format!(
+        "block_size = {BLOCK}\n[[roots]]\npath = '{}'\nexclude = ['literal\\x2Aname', 'back\\\\slash', '\\[x\\]']\n",
+        String::from_utf8_lossy(&root)
+    ));
+    env.update();
+    let mut rels: Vec<Vec<u8>> = env.paths().into_iter().map(|(_, rel)| rel).collect();
+    rels.sort();
+    assert_eq!(
+        rels,
+        vec![b"f\xfe".to_vec(), b"literalXname".to_vec(), b"x".to_vec()]
+    );
+    let roots: Vec<Vec<u8>> = env.paths().into_iter().map(|(root, _)| root).collect();
+    assert!(roots[0].ends_with(b"/arch-\xff"));
+}
+
+#[test]
+fn root_pattern_expansion() {
+    let env = Env::new();
+    env.write("tree/a/f", &random(BLOCK, 1));
+    env.write("tree/b/f", &random(BLOCK, 2));
+    env.write("tree/.hidden/f", &random(BLOCK, 3));
+    env.write("tree/file", &random(BLOCK, 4));
+    env.write("tree/small", &random(10, 5));
+    symlink(env.path("tree/a"), env.path("tree/link")).unwrap();
+    env.configure(&env.root("tree/*", "exclude = ['.hidden']"));
+    env.update();
+    // a, b, file, small are roots; .hidden is excluded; link is a symlink.
+    assert_eq!(env.count("SELECT count(*) FROM roots"), 4);
+    assert_eq!(env.count("SELECT count(*) FROM paths"), 3);
+
+    // `**` spans directories; a pattern matching nothing only warns.
+    env.write("tree/x/y/leaf", &random(BLOCK, 6));
+    env.write("tree/leaf", &random(BLOCK, 7));
+    env.configure(&format!(
+        "{}{}",
+        env.root("tree/**/leaf", ""),
+        env.root("tree/missing/*", "")
+    ));
+    let stderr = env.update();
+    assert!(stderr.contains("matched nothing"), "{stderr}");
+    assert_eq!(env.count("SELECT count(*) FROM roots"), 2);
+    assert_eq!(env.count("SELECT count(*) FROM paths"), 2);
+}
+
+#[test]
+fn duplicate_and_nested_roots_are_rejected() {
+    let env = Env::new();
+    env.write("tree/a/f", &random(BLOCK, 1));
+    env.configure(&format!(
+        "{}{}",
+        env.root("tree", ""),
+        env.root("tree/a", "")
+    ));
+    let stderr = env.update_fails();
+    assert!(stderr.contains("is inside root"), "{stderr}");
+
+    env.configure(&format!(
+        "{}{}",
+        env.root("tree/*", ""),
+        env.root("tree/a", "")
+    ));
+    let stderr = env.update_fails();
+    assert!(stderr.contains("matched by both"), "{stderr}");
+
+    // The index was not changed by the rejected configurations.
+    assert!(!env.index_path().exists() || env.count("SELECT count(*) FROM roots") == 0);
+}
+
+#[test]
+fn updates_reflect_changes_and_rebuilds() {
+    let env = Env::new();
+    env.write("tree/stays", &random(BLOCK, 1));
+    env.write("tree/goes", &random(BLOCK, 2));
+    env.write("tree/shrinks", &random(BLOCK * 2, 3));
+    env.write("tree/moves", &random(BLOCK, 4));
+    env.configure(&env.root("tree", ""));
+    env.update();
+    assert_eq!(env.count("SELECT count(*) FROM inodes"), 4);
+    let index_id = env.index_id();
+
+    std::fs::remove_file(env.path("tree/goes")).unwrap();
+    env.write("tree/shrinks", &random(10, 3));
+    std::fs::rename(env.path("tree/moves"), env.path("tree/moved")).unwrap();
+    env.write("tree/new", &random(BLOCK, 5));
+    env.update();
+    assert_eq!(env.tree_paths(), vec!["moved", "new", "stays"]);
+    assert_eq!(env.count("SELECT count(*) FROM inodes"), 3);
+    assert_eq!(env.count("SELECT count(*) FROM blocks"), 3);
+    assert_eq!(
+        env.index_id(),
+        index_id,
+        "a plain update keeps the index ID"
+    );
+
+    let output = env.run(&["update", "--rebuild"]);
+    assert!(output.status.success());
+    assert_ne!(env.index_id(), index_id, "a rebuild renews the index ID");
+    assert_eq!(env.count("SELECT count(*) FROM inodes"), 3);
+
+    // Changed settings rebuild the index in place.
+    let rebuilt_id = env.index_id();
+    env.configure_with(&format!(
+        "block_size = {}\n{}",
+        BLOCK * 2,
+        env.root("tree", "")
+    ));
+    let stderr = env.update();
+    assert!(stderr.contains("rebuilding"), "{stderr}");
+    assert_ne!(env.index_id(), rebuilt_id);
+    assert_eq!(
+        env.count("SELECT count(*) FROM inodes"),
+        0,
+        "no file has a full 8 KiB block"
+    );
+    assert_eq!(
+        env.count("SELECT value FROM meta WHERE key = 'block_size'"),
+        (BLOCK * 2) as i64
+    );
+}
+
+#[test]
+fn stats_reports_the_index() {
+    let env = Env::new();
+    env.configure(&env.root("tree", ""));
+    let output = env.run(&["stats"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no index"));
+
+    env.write("tree/f", &random(BLOCK * 2, 1));
+    env.update();
+    let stats = env.stats();
+    assert!(stats.contains("schema version:   1"), "{stats}");
+    assert!(
+        stats.contains(&format!("block size:       {BLOCK}")),
+        "{stats}"
+    );
+    assert!(stats.contains("strong hash:      blake3"), "{stats}");
+    assert!(
+        stats.contains("inodes:           1 (0 incomplete)"),
+        "{stats}"
+    );
+    assert!(stats.contains("paths:            1"), "{stats}");
+    assert!(stats.contains("blocks:           2"), "{stats}");
+    assert!(stats.contains("distinct weak:    2"), "{stats}");
+    assert!(
+        stats.contains(&format!("indexed bytes:    {}", BLOCK * 2)),
+        "{stats}"
+    );
+
+    // Stats of an incompatible index still print, with a warning.
+    env.configure_with(&format!(
+        "block_size = {}\n{}",
+        BLOCK * 2,
+        env.root("tree", "")
+    ));
+    let output = env.run(&["stats"]);
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("differ from the configuration"));
+}
+
+#[test]
+fn unreadable_entries_are_skipped_with_a_warning() {
+    if rustix::process::geteuid().is_root() {
+        eprintln!("skipped: root ignores permissions");
+        return;
+    }
+    let env = Env::new();
+    env.write("tree/ok", &random(BLOCK, 1));
+    env.write("tree/secret/f", &random(BLOCK, 2));
+    env.write("tree/unreadable", &random(BLOCK, 3));
+    env.chmod("tree/secret", 0o000);
+    env.chmod("tree/unreadable", 0o000);
+    env.configure(&env.root("tree", ""));
+    let stderr = env.update();
+    env.chmod("tree/secret", 0o755);
+    assert!(
+        stderr.contains("secret: reopen: Permission denied"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("unreadable: reopen: Permission denied"),
+        "{stderr}"
+    );
+    assert_eq!(env.tree_paths(), vec!["ok"]);
+    assert_eq!(
+        env.count("SELECT count(*) FROM inodes WHERE size IS NULL"),
+        0
+    );
+}
+
+#[test]
+fn missing_configuration_fails() {
+    let env = Env::new();
+    let output = env.run(&["update"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cannot read configuration file"));
+}
