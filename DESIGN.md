@@ -222,6 +222,11 @@ Use persistent identities:
 `(fs_id, handle)` is the identity used both by the index and scan-time
 visited sets. SQLite assigns integer IDs for foreign keys.
 
+Distinct filesystems retaining identical filesystem IDs and inode handles,
+such as block-level clones mounted together, are unsupported. They may be
+mistaken for aliases or hard links. Full content verification still protects
+reconstructed output.
+
 Cache filesystem resolution per scan by
 `(stx_mnt_id, stx_dev_major, stx_dev_minor)`, resolving again when this
 triple differs from the parent's. A mount ID alone misses btrfs subvolume
