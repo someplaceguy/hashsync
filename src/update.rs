@@ -7,12 +7,11 @@ use bstr::ByteSlice;
 use crossbeam_channel::bounded;
 use rustix::process::{Resource, getrlimit, setrlimit};
 
-use crate::blocks::BlockHasher;
 use crate::config::Config;
 use crate::fsid::FsCache;
 use crate::index::{self, Settings, writer};
-use crate::roots::{self, Registry};
-use crate::scan::{ScanRoot, Scanner};
+use crate::roots;
+use crate::scan::{self, ScanRoot};
 
 /// Messages in flight between workers and the writer. Each message is
 /// bounded (`blocks::BATCH_ROWS` rows or one path), so this bounds memory.
@@ -53,37 +52,24 @@ pub fn run(config: &Config, rebuild: bool) {
 
     let fs_cache = FsCache::new();
     let locations = roots::expand(config, &fs_cache);
-    let registry = Registry::new(&locations);
     let paths: Vec<&[u8]> = locations.iter().map(|l| l.path.as_slice()).collect();
     let root_ids = index.reconcile_roots(&paths);
-    let scan_roots: Vec<ScanRoot<'_>> = locations
-        .iter()
+    let roots: Vec<ScanRoot> = locations
+        .into_iter()
         .zip(root_ids)
-        .map(|(location, root_id)| ScanRoot {
-            location,
-            config: &config.roots[location.root],
-            root_id,
-        })
+        .map(|(location, root_id)| ScanRoot { location, root_id })
         .collect();
 
     let (tx, rx) = bounded(CHANNEL_CAPACITY);
-    let hasher = BlockHasher::new(config.block_size, config.strong_hash);
     let fs_cache = &fs_cache;
-    let scanner = Scanner::new(&scan_roots, &registry, fs_cache, hasher, tx);
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(thread_count())
-        .thread_name(|i| format!("scan{i}"))
-        .build()
-        .expect("cannot start the scan pool");
     let (counters, (index, summary)) = std::thread::scope(|s| {
         let writer = std::thread::Builder::new()
             .name("writer".into())
             .spawn_scoped(s, move || writer::run(index, fs_cache, rx))
             .expect("cannot start the writer thread");
-        let counters = scanner.run(&pool);
+        let counters = scan::run(config, roots, fs_cache, tx);
         (counters, writer.join().expect("the writer thread panicked"))
     });
-    drop(pool);
 
     let orphans = index.remove_orphans();
     index.ensure_secondary_indexes();
@@ -110,12 +96,6 @@ pub fn run(config: &Config, rebuild: bool) {
         summary.paths,
         orphans
     );
-}
-
-/// `4 × cores`, clamped to 16–64 (DESIGN.md §4.6).
-fn thread_count() -> usize {
-    let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
-    (cores * 4).clamp(16, 64)
 }
 
 /// Raise the soft descriptor limit to the hard limit: every pending task

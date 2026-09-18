@@ -1,14 +1,19 @@
 //! Traversal and hashing of mutable roots (DESIGN.md §4.5 and §4.6).
 //!
-//! One rayon pool runs directory and file tasks. A directory task lists
-//! its entries and queues one task per relevant child, sharing its `O_PATH`
-//! descriptor. A file task claims the file's identity: the first claimer
-//! hashes it and later claimers add hard-link paths. Results go to the
-//! writer thread through a bounded channel.
+//! One rayon pool runs directory and file tasks. A task holds the `O_PATH`
+//! descriptor of its parent directory and opens its own entry when it
+//! starts; root tasks hold the directory that root expansion left open. A
+//! directory task claims the directory's identity in a shared visited set,
+//! where a repeat is fatal, then lists its entries and queues one task per
+//! relevant child. A file task claims the file's identity: the first claimer
+//! hashes it and later claimers add hard-link paths. A root that is not a
+//! directory or a regular file is skipped like any other such entry, but
+//! with a warning, since it is configuration. Results go to the writer
+//! thread through a bounded channel.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
-use std::os::fd::{AsFd, OwnedFd};
+use std::collections::HashMap;
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 
@@ -19,18 +24,16 @@ use rustix::fs::{Dir, FileType};
 use rustix::io::Errno;
 
 use crate::blocks::BlockHasher;
-use crate::config::RootConfig;
+use crate::config::{Config, RootConfig};
 use crate::die::{EXIT_FAILURE, die, warn};
 use crate::fsid::{FsCache, Identity, identify};
 use crate::fsops::{self, Meta};
-use crate::glob;
 use crate::index::writer::{FileId, Msg, RelPath};
-use crate::roots::{self, Location, LocationKind, Registry};
+use crate::roots::{self, Location};
 
 /// A root location to scan and its index row.
-pub struct ScanRoot<'a> {
-    pub location: &'a Location,
-    pub config: &'a RootConfig,
+pub struct ScanRoot {
+    pub location: Location,
     pub root_id: i64,
 }
 
@@ -45,6 +48,65 @@ pub struct Counters {
     pub blocks_in_holes: AtomicU64,
 }
 
+/// Scan every root on a dedicated pool, then close `tx`.
+pub fn run(config: &Config, roots: Vec<ScanRoot>, fs_cache: &FsCache, tx: Sender<Msg>) -> Counters {
+    let mut shared = Vec::with_capacity(roots.len());
+    let mut starts = Vec::with_capacity(roots.len());
+    for ScanRoot {
+        location:
+            Location {
+                root,
+                path,
+                dir,
+                name,
+            },
+        root_id,
+    } in roots
+    {
+        shared.push(Root {
+            path,
+            config: &config.roots[root],
+            root_id,
+        });
+        starts.push((dir, name));
+    }
+    let scanner = Scanner {
+        roots: shared,
+        fs_cache,
+        hasher: BlockHasher::new(config.block_size, config.strong_hash),
+        visited_dirs: Mutex::default(),
+        visited_files: Mutex::default(),
+        tx,
+        counters: Counters::default(),
+    };
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(thread_count())
+        .thread_name(|i| format!("scan{i}"))
+        .build()
+        .expect("cannot start the scan pool");
+    pool.scope(|scope| {
+        for (root, (dir, name)) in starts.into_iter().enumerate() {
+            let scanner = &scanner;
+            scope.spawn(move |scope| scanner.root_task(scope, root, dir, name));
+        }
+    });
+    scanner.counters
+}
+
+/// `4 × cores`, clamped to 16–64 (DESIGN.md §4.6).
+fn thread_count() -> usize {
+    let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+    (cores * 4).clamp(16, 64)
+}
+
+/// What every task under one root shares.
+struct Root<'a> {
+    /// The root's absolute path.
+    path: Vec<u8>,
+    config: &'a RootConfig,
+    root_id: i64,
+}
+
 /// Shared context of a traversed directory.
 struct DirCtx {
     /// The directory's `O_PATH` descriptor, the parent of relative opens.
@@ -53,27 +115,14 @@ struct DirCtx {
     /// Path relative to the root; empty for the root directory.
     rel: Vec<u8>,
     mnt_id: u64,
-    identity: Identity,
-}
-
-/// A root location, reopened and verified.
-enum Opened {
-    Directory {
-        fd: OwnedFd,
-        meta: Meta,
-    },
-    File {
-        fd: OwnedFd,
-        meta: Meta,
-        name: Vec<u8>,
-        parent: Identity,
-    },
 }
 
 /// Why an entry is not indexed. Entries that vanish before they are
-/// opened are normal and silent; other failures are reported.
+/// opened, and symlinks and special files, are normal and silent; failures
+/// are reported.
 enum Skip {
     Vanished,
+    OtherKind,
     Failed(String),
 }
 
@@ -91,48 +140,18 @@ thread_local! {
     static BUFFER: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
-pub struct Scanner<'a> {
-    roots: &'a [ScanRoot<'a>],
-    registry: &'a Registry,
+struct Scanner<'a> {
+    roots: Vec<Root<'a>>,
     fs_cache: &'a FsCache,
     hasher: BlockHasher,
-    visited_dirs: Mutex<HashSet<Identity>>,
+    /// Every claimed directory identity, with the path that claimed it.
+    visited_dirs: Mutex<HashMap<Identity, Vec<u8>>>,
     visited_files: Mutex<HashMap<Identity, FileId>>,
     tx: Sender<Msg>,
     counters: Counters,
 }
 
-impl<'a> Scanner<'a> {
-    pub fn new(
-        roots: &'a [ScanRoot<'a>],
-        registry: &'a Registry,
-        fs_cache: &'a FsCache,
-        hasher: BlockHasher,
-        tx: Sender<Msg>,
-    ) -> Self {
-        Scanner {
-            roots,
-            registry,
-            fs_cache,
-            hasher,
-            visited_dirs: Mutex::new(HashSet::new()),
-            visited_files: Mutex::new(HashMap::new()),
-            tx,
-            counters: Counters::default(),
-        }
-    }
-
-    /// Scan every root on `pool`, then close the writer channel.
-    pub fn run(self, pool: &rayon::ThreadPool) -> Counters {
-        pool.scope(|scope| {
-            for index in 0..self.roots.len() {
-                let scanner = &self;
-                scope.spawn(move |scope| scanner.root_task(scope, index));
-            }
-        });
-        self.counters
-    }
-
+impl Scanner<'_> {
     fn count(&self, counter: impl Fn(&Counters) -> &AtomicU64, n: u64) {
         counter(&self.counters).fetch_add(n, Relaxed);
     }
@@ -142,7 +161,7 @@ impl<'a> Scanner<'a> {
     }
 
     fn abs_path(&self, root: usize, rel: &[u8]) -> Vec<u8> {
-        let base = &self.roots[root].location.path;
+        let base = &self.roots[root].path;
         if rel.is_empty() {
             base.clone()
         } else {
@@ -150,96 +169,15 @@ impl<'a> Scanner<'a> {
         }
     }
 
-    /// Report an entry that is not indexed, and continue.
-    fn report(&self, root: usize, rel: &[u8], skip: Skip) {
-        if let Skip::Failed(message) = skip {
-            warn(format!("{}: {message}", self.abs_path(root, rel).as_bstr()));
-        }
-    }
-
-    fn root_task<'s>(&'s self, scope: &Scope<'s>, index: usize) {
-        let result = match self.open_root(index) {
-            Ok(Opened::Directory { fd, meta }) => {
-                self.visit_dir(scope, fd, &meta, index, Vec::new(), None)
-            }
-            Ok(Opened::File {
-                fd,
-                meta,
-                name,
-                parent,
-            }) => self.visit_file(fd, &meta, index, Vec::new(), &name, &parent),
-            Err(e) => Err(e),
+    fn root_task<'s>(&'s self, scope: &Scope<'s>, root: usize, dir: Arc<OwnedFd>, name: Vec<u8>) {
+        let result = self.open_and_visit(scope, dir.as_fd(), &name, root, Vec::new(), None);
+        let message = match result {
+            Ok(()) => return,
+            Err(Skip::Vanished) => "root does not exist".to_string(),
+            Err(Skip::OtherKind) => "root is not a directory or a regular file".to_string(),
+            Err(Skip::Failed(message)) => message,
         };
-        if let Err(skip) = result {
-            self.report(index, b"", skip);
-        }
-    }
-
-    /// Reopen a root location by walking from `/` and require the
-    /// registered identity to be unchanged.
-    fn open_root(&self, index: usize) -> LocalResult<Opened> {
-        let location = self.roots[index].location;
-        let components: Vec<&[u8]> = glob::components(&location.path).collect();
-        let mut dir = fsops::open_root_dir().map_err(io("open /"))?;
-        let mut dir_meta = fsops::stat(dir.as_fd()).map_err(io("statx"))?;
-        let Some((&name, parents)) = components.split_last() else {
-            // The root is `/` itself.
-            let LocationKind::Directory { identity } = &location.kind else {
-                return Err(Skip::Failed("root is not a directory".into()));
-            };
-            let found = identify(self.fs_cache, dir.as_fd(), &dir_meta).map_err(io("identity"))?;
-            if found != *identity {
-                return Err(Skip::Failed("root location changed".into()));
-            }
-            return Ok(Opened::Directory {
-                fd: dir,
-                meta: dir_meta,
-            });
-        };
-        for component in parents {
-            let next = fsops::open_path(dir.as_fd(), component).map_err(io("open"))?;
-            let meta = fsops::stat(next.as_fd()).map_err(io("statx"))?;
-            if meta.kind != FileType::Directory {
-                return Err(Skip::Failed(format!(
-                    "{}: not a directory",
-                    component.as_bstr()
-                )));
-            }
-            dir = next;
-            dir_meta = meta;
-        }
-        let fd = fsops::open_path(dir.as_fd(), name).map_err(io("open"))?;
-        let meta = fsops::stat(fd.as_fd()).map_err(io("statx"))?;
-        let found = identify(self.fs_cache, fd.as_fd(), &meta).map_err(io("identity"))?;
-        match &location.kind {
-            LocationKind::Directory { identity } => {
-                if meta.kind != FileType::Directory {
-                    return Err(Skip::Failed("root is no longer a directory".into()));
-                }
-                if found != *identity {
-                    return Err(Skip::Failed("root location changed".into()));
-                }
-                Ok(Opened::Directory { fd, meta })
-            }
-            LocationKind::File {
-                identity, parent, ..
-            } => {
-                if meta.kind != FileType::RegularFile {
-                    return Err(Skip::Failed("root is no longer a regular file".into()));
-                }
-                let parent_found =
-                    identify(self.fs_cache, dir.as_fd(), &dir_meta).map_err(io("identity"))?;
-                if found != *identity || parent_found != *parent {
-                    return Err(Skip::Failed("root location changed".into()));
-                }
-                Ok(Opened::File {
-                    fd,
-                    meta,
-                    name: name.to_vec(),
-                    parent: parent_found,
-                })
-            }
-        }
+        warn(format!("{}: {message}", self.abs_path(root, b"").as_bstr()));
     }
 
     fn entry_task<'s>(&'s self, scope: &Scope<'s>, ctx: Arc<DirCtx>, name: Vec<u8>) {
@@ -248,22 +186,39 @@ impl<'a> Scanner<'a> {
         } else {
             roots::join(&ctx.rel, &name)
         };
-        let result = (|| {
-            let fd = fsops::open_path(ctx.fd.as_fd(), &name).map_err(io("open"))?;
-            let meta = fsops::stat(fd.as_fd()).map_err(io("statx"))?;
-            match meta.kind {
-                FileType::Directory => {
-                    self.visit_dir(scope, fd, &meta, ctx.root, rel.clone(), Some(&ctx))
-                }
-                FileType::RegularFile => {
-                    self.visit_file(fd, &meta, ctx.root, rel.clone(), &name, &ctx.identity)
-                }
-                // Symlinks and special files are skipped without I/O.
-                _ => Ok(()),
-            }
-        })();
-        if let Err(skip) = result {
-            self.report(ctx.root, &rel, skip);
+        let result = self.open_and_visit(
+            scope,
+            ctx.fd.as_fd(),
+            &name,
+            ctx.root,
+            rel.clone(),
+            Some(&ctx),
+        );
+        if let Err(Skip::Failed(message)) = result {
+            warn(format!(
+                "{}: {message}",
+                self.abs_path(ctx.root, &rel).as_bstr()
+            ));
+        }
+    }
+
+    /// Open the entry `name` of `dir`, then traverse it as a directory or
+    /// index it as a regular file. Anything else is not opened for I/O.
+    fn open_and_visit<'s>(
+        &'s self,
+        scope: &Scope<'s>,
+        dir: BorrowedFd<'_>,
+        name: &[u8],
+        root: usize,
+        rel: Vec<u8>,
+        parent: Option<&DirCtx>,
+    ) -> LocalResult<()> {
+        let fd = fsops::open_path(dir, name).map_err(io("open"))?;
+        let meta = fsops::stat(fd.as_fd()).map_err(io("statx"))?;
+        match meta.kind {
+            FileType::Directory => self.visit_dir(scope, fd, &meta, root, rel, parent),
+            FileType::RegularFile => self.visit_file(fd, &meta, root, rel),
+            _ => Err(Skip::OtherKind),
         }
     }
 
@@ -284,20 +239,7 @@ impl<'a> Scanner<'a> {
             return Ok(());
         }
         let identity = identify(self.fs_cache, fd.as_fd(), meta).map_err(io("identity"))?;
-        if let Some(owner) = self.registry.directory_owner(&identity)
-            && owner != root
-        {
-            self.die_entered_root(root, &rel, owner);
-        }
-        if !self.visited_dirs.lock().unwrap().insert(identity.clone()) {
-            die(
-                EXIT_FAILURE,
-                format!(
-                    "{}: directory reached twice (cycle or mount alias)",
-                    self.abs_path(root, &rel).as_bstr()
-                ),
-            );
-        }
+        self.claim_dir(identity, root, &rel);
         let readable = fsops::reopen_dir(fd.as_fd()).map_err(io("reopen"))?;
         self.count(|c| &c.directories, 1);
         let ctx = Arc::new(DirCtx {
@@ -305,7 +247,6 @@ impl<'a> Scanner<'a> {
             root,
             rel,
             mnt_id: meta.mnt_id,
-            identity,
         });
         let exclude = &scan_root.config.exclude;
         let dir_abs = self.abs_path(root, &ctx.rel);
@@ -338,20 +279,24 @@ impl<'a> Scanner<'a> {
         Ok(())
     }
 
-    fn visit_file(
-        &self,
-        fd: OwnedFd,
-        meta: &Meta,
-        root: usize,
-        rel: Vec<u8>,
-        name: &[u8],
-        parent: &Identity,
-    ) -> LocalResult<()> {
-        if let Some(owner) = self.registry.file_owner(parent, name)
-            && owner != root
-        {
-            self.die_entered_root(root, &rel, owner);
+    /// Claim a directory identity before traversing the directory. A
+    /// directory reached twice, through a cycle or a mount alias, is fatal
+    /// whatever roots are involved (DESIGN.md §4.5).
+    fn claim_dir(&self, identity: Identity, root: usize, rel: &[u8]) {
+        let path = self.abs_path(root, rel);
+        if let Some(earlier) = self.visited_dirs.lock().unwrap().insert(identity, path) {
+            die(
+                EXIT_FAILURE,
+                format!(
+                    "{} and {} are the same directory (cycle or mount alias)",
+                    earlier.as_bstr(),
+                    self.abs_path(root, rel).as_bstr()
+                ),
+            );
         }
+    }
+
+    fn visit_file(&self, fd: OwnedFd, meta: &Meta, root: usize, rel: Vec<u8>) -> LocalResult<()> {
         let identity = identify(self.fs_cache, fd.as_fd(), meta).map_err(io("identity"))?;
         let (file, first) = self.claim_file(&identity);
         let root_id = self.roots[root].root_id;
@@ -382,18 +327,6 @@ impl<'a> Scanner<'a> {
                 root_id,
                 rel_path: rel,
             },
-        )
-    }
-
-    fn die_entered_root(&self, root: usize, rel: &[u8], owner: usize) -> ! {
-        die(
-            EXIT_FAILURE,
-            format!(
-                "{}: traversal of root {} entered root {}",
-                self.abs_path(root, rel).as_bstr(),
-                self.roots[root].location.path.as_bstr(),
-                self.roots[owner].location.path.as_bstr()
-            ),
         )
     }
 

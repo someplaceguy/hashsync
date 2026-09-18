@@ -8,6 +8,8 @@ use std::process::{Command, Output};
 
 use common::*;
 
+const SAME_DIRECTORY: &str = "are the same directory (cycle or mount alias)";
+
 fn namespaces_available() -> bool {
     Command::new("unshare")
         .args(["-Urm", "true"])
@@ -48,10 +50,7 @@ fn bind_mount_cycle_is_fatal_unless_one_filesystem() {
     let output = update_with_binds(&env, &[("tree/a", "tree/a/b/c")]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(1), "{stderr}");
-    assert!(
-        stderr.contains("reached twice (cycle or mount alias)"),
-        "{stderr}"
-    );
+    assert!(stderr.contains(SAME_DIRECTORY), "{stderr}");
 
     env.configure(&env.root("tree", "one_filesystem = true"));
     let output = update_with_binds(&env, &[("tree/a", "tree/a/b/c")]);
@@ -77,10 +76,7 @@ fn aliased_roots_are_fatal() {
     let output = update_with_binds(&env, &[("tree/x", "tree/y")]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(1), "{stderr}");
-    assert!(
-        stderr.contains("are the same object (mount alias)"),
-        "{stderr}"
-    );
+    assert!(stderr.contains(SAME_DIRECTORY), "{stderr}");
 }
 
 #[test]
@@ -89,6 +85,7 @@ fn entering_another_root_through_an_alias_is_fatal() {
         eprintln!("skipped: no unprivileged user namespaces");
         return;
     }
+    // Whichever traversal claims the directory first, the other one dies.
     let env = Env::new();
     env.write("tree/sub/f", &random(BLOCK, 1));
     env.mkdir("other/x");
@@ -100,27 +97,26 @@ fn entering_another_root_through_an_alias_is_fatal() {
     let output = update_with_binds(&env, &[("tree/sub", "other/x")]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(1), "{stderr}");
-    assert!(stderr.contains("entered root"), "{stderr}");
+    assert!(stderr.contains(SAME_DIRECTORY), "{stderr}");
 }
 
 #[test]
-fn hard_link_to_a_single_file_root_through_an_alias_is_allowed() {
+fn a_file_root_aliased_inside_another_root_is_a_hard_link() {
     if !namespaces_available() {
         eprintln!("skipped: no unprivileged user namespaces");
         return;
     }
-    // A bind mount of a directory makes its file entries aliases too. A
-    // file root is identified by its directory entry, so the same inode
-    // reached through another directory is a hard link, not a conflict.
+    // Only directories are claimed by identity. A single-file root is
+    // handled like any other file, so reaching its inode through a
+    // bind-mounted alias of the other root adds a path instead of
+    // conflicting.
     let env = Env::new();
     env.write("tree/f", &random(BLOCK, 1));
     env.mkdir("mirror");
-    env.mkdir("files");
-    std::fs::hard_link(env.path("tree/f"), env.path("files/root-file")).unwrap();
     env.configure(&format!(
         "{}{}",
         env.root("tree", ""),
-        env.root("files/root-file", "")
+        env.root("mirror/f", "")
     ));
     let output = update_with_binds(&env, &[("tree", "mirror")]);
     let stderr = String::from_utf8_lossy(&output.stderr);

@@ -83,12 +83,10 @@ operations and are not timeouts.
 
 ### 4.1 What gets indexed
 
-- Only regular files, without following symlinks. Repeated directory
-  identities, including bind-mount cycles and aliases, end the update with
-  `die`; traversal never silently skips them.
-- Traversal into another configured root calls `die`, including when reached
-  through a mount alias. Copies sharing an immutable identifier are one
-  logical root.
+- Only regular files, without following symlinks. Directory identities
+  repeated during traversal, including bind-mount cycles and aliases, end
+  the update with `die`, regardless of root or immutable grouping. Root
+  overlap detection is best-effort (section 4.5).
 - Hash each inode once per scan; additional hard links add paths, including
   links across different roots. Sharing a regular-file inode is supported
   and is not itself a traversal conflict.
@@ -122,9 +120,9 @@ index traversal begins.
 
 Resolve roots for every update, run (including `--no-update`), and prune.
 After exclusions, reject duplicate or nested absolute paths before changing
-the index. This check is lexical; traversal also detects entry into another
-configured root through mount aliases (section 4.5). Hard links across
-otherwise separate roots are allowed.
+the index. This check is lexical; mount-alias overlap is detected when
+directory identities repeat during actual traversal (section 4.5). Hard
+links across otherwise separate roots are allowed.
 
 Mutable roots are traversed on every update. Reuse complete inode rows when
 `(size, ctime)` from the open file matches; otherwise rehash. Use kernel
@@ -136,6 +134,11 @@ relative paths from one scanned copy. A non-NULL `roots.identifier` means
 the group was completely indexed. Reuse it without traversal while the
 configuration still names that identifier. NULL means a mutable root or an
 unfinished traversal; configuration supplies the intended kind and identifier.
+
+Copies sharing an identifier promise equivalent content. Directory copies
+must be distinct directories. A change to a copy's root-directory filesystem
+identity or inode handle does not invalidate the completed group or trigger
+a rescan.
 
 All current locations of an immutable group live in memory. Earlier
 `[[roots]]` entries take priority; order within a glob is unspecified. The
@@ -186,11 +189,13 @@ Before scanning, reconcile roots in one transaction:
    including when roots exchange paths. Temporary staging values must remain
    inside this transaction and must never be used for I/O.
 
-Scan every mutable root and one chosen location per unfinished immutable
-group. Publish an immutable identifier only after its traversal and every
-dependent inode result succeeded and committed. A failed chosen copy leaves
-the traversal unfinished; other copies remain available for candidate reads.
-After processing all results, remove every orphaned inode and its blocks.
+Schedule scan tasks for every mutable root and one chosen location per
+unfinished immutable group. Completed groups and unchosen copies have no
+scan tasks. After all scan tasks finish, publish immutable identifiers only
+for groups whose traversals and dependent inode and path results succeeded
+and committed. A failed chosen copy leaves the traversal unfinished; other
+copies remain available for candidate reads. After processing all results,
+remove every orphaned inode and its blocks.
 
 The same reconciliation recovers interrupted updates. Renames and identifier
 changes can reuse complete inodes with unchanged identity, size, and ctime.
@@ -214,7 +219,7 @@ Use persistent identities:
 
 - Filesystem: UUID from `FS_IOC_GETFSUUID`, falling back on unsupported
   filesystems to tagged `f_fsid` from `fstatfs`. An unstable fallback
-  identity causes reindexing after reboot.
+  identity causes scanned files to be rehashed after reboot.
 - Inode: the opaque handle from `name_to_handle_at`, which distinguishes
   inode generations and btrfs subvolumes. On `EOPNOTSUPP`, fall back to a
   tagged inode number.
@@ -360,33 +365,33 @@ apply `O_NOFOLLOW` or `RESOLVE_NO_SYMLINKS` to that step. It requires access
 to `/proc/self/fd`. All descriptors are close-on-exec. Path replacement cannot
 switch the object between checking and reading it.
 
-Before traversal, register current root locations and their logical owners,
-including locations of completed immutable groups. Recognize directory
-roots by directory identity; registering that identity for different logical
-roots is fatal. Recognize single-file root locations by the
-actual directory entry: parent directory identity plus basename. Do not use
-the file inode alone to identify a root location, since another hard link
-to it is allowed. Registration of several copies in one immutable group is
-allowed. Close the registration descriptors; root tasks reopen their entries
-and require the registered location and object identity to be unchanged,
-otherwise abandoning that root. This avoids retaining a descriptor for
-every configured root.
+Open and identify a root when its scan task starts, and use that open object
+for traversal under the descriptor rules above. There is no separate root
+registration pass or close-and-reopen step to compare identities. An identity
+observed during root expansion imposes no continuity requirement on the scan.
 
-A directory task queues relevant children with its shared parent descriptor.
-Before descending into a child, reject entry into another logical root's
-registered location with `die`, reporting both paths. This also catches
-roots whose own tasks have not started or whose immutable index is reused.
-Atomically claim directory and file identities in separate visited sets.
-A second traversal of a directory identity calls `die`, including within
-the same root. Repeated regular files add paths to the first task's result
-regardless of root, preserving all dependent roots and hard-link paths.
-Claims include small files and files without useful blocks.
+Before traversing any directory, including a root, atomically insert its
+`(fs_id, handle)` into the shared directory visited set. A duplicate calls
+`die`, reporting both paths, regardless of root or immutable grouping.
+Retain entries until all scan tasks finish. A directory task then queues
+relevant children with its shared parent descriptor.
 
-These are fatal configuration/traversal errors, without a core dump; do not
-skip the conflicting branch or mark its traversal complete. Completed
-immutable groups and `--no-update` runs are not traversed solely to discover
-hidden overlap. Every conflict that is detected is fatal; interrupted-update
-recovery handles any work committed before detection.
+Claim regular-file identities in a separate visited set. Repeated files add
+paths to the first task's result regardless of root, preserving all dependent
+roots and hard-link paths. Claims include small files and files without
+useful blocks. Single-file roots use the same file handling; no separate
+directory-entry bookkeeping is required to detect overlap beyond the lexical
+root-path checks.
+
+Overlap detection is best-effort. Root expansion has its own cycle detection
+and does not populate the scan's visited sets. Completed immutable groups
+and unused alternate copies are neither opened nor scheduled solely for
+overlap detection. Mount aliases involving skipped roots or copies can go
+undetected. `--no-update` runs perform no index traversal.
+
+Every detected directory conflict calls `die` without a core dump; do not
+skip the conflicting branch or publish new immutable completion markers.
+Interrupted-update recovery handles any work committed before detection.
 
 For a new or changed regular file, obtain the readable descriptor as above
 and read with `pread`, accumulating short reads, and hash useful complete
@@ -442,7 +447,7 @@ but each owner's messages stay ordered:
 | Omit | Remove an inode too small to index and its dependent rows. |
 | Path | Record an additional hard-link path after the owner's result is known. |
 | Abandon | Invalidate referring immutable roots before removing paths and partial inode data; discard pending paths. |
-| RootDone | Publish completion only after a successful traversal and all pending inode dependencies succeed. |
+| RootDone | Record the traversal outcome; completion publication waits until all scan tasks finish and dependent inode and path results commit. |
 
 Every claimed file produces exactly one terminal result: End, Unchanged,
 Omit, or Abandon. Only hashed files send Begin and Blocks. A Path can precede
@@ -451,10 +456,12 @@ paths use the remembered result; a failure makes every dependent root
 unsuccessful. Do not retry an abandoned inode through another hard link
 during the same update.
 
-Remember failed roots even after RootDone. Completion cannot overwrite an
-earlier failure or precede dependent inode and path commits. After all work
-finishes, remove all orphaned inodes and blocks in bounded transactions,
-including orphans left by earlier interrupted cleanup.
+Remember failed roots even after RootDone. Once all scan tasks finish and
+the writer has processed their messages, publish immutable identifiers for
+successful groups whose dependent inode and path results have committed.
+This prevents a group from becoming reusable before a later task detects a
+directory overlap. Then remove all orphaned inodes and blocks in bounded
+transactions, including orphans left by earlier interrupted cleanup.
 
 ## 5. Hashes, hash list, and hash table
 
@@ -1030,8 +1037,9 @@ No extent is punched while its append or REF read is still using it.
 - Invalid frames, unexpected answers, missing pins, protocol arithmetic
   overflow, database errors, and invariant violations are bugs: panic and
   abort.
-- Conflicting immutable-copy policies, repeated directory identities, and
-  traversal into another configured root call `die` without a core dump.
+- Conflicting immutable-copy policies, duplicate or nested root paths, and
+  repeated directory identities detected during expansion or traversal call
+  `die` without a core dump.
 - Filesystem failures during indexing abandon entries; during lookup they
   reject source candidates. Pin-file setup, I/O, reclamation, or verification
   failures end the run with `die` without a core dump; a yes answer cannot
@@ -1339,11 +1347,15 @@ decision history is in version control.
   skipping symlinks and special files without opening them for I/O;
   configuration byte escapes, TOML quoting, literal glob metacharacters,
   and non-UTF-8 root, exclusion, and identifier values; symlinks and cycles
-  during root expansion; fatal cycles and descent into another root; hard links
-  within and across roots (including links to a single-file root); conflicting
-  copy policies; pruning a vanished immutable root and indexing it again
-  when it returns; SSH option precedence and bootstrap quoting of executable
-  paths containing whitespace, quotes, shell metacharacters, and non-UTF-8 bytes;
+  during root expansion; fatal directory cycles and aliases in either
+  traversal order; root replacement between expansion and scanning;
+  immutable reuse after root-directory identity changes; no tasks or opens
+  solely for overlap checks on cached groups or unused copies; completion
+  withheld after a late directory conflict; hard links within and across
+  roots (including links to a single-file root); conflicting copy policies;
+  pruning a vanished immutable root and indexing it again when it returns;
+  SSH option precedence and bootstrap quoting of executable paths containing
+  whitespace, quotes, shell metacharacters, and non-UTF-8 bytes;
   crash recovery and SQLite process exclusion and snapshots after worker
   connections open; cache publication and cleanup races; completion without
   truncation or premature exit under the chosen synchronization scheme;

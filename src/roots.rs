@@ -1,12 +1,16 @@
-//! Root expansion, validation, and registration (DESIGN.md §4.2 and §4.5).
+//! Root expansion and validation (DESIGN.md §4.2).
 //!
 //! Root patterns are expanded by descriptor-relative walking that never
-//! follows symlinks. Each match becomes a `Location` with the identity of
-//! its object, so that traversal can later check that the location is
-//! unchanged and detect entry into another root through a mount alias.
+//! follows symlinks. A pattern without wildcards names its root as written.
+//! Otherwise names come from directory listings, and a literal name after a
+//! wildcard is looked up for existence only. A match is not examined: its
+//! `Location` keeps the directory holding it open, and the root's scan task
+//! opens and classifies the match when it starts (DESIGN.md §4.6). Only the
+//! directories that a pattern continues into are opened here.
 
 use std::collections::HashMap;
 use std::os::fd::{AsFd, OwnedFd};
+use std::sync::Arc;
 
 use bstr::ByteSlice;
 use rustix::fs::{Dir, FileType};
@@ -18,26 +22,18 @@ use crate::fsid::{FsCache, Identity, identify};
 use crate::fsops::{self, Meta};
 use crate::glob::{self, Component};
 
-/// One current location of a configured root.
+/// One current location of a configured root: a directory entry whose
+/// name matched the pattern. Its scan task finds out whether it is a
+/// directory, a regular file, or not a root at all.
 pub struct Location {
     /// Index of the `[[roots]]` entry.
     pub root: usize,
     /// Absolute path bytes, normalized.
     pub path: Vec<u8>,
-    pub kind: LocationKind,
-}
-
-pub enum LocationKind {
-    Directory {
-        identity: Identity,
-    },
-    File {
-        identity: Identity,
-        /// Identity of the directory holding the entry.
-        parent: Identity,
-        /// The entry's basename.
-        name: Vec<u8>,
-    },
+    /// The directory holding the root, shared by every root inside it.
+    pub dir: Arc<OwnedFd>,
+    /// The root's name in `dir`; `.` when the root is `/` itself.
+    pub name: Vec<u8>,
 }
 
 /// Expand every root pattern. Dies on duplicate or nested roots.
@@ -52,11 +48,17 @@ pub fn expand(config: &Config, fs_cache: &FsCache) -> Vec<Location> {
             fs_cache,
             root,
             root_index: index,
+            exact: components
+                .iter()
+                .all(|c| matches!(c, Component::Literal(_))),
             locations: &mut locations,
             visited: HashMap::new(),
         };
         match open_slash() {
-            Ok(node) => walker.walk(&node, &components),
+            Ok(node) => match components.split_first() {
+                None => walker.emit(&node, b".", node.path.clone()),
+                Some((first, rest)) => walker.walk(&node, first, rest),
+            },
             Err(e) => walker.error(b"/", "open", e),
         }
         if locations.len() == before {
@@ -72,7 +74,7 @@ pub fn expand(config: &Config, fs_cache: &FsCache) -> Vec<Location> {
 
 /// An opened directory during expansion.
 struct Node {
-    fd: OwnedFd,
+    fd: Arc<OwnedFd>,
     meta: Meta,
     path: Vec<u8>,
 }
@@ -98,7 +100,7 @@ fn open_slash() -> Result<Node, Errno> {
     let fd = fsops::open_root_dir()?;
     let meta = fsops::stat(fd.as_fd())?;
     Ok(Node {
-        fd,
+        fd: Arc::new(fd),
         meta,
         path: b"/".to_vec(),
     })
@@ -108,6 +110,8 @@ struct Walker<'a> {
     fs_cache: &'a FsCache,
     root: &'a RootConfig,
     root_index: usize,
+    /// The pattern has no wildcards, so it names one root, existing or not.
+    exact: bool,
     locations: &'a mut Vec<Location>,
     /// Directories entered under `**`, for cycle detection.
     visited: HashMap<Identity, Vec<u8>>,
@@ -119,70 +123,93 @@ impl Walker<'_> {
         warn(format!("{}: {what}: {e}", path.as_bstr()));
     }
 
-    fn walk(&mut self, node: &Node, components: &[Component]) {
-        match components.first() {
-            None => self.emit_directory(node),
-            Some(Component::Literal(name)) => match fsops::open_path(node.fd.as_fd(), name) {
-                Ok(fd) => self.consider(node, name, fd, &components[1..], None),
-                Err(Errno::NOENT) => {}
-                Err(e) => self.error(&node.child_path(name), "open", e),
+    /// Match `first`, then `rest`, against the entries of `node`.
+    fn walk(&mut self, node: &Node, first: &Component, rest: &[Component]) {
+        match first {
+            Component::Literal(name) => match self.literal_matches(node, name, rest) {
+                Ok(true) => self.consider(node, name, rest, false),
+                Ok(false) => {}
+                Err(e) => self.error(&node.child_path(name), "stat", e),
             },
-            Some(Component::Wild(pattern)) => {
-                self.for_each_entry(node, |walker, name, fd| {
+            Component::Wild(pattern) => {
+                self.for_each_entry(node, |walker, name| {
                     if glob::matches(pattern, name) {
-                        walker.consider(node, name, fd, &components[1..], None);
+                        walker.consider(node, name, rest, false);
                     }
                 });
             }
-            Some(Component::AnyDepth) => {
-                let rest = &components[1..];
-                if !rest.is_empty() {
+            Component::AnyDepth => {
+                if let Some((next, rest)) = rest.split_first() {
                     // Zero directories.
-                    self.walk(node, rest);
+                    self.walk(node, next, rest);
                 }
-                self.for_each_entry(node, |walker, name, fd| {
-                    walker.consider(node, name, fd, rest, Some(components));
+                self.for_each_entry(node, |walker, name| {
+                    walker.consider(node, name, rest, true);
                 });
             }
         }
     }
 
-    /// Classify an opened entry. `rest` is what follows it in the pattern;
-    /// `any_depth` is the pattern from its `**` when the entry was reached
-    /// under one.
-    fn consider(
+    /// Whether the literal component `name` matches under `node`. Only the
+    /// final literal of a wildcard pattern is looked up: it stands where a
+    /// listing stands for a wildcard and decides which names the pattern
+    /// matches, or `/srv/**/data` would name a root under every directory.
+    /// It decides nothing about the entry itself; the scan task opens the
+    /// root and classifies it from its own descriptor. An exact pattern
+    /// names its root as written, and a literal that the pattern continues
+    /// into is opened by `descend`, which finds out whether it exists.
+    fn literal_matches(&self, node: &Node, name: &[u8], rest: &[Component]) -> Result<bool, Errno> {
+        if self.exact || !rest.is_empty() {
+            return Ok(true);
+        }
+        fsops::entry_exists(node.fd.as_fd(), name)
+    }
+
+    /// Handle the entry `name` of `parent`. `rest` is what follows it in
+    /// the pattern; `any_depth` says that it was reached under `**`.
+    fn consider(&mut self, parent: &Node, name: &[u8], rest: &[Component], any_depth: bool) {
+        let path = parent.child_path(name);
+        if any_depth || !rest.is_empty() {
+            self.descend(parent, name, &path, rest, any_depth);
+        }
+        if rest.is_empty() {
+            self.emit(parent, name, path);
+        }
+    }
+
+    /// Continue the pattern inside the entry `name` of `parent`, if it is
+    /// a directory.
+    fn descend(
         &mut self,
         parent: &Node,
         name: &[u8],
-        fd: OwnedFd,
+        path: &[u8],
         rest: &[Component],
-        any_depth: Option<&[Component]>,
+        any_depth: bool,
     ) {
-        let path = parent.child_path(name);
+        let fd = match fsops::open_path(parent.fd.as_fd(), name) {
+            Ok(fd) => fd,
+            Err(Errno::NOENT) => return,
+            Err(e) => return self.error(path, "open", e),
+        };
         let meta = match fsops::stat(fd.as_fd()) {
             Ok(meta) => meta,
-            Err(e) => return self.error(&path, "statx", e),
+            Err(e) => return self.error(path, "statx", e),
         };
-        match meta.kind {
-            FileType::Directory => {
-                let child = Node { fd, meta, path };
-                match any_depth {
-                    Some(components) => {
-                        if rest.is_empty() {
-                            self.emit_directory(&child);
-                        }
-                        if self.enter_any_depth(&child) {
-                            self.walk(&child, components);
-                        }
-                    }
-                    None if rest.is_empty() => self.emit_directory(&child),
-                    None => self.walk(&child, rest),
-                }
+        if meta.kind != FileType::Directory {
+            return;
+        }
+        let node = Node {
+            fd: Arc::new(fd),
+            meta,
+            path: path.to_vec(),
+        };
+        if any_depth {
+            if self.enter_any_depth(&node) {
+                self.walk(&node, &Component::AnyDepth, rest);
             }
-            FileType::RegularFile if rest.is_empty() => {
-                self.emit_file(parent, name, fd, &meta, path)
-            }
-            _ => {}
+        } else if let Some((next, rest)) = rest.split_first() {
+            self.walk(&node, next, rest);
         }
     }
 
@@ -209,7 +236,9 @@ impl Walker<'_> {
         true
     }
 
-    fn for_each_entry(&mut self, node: &Node, mut f: impl FnMut(&mut Self, &[u8], OwnedFd)) {
+    /// Call `f` with the name of every entry of `node` that can be a root
+    /// or lead to one.
+    fn for_each_entry(&mut self, node: &Node, mut f: impl FnMut(&mut Self, &[u8])) {
         let readable = match fsops::reopen_dir(node.fd.as_fd()) {
             Ok(fd) => fd,
             Err(e) => return self.error(&node.path, "reopen", e),
@@ -228,7 +257,7 @@ impl Walker<'_> {
                 continue;
             }
             // Directory-entry types are hints; they only skip entries
-            // that can never be roots without opening them.
+            // that can never be roots without examining them.
             if matches!(
                 entry.file_type(),
                 FileType::Symlink
@@ -239,11 +268,7 @@ impl Walker<'_> {
             ) {
                 continue;
             }
-            match fsops::open_path(node.fd.as_fd(), name) {
-                Ok(fd) => f(self, name, fd),
-                Err(Errno::NOENT) => {}
-                Err(e) => self.error(&node.child_path(name), "open", e),
-            }
+            f(self, name);
         }
     }
 
@@ -252,40 +277,16 @@ impl Walker<'_> {
         self.root.exclude.excludes(name, || path.to_vec())
     }
 
-    fn emit_directory(&mut self, node: &Node) {
-        if self.excluded(&node.path) {
-            return;
-        }
-        match identify(self.fs_cache, node.fd.as_fd(), &node.meta) {
-            Ok(identity) => self.locations.push(Location {
-                root: self.root_index,
-                path: node.path.clone(),
-                kind: LocationKind::Directory { identity },
-            }),
-            Err(e) => self.error(&node.path, "identity", e),
-        }
-    }
-
-    fn emit_file(&mut self, parent: &Node, name: &[u8], fd: OwnedFd, meta: &Meta, path: Vec<u8>) {
+    /// Record the match `name` of `parent`, unless it is excluded.
+    fn emit(&mut self, parent: &Node, name: &[u8], path: Vec<u8>) {
         if self.excluded(&path) {
             return;
         }
-        let identity = match identify(self.fs_cache, fd.as_fd(), meta) {
-            Ok(identity) => identity,
-            Err(e) => return self.error(&path, "identity", e),
-        };
-        let parent_identity = match identify(self.fs_cache, parent.fd.as_fd(), &parent.meta) {
-            Ok(identity) => identity,
-            Err(e) => return self.error(&parent.path, "identity", e),
-        };
         self.locations.push(Location {
             root: self.root_index,
             path,
-            kind: LocationKind::File {
-                identity,
-                parent: parent_identity,
-                name: name.to_vec(),
-            },
+            dir: Arc::clone(&parent.fd),
+            name: name.to_vec(),
         });
     }
 }
@@ -327,53 +328,6 @@ fn check_nesting(locations: &[Location], config: &Config) {
                 );
             }
         }
-    }
-}
-
-/// Registered root locations, for detecting entry into another root
-/// during traversal.
-pub struct Registry {
-    directories: HashMap<Identity, usize>,
-    /// Single-file roots by parent directory identity, then basename.
-    files: HashMap<Identity, HashMap<Vec<u8>, usize>>,
-}
-
-impl Registry {
-    /// Dies when two locations are the same directory.
-    pub fn new(locations: &[Location]) -> Self {
-        let mut directories = HashMap::new();
-        let mut files: HashMap<Identity, HashMap<Vec<u8>, usize>> = HashMap::new();
-        for (index, location) in locations.iter().enumerate() {
-            let earlier = match &location.kind {
-                LocationKind::Directory { identity } => directories.insert(identity.clone(), index),
-                LocationKind::File { parent, name, .. } => files
-                    .entry(parent.clone())
-                    .or_default()
-                    .insert(name.clone(), index),
-            };
-            if let Some(earlier) = earlier {
-                die(
-                    EXIT_FAILURE,
-                    format!(
-                        "roots {} and {} are the same object (mount alias)",
-                        locations[earlier].path.as_bstr(),
-                        location.path.as_bstr()
-                    ),
-                );
-            }
-        }
-        Registry { directories, files }
-    }
-
-    /// The location index registered for a directory identity.
-    pub fn directory_owner(&self, identity: &Identity) -> Option<usize> {
-        self.directories.get(identity).copied()
-    }
-
-    /// The location index registered for the entry `name` of the directory
-    /// with identity `parent`.
-    pub fn file_owner(&self, parent: &Identity, name: &[u8]) -> Option<usize> {
-        self.files.get(parent)?.get(name).copied()
     }
 }
 

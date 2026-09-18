@@ -32,8 +32,10 @@ Deliver `hashsync update [--rebuild]` and `hashsync stats` for mutable roots.
   `block_size` and both supported strong-hash choices. Handle sparse files
   and files too small or repetitive to contribute blocks.
 - Support hard links within and across roots. Enforce the rules for symlinks,
-  special files, duplicate or nested roots, directory aliases and cycles,
-  and traversal into another root.
+  special files, duplicate or nested root paths, and cycles during root
+  expansion. Detect directory aliases and cycles during actual traversal
+  with shared visited sets. Open roots when their scan tasks start, without
+  a separate registration pass or comparison with an earlier root identity.
 - Report local filesystem failures while continuing eligible work, without
   treating incomplete results as complete.
 - Make the persistent index inspectable and rebuildable. Apply the specified
@@ -151,17 +153,23 @@ Design coverage: §§6.2–6.7, 7–8.
 ## 6. Reuse immutable trees and their alternate copies
 
 - Support immutable roots and every identifier form, including byte-valued
-  identifiers and multiple configured locations sharing one identity.
+  identifiers and multiple configured locations sharing one identifier.
 - Reuse completed immutable groups without traversing them on each update.
-  Preserve that reuse when a group moves or its representative path changes.
+  Preserve that reuse when a group moves, its representative path changes,
+  or a copy's root-directory filesystem identity or handle changes.
 - Require matching indexing policies across copies. Apply the specified
-  root-conflict and hard-link rules across mutable and immutable roots.
+  root-path and hard-link rules across mutable and immutable roots. Detect
+  directory overlap on a best-effort basis during actual traversal; completed
+  groups and unused copies have no tasks or opens solely for overlap checks.
 - Make current copies available for candidate reads in configured priority
   order, including during `--no-update` runs. Try other configured copies
   when a candidate is unavailable or fails verification, within the
   `candidate_attempts` limit.
 - Retry incomplete immutable indexing, including failures or interruptions
   involving files shared with mutable roots.
+- Publish new immutable completion markers only after all scan tasks finish
+  and each group's traversal and dependent inode and path results succeed
+  and commit, so a late directory conflict cannot leave a group complete.
 - Support `update --rebuild` to apply policy changes to completed immutable
   groups, as required by the design.
 

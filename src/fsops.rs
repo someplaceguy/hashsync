@@ -58,6 +58,17 @@ pub fn reopen_dir(fd: BorrowedFd<'_>) -> Result<OwnedFd, Errno> {
     reopen(fd, OFlags::RDONLY | OFlags::DIRECTORY)
 }
 
+/// True when `dir` has an entry `name`, whatever it is; a symlink counts
+/// without being followed. Only existence is reported: an entry's kind is
+/// decided from its own descriptor once it is opened.
+pub fn entry_exists(dir: BorrowedFd<'_>, name: &[u8]) -> Result<bool, Errno> {
+    match rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(_) => Ok(true),
+        Err(Errno::NOENT) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 /// `statx` on the descriptor itself, requiring every field that traversal
 /// depends on. A kernel that omits one of them gets `NOTSUP`.
 pub fn stat(fd: BorrowedFd<'_>) -> Result<Meta, Errno> {

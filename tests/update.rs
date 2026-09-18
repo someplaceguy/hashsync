@@ -222,6 +222,27 @@ fn root_pattern_expansion() {
 }
 
 #[test]
+fn missing_and_non_indexable_roots_only_warn() {
+    let env = Env::new();
+    env.write("tree/f", &random(BLOCK, 1));
+    symlink(env.path("tree"), env.path("link")).unwrap();
+    env.configure(&format!(
+        "{}{}{}",
+        env.root("tree", ""),
+        env.root("missing", ""),
+        env.root("link", "")
+    ));
+    let stderr = env.update();
+    assert!(stderr.contains("missing: root does not exist"), "{stderr}");
+    assert!(
+        stderr.contains("link: root is not a directory or a regular file"),
+        "{stderr}"
+    );
+    assert_eq!(env.tree_paths(), vec!["f"]);
+    assert_eq!(env.count("SELECT count(*) FROM paths"), 1);
+}
+
+#[test]
 fn duplicate_and_nested_roots_are_rejected() {
     let env = Env::new();
     env.write("tree/a/f", &random(BLOCK, 1));
