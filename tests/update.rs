@@ -246,11 +246,12 @@ fn missing_and_non_indexable_roots_only_warn() {
 fn duplicate_and_nested_roots_are_rejected() {
     let env = Env::new();
     env.write("tree/a/f", &random(BLOCK, 1));
-    env.configure(&format!(
-        "{}{}",
-        env.root("tree", ""),
-        env.root("tree/a", "")
-    ));
+    env.configure(&env.root("tree", ""));
+    env.update();
+    let index_id = env.index_id();
+
+    let nested = format!("{}{}", env.root("tree", ""), env.root("tree/a", ""));
+    env.configure(&nested);
     let stderr = env.update_fails();
     assert!(stderr.contains("is inside root"), "{stderr}");
 
@@ -262,8 +263,240 @@ fn duplicate_and_nested_roots_are_rejected() {
     let stderr = env.update_fails();
     assert!(stderr.contains("matched by both"), "{stderr}");
 
-    // The index was not changed by the rejected configurations.
-    assert!(!env.index_path().exists() || env.count("SELECT count(*) FROM roots") == 0);
+    // A rejected configuration is rejected before the index changes, even
+    // when a rebuild was requested or the settings changed.
+    env.configure(&nested);
+    let output = env.run(&["update", "--rebuild"]);
+    assert_eq!(output.status.code(), Some(1));
+    env.configure_with(&format!("block_size = {}\n{nested}", BLOCK * 2));
+    let stderr = env.update_fails();
+    assert!(!stderr.contains("rebuilding"), "{stderr}");
+    assert_eq!(env.index_id(), index_id, "the index ID is unchanged");
+    assert_eq!(env.tree_paths(), vec!["a/f"]);
+    assert_eq!(env.count("SELECT count(*) FROM blocks"), 1);
+    assert_eq!(
+        env.count("SELECT value FROM meta WHERE key = 'block_size'"),
+        BLOCK as i64
+    );
+}
+
+#[test]
+fn any_depth_patterns_enter_each_directory_once() {
+    let env = Env::new();
+    // `tree/**/a/**/leaf` reaches `tree/a` and `tree/a/a` through two
+    // alternatives of the first `**`, and `tree/a/a/leaf` through both.
+    env.write("tree/a/leaf", &random(BLOCK, 1));
+    env.write("tree/a/a/leaf", &random(BLOCK, 2));
+    env.write("tree/a/b/leaf", &random(BLOCK, 3));
+    env.write("tree/x/leaf", &random(BLOCK, 4));
+    env.configure(&env.root("tree/**/a/**/leaf", ""));
+    env.update();
+    assert_eq!(env.count("SELECT count(*) FROM roots"), 3);
+    assert_eq!(env.count("SELECT count(*) FROM paths"), 3);
+
+    // Consecutive `**` components overlap completely.
+    env.configure(&env.root("tree/**/**/leaf", ""));
+    env.update();
+    assert_eq!(env.count("SELECT count(*) FROM roots"), 4);
+    assert_eq!(env.count("SELECT count(*) FROM paths"), 4);
+}
+
+#[test]
+fn unlistable_directories_are_abandoned_under_any_depth() {
+    if rustix::process::geteuid().is_root() {
+        eprintln!("skipped: root ignores permissions");
+        return;
+    }
+    let env = Env::new();
+    let tree = env.tree().display().to_string();
+    let root_paths = |env: &Env| -> Vec<String> {
+        let mut paths: Vec<String> = env
+            .paths()
+            .into_iter()
+            .map(|(root, _)| String::from_utf8(root).unwrap())
+            .collect();
+        paths.sort();
+        paths
+    };
+    env.write("tree/leaf", &random(BLOCK, 1));
+    env.write("tree/x/leaf", &random(BLOCK, 2));
+
+    // `tree` can be searched but not listed, and `**` needs the listing:
+    // nothing under `tree` matches, not even `tree/leaf`, which a lookup
+    // could find. `tree` is the first directory seen on its filesystem,
+    // so identifying it, which reopens it for reading, fails before the
+    // listing is attempted.
+    env.chmod("tree", 0o111);
+    env.configure(&env.root("tree/**/leaf", ""));
+    let stderr = env.update();
+    env.chmod("tree", 0o755);
+    assert!(
+        stderr.contains("tree: identity: Permission denied"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("matched nothing"), "{stderr}");
+    assert_eq!(env.count("SELECT count(*) FROM roots"), 0);
+
+    // A literal after `*` is looked up, which needs no listing.
+    env.chmod("tree/x", 0o111);
+    env.configure(&env.root("tree/*/leaf", ""));
+    let stderr = env.update();
+    assert!(!stderr.contains("Permission denied"), "{stderr}");
+    assert_eq!(root_paths(&env), vec![format!("{tree}/x/leaf")]);
+
+    // Under `**`, the same directory is identified through the filesystem
+    // that `tree` resolved, then abandoned when its listing fails.
+    env.configure(&env.root("tree/**/leaf", ""));
+    let stderr = env.update();
+    env.chmod("tree/x", 0o755);
+    assert!(
+        stderr.contains("tree/x: reopen: Permission denied"),
+        "{stderr}"
+    );
+    assert_eq!(root_paths(&env), vec![format!("{tree}/leaf")]);
+}
+
+#[test]
+fn trailing_any_depth_matches_inside_the_directory_only() {
+    let env = Env::new();
+    env.write("tree/f", &random(BLOCK, 1));
+    env.write("tree/g", &random(BLOCK, 2));
+    env.configure(&env.root("tree/**", ""));
+    env.update();
+    // `tree` itself is not a match; every entry inside it is one.
+    assert_eq!(env.count("SELECT count(*) FROM roots"), 2);
+    assert_eq!(env.count("SELECT count(*) FROM paths"), 2);
+
+    // Nothing is inside a regular file.
+    env.configure(&env.root("tree/f/**", ""));
+    let stderr = env.update();
+    assert!(stderr.contains("matched nothing"), "{stderr}");
+    assert_eq!(env.count("SELECT count(*) FROM roots"), 0);
+}
+
+#[test]
+fn the_slash_root_can_be_excluded() {
+    let env = Env::new();
+    env.write("tree/f", &random(BLOCK, 1));
+    env.configure(&format!(
+        "{}{}",
+        root_entry(b"/", "exclude = ['/']"),
+        env.root("tree", "")
+    ));
+    let stderr = env.update();
+    assert!(
+        stderr.contains("root pattern / matched nothing"),
+        "{stderr}"
+    );
+    assert_eq!(env.count("SELECT count(*) FROM roots"), 1);
+    assert_eq!(env.tree_paths(), vec!["f"]);
+}
+
+#[test]
+fn exclusions_prune_root_expansion() {
+    let env = Env::new();
+    env.write("tree/leaf", &random(BLOCK, 1));
+    env.write("tree/a/leaf", &random(BLOCK, 2));
+    env.write("tree/a/b/leaf", &random(BLOCK, 3));
+    env.write("tree/x/leaf", &random(BLOCK, 4));
+    env.write("tree/x/a/leaf", &random(BLOCK, 5));
+    env.write("tree/x/skip/leaf", &random(BLOCK, 6));
+    let tree = env.tree().display().to_string();
+    let root_paths = |env: &Env| -> Vec<String> {
+        let mut paths: Vec<String> = env
+            .paths()
+            .into_iter()
+            .map(|(root, _)| String::from_utf8(root).unwrap())
+            .collect();
+        paths.sort();
+        paths
+    };
+
+    // An excluded directory is not entered, by name or by absolute path.
+    env.configure(&env.root("tree/**/leaf", &format!("exclude = ['a', '{tree}/x/skip']")));
+    env.update();
+    assert_eq!(
+        root_paths(&env),
+        vec![format!("{tree}/leaf"), format!("{tree}/x/leaf")]
+    );
+
+    // A literal component of a wildcard pattern is subject to exclusion.
+    env.configure(&env.root("tree/*/a/leaf", "exclude = ['a']"));
+    let stderr = env.update();
+    assert!(stderr.contains("matched nothing"), "{stderr}");
+    assert_eq!(env.count("SELECT count(*) FROM roots"), 0);
+
+    // An exact pattern names its root as written; only the root itself
+    // can be excluded.
+    env.configure(&format!(
+        "{}{}",
+        env.root("tree/a/b/leaf", "exclude = ['a']"),
+        env.root("tree/x/leaf", "exclude = ['leaf']")
+    ));
+    let stderr = env.update();
+    assert!(stderr.contains("matched nothing"), "{stderr}");
+    assert_eq!(root_paths(&env), vec![format!("{tree}/a/b/leaf")]);
+}
+
+/// Rows enough to pass the writer's 50,000-work commit limit (COMMIT_WORK)
+/// while full 1,024-row deletion batches (BATCH_ROWS) remain: replacing
+/// them commits during deletion, and again during insertion.
+const MANY_BLOCKS: usize = 51_200;
+
+#[test]
+fn large_files_are_rehashed_in_bounded_batches() {
+    let env = Env::new();
+    env.write("tree/big", &tiled(MANY_BLOCKS, 1));
+    env.configure(&env.root("tree", ""));
+    env.update();
+    assert_eq!(env.count("SELECT count(*) FROM blocks"), MANY_BLOCKS as i64);
+
+    // Changed content: all old rows go, across commits, before the new
+    // rows arrive.
+    env.write("tree/big", &tiled(MANY_BLOCKS, 2));
+    env.update();
+    assert_eq!(env.count("SELECT count(*) FROM blocks"), MANY_BLOCKS as i64);
+    assert_eq!(
+        env.count("SELECT count(*) FROM inodes WHERE size IS NULL"),
+        0
+    );
+
+    // A shrunken file loses its rows, again across several transactions.
+    env.write("tree/big", &random(10, 1));
+    env.update();
+    assert_eq!(env.count("SELECT count(*) FROM blocks"), 0);
+    assert_eq!(env.count("SELECT count(*) FROM inodes"), 0);
+}
+
+#[test]
+fn interrupted_replacements_are_recovered() {
+    let env = Env::new();
+    env.write("tree/big", &tiled(MANY_BLOCKS, 1));
+    env.configure(&env.root("tree", ""));
+    env.update();
+
+    // A replacement interrupted between commits leaves a committed
+    // incomplete inode with only some rows removed. The next update
+    // removes the leftover rows and hashes the file again (DESIGN.md §4.2).
+    env.db_rw()
+        .execute_batch(&format!(
+            "UPDATE inodes SET size = NULL;
+             DELETE FROM blocks WHERE block_no >= {};",
+            MANY_BLOCKS / 2
+        ))
+        .unwrap();
+    assert_eq!(
+        env.count("SELECT count(*) FROM blocks"),
+        (MANY_BLOCKS / 2) as i64
+    );
+    let stderr = env.update();
+    assert!(stderr.contains("1 files hashed"), "{stderr}");
+    assert_eq!(env.count("SELECT count(*) FROM blocks"), MANY_BLOCKS as i64);
+    assert_eq!(
+        env.count("SELECT count(*) FROM inodes WHERE size IS NULL"),
+        0
+    );
+    assert_eq!(env.count("SELECT count(*) FROM paths"), 1);
 }
 
 #[test]

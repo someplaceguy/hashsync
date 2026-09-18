@@ -124,3 +124,43 @@ fn a_file_root_aliased_inside_another_root_is_a_hard_link() {
     assert_eq!(env.count("SELECT count(*) FROM inodes"), 1);
     assert_eq!(env.count("SELECT count(*) FROM paths"), 2);
 }
+
+#[test]
+fn one_filesystem_skips_bind_mounted_files() {
+    if !namespaces_available() {
+        eprintln!("skipped: no unprivileged user namespaces");
+        return;
+    }
+    let env = Env::new();
+    env.write("tree/f", &random(BLOCK, 1));
+    env.write("tree/g", &random(BLOCK, 2));
+    env.write("other/g", &random(BLOCK, 3));
+    env.configure(&env.root("tree", "one_filesystem = true"));
+    let output = update_with_binds(&env, &[("other/g", "tree/g")]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(env.tree_paths(), vec!["f"]);
+
+    env.configure(&env.root("tree", ""));
+    let output = update_with_binds(&env, &[("other/g", "tree/g")]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(env.tree_paths(), vec!["f", "g"]);
+}
+
+#[test]
+fn cycle_during_root_expansion_is_fatal() {
+    if !namespaces_available() {
+        eprintln!("skipped: no unprivileged user namespaces");
+        return;
+    }
+    let env = Env::new();
+    env.write("tree/a/leaf", &random(BLOCK, 1));
+    env.mkdir("tree/a/b/c");
+    env.configure(&env.root("tree/**/leaf", ""));
+    let output = update_with_binds(&env, &[("tree/a", "tree/a/b/c")]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("root pattern"), "{stderr}");
+    assert!(stderr.contains(SAME_DIRECTORY), "{stderr}");
+}

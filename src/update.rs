@@ -21,6 +21,11 @@ pub fn run(config: &Config, rebuild: bool) {
     let start = Instant::now();
     raise_descriptor_limit();
 
+    // Resolve and validate the roots before the index is opened: a rejected
+    // configuration must not change the index (DESIGN.md §3 and §4.2).
+    let fs_cache = FsCache::new();
+    let locations = roots::expand(config, &fs_cache);
+
     let index = index::open_modifying(&config.index_path);
     let settings = Settings::from_config(config);
     let rebuild = rebuild
@@ -50,8 +55,6 @@ pub fn run(config: &Config, rebuild: bool) {
         index.reset(&settings);
     }
 
-    let fs_cache = FsCache::new();
-    let locations = roots::expand(config, &fs_cache);
     let paths: Vec<&[u8]> = locations.iter().map(|l| l.path.as_slice()).collect();
     let root_ids = index.reconcile_roots(&paths);
     let roots: Vec<ScanRoot> = locations

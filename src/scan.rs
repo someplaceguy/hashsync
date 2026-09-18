@@ -215,8 +215,17 @@ impl Scanner<'_> {
     ) -> LocalResult<()> {
         let fd = fsops::open_path(dir, name).map_err(io("open"))?;
         let meta = fsops::stat(fd.as_fd()).map_err(io("statx"))?;
+        // `one_filesystem` skips an entry on another mount whatever its
+        // kind, a bind-mounted file included. A root itself is never
+        // skipped: it has no parent here.
+        if let Some(parent) = parent
+            && self.roots[root].config.one_filesystem
+            && parent.mnt_id != meta.mnt_id
+        {
+            return Ok(());
+        }
         match meta.kind {
-            FileType::Directory => self.visit_dir(scope, fd, &meta, root, rel, parent),
+            FileType::Directory => self.visit_dir(scope, fd, &meta, root, rel),
             FileType::RegularFile => self.visit_file(fd, &meta, root, rel),
             _ => Err(Skip::OtherKind),
         }
@@ -229,15 +238,8 @@ impl Scanner<'_> {
         meta: &Meta,
         root: usize,
         rel: Vec<u8>,
-        parent: Option<&DirCtx>,
     ) -> LocalResult<()> {
         let scan_root = &self.roots[root];
-        if let Some(parent) = parent
-            && scan_root.config.one_filesystem
-            && parent.mnt_id != meta.mnt_id
-        {
-            return Ok(());
-        }
         let identity = identify(self.fs_cache, fd.as_fd(), meta).map_err(io("identity"))?;
         self.claim_dir(identity, root, &rel);
         let readable = fsops::reopen_dir(fd.as_fd()).map_err(io("reopen"))?;
@@ -366,12 +368,14 @@ impl Scanner<'_> {
         });
         let outcome = BUFFER.with_borrow_mut(|buffer| {
             self.hasher
-                .hash_file(readable.as_fd(), meta, buffer, &mut |rows| {
+                .hash_file(readable.as_fd(), buffer, &mut |rows| {
                     self.send(Msg::Blocks { file, rows });
                 })
         });
         match outcome {
             Ok(outcome) => {
+                // The metadata observed before hashing: a file that changed
+                // meanwhile has a later ctime, so the next update rehashes it.
                 self.send(Msg::End {
                     file,
                     size: meta.size,

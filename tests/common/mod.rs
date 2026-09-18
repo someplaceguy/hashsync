@@ -112,6 +112,11 @@ impl Env {
         Connection::open_with_flags(self.index_path(), OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap()
     }
 
+    /// A read-write connection, for tests that manufacture index states.
+    pub fn db_rw(&self) -> Connection {
+        Connection::open_with_flags(self.index_path(), OpenFlags::SQLITE_OPEN_READ_WRITE).unwrap()
+    }
+
     pub fn count(&self, sql: &str) -> i64 {
         self.db().query_row(sql, [], |row| row.get(0)).unwrap()
     }
@@ -225,6 +230,17 @@ pub fn random(len: usize, seed: u64) -> Vec<u8> {
             (state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 56) as u8
         })
         .collect()
+}
+
+/// `count` blocks copied from one pseudo-random tile, each stamped with
+/// its block number: a large file of distinct useful blocks, built
+/// without generating every byte.
+pub fn tiled(count: usize, seed: u64) -> Vec<u8> {
+    let mut data = random(BLOCK, seed).repeat(count);
+    for (block_no, block) in data.chunks_exact_mut(BLOCK).enumerate() {
+        block[..8].copy_from_slice(&(block_no as u64).to_le_bytes());
+    }
+    data
 }
 
 /// Bytes repeating a 16-byte pattern: periodic, never indexed.

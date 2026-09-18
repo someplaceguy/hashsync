@@ -321,10 +321,12 @@ to one thread; the sole writer uses `BEGIN IMMEDIATE`.
   Weak hashes and unsigned file sizes use their `i64` bit patterns;
   stored sizes are compared only for equality. NULL, not an integer
   sentinel, marks an incomplete inode.
-- Before replacing blocks, mark the inode incomplete and delete its old
-  blocks in the same transaction. Stream new blocks across bounded batches
-  and periodic commits; only successful completion stores size and ctime
-  with the last rows. Recovery follows section 4.2.
+- Before replacing blocks, mark the inode incomplete; this may commit before
+  any old blocks are deleted. Remove old blocks in bounded transactions
+  before inserting new ones. Keep the inode incomplete while streaming new
+  blocks across bounded batches and periodic commits; only successful
+  completion stores size and ctime with the last rows. Recovery follows
+  section 4.2.
 - A successful inode with no useful blocks has no persistent inode, block,
   or path rows. Temporary incomplete rows are allowed while hashing.
 - `blocks_by_strong` supplies candidates using 16-byte prefixes; only a
@@ -395,10 +397,10 @@ Interrupted-update recovery handles any work committed before detection.
 
 For a new or changed regular file, obtain the readable descriptor as above
 and read with `pread`, accumulating short reads, and hash useful complete
-blocks. Unexpected EOF within the initial full-block range abandons the
-file. Recheck size and ctime on that same readable fd after hashing; changes
-also abandon it. Unlink or rename alone does not invalidate an open
-descriptor.
+blocks until the file ends, even past the size observed before hashing. A
+file that changes while it is hashed is not abandoned: the stored size and
+ctime are the ones observed before hashing, so the next update rehashes it.
+Unlink or rename alone does not invalidate an open descriptor.
 
 Attempt `SEEK_DATA`/`SEEK_HOLE` for every file being hashed. Allocation
 counts cannot prove absence of holes. Skip only blocks wholly inside a hole,
@@ -440,7 +442,7 @@ but each owner's messages stay ordered:
 
 | Message | Effect |
 |---|---|
-| Begin | Mark the inode incomplete and remove old blocks atomically. |
+| Begin | Mark the inode incomplete, then remove old blocks in bounded transactions. |
 | Blocks | Append a bounded batch of block number, weak hash, and strong prefix rows. |
 | End | Store successful metadata and the owner's path, or remove an inode with no useful blocks. |
 | Unchanged | Reuse complete rows and record the owner's path. |
