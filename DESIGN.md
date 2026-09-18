@@ -61,11 +61,11 @@ asynchronous runtime or event loop.
    temporary pin file before answering yes. The sender emits references for
    yes answers and rescans rejected windows from the next byte. Output is
    always emitted in order; releasing a pin punches a hole in its file range.
-6. The receiver reconstructs stdout. After all command output and the
-   command's exit status are available, the sender sends END. The receiver
-   validates stream completion and flushes stdout before sending END_ACK.
-   Both SSH sessions must exit successfully before it returns the command's
-   status.
+6. The receiver reconstructs stdout. After all command stdout is processed,
+   and the command's exit status is available, the sender sends END. The
+   receiver validates stream completion and flushes stdout before sending
+   END_ACK. Both SSH sessions must exit successfully before it returns the
+   command's status.
 
 **Verification is authoritative.** The index, hash lists, caches, and weak
 hash table are hints. Verify candidates before writing pins and verify the
@@ -165,6 +165,8 @@ patterns after byte-escape decoding and glob quoting, without attempting
 to prove glob equivalence.
 Conflicting policies are a configuration error, including for completed
 groups and `--no-update` runs; reject them before changing the index.
+The user is responsible for making absolute exclusions select corresponding
+content in every copy; pattern equality does not establish that equivalence.
 
 Policy changes do not invalidate completed immutable groups automatically.
 After changing exclusions or `one_filesystem`, the user must run
@@ -200,6 +202,10 @@ The user is responsible for immutability: a completed root can omit files
 added later. Copies may have different inode identities; unequal content
 fails verification. `prune` hashes no files and removes a path only when it
 is absent from every current copy. Inaccessibility does not prove absence.
+When a root is no longer configured or is confirmed absent from every copy,
+remove its paths and root row in the same transaction. Its immutable
+completion marker must not survive removal, so a root that later returns is
+scanned again. An existing root with no indexed paths is still valid.
 
 ### 4.3 Identity of filesystems and inodes
 
@@ -221,6 +227,12 @@ Cache filesystem resolution per scan by
 triple differs from the parent's. A mount ID alone misses btrfs subvolume
 changes and is not a persistent identity. Obtain metadata and handles from
 the open descriptor (section 4.5).
+
+`statx`, `fstatfs`, and `name_to_handle_at` work with the initial `O_PATH`
+descriptor. `FS_IOC_GETFSUUID` requires a readable descriptor: reuse one for
+the same filesystem, or reopen the verified object as in section 4.5 when
+resolving a filesystem for the first time. Do not issue ioctls on `O_PATH`
+descriptors.
 
 ### 4.4 Storage
 
@@ -319,17 +331,29 @@ to one thread; the sole writer uses `BEGIN IMMEDIATE`.
 
 ### 4.5 Traversal and hashing
 
-Below configured roots, all access is relative to open descriptors. Open
-each entry before obtaining its type, metadata, or identity, and keep that
-descriptor through processing. Path replacement cannot switch the object
-between checking and reading it.
+Resolve filesystem entries relative to open directory descriptors, without
+following symlinks in any pathname component. Initially open each entry with
+`O_PATH|O_NOFOLLOW|O_CLOEXEC`. Obtain its type and metadata with `statx` using
+the descriptor, an empty pathname, and `AT_EMPTY_PATH`, checking which fields
+were returned. Skip symlinks and other types besides regular files and
+directories without marking the root unsuccessful or opening them for I/O.
+Directory-entry types are only hints. Obtain regular-file and directory
+handles with `name_to_handle_at` on that descriptor, also using an empty
+pathname and `AT_EMPTY_PATH`.
 
-Directory opens use `O_DIRECTORY|O_NOFOLLOW`; unknown or possible regular
-files also use `O_NONBLOCK|O_NOCTTY` to avoid blocking on special files.
-All descriptors are close-on-exec. Inspect the opened type and skip anything
-other than a regular file or directory. Directory-entry types are only hints.
-Obtain `statx` metadata and inode handles from the descriptor, checking which
-metadata fields were returned.
+When a regular file needs hashing or a candidate read, reopen
+`/proc/self/fd/%d`, where `%d` is its still-open `O_PATH` descriptor, with
+`O_RDONLY|O_CLOEXEC`. For directory listing, reopen the same way with
+`O_RDONLY|O_DIRECTORY|O_CLOEXEC`. Both reopen the verified object even if it
+has been renamed or unlinked; never reopen its original pathname or the text
+returned by `readlink`. Keep the `O_PATH` descriptor alive until reopening
+finishes, then retain the readable descriptor through processing. An `O_PATH`
+directory descriptor can itself serve as the parent for relative opens.
+
+Reopening deliberately follows the process's own procfs magic link; do not
+apply `O_NOFOLLOW` or `RESOLVE_NO_SYMLINKS` to that step. It requires access
+to `/proc/self/fd`. All descriptors are close-on-exec. Path replacement cannot
+switch the object between checking and reading it.
 
 Before traversal, register current root locations and their logical owners,
 including locations of completed immutable groups. Recognize directory
@@ -359,11 +383,12 @@ immutable groups and `--no-update` runs are not traversed solely to discover
 hidden overlap. Every conflict that is detected is fatal; interrupted-update
 recovery handles any work committed before detection.
 
-For a new or changed regular file, read with `pread`, accumulating short
-reads, and hash useful complete blocks. Unexpected EOF within the initial
-full-block range abandons the file. Recheck size and ctime on the same fd
-after hashing; changes also abandon it. Unlink or rename alone does not
-invalidate an open descriptor.
+For a new or changed regular file, obtain the readable descriptor as above
+and read with `pread`, accumulating short reads, and hash useful complete
+blocks. Unexpected EOF within the initial full-block range abandons the
+file. Recheck size and ctime on that same readable fd after hashing; changes
+also abandon it. Unlink or rename alone does not invalidate an open
+descriptor.
 
 Attempt `SEEK_DATA`/`SEEK_HOLE` for every file being hashed. Allocation
 counts cannot prove absence of holes. Skip only blocks wholly inside a hole,
@@ -614,10 +639,25 @@ shares a connection, the program still works but loses the latency benefit.
 
 Use the configured SSH subprocess, preserving its agent, host configuration,
 ProxyJump, and host-key handling. Shell-split `ssh` from configuration,
-a host override, or `--ssh`; append `-o Compression=no`, then the unchanged
-HOST and remote invocation. An explicit compression option in the configured
-command takes precedence under SSH's first-value rule. The sender needs a
-compatible `hashsync` in PATH or at `sender_command`.
+a host override, or `--ssh`; the first word is the executable and the rest
+are its options. For both sessions, insert `-o ClearAllForwardings=yes` and
+`-o RemoteCommand=none` before the configured options, then append
+`-T -x -o Compression=no`, the unchanged HOST, and the remote command string.
+The leading options take precedence under SSH's first-value rule; the final
+`-T` and `-x` disable PTYs and X11 forwarding even if configured options
+requested them. Local, remote, and dynamic port forwardings are cleared.
+An explicit compression option in the configured command still takes
+precedence. SSH options must keep the sessions in the foreground, preserve
+their stdin and stdout, and execute the specified remote command.
+
+SSH executes its remote command through the remote login shell, which must
+support POSIX shell quoting for this bootstrap. Treat `sender_command` as
+one executable name or path, not a shell fragment. Construct a remote
+`exec` command by single-quoting each argument, replacing embedded single
+quotes with `'\''`, and preserving all other bytes, including non-UTF-8
+bytes. Passing separate local argv elements to SSH does not quote them for
+the remote shell. The sender needs a compatible `hashsync` in PATH or at
+`sender_command`.
 
 The receiver generates token `T` and starts both sessions together:
 
@@ -640,8 +680,18 @@ end the relay unsuccessfully.
 Rendezvous waits must also observe receiver disappearance (section 6.7).
 
 The command's argv travels in HELLO, not on the SSH command line. Start it
-without a shell, with stdin from `/dev/null`, piped stdout, inherited stderr,
-and its own process group for cleanup.
+without a shell, with stdin from `/dev/null`, piped stdout and stderr, and
+its own process group for cleanup.
+
+A dedicated sender thread copies command stderr to `serve`'s stderr with
+bounded buffering and prompt writes. SSH forwards these bytes through its
+existing stderr channel; both local SSH subprocesses inherit the receiver's
+stderr. The relay finishes only after command stderr reaches
+EOF and all copied bytes have been written and flushed to SSH. It runs
+independently of stdout scanning and control traffic. Stderr is outside the
+hashsync protocol and compression stream. Successful sender exit requires
+relay completion; its coordination with stdout completion is an implementation
+decision (section 6.7). The receiver waits for both SSH exits before returning.
 
 ### 6.2 Frames
 
@@ -749,8 +799,8 @@ threads perform I/O and compression. Let `B = block_size`.
 - A byte-bounded negative LRU cache holds full strong hashes answered no
   (default 100 MiB). It suppresses queries for the same content at other
   offsets, but does not avoid hashing a new window.
-- Command-output EOF and availability of the command's exit status are
-  separate conditions; both are required to finish.
+- Command stdout EOF and availability of the command's exit status are
+  separate conditions; both are required to finish scanning and send END.
 
 A Query blocks emission of itself and every following record. References
 require a yes for their exact offset; equal hashes at different offsets do
@@ -835,10 +885,11 @@ on notifications for those events, continuing to prioritize answers.
 Backpressure propagates from the data writer through the lookahead buffer
 to the command. Pin allocation and release are entirely receiver-local.
 
-Finish only after EOF, `p = r`, and no Query records remain. Drain all
-records so `e = p = r`, wait for the exit status, then queue END. Obsolete
-unanswered requests do not delay completion. Enter the Ending state before
-queueing END, as specified in section 6.7.
+Finish only after stdout EOF, `p = r`, and no Query records remain. Drain all
+records so `e = p = r`. END can be queued once the exit status is available;
+coordinate shutdown according to section 6.7. Flush queued data before waiting
+for further completion conditions. Obsolete unanswered requests do not delay
+completion.
 
 ### 6.4 The receiver's answering and reconstruction
 
@@ -906,9 +957,10 @@ For `QUERY { offset: x, strong: h }`:
 4. Open a single-file root directly. Otherwise open its root directory and
    resolve the relative path beneath it without symlinks
    (`openat2` with `RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS`, or component-wise
-   `openat` on older kernels). Use the nonblocking/type-safe open rules of
-   section 4.5, check the opened file is regular, and close descriptors
-   after each attempt.
+   `openat` on older kernels). Use the `O_PATH` classification and procfs
+   reopening rules of section 4.5: check that the opened object is a regular
+   file before obtaining its readable descriptor. Close descriptors after
+   each attempt.
 5. Read exactly `B` bytes at `block_no * B`, accumulating short reads.
    Verify the full digest of that buffer. Errors, early EOF, and mismatches
    try the next candidate; filesystem failures are misses, not fatal.
@@ -966,6 +1018,8 @@ No extent is punched while its append or REF read is still using it.
   Startup failure sends status 127 and error text.
 - Truncated streams, broken sessions or receiver stdout, and receiver
   SIGINT/SIGTERM end the run unsuccessfully without a core dump.
+- Stderr relay read, write, or flush failures also end the run with `die`
+  without a core dump.
 - Invalid frames, unexpected answers, missing pins, protocol arithmetic
   overflow, database errors, and invariant violations are bugs: panic and
   abort.
@@ -984,24 +1038,25 @@ that receiver/index.
 
 ### 6.6 Threads at run time
 
-Both roles use blocking threads and channels. Threads are not individually
-cancelled or joined; normal and fatal shutdown end the process.
+Both roles use blocking threads and channels. Fatal shutdown ends the process
+rather than cancelling or joining blocked threads. Normal completion uses the
+coordination chosen by the implementation, subject to section 6.7.
 
 | Role | Responsibilities |
 |---|---|
 | Sender main | Handshake, command startup, then receive END_ACK or detect receiver disappearance. |
-| Sender reader | Fill lookahead until stdout EOF, then observe command exit without reaping and publish its status. |
+| Sender reader | Fill lookahead until stdout EOF; obtain the command's exit status without reaping. |
+| Sender stderr relay | Copy command stderr to sender stderr through EOF and flush. |
 | Sender scanner | Own records and query states; queue queries and output. |
-| Sender data writer | Drain output in order, compress, flush, and publish data completion after END. |
+| Sender data writer | Drain output in order, compress, and finish and flush the stream after END. |
 | Sender control reader/writer | Receive answers and send queries promptly, independently of data output. |
 | Receiver main | Start SSH sessions, reconstruct stdout, validate completion, and send END_ACK. |
 | Receiver control reader/writer | Dispatch queries to lookup workers and send answers promptly. |
 | Receiver signal thread | Handle SIGINT/SIGTERM with status `128 + signal`. |
 | Attach relay | Copy both directions; half-close on stdin EOF, exit after flushing on socket EOF. |
 
-Command exit and stdout EOF can occur in either order, for example when a
-descendant retains stdout. END requires both. Blocking output provides
-backpressure; it must not prevent independent control traffic.
+Blocking output provides backpressure; it must not prevent independent
+control traffic. Completion requirements are in section 6.7.
 
 Keep successfully spawned children unreaped until their owning `hashsync`
 process exits. Obtain command and SSH exit statuses with
@@ -1038,36 +1093,41 @@ session loss is fatal. Monitoring also applies during rendezvous and setup,
 when no command output is flowing. Normal shutdown uses END_ACK, not stdin
 EOF, to establish receiver completion.
 
-The sender has a shared completion state protected by one lock. The scanner
-enters Ending before queueing END. The data writer records `data_finished`
-only after finishing compression and flushing all output. The main thread
-records `ack_received` on END_ACK; an acknowledgement outside Ending or a
-duplicate is a protocol error. Either event may happen first. Normal exit
-requires both, and the thread observing the second event performs normal
-cleanup once. Keep stdout open until process exit. Neither event alone
-permits another thread to exit the process.
+Successful sender completion requires:
 
-Normal completion:
+- Command stdout has reached EOF and all its bytes have been represented by
+  data frames followed by END with the command's exit status. The compression
+  stream, if enabled, is finished and data-session output is flushed.
+- Command stderr has reached EOF and the relay has forwarded and flushed
+  all its bytes to SSH.
+- One valid END_ACK has been received in response to END. An unsolicited or
+  duplicate acknowledgement is a protocol error.
 
-1. The sender obtains command-output EOF and the exit status.
-2. The scanner enters Ending and queues final data and END. The data writer
-   finishes the zstd stream, flushes stdout, and records `data_finished`.
-3. After END, the receiver consumes the rest of that zstd frame, checking its
+The implementation chooses the ordering and synchronization of these
+conditions to make the code simple and reliable. It may serialize waits or
+coordinate concurrent completion; no particular event ordering or state
+machine is required. Startup failure has no command streams to drain.
+
+Keep sender stdout open until process exit. Once the completion conditions
+hold, perform normal cleanup once: remove the rendezvous socket and exit zero.
+Closing the control socket lets `attach` flush and exit zero even though its
+stdin is still open.
+
+Receiver completion:
+
+1. After END, the receiver consumes the rest of that zstd frame, checking its
    trailer and rejecting any further decoded bytes. Stop at frame completion
    without waiting for transport EOF; when compression is disabled END is
    sufficient framing. Flush reconstructed stdout.
-4. The receiver enters Completing before sending and flushing END_ACK on
+2. The receiver enters Completing before sending and flushing END_ACK on
    the data session. It stops admitting lookups and publishing control
    replies; queued replies and late control traffic can be discarded. It
    keeps both session stdin pipes open while awaiting peer exit. Workers
    returning later discard their results, including results of unfinished
    pin-file writes; process exit reclaims the unlinked file. Control EOF,
    broken pipes, and a partial final control frame in Completing are expected
-   closure, not failures. No blocked lookup or control thread is joined.
-5. Once both sender completion events have occurred, remove the rendezvous
-   socket and exit zero. Closing the control socket lets `attach` flush and
-   exit zero even though its stdin is still open.
-6. The receiver drains data-session stdout to transport EOF, rejecting any
+   closure, not failures. Do not wait for blocked lookup or control threads.
+3. The receiver drains data-session stdout to transport EOF, rejecting any
    trailing bytes, and observes both SSH exits without reaping. Both must
    exit zero; otherwise the transfer failed even if END was received. After
    success it closes the session pipes and exits with END's command status.
@@ -1079,9 +1139,10 @@ remains a failure: the receiver never closes those pipes to acknowledge
 success. Failures during stream validation, stdout flushing, or sending
 END_ACK take the fatal cleanup path.
 
-No step has a deadline. A descendant retaining command stdout keeps the run
-open, as under plain SSH. A descendant that leaves the process group can
-survive cleanup and will get a broken pipe on its next write.
+No step has a deadline. A descendant retaining command stdout or stderr
+keeps the run open, as under plain SSH; this is expected behavior. After fatal
+cleanup, a descendant that left the process group can survive and will get
+a broken pipe on its next write to either closed output pipe.
 
 ## 7. Configuration
 
@@ -1188,8 +1249,9 @@ exclude = ['*.tmp', 'literal\x2Aname', 'back\\slash']
   sender entry points.
 - `hashsync stats`: report index statistics.
 - `hashsync prune`: acquire exclusive index access, resolve roots, and
-  remove paths absent from every configured copy, then orphaned inodes and
-  blocks. Inaccessible locations are not proof of absence.
+  remove paths absent from every configured copy. Remove vanished or
+  unconfigured roots together with their paths, then orphaned inodes and
+  blocks. Inaccessible locations are not proof of absence (section 4.2).
 
 ```sh
 hashsync run backup@nas -- tar -C /srv/data -cf - . | tar -C /srv/data -xf -
@@ -1266,14 +1328,20 @@ decision history is in version control.
   rejected-query rescans, and late answers; obsolete writes, unaligned block
   sizes, neighbor preservation during hole punching, pin-file failures,
   corruption detection, and cleanup on exit; filesystem races and sparse
-  files; configuration byte escapes, TOML quoting, literal glob metacharacters,
+  files; reopening regular files and directories after rename or unlink;
+  skipping symlinks and special files without opening them for I/O;
+  configuration byte escapes, TOML quoting, literal glob metacharacters,
   and non-UTF-8 root, exclusion, and identifier values; symlinks and cycles
   during root expansion; fatal cycles and descent into another root; hard links
   within and across roots (including links to a single-file root); conflicting
-  copy policies;
+  copy policies; pruning a vanished immutable root and indexing it again
+  when it returns; SSH option precedence and bootstrap quoting of executable
+  paths containing whitespace, quotes, shell metacharacters, and non-UTF-8 bytes;
   crash recovery and SQLite process exclusion and snapshots after worker
-  connections open; cache publication and cleanup races; both END_ACK/data
-  completion orderings, truncated compression trailers, late lookups, relay
+  connections open; cache publication and cleanup races; completion without
+  truncation or premature exit under the chosen synchronization scheme;
+  complete stderr forwarding with backpressure and delayed stderr EOF from
+  descendants; truncated compression trailers, late lookups, relay
   closure with control writes in flight, shutdown on session loss, and fatal
   cleanup after a child's exit status has been collected without reaping. Use
   separate processes for locking tests and fuzz protocol decoding.
