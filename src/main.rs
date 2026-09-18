@@ -44,6 +44,10 @@ enum Command {
         /// Discard the index and build it again
         #[arg(long)]
         rebuild: bool,
+
+        /// Override the configured thread count; 0 selects the default
+        #[arg(short = 'j', value_name = "N")]
+        jobs: Option<u32>,
     },
     /// Report index statistics
     Stats,
@@ -54,7 +58,7 @@ fn main() {
     let cli = Cli::parse();
     let config = config::load(cli.config.as_deref());
     match cli.command {
-        Command::Update { rebuild } => update::run(&config, rebuild),
+        Command::Update { rebuild, jobs } => update::run(&config, rebuild, jobs),
         Command::Stats => stats::run(&config),
     }
 }

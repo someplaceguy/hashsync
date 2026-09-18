@@ -17,7 +17,7 @@ use crate::scan::{self, ScanRoot};
 /// bounded (`blocks::BATCH_ROWS` rows or one path), so this bounds memory.
 const CHANNEL_CAPACITY: usize = 1024;
 
-pub fn run(config: &Config, rebuild: bool) {
+pub fn run(config: &Config, rebuild: bool, jobs: Option<u32>) {
     let start = Instant::now();
     raise_descriptor_limit();
 
@@ -70,18 +70,17 @@ pub fn run(config: &Config, rebuild: bool) {
             .name("writer".into())
             .spawn_scoped(s, move || writer::run(index, fs_cache, rx))
             .expect("cannot start the writer thread");
-        let counters = scan::run(config, roots, fs_cache, tx);
+        let counters = scan::run(config, roots, fs_cache, tx, jobs);
         (counters, writer.join().expect("the writer thread panicked"))
     });
 
-    let orphans = index.remove_orphans();
     index.ensure_secondary_indexes();
     drop(index);
 
     eprintln!(
         "hashsync: {} in {:.1}s: {} directories, {} files hashed ({} bytes), \
-         {} hard links, {} small files, {} indexed blocks ({} periodic, {} in holes), \
-         {} paths, {} stale inodes removed",
+         {} unchanged, {} hard links, {} small files, {} indexed blocks \
+         ({} periodic, {} in holes), {} paths, {} stale inodes removed",
         if rebuild {
             "rebuilt index"
         } else {
@@ -91,13 +90,14 @@ pub fn run(config: &Config, rebuild: bool) {
         counters.directories.load(Relaxed),
         counters.files_hashed.load(Relaxed),
         counters.bytes_hashed.load(Relaxed),
+        counters.files_unchanged.load(Relaxed),
         counters.files_linked.load(Relaxed),
         counters.files_small.load(Relaxed),
         summary.blocks,
         counters.blocks_periodic.load(Relaxed),
         counters.blocks_in_holes.load(Relaxed),
         summary.paths,
-        orphans
+        summary.orphans
     );
 }
 

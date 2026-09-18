@@ -20,6 +20,11 @@ process-isolation tests, and protocol fuzzing from DESIGN.md §11. Run
 `cargo fmt`, `cargo clippy --all-targets`, and `cargo test` for implementation
 changes.
 
+**Status:** Steps 1 and 2 are implemented: `update` (with `--rebuild` and
+`-j`) and `stats` maintain the index for mutable roots, reuse unchanged
+files by identity, size, and ctime, and recover interrupted work. Step 3
+is next.
+
 ## 1. Build and inspect a local index
 
 Deliver `hashsync update [--rebuild]` and `hashsync stats` for mutable roots.

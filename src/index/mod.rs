@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use bstr::ByteSlice;
 use rusqlite::types::Value;
-use rusqlite::{Connection, ErrorCode, OpenFlags, params};
+use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, params};
 
 use crate::config::Config;
 use crate::die::{EXIT_FAILURE, die};
@@ -187,6 +187,45 @@ pub fn open_modifying(path: &[u8]) -> Index {
     }
 }
 
+/// Open a worker reader of a modifying process (DESIGN.md §4.4): like
+/// every connection of that process, read/write through `unix-excl`, with
+/// `query_only` set before use. The writer already holds the process
+/// lock. Queries run in autocommit, so a reader never pins a WAL snapshot.
+pub fn open_worker_reader(path: &[u8]) -> Reader {
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = db(Connection::open_with_flags_and_vfs(
+        os_path(path),
+        flags,
+        "unix-excl",
+    ));
+    db(conn.busy_handler(Some(wait_forever)));
+    db(conn.pragma_update(None, "foreign_keys", "ON"));
+    db(conn.pragma_update(None, "query_only", "ON"));
+    Reader { conn }
+}
+
+/// A scan worker's read-only view of the index during an update.
+pub struct Reader {
+    conn: Connection,
+}
+
+impl Reader {
+    /// The stored `(size, ctime_ns)` of a complete inode, by persistent
+    /// identity. The size is the stored `i64` bit pattern; compare it only
+    /// for equality.
+    pub fn complete_inode(&self, fsid: &[u8], handle: &[u8]) -> Option<(i64, i64)> {
+        let mut stmt = db(self.conn.prepare_cached(
+            "SELECT inodes.size, inodes.ctime_ns FROM inodes
+             JOIN filesystems ON filesystems.id = inodes.fs_id
+             WHERE filesystems.fsid = ? AND inodes.handle = ?
+               AND inodes.size IS NOT NULL",
+        ));
+        db(stmt
+            .query_row(params![fsid, handle], |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional())
+    }
+}
+
 /// Open the keeper connection of a read-only process. Its read
 /// transaction and schema read last until the `Index` is dropped. `None`
 /// when the index file does not exist.
@@ -313,40 +352,6 @@ impl Index {
         drop(insert);
         db(self.conn.execute_batch("COMMIT"));
         ids
-    }
-
-    /// Remove inodes without paths, and their blocks, in bounded
-    /// transactions. Returns the number of inodes removed.
-    pub fn remove_orphans(&self) -> u64 {
-        const BATCH: usize = 1000;
-        let mut removed = 0u64;
-        let mut after = 0i64;
-        loop {
-            let ids: Vec<i64> = {
-                let mut select = db(self.conn.prepare(
-                    "SELECT id FROM inodes
-                     WHERE id > ? AND NOT EXISTS (SELECT 1 FROM paths WHERE paths.inode_id = inodes.id)
-                     ORDER BY id LIMIT ?",
-                ));
-                let rows = db(select.query_map(params![after, BATCH as i64], |row| row.get(0)));
-                rows.map(db).collect()
-            };
-            let Some(&last) = ids.last() else {
-                return removed;
-            };
-            db(self.conn.execute_batch("BEGIN IMMEDIATE"));
-            for id in &ids {
-                db(self
-                    .conn
-                    .execute("DELETE FROM blocks WHERE inode_id = ?", params![id]));
-                db(self
-                    .conn
-                    .execute("DELETE FROM inodes WHERE id = ?", params![id]));
-            }
-            db(self.conn.execute_batch("COMMIT"));
-            removed += ids.len() as u64;
-            after = last;
-        }
     }
 
     pub fn stats(&self) -> Stats {

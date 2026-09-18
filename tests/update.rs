@@ -500,22 +500,110 @@ fn interrupted_replacements_are_recovered() {
 }
 
 #[test]
+fn unchanged_files_are_reused_without_rehashing() {
+    let env = Env::new();
+    env.write("tree/a", &random(BLOCK, 1));
+    env.write("tree/b/f", &random(BLOCK * 2, 2));
+    env.configure(&env.root("tree", ""));
+    let stderr = env.update();
+    assert!(stderr.contains("2 files hashed"), "{stderr}");
+
+    // Nothing changed: paths are reconstructed without hashing.
+    let stderr = env.update();
+    assert!(stderr.contains(" 0 files hashed"), "{stderr}");
+    assert!(stderr.contains("2 unchanged"), "{stderr}");
+    assert_eq!(env.tree_paths(), vec!["a", "b/f"]);
+    assert_eq!(env.count("SELECT count(*) FROM inodes"), 2);
+    assert_eq!(env.count("SELECT count(*) FROM blocks"), 3);
+
+    // Renaming a directory does not change the ctime of the files inside
+    // it: their content is reused while their paths follow the move.
+    std::fs::rename(env.path("tree/b"), env.path("tree/c")).unwrap();
+    let stderr = env.update();
+    assert!(stderr.contains(" 0 files hashed"), "{stderr}");
+    assert!(stderr.contains("2 unchanged"), "{stderr}");
+    assert_eq!(env.tree_paths(), vec!["a", "c/f"]);
+    assert_eq!(env.count("SELECT count(*) FROM inodes"), 2);
+
+    // New content of the same size, with the mtime put back: the kernel
+    // ctime still changes, so the file is hashed again (DESIGN.md §4.2).
+    let mtime = std::fs::metadata(env.path("tree/a"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    env.write("tree/a", &random(BLOCK, 9));
+    let file = std::fs::File::options()
+        .write(true)
+        .open(env.path("tree/a"))
+        .unwrap();
+    file.set_times(std::fs::FileTimes::new().set_modified(mtime))
+        .unwrap();
+    drop(file);
+    let stderr = env.update();
+    assert!(stderr.contains("1 files hashed"), "{stderr}");
+    assert!(stderr.contains("1 unchanged"), "{stderr}");
+    let expected = blake3::hash(&random(BLOCK, 9)).as_bytes()[..16].to_vec();
+    assert_eq!(env.strong_prefixes("a"), vec![expected]);
+}
+
+#[test]
+fn missing_secondary_indexes_are_repaired() {
+    let env = Env::new();
+    env.write("tree/f", &random(BLOCK, 1));
+    env.configure(&env.root("tree", ""));
+    env.update();
+
+    // An interrupted rebuild can leave the secondary block indexes
+    // missing; every update repairs them (DESIGN.md §4.4).
+    env.db_rw()
+        .execute_batch("DROP INDEX blocks_by_weak; DROP INDEX blocks_by_strong")
+        .unwrap();
+    let stderr = env.update();
+    assert!(stderr.contains("1 unchanged"), "{stderr}");
+    assert_eq!(
+        env.count(
+            "SELECT count(*) FROM sqlite_master
+             WHERE name IN ('blocks_by_weak', 'blocks_by_strong')"
+        ),
+        2
+    );
+}
+
+#[test]
+fn thread_count_options_are_accepted() {
+    let env = Env::new();
+    env.write("tree/f", &random(BLOCK, 1));
+    env.configure(&format!("threads = 2\n{}", env.root("tree", "")));
+    let output = env.run(&["update", "-j", "1"]);
+    assert!(output.status.success());
+    assert_eq!(env.tree_paths(), vec!["f"]);
+}
+
+#[test]
 fn updates_reflect_changes_and_rebuilds() {
     let env = Env::new();
     env.write("tree/stays", &random(BLOCK, 1));
     env.write("tree/goes", &random(BLOCK, 2));
     env.write("tree/shrinks", &random(BLOCK * 2, 3));
     env.write("tree/moves", &random(BLOCK, 4));
+    env.write("tree/blanks", &random(BLOCK, 6));
     env.configure(&env.root("tree", ""));
     env.update();
-    assert_eq!(env.count("SELECT count(*) FROM inodes"), 4);
+    assert_eq!(env.count("SELECT count(*) FROM inodes"), 5);
     let index_id = env.index_id();
 
     std::fs::remove_file(env.path("tree/goes")).unwrap();
     env.write("tree/shrinks", &random(10, 3));
     std::fs::rename(env.path("tree/moves"), env.path("tree/moved")).unwrap();
     env.write("tree/new", &random(BLOCK, 5));
-    env.update();
+    // Only periodic content: the file keeps its size but loses its rows.
+    env.write("tree/blanks", &vec![0u8; BLOCK]);
+    let stderr = env.update();
+    // A rename changes the file's ctime, so `moved` is hashed again;
+    // `blanks` and `new` are the other two.
+    assert!(stderr.contains("3 files hashed"), "{stderr}");
+    assert!(stderr.contains("1 unchanged"), "{stderr}");
+    assert!(stderr.contains("1 stale inodes removed"), "{stderr}");
     assert_eq!(env.tree_paths(), vec!["moved", "new", "stays"]);
     assert_eq!(env.count("SELECT count(*) FROM inodes"), 3);
     assert_eq!(env.count("SELECT count(*) FROM blocks"), 3);
@@ -527,6 +615,9 @@ fn updates_reflect_changes_and_rebuilds() {
 
     let output = env.run(&["update", "--rebuild"]);
     assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("4 files hashed"), "{stderr}");
+    assert!(stderr.contains(" 0 unchanged"), "{stderr}");
     assert_ne!(env.index_id(), index_id, "a rebuild renews the index ID");
     assert_eq!(env.count("SELECT count(*) FROM inodes"), 3);
 

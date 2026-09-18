@@ -22,6 +22,8 @@ pub struct Config {
     pub strong_hash: StrongHash,
     /// Path bytes of the index database.
     pub index_path: Vec<u8>,
+    /// Scan threads; 0 selects the default count (DESIGN.md §4.6).
+    pub threads: u32,
     pub roots: Vec<RootConfig>,
 }
 
@@ -62,6 +64,7 @@ struct RawConfig {
     block_size: Option<Size>,
     strong_hash: Option<StrongHash>,
     index_path: Option<String>,
+    threads: Option<u32>,
     #[serde(default)]
     roots: Vec<RawRoot>,
 }
@@ -149,6 +152,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
         block_size,
         strong_hash: raw.strong_hash.unwrap_or(StrongHash::DEFAULT),
         index_path,
+        threads: raw.threads.unwrap_or(0),
         roots,
     })
 }
@@ -424,6 +428,7 @@ mod tests {
 block_size = "64KiB"
 strong_hash = "sha256"
 index_path = '/tmp/\xFF/index.sqlite'
+threads = 24
 
 [[roots]]
 path = '/srv/archive-\xFF'
@@ -438,6 +443,7 @@ one_filesystem = true
         assert_eq!(config.block_size, 64 * 1024);
         assert_eq!(config.strong_hash, StrongHash::Sha256);
         assert_eq!(config.index_path, b"/tmp/\xff/index.sqlite");
+        assert_eq!(config.threads, 24);
         assert_eq!(config.roots.len(), 2);
         assert_eq!(config.roots[0].pattern, b"/srv/archive-\xff");
         let exclude = &config.roots[0].exclude;
@@ -464,6 +470,7 @@ one_filesystem = true
         let config = parse("[[roots]]\npath = \"/srv/\\\\xFF/*\"\n").unwrap();
         assert_eq!(config.block_size, DEFAULT_BLOCK_SIZE);
         assert_eq!(config.strong_hash, StrongHash::Blake3);
+        assert_eq!(config.threads, 0);
         assert_eq!(config.roots[0].pattern, b"/srv/\xff/*");
         let config = parse("[[roots]]\npath = '/srv/\\xFF/*'\n").unwrap();
         assert_eq!(config.roots[0].pattern, b"/srv/\xff/*");
@@ -484,6 +491,7 @@ one_filesystem = true
                 .contains("at most")
         );
         assert!(parse("strong_hash = \"md5\"").is_err());
+        assert!(parse("threads = -1").is_err());
         assert!(parse("lookahead = \"1MiB\"").is_err());
         assert!(
             parse("[[roots]]\npath = \"relative\"")
