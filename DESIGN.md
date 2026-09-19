@@ -333,7 +333,7 @@ to one thread; the sole writer uses `BEGIN IMMEDIATE`.
   full digest comparison verifies a candidate. `blocks_by_weak` serves
   distinct weak-hash export.
 - Rebuild under process-exclusive access by resetting schema and metadata
-  in one transaction, then populating in batches and creating secondary
+  in one transaction, then populating in batches and creating deferred
   block indexes. Never replace the database file by rename. Every update
   repairs missing indexes from an interrupted rebuild; read-only runs
   requiring them request an update.

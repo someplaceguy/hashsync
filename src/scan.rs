@@ -353,10 +353,10 @@ impl Scanner<'_> {
             self.count(|c| &c.files_linked, 1);
             return Ok(());
         }
-        if self.unchanged(&identity, meta) {
+        if let Some(inode_id) = self.reusable_inode(&identity, meta) {
             self.send(Msg::Unchanged {
                 file,
-                identity,
+                inode_id,
                 path,
             });
             self.count(|c| &c.files_unchanged, 1);
@@ -365,14 +365,15 @@ impl Scanner<'_> {
         self.hash_owner(fd, meta, file, identity, path)
     }
 
-    /// Whether the index holds a complete row for `identity` with the
-    /// observed size and ctime, so the file's content can be reused
-    /// without hashing or reopening it (DESIGN.md §4.2).
-    fn unchanged(&self, identity: &Identity, meta: &Meta) -> bool {
+    /// The complete inode row that holds `identity` with the observed
+    /// size and ctime, so the file's content can be reused without
+    /// hashing or reopening it (DESIGN.md §4.2). The row stays valid for
+    /// the writer: only this task, its owner, can replace it.
+    fn reusable_inode(&self, identity: &Identity, meta: &Meta) -> Option<i64> {
         READER.with_borrow_mut(|reader| {
             let reader = reader.get_or_insert_with(|| index::open_worker_reader(self.index_path));
             let fsid = &self.fs_cache.info(identity.fs).fsid;
-            reader.complete_inode(fsid, &identity.handle) == Some((meta.size as i64, meta.ctime_ns))
+            reader.reusable_inode(fsid, &identity.handle, meta.size, meta.ctime_ns)
         })
     }
 

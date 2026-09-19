@@ -44,11 +44,14 @@ pub enum Msg {
         ctime_ns: i64,
         path: RelPath,
     },
-    /// The stored content is current (DESIGN.md §4.2): reuse the complete
-    /// inode row and record the owner's path.
+    /// The stored content is current (DESIGN.md §4.2): record the owner's
+    /// path against the reused complete inode row. The row survives until
+    /// this message is applied: reconciliation removed incomplete rows
+    /// before the scan, only the owning task replaces an inode, and
+    /// orphan removal starts after the last message.
     Unchanged {
         file: FileId,
-        identity: Identity,
+        inode_id: i64,
         path: RelPath,
     },
     /// The file is too small to index; remove its rows.
@@ -236,26 +239,13 @@ impl Writer<'_> {
             }
             Msg::Unchanged {
                 file,
-                identity,
+                inode_id,
                 path,
             } => {
                 let paths = match self.file(file) {
                     FileState::Pending(paths) => mem::take(paths),
                     _ => panic!("Unchanged after Begin or after the terminal message"),
                 };
-                // The row exists and is complete: reconciliation removed
-                // incomplete rows before the scan, and only this file's
-                // owner could have replaced it since.
-                let fs_id = self.fs_id(identity.fs);
-                let mut select = db(self.conn.prepare_cached(
-                    "SELECT id FROM inodes
-                     WHERE fs_id = ? AND handle = ? AND size IS NOT NULL",
-                ));
-                let inode_id = db(select
-                    .query_row(params![fs_id, &*identity.handle], |row| row.get(0))
-                    .optional())
-                .expect("Unchanged without a complete inode row");
-                drop(select);
                 for path in std::iter::once(&path).chain(&paths) {
                     self.insert_path(inode_id, path);
                 }

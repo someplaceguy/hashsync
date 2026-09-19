@@ -59,7 +59,7 @@ DROP TABLE IF EXISTS meta;
 ";
 
 /// Created after population; repaired by every update.
-const SECONDARY_INDEXES: &str = "
+const DEFERRED_BLOCK_INDEXES: &str = "
 CREATE INDEX IF NOT EXISTS blocks_by_weak   ON blocks (weak);
 CREATE INDEX IF NOT EXISTS blocks_by_strong ON blocks (strong);
 ";
@@ -111,7 +111,7 @@ pub struct Stats {
     pub blocks: u64,
     pub distinct_weak: u64,
     pub indexed_bytes: u64,
-    pub secondary_indexes: bool,
+    pub deferred_block_indexes: bool,
 }
 
 /// An open index connection: the writer of a modifying process, or the
@@ -146,6 +146,18 @@ fn schema_read(conn: &Connection) -> rusqlite::Result<()> {
     conn.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))
 }
 
+/// Open one connection of a modifying process: read/write through
+/// `unix-excl`, waiting forever on contention, like every connection of
+/// that process must (DESIGN.md §4.4). The writer and its worker readers
+/// share this one recipe: a change to the VFS or the flags here changes
+/// the writer, whose exclusion the locking tests verify.
+fn open_unix_excl(path: &[u8], extra: OpenFlags) -> rusqlite::Result<Connection> {
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX | extra;
+    let conn = Connection::open_with_flags_and_vfs(os_path(path), flags, "unix-excl")?;
+    conn.busy_handler(Some(wait_forever))?;
+    Ok(conn)
+}
+
 /// Open the writer of a modifying process, waiting for exclusive access.
 pub fn open_modifying(path: &[u8]) -> Index {
     if let Some(parent) = os_path(path).parent()
@@ -157,17 +169,13 @@ pub fn open_modifying(path: &[u8]) -> Index {
         );
     }
     loop {
-        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
-            | OpenFlags::SQLITE_OPEN_CREATE
-            | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-        let conn = match Connection::open_with_flags_and_vfs(os_path(path), flags, "unix-excl") {
+        let conn = match open_unix_excl(path, OpenFlags::SQLITE_OPEN_CREATE) {
             Ok(conn) => conn,
             Err(e) => die(
                 EXIT_FAILURE,
                 format!("cannot open index {}: {e}", path.as_bstr()),
             ),
         };
-        db(conn.busy_handler(Some(wait_forever)));
         match schema_read(&conn) {
             Ok(()) => {
                 db(conn.pragma_update(None, "foreign_keys", "ON"));
@@ -192,13 +200,7 @@ pub fn open_modifying(path: &[u8]) -> Index {
 /// `query_only` set before use. The writer already holds the process
 /// lock. Queries run in autocommit, so a reader never pins a WAL snapshot.
 pub fn open_worker_reader(path: &[u8]) -> Reader {
-    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    let conn = db(Connection::open_with_flags_and_vfs(
-        os_path(path),
-        flags,
-        "unix-excl",
-    ));
-    db(conn.busy_handler(Some(wait_forever)));
+    let conn = db(open_unix_excl(path, OpenFlags::empty()));
     db(conn.pragma_update(None, "foreign_keys", "ON"));
     db(conn.pragma_update(None, "query_only", "ON"));
     Reader { conn }
@@ -210,18 +212,28 @@ pub struct Reader {
 }
 
 impl Reader {
-    /// The stored `(size, ctime_ns)` of a complete inode, by persistent
-    /// identity. The size is the stored `i64` bit pattern; compare it only
-    /// for equality.
-    pub fn complete_inode(&self, fsid: &[u8], handle: &[u8]) -> Option<(i64, i64)> {
+    /// The ID of the complete inode row that stores this identity with
+    /// the observed size and ctime, so the file's content can be reused
+    /// without hashing (DESIGN.md §4.2). The comparison uses the stored
+    /// `i64` bit pattern of the unsigned size; the equality also rejects
+    /// incomplete rows, whose size is NULL.
+    pub fn reusable_inode(
+        &self,
+        fsid: &[u8],
+        handle: &[u8],
+        size: u64,
+        ctime_ns: i64,
+    ) -> Option<i64> {
         let mut stmt = db(self.conn.prepare_cached(
-            "SELECT inodes.size, inodes.ctime_ns FROM inodes
+            "SELECT inodes.id FROM inodes
              JOIN filesystems ON filesystems.id = inodes.fs_id
              WHERE filesystems.fsid = ? AND inodes.handle = ?
-               AND inodes.size IS NOT NULL",
+               AND inodes.size = ? AND inodes.ctime_ns = ?",
         ));
         db(stmt
-            .query_row(params![fsid, handle], |row| Ok((row.get(0)?, row.get(1)?)))
+            .query_row(params![fsid, handle, size as i64, ctime_ns], |row| {
+                row.get(0)
+            })
             .optional())
     }
 }
@@ -302,8 +314,8 @@ impl Index {
     }
 
     /// Reset schema and metadata in one transaction, with a new index ID.
-    /// Secondary block indexes are created later by
-    /// `ensure_secondary_indexes`.
+    /// Deferred block indexes are created after population by
+    /// `ensure_deferred_block_indexes`.
     pub fn reset(&self, settings: &Settings) {
         let mut index_id = [0u8; 16];
         rustix::rand::getrandom(&mut index_id, rustix::rand::GetRandomFlags::empty())
@@ -323,8 +335,8 @@ impl Index {
         db(self.conn.execute_batch("COMMIT"));
     }
 
-    pub fn ensure_secondary_indexes(&self) {
-        db(self.conn.execute_batch(SECONDARY_INDEXES));
+    pub fn ensure_deferred_block_indexes(&self) {
+        db(self.conn.execute_batch(DEFERRED_BLOCK_INDEXES));
     }
 
     /// Reconcile roots before scanning (DESIGN.md §4.2): remove paths and
@@ -374,10 +386,157 @@ impl Index {
             blocks: count("SELECT count(*) FROM blocks"),
             distinct_weak: count("SELECT count(DISTINCT weak) FROM blocks"),
             indexed_bytes: indexed_bytes as u64,
-            secondary_indexes: count(
+            deferred_block_indexes: count(
                 "SELECT count(*) FROM sqlite_master WHERE type = 'index'
                  AND name IN ('blocks_by_weak', 'blocks_by_strong')",
             ) == 2,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::ffi::OsStrExt;
+    use std::process::Command;
+
+    use super::*;
+
+    fn settings() -> Settings {
+        Settings {
+            block_size: 4096,
+            weak_hash_id: "test".into(),
+            strong_hash_id: "test".into(),
+        }
+    }
+
+    /// The exit code of a completed probe. The probe process exits with
+    /// it because a plain successful exit proves nothing: a filter that
+    /// selects no test also exits zero.
+    const PROBE_RAN: i32 = 42;
+
+    /// Assert, from a separate process, that the index at `path` is
+    /// locked (`busy`) or readable (`open`). The probe makes the first
+    /// attempt of a read-only process, without the retry loop: this test
+    /// binary runs `lock_probe_child` selected by the environment.
+    fn probe(path: &Path, expect: &str) {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "index::tests::lock_probe_child", "--ignored"])
+            .env("HASHSYNC_TEST_LOCK_DB", path)
+            .env("HASHSYNC_TEST_LOCK_EXPECT", expect)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(PROBE_RAN),
+            "the probe did not run, or did not find the index {expect}:\n{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Not a test of its own: the separate process that
+    /// `exclusion_survives_worker_readers` starts through `probe`. On the
+    /// expected outcome it exits the process with `PROBE_RAN` instead of
+    /// returning, which tells the parent that the probe really ran.
+    #[test]
+    #[ignore = "helper process of exclusion_survives_worker_readers"]
+    fn lock_probe_child() {
+        let Some(path) = std::env::var_os("HASHSYNC_TEST_LOCK_DB") else {
+            return;
+        };
+        let expect = std::env::var("HASHSYNC_TEST_LOCK_EXPECT").unwrap();
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let conn = Connection::open_with_flags(Path::new(&path), flags).unwrap();
+        // The bundled SQLite installs a default busy timeout on every new
+        // connection; remove it so contention reports busy at once.
+        conn.busy_handler(None).unwrap();
+        let result = conn
+            .execute_batch("BEGIN")
+            .and_then(|()| schema_read(&conn));
+        match (expect.as_str(), result) {
+            ("busy", Err(e)) if is_busy(&e) => {}
+            ("open", Ok(())) => {}
+            (expect, result) => panic!("expected {expect}, got {result:?}"),
+        }
+        drop(conn);
+        std::process::exit(PROBE_RAN);
+    }
+
+    /// Process exclusion must survive the worker readers of a modifying
+    /// process (DESIGN.md §4.4): opened by the real helpers, they must
+    /// not downgrade the process lock, and closing them before the
+    /// writer must leave no gap in exclusion. Every probe is a separate
+    /// process (DESIGN.md §11).
+    #[test]
+    fn exclusion_survives_worker_readers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.sqlite");
+        let path_bytes = path.as_os_str().as_bytes().to_vec();
+
+        let index = open_modifying(&path_bytes);
+        index.reset(&settings());
+        let reader = open_worker_reader(&path_bytes);
+        assert_eq!(reader.reusable_inode(b"\x01", b"\x02", 4096, 123), None);
+
+        // The connections of this process share the heap WAL index of
+        // `unix-excl`; a writer through the normal VFS would create the
+        // shared-memory file instead. Readers attach to the index the
+        // writer created, so this observes the shared `open_unix_excl`
+        // recipe through the writer.
+        assert!(
+            dir.path().join("index.sqlite-wal").exists(),
+            "the index is not in WAL mode"
+        );
+        assert!(
+            !dir.path().join("index.sqlite-shm").exists(),
+            "the writer bypassed the unix-excl VFS"
+        );
+        probe(&path, "busy");
+
+        drop(reader);
+        probe(&path, "busy");
+
+        drop(index);
+        probe(&path, "open");
+    }
+
+    /// A worker reader opens after the writer holds the process lock and
+    /// queries in autocommit: each query must observe the writer's latest
+    /// commit through the WAL that the `unix-excl` connections share
+    /// (DESIGN.md §4.4).
+    #[test]
+    fn worker_readers_see_later_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.sqlite");
+        let path_bytes = path.as_os_str().as_bytes().to_vec();
+
+        let index = open_modifying(&path_bytes);
+        index.reset(&settings());
+        let reader = open_worker_reader(&path_bytes);
+        assert_eq!(reader.reusable_inode(b"\x01", b"\x02", 4096, 123), None);
+
+        // Committed after the reader's first query: the reader must not
+        // stay on its earlier snapshot.
+        db(index.conn.execute_batch(
+            "BEGIN IMMEDIATE;
+             INSERT INTO filesystems (id, fsid) VALUES (1, x'01');
+             INSERT INTO inodes (id, fs_id, handle, size, ctime_ns)
+             VALUES (7, 1, x'02', 4096, 123);
+             INSERT INTO inodes (id, fs_id, handle, size, ctime_ns)
+             VALUES (8, 1, x'03', NULL, 123);
+             COMMIT;",
+        ));
+        assert_eq!(
+            reader.reusable_inode(b"\x01", b"\x02", 4096, 123),
+            Some(7),
+            "the reader must see the commit"
+        );
+        assert_eq!(reader.reusable_inode(b"\x01", b"\x02", 4096, 124), None);
+        assert_eq!(reader.reusable_inode(b"\x01", b"\x02", 4095, 123), None);
+        assert_eq!(
+            reader.reusable_inode(b"\x01", b"\x03", 4096, 123),
+            None,
+            "an incomplete row is not reusable"
+        );
     }
 }

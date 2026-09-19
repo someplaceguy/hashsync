@@ -62,7 +62,7 @@ pub fn run(config: &Config) {
             "the index settings differ from the configuration; run `hashsync update` to rebuild it",
         );
     }
-    if !stats.secondary_indexes {
-        warn("secondary block indexes are missing; run `hashsync update`");
+    if !stats.deferred_block_indexes {
+        warn("deferred block indexes are missing; run `hashsync update`");
     }
 }

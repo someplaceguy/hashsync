@@ -74,13 +74,13 @@ pub fn run(config: &Config, rebuild: bool, jobs: Option<u32>) {
         (counters, writer.join().expect("the writer thread panicked"))
     });
 
-    index.ensure_secondary_indexes();
+    index.ensure_deferred_block_indexes();
     drop(index);
 
     eprintln!(
         "hashsync: {} in {:.1}s: {} directories, {} files hashed ({} bytes), \
-         {} unchanged, {} hard links, {} small files, {} indexed blocks \
-         ({} periodic, {} in holes), {} paths, {} stale inodes removed",
+         {} unchanged, {} hard links, {} small files, {} newly indexed blocks \
+         (skipped: {} periodic, {} in holes), {} paths, {} stale inodes removed",
         if rebuild {
             "rebuilt index"
         } else {

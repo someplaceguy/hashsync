@@ -49,7 +49,7 @@ fn indexes_complete_useful_blocks() {
     let sizes: i64 = env.count("SELECT sum(size) FROM inodes");
     assert_eq!(sizes as usize, BLOCK + (BLOCK * 2 + BLOCK / 2) + BLOCK * 3);
 
-    // Secondary indexes exist after the update.
+    // Deferred block indexes exist after the update.
     assert_eq!(
         env.count("SELECT count(*) FROM sqlite_master WHERE name IN ('blocks_by_weak', 'blocks_by_strong')"),
         2
@@ -124,6 +124,56 @@ fn hard_links_within_and_across_roots() {
         root_file.1.is_empty(),
         "a single-file root has an empty rel_path"
     );
+}
+
+#[test]
+fn hard_links_across_repeated_updates() {
+    let env = Env::new();
+    env.write("tree/one", &random(BLOCK, 1));
+    std::fs::hard_link(env.path("tree/one"), env.path("tree/two")).unwrap();
+    env.configure(&env.root("tree", ""));
+    env.update();
+
+    // Nothing changed: the owner reuses its row and the other link
+    // re-adds its path against that reused row.
+    let stderr = env.update();
+    assert!(stderr.contains(" 0 files hashed"), "{stderr}");
+    assert!(stderr.contains("1 unchanged"), "{stderr}");
+    assert!(stderr.contains("1 hard links"), "{stderr}");
+    assert_eq!(env.tree_paths(), vec!["one", "two"]);
+    assert_eq!(env.count("SELECT count(*) FROM inodes"), 1);
+    assert_eq!(env.count("SELECT count(*) FROM blocks"), 1);
+
+    // An added link changes the inode's ctime, so the content is hashed
+    // again into the same inode row; all three links get paths.
+    std::fs::hard_link(env.path("tree/one"), env.path("tree/three")).unwrap();
+    let stderr = env.update();
+    assert!(stderr.contains("1 files hashed"), "{stderr}");
+    assert!(stderr.contains("2 hard links"), "{stderr}");
+    assert_eq!(env.tree_paths(), vec!["one", "three", "two"]);
+    assert_eq!(env.count("SELECT count(*) FROM inodes"), 1);
+    assert_eq!(env.count("SELECT count(*) FROM blocks"), 1);
+
+    // A removed link also changes the ctime; the remaining links keep
+    // the inode alive.
+    std::fs::remove_file(env.path("tree/two")).unwrap();
+    let stderr = env.update();
+    assert!(stderr.contains("1 files hashed"), "{stderr}");
+    assert!(stderr.contains("1 hard links"), "{stderr}");
+    assert!(stderr.contains(" 0 stale inodes removed"), "{stderr}");
+    assert_eq!(env.tree_paths(), vec!["one", "three"]);
+    assert_eq!(env.count("SELECT count(*) FROM inodes"), 1);
+    assert_eq!(env.count("SELECT count(*) FROM blocks"), 1);
+
+    // Removing the last links orphans the inode.
+    std::fs::remove_file(env.path("tree/one")).unwrap();
+    std::fs::remove_file(env.path("tree/three")).unwrap();
+    let stderr = env.update();
+    assert!(stderr.contains(" 0 files hashed"), "{stderr}");
+    assert!(stderr.contains("1 stale inodes removed"), "{stderr}");
+    assert_eq!(env.count("SELECT count(*) FROM paths"), 0);
+    assert_eq!(env.count("SELECT count(*) FROM inodes"), 0);
+    assert_eq!(env.count("SELECT count(*) FROM blocks"), 0);
 }
 
 #[test]
@@ -547,13 +597,13 @@ fn unchanged_files_are_reused_without_rehashing() {
 }
 
 #[test]
-fn missing_secondary_indexes_are_repaired() {
+fn missing_deferred_block_indexes_are_repaired() {
     let env = Env::new();
     env.write("tree/f", &random(BLOCK, 1));
     env.configure(&env.root("tree", ""));
     env.update();
 
-    // An interrupted rebuild can leave the secondary block indexes
+    // An interrupted rebuild can leave the deferred block indexes
     // missing; every update repairs them (DESIGN.md §4.4).
     env.db_rw()
         .execute_batch("DROP INDEX blocks_by_weak; DROP INDEX blocks_by_strong")
