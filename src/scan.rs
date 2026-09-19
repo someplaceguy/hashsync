@@ -419,12 +419,12 @@ impl Scanner<'_> {
         });
         match outcome {
             Ok(outcome) => {
-                // The metadata observed before hashing: a file that changed
-                // meanwhile has a later ctime, so the next update rehashes it.
+                // The size observed before hashing, like the ctime sent
+                // with Begin: a file that changed meanwhile has a later
+                // ctime, so the next update rehashes it.
                 self.send(Msg::End {
                     file,
                     size: meta.size,
-                    ctime_ns: meta.ctime_ns,
                     path,
                 });
                 self.count(|c| &c.files_hashed, 1);

@@ -23,7 +23,7 @@ changes.
 **Status:** Steps 1 and 2 are implemented: `update` (with `--rebuild` and
 `-j`) and `stats` maintain the index for mutable roots, reuse unchanged
 files by identity, size, and ctime, and recover interrupted work. Step 3
-is next.
+is the next milestone.
 
 ## 1. Build and inspect a local index
 
@@ -35,7 +35,9 @@ Deliver `hashsync update [--rebuild]` and `hashsync stats` for mutable roots.
   and literal glob metacharacters.
 - Index the complete, useful blocks defined in the design, honoring
   `block_size` and both supported strong-hash choices. Handle sparse files
-  and files too small or repetitive to contribute blocks.
+  and files too small or repetitive to contribute blocks. Retain completed
+  inode and path rows for files at least `block_size` even when every
+  complete block is skipped.
 - Support hard links within and across roots. Enforce the rules for symlinks,
   special files, duplicate or nested root paths, and cycles during root
   expansion. Detect directory aliases and cycles during actual traversal
@@ -53,7 +55,7 @@ Design coverage: §§4.1–4.6, 5.1–5.3, 7–8.
 ## 2. Refresh the index efficiently and recover interrupted work
 
 - Reuse unchanged file content across updates, using the design's identity
-  and change-detection rules.
+  and change-detection rules, including completed files with no useful blocks.
 - Reflect additions, removals, renames, hard-link changes, and files that
   shrink or cease to contain useful blocks. Refresh paths even when file
   content can be reused.

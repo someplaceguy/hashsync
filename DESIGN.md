@@ -100,6 +100,10 @@ operations and are not timeouts.
   indexing policy, not a protocol constant.
 - Skip reads of blocks entirely inside sparse-file holes. Read blocks
   partially overlapping holes normally.
+- For files at least `block_size`, retain inode and path rows and mark the
+  inode complete after successful processing, even if all complete blocks
+  are skipped as repetitive or holes, with or without a partial tail.
+  This avoids rehashing unchanged files on every update.
 
 ### 4.2 Roots and change detection
 
@@ -262,7 +266,7 @@ CREATE TABLE inodes      (id INTEGER PRIMARY KEY,
                             ON DELETE RESTRICT,
                           handle BLOB NOT NULL, size INTEGER,
                           ctime_ns INTEGER NOT NULL, UNIQUE (fs_id, handle));
-  -- size: NULL while block rows are incomplete; otherwise stx_size bits
+  -- size: NULL while processing is incomplete; otherwise stx_size bits
 CREATE TABLE paths       (root_id INTEGER NOT NULL REFERENCES roots(id)
                             ON DELETE RESTRICT,
                           rel_path BLOB NOT NULL,
@@ -321,14 +325,15 @@ to one thread; the sole writer uses `BEGIN IMMEDIATE`.
   Weak hashes and unsigned file sizes use their `i64` bit patterns;
   stored sizes are compared only for equality. NULL, not an integer
   sentinel, marks an incomplete inode.
-- Before replacing blocks, mark the inode incomplete; this may commit before
-  any old blocks are deleted. Remove old blocks in bounded transactions
-  before inserting new ones. Keep the inode incomplete while streaming new
-  blocks across bounded batches and periodic commits; only successful
-  completion stores size and ctime with the last rows. Recovery follows
-  section 4.2.
-- A successful inode with no useful blocks has no persistent inode, block,
-  or path rows. Temporary incomplete rows are allowed while hashing.
+- Before replacing blocks, mark the inode incomplete and store the ctime
+  observed before hashing; this may commit before any old blocks are
+  deleted. Remove old blocks in bounded transactions before inserting new
+  ones. Keep the inode incomplete while streaming new blocks across bounded
+  batches and periodic commits; only successful completion stores the size,
+  together with any final block rows. Recovery follows section 4.2.
+- Successful processing of a file at least `block_size` retains the inode
+  and path rows even when no block rows were inserted. Store the size
+  normally so the inode is complete and reusable.
 - `blocks_by_strong` supplies candidates using 16-byte prefixes; only a
   full digest comparison verifies a candidate. `blocks_by_weak` serves
   distinct weak-hash export.
@@ -442,9 +447,9 @@ but each owner's messages stay ordered:
 
 | Message | Effect |
 |---|---|
-| Begin | Mark the inode incomplete, then remove old blocks in bounded transactions. |
+| Begin | Mark the inode incomplete with the observed ctime, then remove old blocks in bounded transactions. |
 | Blocks | Append a bounded batch of block number, weak hash, and strong prefix rows. |
-| End | Store successful metadata and the owner's path, or remove an inode with no useful blocks. |
+| End | Store the successful size and the owner's path, marking the inode complete even if no block rows were inserted. |
 | Unchanged | Reuse complete rows and record the owner's path. |
 | Omit | Remove an inode too small to index and its dependent rows. |
 | Path | Record an additional hard-link path after the owner's result is known. |

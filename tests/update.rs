@@ -24,11 +24,12 @@ fn indexes_complete_useful_blocks() {
     env.configure(&env.root("tree", ""));
 
     let stderr = env.update();
-    // Periodic-only files are hashed too; they just add no rows.
+    // Periodic-only files are hashed too; they add no block rows but
+    // keep complete inode and path rows (DESIGN.md §4.1).
     assert!(stderr.contains("5 files hashed"), "{stderr}");
     assert!(stderr.contains("6 periodic"), "{stderr}");
 
-    assert_eq!(env.count("SELECT count(*) FROM inodes"), 3);
+    assert_eq!(env.count("SELECT count(*) FROM inodes"), 5);
     assert_eq!(
         env.count("SELECT count(*) FROM inodes WHERE size IS NULL"),
         0
@@ -38,16 +39,27 @@ fn indexes_complete_useful_blocks() {
     assert_eq!(env.count("SELECT count(*) FROM filesystems"), 1);
     assert_eq!(
         env.tree_paths(),
-        vec!["one_block", "sub/dir/mixed", "two_and_half"]
+        vec![
+            "one_block",
+            "pattern16",
+            "sub/dir/mixed",
+            "two_and_half",
+            "zeros"
+        ]
     );
     assert_eq!(env.block_numbers("sub/dir/mixed"), vec![0, 2]);
     assert_eq!(env.block_numbers("two_and_half"), vec![0, 1]);
+    assert!(env.block_numbers("zeros").is_empty());
 
     // Stored strong prefixes are the first 16 bytes of BLAKE3.
     let expected = blake3::hash(&random(BLOCK, 2)).as_bytes()[..16].to_vec();
     assert_eq!(env.strong_prefixes("one_block"), vec![expected]);
+    // one_block, two_and_half, zeros, pattern16, and mixed.
     let sizes: i64 = env.count("SELECT sum(size) FROM inodes");
-    assert_eq!(sizes as usize, BLOCK + (BLOCK * 2 + BLOCK / 2) + BLOCK * 3);
+    assert_eq!(
+        sizes as usize,
+        BLOCK + (BLOCK * 2 + BLOCK / 2) + BLOCK * 3 + BLOCK * 2 + BLOCK * 3
+    );
 
     // Deferred block indexes exist after the update.
     assert_eq!(
@@ -597,6 +609,36 @@ fn unchanged_files_are_reused_without_rehashing() {
 }
 
 #[test]
+fn files_without_useful_blocks_are_retained_and_reused() {
+    let env = Env::new();
+    // Every complete block is skipped: as repetitive content, with or
+    // without a partial tail, or as a hole (DESIGN.md §4.1).
+    env.write("tree/zeros", &vec![0u8; BLOCK * 2]);
+    env.write("tree/tail", &pattern16(BLOCK + 100));
+    let sparse = std::fs::File::create(env.path("tree/sparse")).unwrap();
+    sparse.set_len((BLOCK * 2) as u64).unwrap();
+    drop(sparse);
+    env.configure(&env.root("tree", ""));
+    let stderr = env.update();
+    assert!(stderr.contains("3 files hashed"), "{stderr}");
+
+    // The files keep complete inode and path rows, without block rows.
+    assert_eq!(env.tree_paths(), vec!["sparse", "tail", "zeros"]);
+    assert_eq!(env.count("SELECT count(*) FROM inodes"), 3);
+    assert_eq!(
+        env.count("SELECT count(*) FROM inodes WHERE size IS NULL"),
+        0
+    );
+    assert_eq!(env.count("SELECT count(*) FROM blocks"), 0);
+
+    // The next update reuses the files instead of rehashing them.
+    let stderr = env.update();
+    assert!(stderr.contains(" 0 files hashed"), "{stderr}");
+    assert!(stderr.contains("3 unchanged"), "{stderr}");
+    assert_eq!(env.tree_paths(), vec!["sparse", "tail", "zeros"]);
+}
+
+#[test]
 fn missing_deferred_block_indexes_are_repaired() {
     let env = Env::new();
     env.write("tree/f", &random(BLOCK, 1));
@@ -646,7 +688,8 @@ fn updates_reflect_changes_and_rebuilds() {
     env.write("tree/shrinks", &random(10, 3));
     std::fs::rename(env.path("tree/moves"), env.path("tree/moved")).unwrap();
     env.write("tree/new", &random(BLOCK, 5));
-    // Only periodic content: the file keeps its size but loses its rows.
+    // Only periodic content: the file keeps a complete inode and its
+    // path, but loses its block rows.
     env.write("tree/blanks", &vec![0u8; BLOCK]);
     let stderr = env.update();
     // A rename changes the file's ctime, so `moved` is hashed again;
@@ -654,9 +697,10 @@ fn updates_reflect_changes_and_rebuilds() {
     assert!(stderr.contains("3 files hashed"), "{stderr}");
     assert!(stderr.contains("1 unchanged"), "{stderr}");
     assert!(stderr.contains("1 stale inodes removed"), "{stderr}");
-    assert_eq!(env.tree_paths(), vec!["moved", "new", "stays"]);
-    assert_eq!(env.count("SELECT count(*) FROM inodes"), 3);
+    assert_eq!(env.tree_paths(), vec!["blanks", "moved", "new", "stays"]);
+    assert_eq!(env.count("SELECT count(*) FROM inodes"), 4);
     assert_eq!(env.count("SELECT count(*) FROM blocks"), 3);
+    assert!(env.block_numbers("blanks").is_empty());
     assert_eq!(
         env.index_id(),
         index_id,
@@ -669,7 +713,7 @@ fn updates_reflect_changes_and_rebuilds() {
     assert!(stderr.contains("4 files hashed"), "{stderr}");
     assert!(stderr.contains(" 0 unchanged"), "{stderr}");
     assert_ne!(env.index_id(), index_id, "a rebuild renews the index ID");
-    assert_eq!(env.count("SELECT count(*) FROM inodes"), 3);
+    assert_eq!(env.count("SELECT count(*) FROM inodes"), 4);
 
     // Changed settings rebuild the index in place.
     let rebuilt_id = env.index_id();
@@ -684,7 +728,7 @@ fn updates_reflect_changes_and_rebuilds() {
     assert_eq!(
         env.count("SELECT count(*) FROM inodes"),
         0,
-        "no file has a full 8 KiB block"
+        "every file is smaller than the 8 KiB block size"
     );
     assert_eq!(
         env.count("SELECT value FROM meta WHERE key = 'block_size'"),

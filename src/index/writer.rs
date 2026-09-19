@@ -27,8 +27,8 @@ pub struct RelPath {
 }
 
 pub enum Msg {
-    /// Mark the inode incomplete, then remove its old blocks in bounded
-    /// transactions.
+    /// Mark the inode incomplete, storing the observed ctime, then remove
+    /// its old blocks in bounded transactions.
     Begin {
         file: FileId,
         identity: Identity,
@@ -36,12 +36,12 @@ pub enum Msg {
     },
     /// A bounded batch of block rows.
     Blocks { file: FileId, rows: Vec<BlockRow> },
-    /// Hashing succeeded: store metadata and the owner's path, or remove
-    /// an inode with no useful blocks.
+    /// Hashing succeeded: store the size and the owner's path. The inode
+    /// becomes complete even when no block rows were inserted
+    /// (DESIGN.md §4.4).
     End {
         file: FileId,
         size: u64,
-        ctime_ns: i64,
         path: RelPath,
     },
     /// The stored content is current (DESIGN.md §4.2): record the owner's
@@ -78,11 +78,7 @@ enum FileState {
     /// Neither `Begin` nor a terminal message yet: paths wait.
     Pending(Vec<RelPath>),
     /// `Begin` arrived: block rows are being appended to this inode.
-    Hashing {
-        inode_id: i64,
-        blocks: u64,
-        paths: Vec<RelPath>,
-    },
+    Hashing { inode_id: i64, paths: Vec<RelPath> },
     /// Indexed: paths link to this inode row.
     Indexed(i64),
     /// Omitted or abandoned: paths are dropped.
@@ -176,20 +172,11 @@ impl Writer<'_> {
                     _ => panic!("Begin after Begin or after the terminal message"),
                 };
                 let inode_id = self.begin_inode(&identity, ctime_ns);
-                *self.file(file) = FileState::Hashing {
-                    inode_id,
-                    blocks: 0,
-                    paths,
-                };
+                *self.file(file) = FileState::Hashing { inode_id, paths };
             }
             Msg::Blocks { file, rows } => {
                 let inode_id = match self.file(file) {
-                    FileState::Hashing {
-                        inode_id, blocks, ..
-                    } => {
-                        *blocks += rows.len() as u64;
-                        *inode_id
-                    }
+                    FileState::Hashing { inode_id, .. } => *inode_id,
                     _ => panic!("Blocks without Begin"),
                 };
                 let mut insert = db(self.conn.prepare_cached(
@@ -206,36 +193,23 @@ impl Writer<'_> {
                 self.summary.blocks += rows.len() as u64;
                 self.work += rows.len() as u64;
             }
-            Msg::End {
-                file,
-                size,
-                ctime_ns,
-                path,
-            } => {
-                let (inode_id, blocks, paths) =
-                    match mem::replace(self.file(file), FileState::Dropped) {
-                        FileState::Hashing {
-                            inode_id,
-                            blocks,
-                            paths,
-                        } => (inode_id, blocks, paths),
-                        _ => panic!("End without Begin"),
-                    };
-                if blocks == 0 {
-                    // No useful blocks: nothing persists (DESIGN.md §4.4).
-                    db(self
-                        .conn
-                        .execute("DELETE FROM inodes WHERE id = ?", params![inode_id]));
-                } else {
-                    db(self.conn.execute(
-                        "UPDATE inodes SET size = ?, ctime_ns = ? WHERE id = ?",
-                        params![size as i64, ctime_ns, inode_id],
-                    ));
-                    for path in std::iter::once(&path).chain(&paths) {
-                        self.insert_path(inode_id, path);
-                    }
-                    *self.file(file) = FileState::Indexed(inode_id);
+            Msg::End { file, size, path } => {
+                let (inode_id, paths) = match self.file(file) {
+                    FileState::Hashing { inode_id, paths } => (*inode_id, mem::take(paths)),
+                    _ => panic!("End without Begin"),
+                };
+                // The ctime is already there from Begin's incomplete mark.
+                // Also with no block rows, the complete inode lets the
+                // next update reuse the unchanged file without hashing
+                // it again (DESIGN.md §4.4).
+                db(self.conn.execute(
+                    "UPDATE inodes SET size = ? WHERE id = ?",
+                    params![size as i64, inode_id],
+                ));
+                for path in std::iter::once(&path).chain(&paths) {
+                    self.insert_path(inode_id, path);
                 }
+                *self.file(file) = FileState::Indexed(inode_id);
             }
             Msg::Unchanged {
                 file,
@@ -311,8 +285,8 @@ impl Writer<'_> {
     }
 
     /// Start replacing the blocks of a file: mark its inode incomplete,
-    /// then remove the old blocks in bounded transactions (DESIGN.md §4.4).
-    /// Returns the inode row.
+    /// storing the observed ctime, then remove the old blocks in bounded
+    /// transactions (DESIGN.md §4.4). Returns the inode row.
     fn begin_inode(&mut self, identity: &Identity, ctime_ns: i64) -> i64 {
         let fs_id = self.fs_id(identity.fs);
         match self.select_inode(fs_id, &identity.handle) {
