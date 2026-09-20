@@ -22,7 +22,7 @@ use std::os::fd::{AsFd, OwnedFd};
 use std::sync::Arc;
 
 use bstr::ByteSlice;
-use rustix::fs::{Dir, FileType};
+use rustix::fs::FileType;
 use rustix::io::Errno;
 
 use crate::config::{Config, RootConfig};
@@ -217,10 +217,18 @@ impl Walker<'_> {
             return;
         }
         // The listing supplies the names; a literal position matches a
-        // listed name and needs no lookup of its own.
-        self.for_each_entry(node, |walker, name| {
-            walker.consider(node, name, positions, true);
-        });
+        // listed name and needs no lookup of its own. A listing failure
+        // is reported and abandons the entries not yet listed.
+        let entries = match fsops::list_dir(node.fd.as_fd()) {
+            Ok(entries) => entries,
+            Err(e) => return self.error(&node.path, "reopen", e),
+        };
+        for entry in entries {
+            match entry {
+                Ok(entry) => self.consider(node, entry.file_name().to_bytes(), positions, true),
+                Err(e) => return self.error(&node.path, "readdir", e),
+            }
+        }
     }
 
     /// Handle the entry `name` of `node`. `listed` says that the name came
@@ -313,43 +321,6 @@ impl Walker<'_> {
             );
         }
         true
-    }
-
-    /// Call `f` with the name of every entry of `node` that can be a root
-    /// or lead to one. A listing failure is reported and skips the
-    /// entries not yet listed.
-    fn for_each_entry(&mut self, node: &Node, mut f: impl FnMut(&mut Self, &[u8])) {
-        let readable = match fsops::reopen_dir(node.fd.as_fd()) {
-            Ok(fd) => fd,
-            Err(e) => return self.error(&node.path, "reopen", e),
-        };
-        let dir = match Dir::new(readable) {
-            Ok(dir) => dir,
-            Err(e) => return self.error(&node.path, "opendir", e),
-        };
-        for entry in dir {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(e) => return self.error(&node.path, "readdir", e),
-            };
-            let name = entry.file_name().to_bytes();
-            if name == b"." || name == b".." {
-                continue;
-            }
-            // Directory-entry types are hints; they only skip entries
-            // that can never be roots without examining them.
-            if matches!(
-                entry.file_type(),
-                FileType::Symlink
-                    | FileType::Fifo
-                    | FileType::Socket
-                    | FileType::CharacterDevice
-                    | FileType::BlockDevice
-            ) {
-                continue;
-            }
-            f(self, name);
-        }
     }
 
     fn excluded(&self, name: &[u8], path: &[u8]) -> bool {

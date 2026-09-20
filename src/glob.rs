@@ -13,6 +13,18 @@ pub fn matches(pattern: &[u8], value: &[u8]) -> bool {
     gix_glob::wildmatch(pattern.as_bstr(), value.as_bstr(), MODE)
 }
 
+/// Bytes that a backslash may quote in a pattern.
+pub const QUOTABLE: &[u8] = b"*?[]-!^\\";
+
+/// Append `byte` to `pattern` so that the pattern matches it literally:
+/// a quotable byte gets a backslash, every other byte matches itself.
+pub fn push_quoted(pattern: &mut Vec<u8>, byte: u8) {
+    if QUOTABLE.contains(&byte) {
+        pattern.push(b'\\');
+    }
+    pattern.push(byte);
+}
+
 /// One `/`-separated component of a root pattern.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Component {
@@ -102,5 +114,19 @@ mod tests {
         assert_eq!(classify(b"a**"), Component::Wild(b"a**".to_vec()));
         let comps: Vec<&[u8]> = components(b"//srv//data/").collect();
         assert_eq!(comps, vec![&b"srv"[..], &b"data"[..]]);
+    }
+
+    #[test]
+    fn pushed_bytes_match_literally() {
+        let mut pattern = Vec::new();
+        for &byte in b"a*b?\\\xff" {
+            push_quoted(&mut pattern, byte);
+        }
+        assert_eq!(pattern, b"a\\*b\\?\\\\\xff");
+        assert!(matches(&pattern, b"a*b?\\\xff"));
+        assert_eq!(
+            classify(&pattern),
+            Component::Literal(b"a*b?\\\xff".to_vec())
+        );
     }
 }

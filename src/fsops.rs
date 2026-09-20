@@ -11,7 +11,7 @@
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 use std::path::Path;
 
-use rustix::fs::{AtFlags, FileType, Mode, OFlags, StatxFlags};
+use rustix::fs::{AtFlags, Dir, DirEntry, FileType, Mode, OFlags, StatxFlags};
 use rustix::io::{Errno, retry_on_intr};
 
 /// Flags for the initial open of any entry.
@@ -73,6 +73,35 @@ pub fn entry_exists(dir: BorrowedFd<'_>, name: &[u8]) -> Result<bool, Errno> {
         Err(Errno::NOENT) => Ok(false),
         Err(e) => Err(e),
     }
+}
+
+/// List a verified directory: reopen the object behind its `O_PATH`
+/// descriptor and iterate the entries. `.` and `..` are skipped, and so
+/// is every entry whose type hint says that it can never be indexed nor
+/// contain anything indexable: symlinks, fifos, sockets, and devices.
+/// Entry types are only hints (DESIGN.md §4.5): the caller opens each
+/// remaining entry and decides its kind from that entry's own descriptor.
+pub fn list_dir(
+    fd: BorrowedFd<'_>,
+) -> Result<impl Iterator<Item = Result<DirEntry, Errno>> + use<>, Errno> {
+    let dir = Dir::new(reopen_dir(fd)?)?;
+    Ok(dir.filter(|entry| match entry {
+        Ok(entry) => {
+            let name = entry.file_name().to_bytes();
+            name != b"."
+                && name != b".."
+                && !matches!(
+                    entry.file_type(),
+                    FileType::Symlink
+                        | FileType::Fifo
+                        | FileType::Socket
+                        | FileType::CharacterDevice
+                        | FileType::BlockDevice
+                )
+        }
+        // Errors pass through; iteration ends after the first one.
+        Err(_) => true,
+    }))
 }
 
 /// Run a `std::io` operation again while a signal interrupts it. The

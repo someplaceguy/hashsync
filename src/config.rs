@@ -208,9 +208,6 @@ pub enum Escapes {
     Glob,
 }
 
-/// Bytes that a backslash may quote in a glob pattern.
-const GLOB_QUOTABLE: &[u8] = b"*?[]-!^\\";
-
 /// Decode the byte escapes of DESIGN.md §7 after TOML parsing.
 pub fn decode_escapes(text: &str, mode: Escapes) -> Result<Vec<u8>, String> {
     let bytes = text.as_bytes();
@@ -225,7 +222,7 @@ pub fn decode_escapes(text: &str, mode: Escapes) -> Result<Vec<u8>, String> {
         let Some(&next) = bytes.get(i + 1) else {
             return Err("trailing backslash".into());
         };
-        match next {
+        let value = match next {
             b'x' => {
                 let digits = bytes
                     .get(i + 2..i + 4)
@@ -233,29 +230,25 @@ pub fn decode_escapes(text: &str, mode: Escapes) -> Result<Vec<u8>, String> {
                     .ok_or_else(|| {
                         "malformed \\x escape: expected two hexadecimal digits".to_string()
                     })?;
-                let value = u8::from_str_radix(std::str::from_utf8(digits).unwrap(), 16).unwrap();
-                if mode == Escapes::Glob && GLOB_QUOTABLE.contains(&value) {
-                    out.push(b'\\');
-                }
-                out.push(value);
                 i += 4;
+                u8::from_str_radix(std::str::from_utf8(digits).unwrap(), 16).unwrap()
             }
             b'\\' => {
-                if mode == Escapes::Glob {
-                    out.push(b'\\');
-                }
-                out.push(b'\\');
                 i += 2;
+                b'\\'
             }
-            c if mode == Escapes::Glob && GLOB_QUOTABLE.contains(&c) => {
-                out.push(b'\\');
-                out.push(c);
+            c if mode == Escapes::Glob && glob::QUOTABLE.contains(&c) => {
                 i += 2;
+                c
             }
             _ => {
                 let shown = text[i + 1..].chars().next().unwrap();
                 return Err(format!("unsupported escape \\{shown}"));
             }
+        };
+        match mode {
+            Escapes::Glob => glob::push_quoted(&mut out, value),
+            Escapes::Plain => out.push(value),
         }
     }
     Ok(out)

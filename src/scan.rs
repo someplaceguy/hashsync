@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use bstr::ByteSlice;
 use crossbeam_channel::Sender;
 use rayon::Scope;
-use rustix::fs::{Dir, FileType};
+use rustix::fs::FileType;
 use rustix::io::Errno;
 
 use crate::blocks::BlockHasher;
@@ -277,7 +277,7 @@ impl Scanner<'_> {
         let scan_root = &self.roots[root];
         let identity = identify(self.fs_cache, fd.as_fd(), meta).map_err(io("identity"))?;
         self.claim_dir(identity, root, &rel);
-        let readable = fsops::reopen_dir(fd.as_fd()).map_err(io("reopen"))?;
+        let entries = fsops::list_dir(fd.as_fd()).map_err(io("reopen"))?;
         self.count(|c| &c.directories, 1);
         let ctx = Arc::new(DirCtx {
             fd,
@@ -287,25 +287,9 @@ impl Scanner<'_> {
         });
         let exclude = &scan_root.config.exclude;
         let dir_abs = self.abs_path(root, &ctx.rel);
-        let dir = Dir::new(readable).map_err(io("opendir"))?;
-        for entry in dir {
+        for entry in entries {
             let entry = entry.map_err(io("readdir"))?;
             let name = entry.file_name().to_bytes();
-            if name == b"." || name == b".." {
-                continue;
-            }
-            // Entry types are hints; they only skip entries that are
-            // never indexed, without opening them.
-            if matches!(
-                entry.file_type(),
-                FileType::Symlink
-                    | FileType::Fifo
-                    | FileType::Socket
-                    | FileType::CharacterDevice
-                    | FileType::BlockDevice
-            ) {
-                continue;
-            }
             if exclude.excludes(name, || roots::join(&dir_abs, name)) {
                 continue;
             }
