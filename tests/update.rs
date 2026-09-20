@@ -212,18 +212,21 @@ fn sparse_file_holes_are_skipped() {
     let env = Env::new();
     env.mkdir("tree");
     let mut file = std::fs::File::create(env.path("tree/sparse")).unwrap();
-    file.set_len((BLOCK * 10) as u64).unwrap();
+    file.set_len((BLOCK * 44) as u64).unwrap();
     file.write_all(&random(BLOCK, 1)).unwrap();
-    file.seek(SeekFrom::Start((BLOCK * 7) as u64)).unwrap();
+    // Blocks 1 to 39 are a hole larger than the 128 KiB hole window, so
+    // they are skipped without reading; the small hole behind block 40 is
+    // read through.
+    file.seek(SeekFrom::Start((BLOCK * 40) as u64)).unwrap();
     file.write_all(&random(BLOCK, 2)).unwrap();
     // A partial overlap with the hole is still read in full.
-    file.seek(SeekFrom::Start((BLOCK * 9 + 100) as u64))
+    file.seek(SeekFrom::Start((BLOCK * 43 + 100) as u64))
         .unwrap();
     file.write_all(&random(100, 3)).unwrap();
     drop(file);
     env.configure(&env.root("tree", ""));
     env.update();
-    assert_eq!(env.block_numbers("sparse"), vec![0, 7, 9]);
+    assert_eq!(env.block_numbers("sparse"), vec![0, 40, 43]);
 }
 
 #[test]

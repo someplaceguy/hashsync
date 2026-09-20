@@ -410,9 +410,32 @@ Unlink or rename alone does not invalidate an open descriptor.
 Attempt `SEEK_DATA`/`SEEK_HOLE` for every file being hashed. Allocation
 counts cannot prove absence of holes. Skip only blocks wholly inside a hole,
 read partial overlaps in full, and treat `SEEK_DATA` returning `ENXIO` as
-no further data before EOF. Unsupported seeking (`EINVAL` or
-`EOPNOTSUPP`) falls back to ordinary reads; other seek errors abandon the
-file. Use separate SEQUENTIAL and NOREUSE cache-advice calls as optional hints.
+no further data before EOF. Retry interrupted seeks. Unsupported seeking
+(`EINVAL` or `EOPNOTSUPP`) falls back to reading without hole discovery. Use
+separate SEQUENTIAL and NOREUSE cache-advice calls as optional hints.
+
+Batch reads to reduce system calls. From the block size `B`, compute with
+integer division a batch size `B × max(1, 1 MiB / B)` and a hole window
+`B × max(1, 128 KiB / B)`. Both are whole numbers of blocks; a block larger
+than 1 MiB is read in one `pread`. Plan each read up to the batch size,
+stopping at the next hole boundary rounded up to a block boundary. When the
+planned read is shorter than the hole window, look ahead with `SEEK_DATA`
+at the hole's start. If the next data starts within one hole window of the
+read's start, extend the read to the hole window and do not inspect the
+holes inside it; hole blocks read this way count as read and are filtered
+as periodic. Otherwise keep the shorter read, reuse the lookahead answer
+for the following seek, and skip the hole. After a read that crosses holes,
+resume hole discovery at the next unread block; do not reuse extent
+information for positions already read. This policy is a heuristic: an
+extended window can contain a large hole that was not examined. Accept this
+bounded read amplification instead of inspecting every extent.
+
+If `SEEK_HOLE` returns `ENXIO` or an offset no greater than the preceding
+data offset or the current unread offset, discard the stale extent and
+lookahead, perform one batch-size read at the current unread offset, and
+resume seeking at the next unread block. This makes progress after
+concurrent truncation, hole punching, or inconsistent seek results while
+keeping seeking enabled. Other seek errors abandon the file.
 
 Opening, metadata, directory-listing, and reading errors are local: log
 them, abandon the entry, and continue. An entry that vanishes before it is
