@@ -4,11 +4,15 @@
 //! `statx`. An object that needs I/O is reopened through
 //! `/proc/self/fd/N`, which reopens the verified object even after a rename
 //! or unlink and never follows a symlink in the original pathname.
+//!
+//! Every wrapper retries a call that a signal interrupts, so callers never
+//! see `EINTR`.
 
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
+use std::path::Path;
 
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, StatxFlags};
-use rustix::io::Errno;
+use rustix::io::{Errno, retry_on_intr};
 
 /// Flags for the initial open of any entry.
 pub const PATH_FLAGS: OFlags = OFlags::PATH.union(OFlags::NOFOLLOW).union(OFlags::CLOEXEC);
@@ -29,23 +33,25 @@ pub struct Meta {
 
 /// Open `/` for descriptor-relative walking.
 pub fn open_root_dir() -> Result<OwnedFd, Errno> {
-    rustix::fs::open(
-        "/",
-        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
+    retry_on_intr(|| {
+        rustix::fs::open(
+            "/",
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+    })
 }
 
 /// Open the entry `name` of `dir` without following symlinks, for
 /// classification only.
 pub fn open_path(dir: BorrowedFd<'_>, name: &[u8]) -> Result<OwnedFd, Errno> {
-    rustix::fs::openat(dir, name, PATH_FLAGS, Mode::empty())
+    retry_on_intr(|| rustix::fs::openat(dir, name, PATH_FLAGS, Mode::empty()))
 }
 
 /// Reopen the object behind an `O_PATH` descriptor for I/O.
 fn reopen(fd: BorrowedFd<'_>, flags: OFlags) -> Result<OwnedFd, Errno> {
     let path = format!("/proc/self/fd/{}", fd.as_raw_fd());
-    rustix::fs::open(path, flags | OFlags::CLOEXEC, Mode::empty())
+    retry_on_intr(|| rustix::fs::open(path.as_str(), flags | OFlags::CLOEXEC, Mode::empty()))
 }
 
 /// Reopen a verified regular file for reading.
@@ -62,10 +68,56 @@ pub fn reopen_dir(fd: BorrowedFd<'_>) -> Result<OwnedFd, Errno> {
 /// without being followed. Only existence is reported: an entry's kind is
 /// decided from its own descriptor once it is opened.
 pub fn entry_exists(dir: BorrowedFd<'_>, name: &[u8]) -> Result<bool, Errno> {
-    match rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
+    match retry_on_intr(|| rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW)) {
         Ok(_) => Ok(true),
         Err(Errno::NOENT) => Ok(false),
         Err(e) => Err(e),
+    }
+}
+
+/// Run a `std::io` operation again while a signal interrupts it. The
+/// standard library retries `EINTR` for `open` and inside its read and
+/// write loops, but not for calls such as `mkdir` or `stat`. Do not use
+/// this for operations that can complete when they are interrupted, such
+/// as `close`.
+pub fn retry_interrupted<T>(mut op: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    loop {
+        match op() {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            result => return result,
+        }
+    }
+}
+
+/// Create `dir` and its missing ancestors. `std::fs::create_dir_all` is
+/// unsuitable: it confirms an existing directory with a check that
+/// swallows an interruption and then misreports the directory as a
+/// conflicting entry.
+pub fn create_dir_all(dir: &Path) -> std::io::Result<()> {
+    // The empty parent of a bare relative filename needs no directories,
+    // as for `std::fs::create_dir_all`.
+    if dir.as_os_str().is_empty() {
+        return Ok(());
+    }
+    let mut prefixes: Vec<&Path> = dir.ancestors().collect();
+    prefixes.reverse();
+    // `mkdir` on an existing ancestor is safe, including `/` and
+    // directories that deny writing: Linux reports `EEXIST` for an
+    // existing entry before the write-permission and read-only checks.
+    for prefix in prefixes {
+        if prefix.as_os_str().is_empty() {
+            continue;
+        }
+        match retry_on_intr(|| rustix::fs::mkdir(prefix, Mode::from_raw_mode(0o777))) {
+            Ok(()) | Err(Errno::EXIST) => {}
+            Err(errno) => return Err(errno.into()),
+        }
+    }
+    // `EXIST` also covers an existing entry that is not a directory.
+    if retry_interrupted(|| std::fs::metadata(dir))?.is_dir() {
+        Ok(())
+    } else {
+        Err(std::io::ErrorKind::NotADirectory.into())
     }
 }
 
@@ -77,7 +129,7 @@ pub fn stat(fd: BorrowedFd<'_>) -> Result<Meta, Errno> {
         .union(StatxFlags::SIZE)
         .union(StatxFlags::CTIME)
         .union(StatxFlags::MNT_ID);
-    let stx = rustix::fs::statx(fd, "", AtFlags::EMPTY_PATH, REQUIRED)?;
+    let stx = retry_on_intr(|| rustix::fs::statx(fd, "", AtFlags::EMPTY_PATH, REQUIRED))?;
     if !StatxFlags::from_bits_retain(stx.stx_mask).contains(REQUIRED) {
         return Err(Errno::NOTSUP);
     }
@@ -95,4 +147,53 @@ pub fn stat(fd: BorrowedFd<'_>) -> Result<Meta, Errno> {
         dev_major: stx.stx_dev_major,
         dev_minor: stx.stx_dev_minor,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Error, ErrorKind};
+
+    use super::*;
+
+    #[test]
+    fn interrupted_std_operations_are_retried() {
+        let mut attempts = 0;
+        let result = retry_interrupted(|| {
+            attempts += 1;
+            if attempts < 3 {
+                Err(Error::from(ErrorKind::Interrupted))
+            } else {
+                Ok(attempts)
+            }
+        });
+        assert_eq!(result.unwrap(), 3);
+    }
+
+    #[test]
+    fn create_dir_all_handles_existing_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("a/b/c");
+        create_dir_all(&nested).unwrap();
+        create_dir_all(&nested).unwrap();
+        assert!(nested.is_dir());
+        let file = dir.path().join("f");
+        std::fs::write(&file, b"x").unwrap();
+        let error = create_dir_all(&file).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::NotADirectory);
+        assert!(create_dir_all(&file.join("d")).is_err());
+    }
+
+    #[test]
+    fn create_dir_all_accepts_an_empty_path() {
+        // The parent of a bare relative filename.
+        create_dir_all(Path::new("")).unwrap();
+    }
+
+    #[test]
+    fn other_std_errors_are_reported() {
+        let error =
+            retry_interrupted(|| -> std::io::Result<()> { Err(Error::from(ErrorKind::NotFound)) })
+                .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::NotFound);
+    }
 }

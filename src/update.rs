@@ -108,6 +108,6 @@ fn raise_descriptor_limit() {
     if limit.current != limit.maximum {
         limit.current = limit.maximum;
         // Failure only means fewer descriptors; opens report it later.
-        let _ = setrlimit(Resource::Nofile, limit);
+        let _ = rustix::io::retry_on_intr(|| setrlimit(Resource::Nofile, limit));
     }
 }

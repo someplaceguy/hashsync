@@ -816,3 +816,29 @@ fn missing_configuration_fails() {
     assert_eq!(output.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&output.stderr).contains("cannot read configuration file"));
 }
+
+#[test]
+fn bare_relative_index_filename() {
+    let env = Env::new();
+    env.write("tree/a", &random(BLOCK, 1));
+    // A single-component relative filename has an empty parent path, which
+    // needs no directory creation.
+    std::fs::write(
+        env.config_path(),
+        format!(
+            "index_path = 'index.sqlite'\nblock_size = {BLOCK}\n{}",
+            env.root("tree", "")
+        ),
+    )
+    .unwrap();
+    let mut update = env.command(&["update"]);
+    update.current_dir(env.dir.path());
+    for run in ["first", "second"] {
+        // The second run opens the index that already exists.
+        let output = update.output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{run} update failed:\n{stderr}");
+    }
+    assert!(env.index_path().is_file());
+    assert_eq!(env.count("SELECT count(*) FROM blocks"), 1);
+}

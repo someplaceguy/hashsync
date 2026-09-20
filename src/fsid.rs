@@ -86,7 +86,7 @@ impl FsCache {
                 v
             }
             None => {
-                let statfs = rustix::fs::fstatfs(fd.as_fd())?;
+                let statfs = rustix::io::retry_on_intr(|| rustix::fs::fstatfs(fd.as_fd()))?;
                 let mut v = vec![FSID_TAG_FSID];
                 v.extend_from_slice(&sys::fsid_bytes(&statfs.f_fsid));
                 v

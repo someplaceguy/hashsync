@@ -10,6 +10,7 @@ use bstr::ByteSlice;
 use serde::Deserialize;
 
 use crate::die::{EXIT_FAILURE, die};
+use crate::fsops;
 use crate::glob;
 use crate::hash::StrongHash;
 
@@ -96,7 +97,7 @@ pub fn load(path: Option<&OsStr>) -> Config {
         None => default_config_path(),
     };
     let shown = path.as_bstr();
-    let text = match std::fs::read(OsStr::from_bytes(&path)) {
+    let text = match fsops::retry_interrupted(|| std::fs::read(OsStr::from_bytes(&path))) {
         Ok(bytes) => bytes,
         Err(e) => die(
             EXIT_FAILURE,

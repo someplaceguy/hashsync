@@ -20,6 +20,7 @@ use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, params};
 
 use crate::config::Config;
 use crate::die::{EXIT_FAILURE, die};
+use crate::fsops;
 use crate::hash::weak;
 
 pub const SCHEMA_VERSION: i64 = 1;
@@ -161,7 +162,7 @@ fn open_unix_excl(path: &[u8], extra: OpenFlags) -> rusqlite::Result<Connection>
 /// Open the writer of a modifying process, waiting for exclusive access.
 pub fn open_modifying(path: &[u8]) -> Index {
     if let Some(parent) = os_path(path).parent()
-        && let Err(e) = std::fs::create_dir_all(parent)
+        && let Err(e) = fsops::create_dir_all(parent)
     {
         die(
             EXIT_FAILURE,
@@ -247,13 +248,21 @@ pub fn open_read_only(path: &[u8]) -> Option<Index> {
         let conn = match Connection::open_with_flags(os_path(path), flags) {
             Ok(conn) => conn,
             Err(e) => {
-                if !os_path(path).exists() {
-                    return None;
+                // Not `Path::exists`: it reports an interrupted check as
+                // a missing index.
+                match fsops::retry_interrupted(|| os_path(path).try_exists()) {
+                    Ok(false) => return None,
+                    Ok(true) => die(
+                        EXIT_FAILURE,
+                        format!("cannot open index {}: {e}", path.as_bstr()),
+                    ),
+                    // SQLite's message omits the errno; the check's error
+                    // names it.
+                    Err(check) => die(
+                        EXIT_FAILURE,
+                        format!("cannot open index {}: {e} ({check})", path.as_bstr()),
+                    ),
                 }
-                die(
-                    EXIT_FAILURE,
-                    format!("cannot open index {}: {e}", path.as_bstr()),
-                )
             }
         };
         db(conn.busy_handler(Some(wait_forever)));
@@ -318,8 +327,10 @@ impl Index {
     /// `ensure_deferred_block_indexes`.
     pub fn reset(&self, settings: &Settings) {
         let mut index_id = [0u8; 16];
-        rustix::rand::getrandom(&mut index_id, rustix::rand::GetRandomFlags::empty())
-            .unwrap_or_else(|e| panic!("getrandom: {e}"));
+        rustix::io::retry_on_intr(|| {
+            rustix::rand::getrandom(&mut index_id, rustix::rand::GetRandomFlags::empty())
+        })
+        .unwrap_or_else(|e| panic!("getrandom: {e}"));
         db(self
             .conn
             .execute_batch(&format!("BEGIN IMMEDIATE;{DROP_SCHEMA}{SCHEMA}")));

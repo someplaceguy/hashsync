@@ -79,6 +79,16 @@ deadline; a stalled process can be inspected with a debugger. Fatal errors
 end the process (section 6.7). Retry intervals and cache expiry do not fail
 operations and are not timeouts.
 
+**Retry interrupted calls.** Every system call that fails with `EINTR` is
+retried indefinitely; an interruption is never a failure. The exception is
+`close`: Linux releases the descriptor even when `close` reports `EINTR`,
+so a retry could close an unrelated, reused descriptor. Close descriptors
+once and ignore the result. Retrying `connect` is safe for the Unix
+sockets this program uses: an interrupted `connect` leaves them unconnected.
+A TCP connection attempt instead continues after `EINTR` and a retried
+`connect` reports `EALREADY`, so TCP would need another exception; this
+program opens no TCP sockets (section 6.1).
+
 ## 4. The receiver's index
 
 ### 4.1 What gets indexed
@@ -410,9 +420,9 @@ Unlink or rename alone does not invalidate an open descriptor.
 Attempt `SEEK_DATA`/`SEEK_HOLE` for every file being hashed. Allocation
 counts cannot prove absence of holes. Skip only blocks wholly inside a hole,
 read partial overlaps in full, and treat `SEEK_DATA` returning `ENXIO` as
-no further data before EOF. Retry interrupted seeks. Unsupported seeking
-(`EINVAL` or `EOPNOTSUPP`) falls back to reading without hole discovery. Use
-separate SEQUENTIAL and NOREUSE cache-advice calls as optional hints.
+no further data before EOF. Unsupported seeking (`EINVAL` or `EOPNOTSUPP`)
+falls back to reading without hole discovery. Use separate SEQUENTIAL and
+NOREUSE cache-advice calls as optional hints.
 
 Batch reads to reduce system calls. From the block size `B`, compute with
 integer division a batch size `B × max(1, 1 MiB / B)` and a hole window

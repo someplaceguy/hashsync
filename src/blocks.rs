@@ -101,9 +101,10 @@ impl BlockHasher {
         let bs = block_size as u64;
         let mut reads = ReadPlanner::new(bs);
         buf.resize(reads.max_batch as usize, 0);
-        // Optional hints; failures do not matter.
-        let _ = rustix::fs::fadvise(fd, 0, None, Advice::Sequential);
-        let _ = rustix::fs::fadvise(fd, 0, None, Advice::NoReuse);
+        // Optional hints; failures do not matter, but an interrupted call
+        // is retried so the hint is applied.
+        let _ = rustix::io::retry_on_intr(|| rustix::fs::fadvise(fd, 0, None, Advice::Sequential));
+        let _ = rustix::io::retry_on_intr(|| rustix::fs::fadvise(fd, 0, None, Advice::NoReuse));
 
         let mut rows = Vec::with_capacity(BATCH_ROWS);
         let mut outcome = Outcome::default();

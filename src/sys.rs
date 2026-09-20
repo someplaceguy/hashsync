@@ -1,5 +1,8 @@
 //! Unsafe system-call wrappers. This is the only module that may use unsafe
 //! code (DESIGN.md §11).
+//!
+//! Every wrapper retries a call that a signal interrupts, so callers never
+//! see `EINTR`.
 #![allow(unsafe_code)]
 
 use std::mem;
@@ -24,21 +27,26 @@ pub fn name_to_handle(fd: BorrowedFd<'_>) -> Result<Option<Vec<u8>>, Errno> {
     // and `handle_bytes` tells the kernel that capacity. The empty pathname
     // with `AT_EMPTY_PATH` refers to `fd` itself.
     unsafe {
-        (*handle).handle_bytes = max as libc::c_uint;
-        let rc = libc::name_to_handle_at(
-            fd.as_raw_fd(),
-            c"".as_ptr(),
-            handle,
-            &mut mount_id,
-            libc::AT_EMPTY_PATH,
-        );
-        if rc != 0 {
-            let errno = last_errno();
-            return if errno == Errno::NOTSUP {
-                Ok(None)
-            } else {
-                Err(errno)
-            };
+        loop {
+            // Set the capacity before every attempt; a failed call can
+            // overwrite it with the required size.
+            (*handle).handle_bytes = max as libc::c_uint;
+            let rc = libc::name_to_handle_at(
+                fd.as_raw_fd(),
+                c"".as_ptr(),
+                handle,
+                &mut mount_id,
+                libc::AT_EMPTY_PATH,
+            );
+            if rc == 0 {
+                break;
+            }
+            // Read the errno before another call can change it.
+            match last_errno() {
+                Errno::INTR => {}
+                Errno::NOTSUP => return Ok(None),
+                errno => return Err(errno),
+            }
         }
         let len = (*handle).handle_bytes as usize;
         let handle_type = (*handle).handle_type;
@@ -55,11 +63,14 @@ pub fn name_to_handle(fd: BorrowedFd<'_>) -> Result<Option<Vec<u8>>, Errno> {
 /// kernel or filesystem does not support it.
 pub fn fs_uuid(fd: BorrowedFd<'_>) -> Result<Option<Vec<u8>>, Errno> {
     const FS_IOC_GETFSUUID: Opcode = ioctl::opcode::read::<fsuuid2>(0x15, 0);
-    // SAFETY: the opcode is `_IOR(0x15, 0, struct fsuuid2)` from
-    // `linux/fs.h`, and the kernel writes a `struct fsuuid2`.
-    let getter = unsafe { Getter::<FS_IOC_GETFSUUID, fsuuid2>::new() };
-    // SAFETY: the getter describes the opcode's output type.
-    match unsafe { ioctl::ioctl(fd, getter) } {
+    let result = rustix::io::retry_on_intr(|| {
+        // SAFETY: the opcode is `_IOR(0x15, 0, struct fsuuid2)` from
+        // `linux/fs.h`, and the kernel writes a `struct fsuuid2`.
+        let getter = unsafe { Getter::<FS_IOC_GETFSUUID, fsuuid2>::new() };
+        // SAFETY: the getter describes the opcode's output type.
+        unsafe { ioctl::ioctl(fd, getter) }
+    });
+    match result {
         Ok(out) => {
             let len = usize::from(out.len);
             if len == 0 || len > out.uuid.len() {

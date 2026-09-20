@@ -7,6 +7,7 @@ use bstr::ByteSlice;
 
 use crate::config::Config;
 use crate::die::{EXIT_FAILURE, die, warn};
+use crate::fsops;
 use crate::index::{self, Settings};
 
 pub fn run(config: &Config) {
@@ -29,7 +30,7 @@ pub fn run(config: &Config) {
     let file_size = |suffix: &str| -> u64 {
         let mut p = config.index_path.clone();
         p.extend_from_slice(suffix.as_bytes());
-        std::fs::metadata(OsStr::from_bytes(&p)).map_or(0, |m| m.len())
+        fsops::retry_interrupted(|| std::fs::metadata(OsStr::from_bytes(&p))).map_or(0, |m| m.len())
     };
     let index_id: String = meta.index_id.iter().map(|b| format!("{b:02x}")).collect();
     println!("index path:       {path}");
