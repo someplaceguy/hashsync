@@ -21,6 +21,10 @@ mod update;
 use std::ffi::OsString;
 
 use clap::{Parser, Subcommand};
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 #[derive(Parser)]
 #[command(
@@ -56,6 +60,8 @@ enum Command {
 fn main() {
     die::install_panic_hook();
     let cli = Cli::parse();
+    // SQLite accepts an allocator only before its first use.
+    sys::sqlite_use_mimalloc();
     let config = config::load(cli.config.as_deref());
     match cli.command {
         Command::Update { rebuild, jobs } => update::run(&config, rebuild, jobs),
