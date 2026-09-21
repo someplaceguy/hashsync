@@ -19,7 +19,7 @@ use rusqlite::types::Value;
 use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, params};
 
 use crate::config::Config;
-use crate::die::{EXIT_FAILURE, die};
+use crate::die::die;
 use crate::fsops;
 use crate::hash::weak;
 
@@ -164,18 +164,15 @@ pub fn open_modifying(path: &[u8]) -> Index {
     if let Some(parent) = os_path(path).parent()
         && let Err(e) = fsops::create_dir_all(parent)
     {
-        die(
-            EXIT_FAILURE,
-            format!("cannot create index directory {}: {e}", parent.display()),
-        );
+        die(format!(
+            "cannot create index directory {}: {e}",
+            parent.display()
+        ));
     }
     loop {
         let conn = match open_unix_excl(path, OpenFlags::SQLITE_OPEN_CREATE) {
             Ok(conn) => conn,
-            Err(e) => die(
-                EXIT_FAILURE,
-                format!("cannot open index {}: {e}", path.as_bstr()),
-            ),
+            Err(e) => die(format!("cannot open index {}: {e}", path.as_bstr())),
         };
         match schema_read(&conn) {
             Ok(()) => {
@@ -255,16 +252,13 @@ pub fn open_read_only(path: &[u8]) -> Option<Index> {
                 // a missing index.
                 match fsops::retry_interrupted(|| os_path(path).try_exists()) {
                     Ok(false) => return None,
-                    Ok(true) => die(
-                        EXIT_FAILURE,
-                        format!("cannot open index {}: {e}", path.as_bstr()),
-                    ),
+                    Ok(true) => die(format!("cannot open index {}: {e}", path.as_bstr())),
                     // SQLite's message omits the errno; the check's error
                     // names it.
-                    Err(check) => die(
-                        EXIT_FAILURE,
-                        format!("cannot open index {}: {e} ({check})", path.as_bstr()),
-                    ),
+                    Err(check) => die(format!(
+                        "cannot open index {}: {e} ({check})",
+                        path.as_bstr()
+                    )),
                 }
             }
         };
@@ -353,6 +347,48 @@ impl Index {
         db(self.conn.execute_batch(DEFERRED_BLOCK_INDEXES));
     }
 
+    /// True when both deferred block indexes exist. A read-only run needs
+    /// `blocks_by_weak` for the export and requests an update otherwise
+    /// (DESIGN.md §4.4).
+    pub fn has_block_indexes(&self) -> bool {
+        let count: i64 = db(self.conn.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'index'
+             AND name IN ('blocks_by_weak', 'blocks_by_strong')",
+            [],
+            |row| row.get(0),
+        ));
+        count == 2
+    }
+
+    /// The distinct weak hashes, sorted as unsigned 64-bit values, from
+    /// one database snapshot (DESIGN.md §5.4). Values are stored as `i64`
+    /// bit patterns, so the non-negative rows are the low unsigned half
+    /// and the negative rows the high half; both scans use
+    /// `blocks_by_weak`.
+    pub fn export_weak_hashes(&self) -> Vec<u64> {
+        // A read-only keeper is already inside its long transaction;
+        // give the autocommit writer a transaction of its own.
+        let own_transaction = self.conn.is_autocommit();
+        if own_transaction {
+            db(self.conn.execute_batch("BEGIN"));
+        }
+        let mut values: Vec<u64> = Vec::new();
+        for range in [
+            "SELECT DISTINCT weak FROM blocks WHERE weak >= 0 ORDER BY weak",
+            "SELECT DISTINCT weak FROM blocks WHERE weak < 0 ORDER BY weak",
+        ] {
+            let mut stmt = db(self.conn.prepare(range));
+            let rows = db(stmt.query_map([], |row| row.get::<_, i64>(0)));
+            for row in rows {
+                values.push(db(row) as u64);
+            }
+        }
+        if own_transaction {
+            db(self.conn.execute_batch("COMMIT"));
+        }
+        values
+    }
+
     /// Reconcile roots before scanning (DESIGN.md §4.2): remove paths and
     /// rows of unfinished roots and of incomplete inodes, then create rows
     /// for the roots to scan. Returns their IDs in order.
@@ -400,10 +436,7 @@ impl Index {
             blocks: count("SELECT count(*) FROM blocks"),
             distinct_weak: count("SELECT count(DISTINCT weak) FROM blocks"),
             indexed_bytes: indexed_bytes as u64,
-            deferred_block_indexes: count(
-                "SELECT count(*) FROM sqlite_master WHERE type = 'index'
-                 AND name IN ('blocks_by_weak', 'blocks_by_strong')",
-            ) == 2,
+            deferred_block_indexes: self.has_block_indexes(),
         }
     }
 }
@@ -512,6 +545,45 @@ mod tests {
 
         drop(index);
         probe(&path, "open");
+    }
+
+    /// The export sorts the stored `i64` bit patterns as unsigned values
+    /// and deduplicates across inodes (DESIGN.md §5.4).
+    #[test]
+    fn weak_hashes_export_distinct_and_unsigned_sorted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.sqlite");
+        let index = open_modifying(path.as_os_str().as_bytes());
+        index.reset(&settings());
+        assert_eq!(index.export_weak_hashes(), Vec::<u64>::new());
+        db(index.conn.execute_batch(
+            "BEGIN IMMEDIATE;
+             INSERT INTO filesystems (id, fsid) VALUES (1, x'01');
+             INSERT INTO inodes (id, fs_id, handle, size, ctime_ns)
+             VALUES (1, 1, x'02', 4096, 1), (2, 1, x'03', 4096, 1);
+             COMMIT;",
+        ));
+        let mut insert = db(index
+            .conn
+            .prepare("INSERT INTO blocks (inode_id, block_no, weak, strong) VALUES (?, ?, ?, ?)"));
+        // 2^63 and u64::MAX are negative as i64 and sort after the small
+        // values only in unsigned order; 7 repeats on another inode.
+        let values: [(i64, u64); 5] = [
+            (7i64, 7),
+            (0, 0),
+            (u64::MAX as i64, u64::MAX),
+            ((1u64 << 63) as i64, 1 << 63),
+            (i64::MAX, i64::MAX as u64),
+        ];
+        for (row, (stored, _)) in values.iter().enumerate() {
+            db(insert.execute(params![1, row as i64, stored, &[0u8; 16][..]]));
+        }
+        db(insert.execute(params![2, 0, 7i64, &[0u8; 16][..]]));
+        drop(insert);
+        assert_eq!(
+            index.export_weak_hashes(),
+            vec![0, 7, i64::MAX as u64, 1 << 63, u64::MAX]
+        );
     }
 
     /// A worker reader opens after the writer holds the process lock and

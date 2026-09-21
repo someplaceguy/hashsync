@@ -54,7 +54,8 @@ asynchronous runtime or event loop.
 3. HELLO negotiates parameters and cached lists. The receiver durably
    publishes its target list, then sends a full list, a delta, or confirmation
    that the sender's list is current. The sender verifies it, builds its
-   table, and reports whether it stored the list.
+   table, durably publishes it when caching is enabled, and acknowledges
+   the accepted target.
 4. The sender starts the command. Its scanner sends literals for misses,
    runs for repeated bytes, and queries for possible block matches.
 5. The receiver reads and verifies candidates, appending their bytes to its
@@ -76,8 +77,8 @@ deduplication, never change the reconstructed output.
 **No timeouts.** Waits end when the expected event occurs or a peer,
 descriptor, or process goes away. Slow systems must not fail because of a
 deadline; a stalled process can be inspected with a debugger. Fatal errors
-end the process (section 6.7). Retry intervals and cache expiry do not fail
-operations and are not timeouts.
+end the process (section 6.7). Retry intervals and cache age bounds are not
+operation deadlines.
 
 **Retry interrupted calls.** Every system call that fails with `EINTR` is
 retried indefinitely; an interruption is never a failure. The exception is
@@ -626,6 +627,29 @@ Directories are private (0700), files 0600. A versioned wrapper stores the
 list ID, block size, weak-hash parameters, and encoded length. Hash only the
 canonical list bytes, excluding the wrapper and peer identities.
 
+**Cache failures and validation.**
+
+For both roles, cache directory and file operation failures end the run with
+`die` without a core dump. This includes creation, directory enumeration,
+opening, metadata reads, reading, writing, fsync, rename, renewal, and
+removal. Apply the same rule to publication, invalid-file removal, cleanup
+for `sender_cache = false`, and expiry, including abandoned temporaries.
+Retry interrupted calls as specified in section 3.
+
+An absent cached list is a cache miss. Missing cache directories during
+lookup or cleanup, and files that disappear during lookup or are already
+gone when removed, are normal absence. Failures to create or publish a
+required file remain fatal.
+
+Unexpected cached file contents are also a cache miss: remove the file and
+continue without it. This includes malformed or truncated wrappers or list
+encodings, unsupported formats, and list-ID or checksum mismatches. Failure
+to remove the file is fatal unless it is already gone. An I/O error while
+reading a file is fatal; successfully reading invalid contents is not.
+Valid lists with incompatible block size or weak-hash parameters are simply
+ineligible bases. Validation failures in lists received over the protocol
+follow the exchange rules below.
+
 **Exchange.**
 
 1. Export and hash the target from one database snapshot. Once the sender's
@@ -647,17 +671,19 @@ canonical list bytes, excluding the wrapper and peer identities.
    HASHFULL; a bad full list is a protocol error. HASHKEEP uses the retained,
    verified base.
 5. Build the table and durably publish the verified target on the sender.
-   Reply `CACHE_RESULT { target, stored: 1 }` only after publication.
+   Reply `CACHE_RESULT { target }` only after publication.
    Then remove the advertised old file from that peer/index directory if
-   its ID differs. A store failure warns and replies `stored: 0`, retaining
-   the old cache and allowing the command transfer.
-6. On `stored: 1`, the receiver may remove that exchange's old list from
-   its peer/index directory, unless it equals the target. On `stored: 0`
-   or lost acknowledgement, retain it until expiry. Never remove matching
-   files from other peer/index directories as part of this cleanup.
+   its ID differs.
+6. On CACHE_RESULT, the receiver may remove that exchange's old list from
+   its peer/index directory, unless it equals the target. On lost
+   acknowledgement, retain it until expiry. Never remove matching files
+   from other peer/index directories as part of this cleanup.
 
 `sender_cache = false` advertises no base, stores nothing, removes earlier
-files in that receiver/index directory, and reports `stored: 0`.
+files in that receiver/index directory, and sends the same
+`CACHE_RESULT { target }` after verification, table construction, and removal.
+The receiver still durably publishes its target. The negotiated setting
+determines whether the sender publishes; no storage-success flag is needed.
 
 **Publication, concurrency, and expiry.**
 
@@ -669,18 +695,22 @@ Published files are never edited in place.
 
 No cache locks or mutable current-list pointer are needed. Retained fds or
 bytes survive replacement and unlink. Tolerate disappearance during directory
-scans and fall back to a full transfer. Cleanup racing with publication may
-lose a future cache hit; it cannot invalidate current bytes. Acknowledgement
-promises completed publication, not immunity from later deletion.
+scans and fall back to a full transfer. Cleanup racing with replacement or
+removal of a published file may lose a future cache hit; it cannot invalidate
+retained bytes. A concurrent cleanup can remove a temporary before its rename.
+Treat this as normal absence: the effect is the same as removal of the
+published file just after publication. Other failures to publish a required
+target remain fatal. With sender caching enabled, acknowledgement promises
+completed publication, not immunity from later deletion.
 
 Touch verified files through their open descriptors after successful use.
-The sender renews its accepted target; the receiver renews its target and any
+The sender renews its published target; the receiver renews its target and any
 base used after receiving CACHE_RESULT. Use `ctime` as the renewal marker.
 After the exchange, both sides expire files in both local and remote cache
 trees older than `hashlist_max_age` (default 90 days, sent in HELLO).
-Apply the same age bound to abandoned hidden temporaries. Missing files and
-cleanup failures are nonfatal; equal base and target IDs never justify
-deleting the current target.
+Apply the same age bound to abandoned hidden temporaries. The cache failure
+rules above apply to renewal and expiry too; equal base and target IDs never
+justify deleting the current target.
 
 Retained versions and lost acknowledgements may leave extra files. Database
 restore or rebuild needs no cache repair or publication checkpoint because
@@ -797,10 +827,12 @@ Payloads:
 - HASHFULL: `target list_id`. Request a full list once after a delta
   digest mismatch, before command output. The response is HASHLIST for that
   target. Failed results are never published or used for the final table.
-- CACHE_RESULT: `target list_id, stored u8`. A single response after target
-  verification: 1 for durable sender publication, 0 for disabled or failed
-  caching. Either permits transfer. Wrong targets or repeated results are
-  protocol errors. Flush before starting the command.
+- CACHE_RESULT: `target list_id`. A single acknowledgement after target
+  verification, table construction, and durable sender publication when
+  caching is enabled. With `sender_cache = false`, send it after removing
+  earlier files for this receiver/index. Cache operation failures are fatal
+  as specified in section 5.6. Wrong targets or repeated acknowledgements
+  are protocol errors. Flush before starting the command.
 - LIT: literal bytes.
 - REF: empty; use the pin at the current output offset.
 - RLE: `byte u8, length u64`.
@@ -845,7 +877,7 @@ threads perform I/O and compression. Let `B = block_size`.
   command bytes read. Initially all are zero, with `e <= p <= r`.
 - The lookahead buffer retains immutable bytes `[e, r)`, including scanned
   bytes that a rejection may require again. Its capacity is `lookahead + B`;
-  the reader pauses when full. Scanning starts a step only while
+  the command reader pauses when full. Scanning starts a step only while
   `p - e < lookahead`; a full-window step may advance `p` by `B`.
 - Ordered records cover exactly `[e, p)`, without gaps or overlaps:
   `Literal { offset, length }`, `Run { offset, length, byte }`,
@@ -1087,9 +1119,11 @@ No extent is punched while its append or REF read is still using it.
 - Filesystem failures during indexing abandon entries; during lookup they
   reject source candidates. Pin-file setup, I/O, reclamation, or verification
   failures end the run with `die` without a core dump; a yes answer cannot
-  be retracted. Sender cache-store failures allow transfer with
-  `stored: 0`; failure to persist the receiver's target ends setup without
-  a core dump.
+  be retracted.
+- Cache directory and file operation failures on either role end the run
+  with `die` without a core dump, subject to the absence and invalid-content
+  rules in section 5.6. Invalid cached files are removed and treated as
+  misses; failures to remove them are fatal unless they are already gone.
 
 Use trusted peers: the sender learns hashes of all indexed content.
 `sender_cache = false` disables retention and removes earlier caches for
@@ -1103,8 +1137,9 @@ coordination chosen by the implementation, subject to section 6.7.
 
 | Role | Responsibilities |
 |---|---|
-| Sender main | Handshake, command startup, then receive END_ACK or detect receiver disappearance. |
-| Sender reader | Fill lookahead until stdout EOF; obtain the command's exit status without reaping. |
+| Sender main | Handshake and command startup, then wait for the completion conditions of section 6.7. |
+| Sender data reader | Read data-session frames for the whole run: HELLO, the list, and END_ACK. EOF before the normal exit means that the receiver disappeared. |
+| Sender command reader | Fill lookahead until stdout EOF; obtain the command's exit status without reaping. |
 | Sender stderr relay | Copy command stderr to sender stderr through EOF and flush. |
 | Sender scanner | Own records and query states; queue queries and output. |
 | Sender data writer | Drain output in order, compress, and finish and flush the stream after END. |
@@ -1146,11 +1181,13 @@ Build with `panic = "abort"`; install a panic hook that performs the same
 cleanup before aborting. External failures use `die` without a core dump;
 bugs and database errors abort. Per-entry failures remain local.
 
-The receiver monitors stdout, both sessions, and termination signals.
-The sender monitors stdin, stdout, and the control socket. Unexpected EOF or
-session loss is fatal. Monitoring also applies during rendezvous and setup,
-when no command output is flowing. Normal shutdown uses END_ACK, not stdin
-EOF, to establish receiver completion.
+The receiver monitors both sessions and termination signals. The sender
+monitors stdin and the control socket. Unexpected EOF or session loss is
+fatal. Monitoring also applies during rendezvous and setup, when no command
+output is flowing. A broken stdout is detected when a write to it fails;
+neither role watches an idle stdout. As under plain SSH, a consumer that
+exits after it reads all output does not fail the run. Normal shutdown uses
+END_ACK, not stdin EOF, to establish receiver completion.
 
 Successful sender completion requires:
 
@@ -1401,8 +1438,10 @@ decision history is in version control.
   SSH option precedence and bootstrap quoting of executable paths containing
   whitespace, quotes, shell metacharacters, and non-UTF-8 bytes;
   crash recovery and SQLite process exclusion and snapshots after worker
-  connections open; cache publication and cleanup races; completion without
-  truncation or premature exit under the chosen synchronization scheme;
+  connections open; cache publication and cleanup races, fatal cache I/O
+  failures, and removal of invalid cached lists with fallback to a full list;
+  completion without truncation or premature exit under the chosen
+  synchronization scheme;
   complete stderr forwarding with backpressure and delayed stderr EOF from
   descendants; truncated compression trailers, late lookups, relay
   closure with control writes in flight, shutdown on session loss, and fatal

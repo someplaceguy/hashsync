@@ -8,6 +8,7 @@ use crossbeam_channel::bounded;
 use rustix::process::{Resource, getrlimit, setrlimit};
 
 use crate::config::Config;
+use crate::die;
 use crate::fsid::FsCache;
 use crate::index::{self, Settings, writer};
 use crate::roots;
@@ -18,6 +19,13 @@ use crate::scan::{self, ScanRoot};
 const CHANNEL_CAPACITY: usize = 1024;
 
 pub fn run(config: &Config, rebuild: bool, jobs: Option<u32>) {
+    drop(perform(config, rebuild, jobs));
+}
+
+/// Update the index and return it still open: a normal `run` keeps this
+/// writer alive through the transfer, so there is no gap in exclusion
+/// between update and use (DESIGN.md §4.4).
+pub fn perform(config: &Config, rebuild: bool, jobs: Option<u32>) -> index::Index {
     let start = Instant::now();
     raise_descriptor_limit();
 
@@ -31,13 +39,13 @@ pub fn run(config: &Config, rebuild: bool, jobs: Option<u32>) {
     let rebuild = rebuild
         || match index.read_meta() {
             None => {
-                eprintln!("hashsync: creating index {}", config.index_path.as_bstr());
+                die::note(format!("creating index {}", config.index_path.as_bstr()));
                 true
             }
             Some(meta) if meta.compatible(&settings) => false,
             Some(meta) => {
-                eprintln!(
-                    "hashsync: index settings changed (schema {} -> {}, block size {} -> {}, \
+                die::note(format!(
+                    "index settings changed (schema {} -> {}, block size {} -> {}, \
                      weak hash {} -> {}, strong hash {} -> {}); rebuilding",
                     meta.schema_version,
                     index::SCHEMA_VERSION,
@@ -47,7 +55,7 @@ pub fn run(config: &Config, rebuild: bool, jobs: Option<u32>) {
                     settings.weak_hash_id,
                     meta.settings.strong_hash_id,
                     settings.strong_hash_id
-                );
+                ));
                 true
             }
         };
@@ -75,10 +83,9 @@ pub fn run(config: &Config, rebuild: bool, jobs: Option<u32>) {
     });
 
     index.ensure_deferred_block_indexes();
-    drop(index);
 
-    eprintln!(
-        "hashsync: {} in {:.1}s: {} directories, {} files hashed ({} bytes), \
+    die::note(format!(
+        "{} in {:.1}s: {} directories, {} files hashed ({} bytes), \
          {} unchanged, {} hard links, {} small files, {} newly indexed blocks \
          (skipped: {} periodic, {} in holes), {} paths, {} stale inodes removed",
         if rebuild {
@@ -98,7 +105,8 @@ pub fn run(config: &Config, rebuild: bool, jobs: Option<u32>) {
         counters.blocks_in_holes.load(Relaxed),
         summary.paths,
         summary.orphans
-    );
+    ));
+    index
 }
 
 /// Raise the soft descriptor limit to the hard limit: every pending task

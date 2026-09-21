@@ -150,6 +150,45 @@ pub fn create_dir_all(dir: &Path) -> std::io::Result<()> {
     }
 }
 
+/// A standard descriptor as an `io::Read` that never reports `EINTR`.
+/// The standard library's `Stdin` cannot be used instead: it takes a
+/// process-wide reentrant lock whose guard cannot move to another thread,
+/// and the transfer roles hand their standard streams between threads.
+pub struct FdReader(BorrowedFd<'static>);
+
+impl std::io::Read for FdReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        Ok(retry_on_intr(|| rustix::io::read(self.0, &mut *buf))?)
+    }
+}
+
+/// A standard descriptor as an `io::Write` that never reports `EINTR`.
+/// Writes are unbuffered, so `flush` has nothing to do; `Stdout` is
+/// unsuitable because it inserts a line buffer.
+pub struct FdWriter(BorrowedFd<'static>);
+
+impl std::io::Write for FdWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        Ok(retry_on_intr(|| rustix::io::write(self.0, buf))?)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+pub fn stdin() -> FdReader {
+    FdReader(rustix::stdio::stdin())
+}
+
+pub fn stdout() -> FdWriter {
+    FdWriter(rustix::stdio::stdout())
+}
+
+pub fn stderr() -> FdWriter {
+    FdWriter(rustix::stdio::stderr())
+}
+
 /// `statx` on the descriptor itself, requiring every field that traversal
 /// depends on. A kernel that omits one of them gets `NOTSUP`.
 pub fn stat(fd: BorrowedFd<'_>) -> Result<Meta, Errno> {

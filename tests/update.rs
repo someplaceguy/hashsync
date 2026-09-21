@@ -809,6 +809,48 @@ fn unreadable_entries_are_skipped_with_a_warning() {
     );
 }
 
+/// A pipe without a reader: every write to it fails with `EPIPE`.
+fn broken_pipe() -> std::io::PipeWriter {
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    writer
+}
+
+#[test]
+fn broken_output_streams_never_abort() {
+    // Diagnostics are best effort, so a broken stderr changes no outcome:
+    // an update still succeeds after its warnings and summary, and a fatal
+    // error still exits with status 1, without a core dump.
+    let env = Env::new();
+    env.write("tree/a", &random(BLOCK, 1));
+    env.write("tree/unreadable", &random(BLOCK, 2));
+    env.chmod("tree/unreadable", 0o000);
+    env.configure(&env.root("tree", ""));
+    let status = env
+        .command(&["update"])
+        .stderr(broken_pipe())
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(0), "{status}");
+    let status = Command::new(env!("CARGO_BIN_EXE_hashsync"))
+        .args(["--config", "/nonexistent/config.toml", "stats"])
+        .stderr(broken_pipe())
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(1), "{status}");
+
+    // The report of `stats` is its output: a broken stdout is an external
+    // failure.
+    let output = env
+        .command(&["stats"])
+        .stdout(broken_pipe())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("cannot write to stdout"), "{stderr}");
+}
+
 #[test]
 fn missing_configuration_fails() {
     let env = Env::new();

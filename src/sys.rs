@@ -7,7 +7,8 @@
 
 use std::ffi::{c_int, c_void};
 use std::mem;
-use std::os::fd::{AsRawFd, BorrowedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::unix::process::CommandExt;
 
 use libmimalloc_sys::{
     mi_free, mi_good_size, mi_is_in_heap_region, mi_malloc, mi_realloc, mi_usable_size,
@@ -100,6 +101,113 @@ fn last_errno() -> Errno {
     Errno::from_io_error(&std::io::Error::last_os_error()).unwrap_or(Errno::IO)
 }
 
+/// Wait for a child to exit without reaping it (`WEXITED | WNOWAIT`), so
+/// its process and group IDs stay reserved until this process exits
+/// (DESIGN.md §6.6). Returns the child's exit status, or `128 + signal`
+/// when a signal terminated it.
+pub fn wait_exit_status(pid: rustix::process::Pid) -> i32 {
+    use rustix::process::{WaitId, WaitIdOptions, waitid};
+    let status = rustix::io::retry_on_intr(|| {
+        waitid(
+            WaitId::Pid(pid),
+            WaitIdOptions::EXITED | WaitIdOptions::NOWAIT,
+        )
+    })
+    .unwrap_or_else(|e| panic!("waitid: {e}"))
+    .expect("waitid without NOHANG returned no status");
+    if let Some(code) = status.exit_status() {
+        code
+    } else if let Some(signal) = status.terminating_signal() {
+        128 + signal
+    } else {
+        panic!("waitid: neither an exit status nor a signal")
+    }
+}
+
+/// Set `SIGCHLD` to `SIG_DFL` with `SA_NOCLDWAIT` clear, so children stay
+/// unreaped until process exit and `waitid` with `WNOWAIT` can observe
+/// them (DESIGN.md §6.6). Call before spawning the first child.
+pub fn reset_sigchld() {
+    // SAFETY: a zeroed `sigaction` with an empty mask installs `SIG_DFL`
+    // with no flags, which is a valid disposition for `SIGCHLD`.
+    unsafe {
+        let mut action: libc::sigaction = mem::zeroed();
+        action.sa_sigaction = libc::SIG_DFL;
+        libc::sigemptyset(&mut action.sa_mask);
+        let rc = libc::sigaction(libc::SIGCHLD, &action, std::ptr::null_mut());
+        assert_eq!(rc, 0, "sigaction(SIGCHLD): {}", last_errno());
+    }
+}
+
+/// SIGINT and SIGTERM: the signals that end a receiver's run.
+fn termination_signals() -> libc::sigset_t {
+    // SAFETY: `sigemptyset` initializes the set before `sigaddset` adds
+    // valid signal numbers to it.
+    unsafe {
+        let mut set: libc::sigset_t = mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGINT);
+        libc::sigaddset(&mut set, libc::SIGTERM);
+        set
+    }
+}
+
+/// A thread's set of blocked signals.
+#[derive(Clone, Copy)]
+pub struct SignalMask(libc::sigset_t);
+
+/// Block SIGINT and SIGTERM in the calling thread. Returns the mask from
+/// before, and a `signalfd` that is readable while one of the two signals
+/// is pending. The descriptor is only polled, never read, so the signal
+/// stays pending.
+pub fn block_termination_signals() -> (SignalMask, OwnedFd) {
+    let set = termination_signals();
+    // SAFETY: `set` is an initialized signal set, and the kernel writes
+    // the old mask to `old`.
+    let old = unsafe {
+        let mut old: libc::sigset_t = mem::zeroed();
+        let rc = libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old);
+        assert_eq!(rc, 0, "pthread_sigmask: {}", Errno::from_raw_os_error(rc));
+        old
+    };
+    // SAFETY: `-1` requests a new descriptor for the signals in `set`.
+    let fd = unsafe { libc::signalfd(-1, &set, libc::SFD_CLOEXEC) };
+    assert!(fd >= 0, "signalfd: {}", last_errno());
+    // SAFETY: `signalfd` returned a new descriptor that nothing else owns.
+    (SignalMask(old), unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Start `command`'s child with `mask` blocked, instead of the mask of the
+/// thread that spawns it, which `Command` keeps.
+pub fn set_child_signal_mask(command: &mut std::process::Command, mask: SignalMask) {
+    let hook = move || {
+        // SAFETY: `mask.0` is an initialized signal set.
+        match unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &mask.0, std::ptr::null_mut()) } {
+            0 => Ok(()),
+            rc => Err(std::io::Error::from_raw_os_error(rc)),
+        }
+    };
+    // SAFETY: the hook runs in the child between `fork` and `exec`, where
+    // only async-signal-safe functions may run; `pthread_sigmask` is one.
+    unsafe { command.pre_exec(hook) };
+}
+
+/// SIGINT or SIGTERM when one is pending: sent, blocked, and not yet
+/// accepted. SIGINT comes first when both are pending.
+pub fn pending_termination_signal() -> Option<i32> {
+    // SAFETY: `sigpending` initializes the set.
+    let pending = unsafe {
+        let mut set: libc::sigset_t = mem::zeroed();
+        let rc = libc::sigpending(&mut set);
+        assert_eq!(rc, 0, "sigpending: {}", last_errno());
+        set
+    };
+    [libc::SIGINT, libc::SIGTERM]
+        .into_iter()
+        // SAFETY: `pending` is an initialized signal set.
+        .find(|&signal| unsafe { libc::sigismember(&pending, signal) } == 1)
+}
+
 /// Make SQLite allocate through mimalloc (`SQLITE_CONFIG_MALLOC`).
 ///
 /// Call this one time, before the first use of SQLite: SQLite refuses the
@@ -175,6 +283,15 @@ pub fn sqlite_use_mimalloc() {
     // SAFETY: `p` came from `sqlite3_malloc` and is freed one time.
     unsafe { ffi::sqlite3_free(p) };
     assert!(effective, "SQLite does not allocate through mimalloc");
+}
+
+/// Test-only: set an environment variable. `set_var` is unsafe because
+/// other threads may read the environment concurrently; the tests that
+/// use this serialize themselves with a lock.
+#[cfg(test)]
+pub fn set_var_for_tests(key: &str, value: &std::ffi::OsStr) {
+    // SAFETY: the caller serializes environment access.
+    unsafe { std::env::set_var(key, value) }
 }
 
 #[cfg(test)]

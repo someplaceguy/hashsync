@@ -9,13 +9,23 @@ use std::os::unix::ffi::OsStrExt;
 use bstr::ByteSlice;
 use serde::Deserialize;
 
-use crate::die::{EXIT_FAILURE, die};
+use crate::die::die;
 use crate::fsops;
 use crate::glob;
 use crate::hash::StrongHash;
+use crate::ssh;
 
 pub const MIN_BLOCK_SIZE: u64 = 4096;
 pub const DEFAULT_BLOCK_SIZE: u32 = 32 * 1024;
+
+/// 90 days (DESIGN.md §5.6), in seconds.
+pub const DEFAULT_HASHLIST_MAX_AGE: u64 = 90 * 24 * 3600;
+
+/// Defaults sent in HELLO until the milestones that add the options:
+/// `lookahead` arrives with references (PLAN.md step 4) and
+/// `negative_cache` with the scanner that uses it.
+pub const DEFAULT_LOOKAHEAD: u64 = 256 << 20;
+pub const DEFAULT_NEGATIVE_CACHE: u64 = 100 << 20;
 
 #[derive(Debug)]
 pub struct Config {
@@ -25,7 +35,63 @@ pub struct Config {
     pub index_path: Vec<u8>,
     /// Scan threads; 0 selects the default count (DESIGN.md §4.6).
     pub threads: u32,
+    /// Hash-list cache expiry, in seconds (DESIGN.md §5.6).
+    pub hashlist_max_age: u64,
+    /// The transfer options a host override can replace; read them
+    /// through `transfer_options`.
+    ssh: Vec<Vec<u8>>,
+    sender_command: Vec<u8>,
+    sender_cache: bool,
+    hosts: Vec<HostConfig>,
     pub roots: Vec<RootConfig>,
+}
+
+/// `[hosts.NAME]`: overrides keyed by the run command's HOST argument.
+#[derive(Debug)]
+struct HostConfig {
+    name: String,
+    ssh: Option<Vec<Vec<u8>>>,
+    sender_command: Option<Vec<u8>>,
+    sender_cache: Option<bool>,
+}
+
+/// The transfer options of one run, after host overrides and CLI
+/// precedence (DESIGN.md §8).
+#[derive(Debug)]
+pub struct TransferOptions {
+    /// The shell-split SSH command; the first word is the executable.
+    pub ssh: Vec<Vec<u8>>,
+    /// One executable name or path, not a shell fragment.
+    pub sender_command: Vec<u8>,
+    pub sender_cache: bool,
+}
+
+impl Config {
+    /// Resolve the transfer options for `host`. `cli_ssh` is `--ssh`,
+    /// which takes precedence over a host override, which takes
+    /// precedence over the global options. CLI arguments get no byte
+    /// escapes (DESIGN.md §7).
+    pub fn transfer_options(&self, host: &[u8], cli_ssh: Option<&[u8]>) -> TransferOptions {
+        let overrides = self.hosts.iter().find(|h| h.name.as_bytes() == host);
+        let ssh = match cli_ssh {
+            Some(text) => match split_ssh_words(text) {
+                Ok(words) => words,
+                Err(e) => die(format!("--ssh: {e}")),
+            },
+            None => overrides
+                .and_then(|h| h.ssh.clone())
+                .unwrap_or_else(|| self.ssh.clone()),
+        };
+        TransferOptions {
+            ssh,
+            sender_command: overrides
+                .and_then(|h| h.sender_command.clone())
+                .unwrap_or_else(|| self.sender_command.clone()),
+            sender_cache: overrides
+                .and_then(|h| h.sender_cache)
+                .unwrap_or(self.sender_cache),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -66,8 +132,22 @@ struct RawConfig {
     strong_hash: Option<StrongHash>,
     index_path: Option<String>,
     threads: Option<u32>,
+    hashlist_max_age: Option<String>,
+    ssh: Option<String>,
+    sender_command: Option<String>,
+    sender_cache: Option<bool>,
+    #[serde(default)]
+    hosts: std::collections::BTreeMap<String, RawHost>,
     #[serde(default)]
     roots: Vec<RawRoot>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawHost {
+    ssh: Option<String>,
+    sender_command: Option<String>,
+    sender_cache: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -99,21 +179,15 @@ pub fn load(path: Option<&OsStr>) -> Config {
     let shown = path.as_bstr();
     let text = match fsops::retry_interrupted(|| std::fs::read(OsStr::from_bytes(&path))) {
         Ok(bytes) => bytes,
-        Err(e) => die(
-            EXIT_FAILURE,
-            format!("cannot read configuration file {shown}: {e}"),
-        ),
+        Err(e) => die(format!("cannot read configuration file {shown}: {e}")),
     };
     let text = match String::from_utf8(text) {
         Ok(text) => text,
-        Err(_) => die(
-            EXIT_FAILURE,
-            format!("configuration file {shown} is not UTF-8"),
-        ),
+        Err(_) => die(format!("configuration file {shown} is not UTF-8")),
     };
     match parse(&text) {
         Ok(config) => config,
-        Err(message) => die(EXIT_FAILURE, format!("{shown}: {message}")),
+        Err(message) => die(format!("{shown}: {message}")),
     }
 }
 
@@ -145,6 +219,36 @@ pub fn parse(text: &str) -> Result<Config, String> {
             expand_tilde(decoded)
         }
     };
+    let hashlist_max_age = match raw.hashlist_max_age {
+        None => DEFAULT_HASHLIST_MAX_AGE,
+        Some(text) => parse_duration(&text).map_err(|e| format!("hashlist_max_age: {e}"))?,
+    };
+    let ssh = match raw.ssh {
+        None => vec![b"ssh".to_vec()],
+        Some(text) => parse_ssh(&text).map_err(|e| format!("ssh: {e}"))?,
+    };
+    let sender_command = match raw.sender_command {
+        None => b"hashsync".to_vec(),
+        Some(text) => parse_sender_command(&text).map_err(|e| format!("sender_command: {e}"))?,
+    };
+    let mut hosts = Vec::with_capacity(raw.hosts.len());
+    for (name, host) in raw.hosts {
+        let parsed = HostConfig {
+            ssh: host
+                .ssh
+                .map(|text| parse_ssh(&text))
+                .transpose()
+                .map_err(|e| format!("hosts.{name}.ssh: {e}"))?,
+            sender_command: host
+                .sender_command
+                .map(|text| parse_sender_command(&text))
+                .transpose()
+                .map_err(|e| format!("hosts.{name}.sender_command: {e}"))?,
+            sender_cache: host.sender_cache,
+            name,
+        };
+        hosts.push(parsed);
+    }
     let mut roots = Vec::with_capacity(raw.roots.len());
     for (i, root) in raw.roots.into_iter().enumerate() {
         roots.push(parse_root(root).map_err(|e| format!("roots[{i}]: {e}"))?);
@@ -154,8 +258,79 @@ pub fn parse(text: &str) -> Result<Config, String> {
         strong_hash: raw.strong_hash.unwrap_or(StrongHash::DEFAULT),
         index_path,
         threads: raw.threads.unwrap_or(0),
+        hashlist_max_age,
+        ssh,
+        sender_command,
+        sender_cache: raw.sender_cache.unwrap_or(true),
+        hosts,
         roots,
     })
+}
+
+/// A configured `ssh` command: shell-split first, then decode the byte
+/// escapes of each argv word (DESIGN.md §7).
+fn parse_ssh(text: &str) -> Result<Vec<Vec<u8>>, String> {
+    let words = ssh::shell_split(text.as_bytes())?;
+    words
+        .into_iter()
+        .map(|word| {
+            // Splitting UTF-8 text at ASCII delimiters keeps every word
+            // UTF-8.
+            let word = decode_escapes(std::str::from_utf8(&word).unwrap(), Escapes::Plain)?;
+            check_no_nul(&word)?;
+            Ok(word)
+        })
+        .collect::<Result<Vec<_>, String>>()
+        .and_then(require_command)
+}
+
+/// `--ssh` from the command line: shell-split without byte escapes
+/// (DESIGN.md §7: no configuration escapes for CLI arguments).
+fn split_ssh_words(text: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+    ssh::shell_split(text).and_then(require_command)
+}
+
+fn require_command(words: Vec<Vec<u8>>) -> Result<Vec<Vec<u8>>, String> {
+    if words.is_empty() {
+        return Err("empty command".into());
+    }
+    Ok(words)
+}
+
+/// `sender_command` is one executable name or path, not a shell fragment
+/// (DESIGN.md §6.1).
+fn parse_sender_command(text: &str) -> Result<Vec<u8>, String> {
+    let decoded = decode_escapes(text, Escapes::Plain)?;
+    check_no_nul(&decoded)?;
+    if decoded.is_empty() {
+        return Err("empty command".into());
+    }
+    Ok(decoded)
+}
+
+/// Parse a duration such as `90d`, `12h`, `30m`, or `3600` (seconds).
+pub fn parse_duration(text: &str) -> Result<u64, String> {
+    let text = text.trim();
+    let digits_end = text
+        .bytes()
+        .position(|b| !b.is_ascii_digit())
+        .unwrap_or(text.len());
+    if digits_end == 0 {
+        return Err(format!("expected a number: {text:?}"));
+    }
+    let number: u64 = text[..digits_end]
+        .parse()
+        .map_err(|_| format!("number too large: {text:?}"))?;
+    let multiplier: u64 = match text[digits_end..].trim() {
+        "" | "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 24 * 3600,
+        unit => return Err(format!("unknown unit {unit:?}")),
+    };
+    number
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("duration too large: {text:?}"))
 }
 
 fn parse_root(raw: RawRoot) -> Result<RootConfig, String> {
@@ -295,12 +470,12 @@ pub fn parse_size(text: &str) -> Result<u64, String> {
 fn home_dir() -> Vec<u8> {
     match std::env::var_os("HOME") {
         Some(home) if !home.is_empty() => home.as_bytes().to_vec(),
-        _ => die(EXIT_FAILURE, "HOME is not set"),
+        _ => die("HOME is not set"),
     }
 }
 
 /// `$VAR` when it is set to an absolute path, else `$HOME/<fallback>`.
-fn xdg_dir(var: &str, fallback: &str) -> Vec<u8> {
+pub fn xdg_dir(var: &str, fallback: &str) -> Vec<u8> {
     if let Some(value) = std::env::var_os(var)
         && value.as_bytes().first() == Some(&b'/')
     {
@@ -529,5 +704,100 @@ one_filesystem = true
     fn root_slash() {
         let config = parse("[[roots]]\npath = \"/\"").unwrap();
         assert_eq!(config.roots[0].pattern, b"/");
+    }
+
+    #[test]
+    fn durations() {
+        assert_eq!(parse_duration("90d").unwrap(), 90 * 24 * 3600);
+        assert_eq!(parse_duration("12h").unwrap(), 12 * 3600);
+        assert_eq!(parse_duration("30 m").unwrap(), 30 * 60);
+        assert_eq!(parse_duration("45s").unwrap(), 45);
+        assert_eq!(parse_duration("3600").unwrap(), 3600);
+        assert!(parse_duration("d").is_err());
+        assert!(parse_duration("5w").is_err());
+        assert!(parse_duration("99999999999999999999d").is_err());
+    }
+
+    #[test]
+    fn transfer_defaults() {
+        let config = parse("").unwrap();
+        assert_eq!(config.hashlist_max_age, DEFAULT_HASHLIST_MAX_AGE);
+        let options = config.transfer_options(b"anyhost", None);
+        assert_eq!(options.ssh, vec![b"ssh".to_vec()]);
+        assert_eq!(options.sender_command, b"hashsync");
+        assert!(options.sender_cache);
+    }
+
+    #[test]
+    fn host_overrides_and_cli_precedence() {
+        let config = parse(
+            r#"
+ssh = "ssh -i '/key file'"
+sender_command = 'hashsync'
+sender_cache = true
+hashlist_max_age = "1d"
+
+[hosts.builder]
+ssh = 'ssh -p 2222'
+sender_command = '/opt/bin\x20dir/hashsync'
+sender_cache = false
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.hashlist_max_age, 24 * 3600);
+
+        let global = config.transfer_options(b"other", None);
+        assert_eq!(
+            global.ssh,
+            vec![b"ssh".to_vec(), b"-i".to_vec(), b"/key file".to_vec()]
+        );
+        assert_eq!(global.sender_command, b"hashsync");
+        assert!(global.sender_cache);
+
+        // The override table is keyed by the HOST argument as given.
+        let host = config.transfer_options(b"builder", None);
+        assert_eq!(
+            host.ssh,
+            vec![b"ssh".to_vec(), b"-p".to_vec(), b"2222".to_vec()]
+        );
+        assert_eq!(host.sender_command, b"/opt/bin dir/hashsync");
+        assert!(!host.sender_cache);
+        assert!(
+            config.transfer_options(b"user@builder", None).sender_cache,
+            "the key must match the whole HOST argument"
+        );
+
+        // `--ssh` wins over the override, without byte escapes.
+        let cli = config.transfer_options(b"builder", Some(br"ssh -o 'X\x41'"));
+        assert_eq!(
+            cli.ssh,
+            vec![b"ssh".to_vec(), b"-o".to_vec(), br"X\x41".to_vec()]
+        );
+        assert!(!cli.sender_cache, "--ssh replaces only the SSH command");
+    }
+
+    #[test]
+    fn rejected_transfer_configurations() {
+        assert!(parse("ssh = \"\"").unwrap_err().contains("empty"));
+        assert!(parse("ssh = \"ssh 'x\"").unwrap_err().contains("quote"));
+        assert!(parse("sender_command = ''").unwrap_err().contains("empty"));
+        assert!(
+            parse("sender_command = 'a\\x00b'")
+                .unwrap_err()
+                .contains("NUL")
+        );
+        assert!(
+            parse("hashlist_max_age = \"soon\"")
+                .unwrap_err()
+                .contains("hashlist_max_age")
+        );
+        assert!(parse("[hosts.h]\nbogus = 1").is_err());
+        // Inside shell double quotes the backslash survives splitting
+        // and reaches the byte-escape decoder, which rejects `\q`.
+        assert!(
+            parse("[hosts.h]\nssh = 'x \"\\q\"'")
+                .unwrap_err()
+                .contains("hosts.h.ssh")
+        );
     }
 }

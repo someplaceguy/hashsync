@@ -26,7 +26,7 @@ use rustix::io::Errno;
 
 use crate::blocks::BlockHasher;
 use crate::config::{Config, RootConfig};
-use crate::die::{EXIT_FAILURE, die, warn};
+use crate::die::{die, warn};
 use crate::fsid::{FsCache, Identity, identify};
 use crate::fsops::{self, Meta};
 use crate::index;
@@ -306,14 +306,11 @@ impl Scanner<'_> {
     fn claim_dir(&self, identity: Identity, root: usize, rel: &[u8]) {
         let path = self.abs_path(root, rel);
         if let Some(earlier) = self.visited_dirs.lock().unwrap().insert(identity, path) {
-            die(
-                EXIT_FAILURE,
-                format!(
-                    "{} and {} are the same directory (cycle or mount alias)",
-                    earlier.as_bstr(),
-                    self.abs_path(root, rel).as_bstr()
-                ),
-            );
+            die(format!(
+                "{} and {} are the same directory (cycle or mount alias)",
+                earlier.as_bstr(),
+                self.abs_path(root, rel).as_bstr()
+            ));
         }
     }
 

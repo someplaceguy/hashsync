@@ -1,19 +1,28 @@
 //! `hashsync` copies a remote command's stdout, replacing blocks that the
 //! receiver already holds with verified local content. See `DESIGN.md`.
 //!
-//! This build implements the first milestone of `PLAN.md`: `update` and
-//! `stats` for mutable roots.
+//! This build implements PLAN.md steps 1–3: `update` and `stats` for
+//! mutable roots, and `run` transfers that send all output as literals.
 
+mod attach;
 mod blocks;
+mod cache;
 mod config;
 mod die;
 mod fsid;
 mod fsops;
 mod glob;
 mod hash;
+mod hashlist;
+mod hashtable;
 mod index;
+mod protocol;
+mod rendezvous;
 mod roots;
+mod run;
 mod scan;
+mod serve;
+mod ssh;
 mod stats;
 mod sys;
 mod update;
@@ -55,6 +64,36 @@ enum Command {
     },
     /// Report index statistics
     Stats,
+    /// Run a remote command and reproduce its output locally
+    Run {
+        /// Share read-only index access instead of updating first
+        #[arg(long)]
+        no_update: bool,
+
+        /// Override the configured SSH command for this run
+        #[arg(long, value_name = "CMD")]
+        ssh: Option<OsString>,
+
+        /// The SSH destination, passed to SSH unchanged
+        #[arg(value_name = "[USER@]HOST")]
+        host: OsString,
+
+        /// The remote command and its arguments, after `--`
+        #[arg(value_name = "COMMAND", last = true, required = true)]
+        command: Vec<OsString>,
+    },
+    /// Internal sender entry point: serve one transfer (DESIGN.md §6.1)
+    #[command(hide = true)]
+    Serve {
+        #[arg(long)]
+        token: String,
+    },
+    /// Internal sender entry point: relay the control session
+    #[command(hide = true)]
+    Attach {
+        #[arg(long)]
+        token: String,
+    },
 }
 
 fn main() {
@@ -62,9 +101,19 @@ fn main() {
     let cli = Cli::parse();
     // SQLite accepts an allocator only before its first use.
     sys::sqlite_use_mimalloc();
-    let config = config::load(cli.config.as_deref());
+    // The sender entry points run on the remote host, which needs no
+    // configuration file.
+    let load_config = || config::load(cli.config.as_deref());
     match cli.command {
-        Command::Update { rebuild, jobs } => update::run(&config, rebuild, jobs),
-        Command::Stats => stats::run(&config),
+        Command::Update { rebuild, jobs } => update::run(&load_config(), rebuild, jobs),
+        Command::Stats => stats::run(&load_config()),
+        Command::Run {
+            no_update,
+            ssh,
+            host,
+            command,
+        } => run::run(&load_config(), no_update, ssh.as_deref(), &host, &command),
+        Command::Serve { token } => serve::run(&token),
+        Command::Attach { token } => attach::run(&token),
     }
 }

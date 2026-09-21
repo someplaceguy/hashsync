@@ -20,10 +20,13 @@ process-isolation tests, and protocol fuzzing from DESIGN.md §11. Run
 `cargo fmt`, `cargo clippy --all-targets`, and `cargo test` for implementation
 changes.
 
-**Status:** Steps 1 and 2 are implemented: `update` (with `--rebuild` and
+**Status:** Steps 1 to 3 are implemented: `update` (with `--rebuild` and
 `-j`) and `stats` maintain the index for mutable roots, reuse unchanged
-files by identity, size, and ctime, and recover interrupted work. Step 3
-is the next milestone.
+files by identity, size, and ctime, and recover interrupted work; `run`
+(with `--no-update` and `--ssh`), `serve`, and `attach` transfer a remote
+command's output as literals over two SSH sessions, with the full
+hash-list exchange, account identities, and durable list caches. Step 4 is
+the next milestone.
 
 ## 1. Build and inspect a local index
 
@@ -98,9 +101,11 @@ disabled. Block references and compressed output follow in steps 4 and 5.
   correct behavior across concurrent transfers, interrupted publication,
   missing acknowledgements, database restore, and rebuild.
 - Support `sender_cache = false`, including removal of earlier retained
-  lists for that receiver/index, and `hashlist_max_age` expiry. Receiver
-  publication failure stops setup; sender storage failure allows transfer
-  to continue with `stored: 0`.
+  lists for that receiver/index, and `hashlist_max_age` expiry. Cache
+  directory and file operation failures on either role are fatal, with
+  the absence and invalid-content exceptions in DESIGN.md §5.6.
+  `CACHE_RESULT` acknowledges the accepted target without a storage-success
+  flag; enabled sender caching must publish durably before acknowledgement.
 - Complete only after stdout is validated and flushed, stderr is fully
   forwarded, and both SSH sessions exit successfully. Handle interrupted
   output, peer disappearance during setup or transfer, and termination
@@ -211,9 +216,11 @@ Design coverage: §§4.2, 4.4, 8.
 - Advertise the sender's most recent verified compatible list and find
   bases across the receiver's cached peer histories as specified, including
   bases using a different supported strong hash.
-- Fall back to a full list when a base is unavailable or damaged, or when
-  delta verification requests the permitted retry. Failed cache data must
-  never change reconstructed output.
+- Fall back to a full list when a base is missing or invalid, or when delta
+  verification requests the permitted retry. Remove invalid cached files;
+  removal failures are fatal unless the file is already gone. Other cache
+  I/O failures are fatal as specified in step 3. Failed cache data must never
+  change reconstructed output.
 - Extend cache validation to reuse and deltas under concurrent transfers,
   interrupted publication, missing acknowledgements, database restore,
   and rebuild. Retain the storage controls and failure behavior from step 3.

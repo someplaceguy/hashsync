@@ -32,6 +32,15 @@ impl StrongHash {
         }
     }
 
+    /// The algorithm with this name; `None` for unsupported names.
+    pub fn from_id(id: &str) -> Option<StrongHash> {
+        match id {
+            "blake3" => Some(StrongHash::Blake3),
+            "sha256" => Some(StrongHash::Sha256),
+            _ => None,
+        }
+    }
+
     pub fn digest(self, data: &[u8]) -> Strong {
         match self {
             StrongHash::Blake3 => *blake3::hash(data).as_bytes(),

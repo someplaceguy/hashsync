@@ -1,0 +1,417 @@
+//! `hashsync run [--no-update] [--ssh CMD] [USER@]HOST -- COMMAND ...`
+//! (DESIGN.md §3, §5.6, §6): the receiver.
+//!
+//! This milestone reconstructs stdout from literals; references and
+//! compression arrive with PLAN.md steps 4 and 5. The run updates the
+//! index (or opens it read-only), exports and publishes the hash list,
+//! starts both SSH sessions, completes the exchange, reconstructs
+//! stdout, and returns the command's status once both sessions exited
+//! successfully.
+
+use std::ffi::OsStr;
+use std::io::{BufReader, Read, Write};
+use std::os::unix::ffi::OsStrExt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed, Ordering::SeqCst};
+
+use bstr::ByteSlice;
+
+use crate::cache::{self, ListMeta, ListStore};
+use crate::config::{self, Config};
+use crate::die::{self, die};
+use crate::fsid::FsCache;
+use crate::fsops;
+use crate::hash::weak;
+use crate::hashlist;
+use crate::index::{self, Settings};
+use crate::protocol::{
+    self, CacheResult, ControlHello, End, FrameReader, FrameWriter, HashList, ListId,
+    ReceiverHello, Rle, SenderHello, frame,
+};
+use crate::rendezvous;
+use crate::roots;
+use crate::ssh;
+use crate::sys;
+use crate::update;
+
+pub fn run(
+    config: &Config,
+    no_update: bool,
+    cli_ssh: Option<&OsStr>,
+    host: &OsStr,
+    command: &[std::ffi::OsString],
+) -> ! {
+    // Before any other thread starts: SIGINT and SIGTERM end the run with
+    // `128 + signal`, and the end kills the SSH children (DESIGN.md §6.6).
+    die::handle_termination_signals();
+
+    let options = config.transfer_options(host.as_bytes(), cli_ssh.map(OsStr::as_bytes));
+
+    // Hold index access through the whole run (DESIGN.md §3): the update
+    // keeps its writer, a read-only run keeps its keeper connection.
+    let index = if no_update {
+        open_read_only(config)
+    } else {
+        update::perform(config, false, None)
+    };
+    let meta = index.read_meta().expect("the index lost its metadata");
+
+    // Export and hash the target from one database snapshot, before the
+    // sessions start (DESIGN.md §3 and §5.6).
+    let encoded = hashlist::encode(&index.export_weak_hashes());
+    let target = ListId {
+        algorithm: config.strong_hash,
+        digest: config.strong_hash.digest(&encoded),
+    };
+
+    let account_id = cache::account_id();
+    let token = rendezvous::new_token();
+    sys::reset_sigchld();
+    let (data, control) = ssh::start_sessions(
+        &options.ssh,
+        &options.sender_command,
+        host.as_bytes(),
+        &token,
+    );
+    let sessions = [(data.pid(), "data"), (control.pid(), "control")];
+
+    // Both control sides send their HELLO immediately (DESIGN.md §6.2).
+    // The relay delivers it once `attach` connects. The write end must
+    // stay open until the sender exits, so the writer lives to the end
+    // of the run.
+    let mut control_out = FrameWriter::new(control.stdin);
+    if let Err(e) = control_out
+        .send(frame::HELLO, &ControlHello::current().encode())
+        .and_then(|()| control_out.flush())
+    {
+        die(format!("control session: {e}"));
+    }
+    let completing = Arc::new(AtomicBool::new(false));
+    {
+        let completing = Arc::clone(&completing);
+        let control_stdout = control.stdout;
+        std::thread::Builder::new()
+            .name("control".into())
+            .spawn(move || control_loop(control_stdout, &completing))
+            .expect("cannot start the control thread");
+    }
+
+    // The data session, with received bytes counted for the summary.
+    let wire_bytes = Arc::new(AtomicU64::new(0));
+    let mut data_out = FrameWriter::new(data.stdin);
+    let mut data_in = FrameReader::new(BufReader::new(CountingReader {
+        inner: data.stdout,
+        count: Arc::clone(&wire_bytes),
+    }));
+
+    let hello = ReceiverHello {
+        protocol_version: protocol::PROTOCOL_VERSION,
+        program_version: protocol::PROGRAM_VERSION.to_string(),
+        block_size: config.block_size,
+        weak_hash_id: weak::ID.to_string(),
+        strong_hash_id: config.strong_hash.id().to_string(),
+        width: protocol::WIDTH,
+        account_id,
+        index_id: meta.index_id,
+        target,
+        sender_cache: options.sender_cache,
+        hashlist_max_age: config.hashlist_max_age,
+        lookahead: config::DEFAULT_LOOKAHEAD,
+        // Compression arrives with PLAN.md step 5: negotiate it
+        // disabled.
+        compression_level: 0,
+        compression_threads: 0,
+        negative_cache: config::DEFAULT_NEGATIVE_CACHE,
+        command: command.iter().map(|arg| arg.as_bytes().to_vec()).collect(),
+    };
+    send_data(&mut data_out, frame::HELLO, &hello.encode());
+    flush_data(&mut data_out);
+
+    let payload = read_hello(&mut data_in, host);
+    let sender = SenderHello::decode(payload);
+    check_sender_hello(&hello, &sender);
+
+    // Durably publish the target in the sender's peer directory before
+    // sending list data; a publication failure is fatal and ends setup
+    // (DESIGN.md §5.6).
+    let store = ListStore::receiver_side(&sender.account_id, &meta.index_id);
+    let list_meta = ListMeta {
+        block_size: config.block_size,
+        weak_hash_id: weak::ID.to_string(),
+        id: target,
+    };
+    let published = store.publish(&list_meta, &encoded);
+
+    // The full list; cached bases and deltas arrive with PLAN.md step 8.
+    let header = HashList {
+        target,
+        length: encoded.len() as u64,
+    };
+    send_data(&mut data_out, frame::HASHLIST, &header.encode());
+    for chunk in encoded.chunks(protocol::MAX_LISTDATA) {
+        send_data(&mut data_out, frame::LISTDATA, chunk);
+    }
+    flush_data(&mut data_out);
+    let hash_list_bytes = encoded.len() as u64;
+    drop(encoded);
+
+    let payload = expect_data(&mut data_in, frame::CACHE_RESULT, "CACHE_RESULT");
+    let result = CacheResult::decode(payload);
+    assert!(
+        result.target == target,
+        "protocol error: CACHE_RESULT for {}, expected {target}",
+        result.target
+    );
+    // Renew the target after CACHE_RESULT; with a base this would renew
+    // it too (DESIGN.md §5.6). Then expire both cache trees.
+    published.renew();
+    drop(published);
+    cache::expire(config.hashlist_max_age);
+
+    // Reconstruct stdout in order (DESIGN.md §6.4).
+    let mut stdout = fsops::stdout();
+    let mut output_bytes = 0u64;
+    let mut literal_bytes = 0u64;
+    let mut run_bytes = 0u64;
+    let end = loop {
+        let received = match data_in.next() {
+            Ok(Some(received)) => received,
+            Ok(None) => die("the data session ended before END"),
+            Err(e) => die_data(&e),
+        };
+        match received.kind {
+            frame::LIT => {
+                assert!(!received.payload.is_empty(), "protocol error: empty LIT");
+                write_output(&mut stdout, received.payload);
+                output_bytes = advance(output_bytes, received.payload.len() as u64);
+                literal_bytes += received.payload.len() as u64;
+            }
+            frame::RLE => {
+                // The sender emits runs from step 5 on; accept any
+                // positive length (DESIGN.md §6.4).
+                let rle = Rle::decode(received.payload);
+                output_bytes = advance(output_bytes, rle.length);
+                run_bytes += rle.length;
+                let chunk = vec![rle.byte; rle.length.min(64 * 1024) as usize];
+                let mut remaining = rle.length;
+                while remaining > 0 {
+                    let n = remaining.min(chunk.len() as u64) as usize;
+                    write_output(&mut stdout, &chunk[..n]);
+                    remaining -= n as u64;
+                }
+            }
+            // No pins exist before PLAN.md step 4: a REF cannot name one.
+            frame::REF => panic!("protocol error: REF without a pin at offset {output_bytes}"),
+            frame::END => break End::decode(received.payload),
+            kind => panic!("protocol error: unexpected data frame type {kind}"),
+        }
+    };
+
+    // Completion (DESIGN.md §6.7). Compression is disabled, so END is
+    // sufficient framing; flush reconstructed stdout, enter Completing,
+    // send the single END_ACK, and drain the session to a clean EOF.
+    if let Err(e) = stdout.flush() {
+        die(format!("cannot write to stdout: {e}"));
+    }
+    completing.store(true, SeqCst);
+    send_data(&mut data_out, frame::END_ACK, b"");
+    flush_data(&mut data_out);
+    match data_in.drain_to_eof() {
+        Ok(true) => {}
+        Ok(false) => die("trailing data after END"),
+        Err(e) => die_data(&e),
+    }
+
+    // Both sessions must exit successfully before the command's status
+    // is returned, without reaping (DESIGN.md §6.6–6.7).
+    for (pid, name) in sessions {
+        let status = sys::wait_exit_status(pid);
+        if status != 0 {
+            die(format!("the {name} session exited with status {status}"));
+        }
+    }
+
+    if end.status == 127 && !end.error.is_empty() {
+        die::note(format!("remote command failed to start: {}", end.error));
+    }
+    die::note(format!(
+        "{output_bytes} bytes output ({literal_bytes} literal, 0 reference, {run_bytes} run), \
+         {} bytes wire, {hash_list_bytes} bytes hash list, 0 bytes delta",
+        wire_bytes.load(Relaxed),
+    ));
+    die::finish(end.status)
+}
+
+/// Read-only index access for `--no-update` (DESIGN.md §4.4 and §8):
+/// resolve current roots, then require a compatible index with its block
+/// indexes.
+fn open_read_only(config: &Config) -> index::Index {
+    // Resolve and validate the roots first, like an update would;
+    // candidate reads use the current locations from step 4 on.
+    let fs_cache = FsCache::new();
+    let _locations = roots::expand(config, &fs_cache);
+
+    let path = config.index_path.as_bstr();
+    let Some(index) = index::open_read_only(&config.index_path) else {
+        die(format!("no index at {path}; run `hashsync update`"));
+    };
+    let Some(meta) = index.read_meta() else {
+        die(format!("index {path} has no schema; run `hashsync update`"));
+    };
+    if !meta.compatible(&Settings::from_config(config)) {
+        die(format!(
+            "index {path} does not match the configuration; run `hashsync update`"
+        ));
+    }
+    if !index.has_block_indexes() {
+        die(format!(
+            "index {path} is missing its block indexes; run `hashsync update`"
+        ));
+    }
+    index
+}
+
+/// Counts the bytes received on the data session, for the summary's
+/// wire count.
+struct CountingReader<R> {
+    inner: R,
+    count: Arc<AtomicU64>,
+}
+
+impl<R: Read> Read for CountingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.count.fetch_add(n as u64, Relaxed);
+        Ok(n)
+    }
+}
+
+fn die_data(e: &std::io::Error) -> ! {
+    if e.kind() == std::io::ErrorKind::UnexpectedEof {
+        die("the data session ended unexpectedly");
+    }
+    die(format!("data session: {e}"))
+}
+
+fn send_data<W: Write>(out: &mut FrameWriter<W>, kind: u8, payload: &[u8]) {
+    if let Err(e) = out.send(kind, payload) {
+        die(format!("data session: {e}"));
+    }
+}
+
+fn flush_data<W: Write>(out: &mut FrameWriter<W>) {
+    if let Err(e) = out.flush() {
+        die(format!("data session: {e}"));
+    }
+}
+
+fn expect_data<'a, R: Read>(
+    data_in: &'a mut FrameReader<R>,
+    kind: u8,
+    what: &'static str,
+) -> &'a [u8] {
+    match data_in.expect(kind, what) {
+        Ok(payload) => payload,
+        Err(e) => die_data(&e),
+    }
+}
+
+fn read_hello<'a, R: Read>(data_in: &'a mut FrameReader<R>, host: &OsStr) -> &'a [u8] {
+    let received = match data_in.next() {
+        Ok(Some(received)) => received,
+        Ok(None) => die(format!(
+            "the data session ended before the sender's HELLO; \
+             is a compatible hashsync installed on {}?",
+            host.as_bytes().as_bstr()
+        )),
+        Err(e) => die_data(&e),
+    };
+    assert!(
+        received.kind == frame::HELLO,
+        "protocol error: expected HELLO, received frame type {}",
+        received.kind
+    );
+    protocol::check_protocol_version(received.payload, "sender");
+    received.payload
+}
+
+/// Require the equal parameters of DESIGN.md §6.2 before command
+/// startup.
+fn check_sender_hello(sent: &ReceiverHello, sender: &SenderHello) {
+    let mut problems = Vec::new();
+    if sender.block_size != sent.block_size {
+        problems.push(format!(
+            "block size {} (this receiver: {})",
+            sender.block_size, sent.block_size
+        ));
+    }
+    if sender.weak_hash_id != sent.weak_hash_id {
+        problems.push(format!(
+            "weak hash {} (this receiver: {})",
+            sender.weak_hash_id, sent.weak_hash_id
+        ));
+    }
+    if sender.strong_hash_id != sent.strong_hash_id {
+        problems.push(format!(
+            "strong hash {} (this receiver: {})",
+            sender.strong_hash_id, sent.strong_hash_id
+        ));
+    }
+    if sender.width != sent.width {
+        problems.push(format!("width {}", sender.width));
+    }
+    if let Some(problem) = problems.first() {
+        die(format!(
+            "incompatible sender (hashsync {}): {problem}",
+            sender.program_version
+        ));
+    }
+}
+
+fn write_output(stdout: &mut fsops::FdWriter, bytes: &[u8]) {
+    if let Err(e) = stdout.write_all(bytes) {
+        die(format!("cannot write to stdout: {e}"));
+    }
+}
+
+/// Advance the output offset; overflow is a protocol error
+/// (DESIGN.md §6.2).
+fn advance(offset: u64, length: u64) -> u64 {
+    offset
+        .checked_add(length)
+        .expect("protocol error: output offset overflow")
+}
+
+/// Watch the control session: HELLO, then nothing until answers arrive
+/// with PLAN.md step 4. Loss before Completing is fatal
+/// (DESIGN.md §6.7); in Completing, EOF and broken pipes are expected
+/// closure.
+fn control_loop(stdout: std::process::ChildStdout, completing: &AtomicBool) {
+    let mut control_in = FrameReader::new(BufReader::new(stdout));
+    let expected_closure = || {
+        if !completing.load(SeqCst) {
+            die("the control session closed unexpectedly");
+        }
+    };
+    match control_in.next() {
+        Ok(Some(received)) => {
+            assert!(
+                received.kind == frame::HELLO,
+                "protocol error: expected HELLO, received frame type {}",
+                received.kind
+            );
+            protocol::check_protocol_version(received.payload, "sender's control session");
+            ControlHello::decode(received.payload);
+        }
+        Ok(None) | Err(_) => return expected_closure(),
+    }
+    // No control frame follows HELLO in this milestone: the next event
+    // is the session's closure.
+    match control_in.next() {
+        Ok(Some(received)) => panic!(
+            "protocol error: unexpected control frame type {}",
+            received.kind
+        ),
+        Ok(None) | Err(_) => expected_closure(),
+    }
+}
