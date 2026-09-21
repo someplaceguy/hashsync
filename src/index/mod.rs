@@ -184,6 +184,9 @@ pub fn open_modifying(path: &[u8]) -> Index {
                     db(conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0)));
                 assert_eq!(mode, "wal", "cannot enable WAL mode");
                 db(conn.pragma_update(None, "synchronous", "NORMAL"));
+                // A negative cache_size specifies KiB.
+                db(conn.pragma_update(None, "cache_size", -64 * 1024));
+                db(conn.pragma_update(None, "threads", 8));
                 return Index { conn };
             }
             // Busy without the handler running: retry with a fresh connection.

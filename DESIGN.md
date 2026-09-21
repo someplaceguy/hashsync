@@ -297,6 +297,10 @@ Use WAL mode with `synchronous=NORMAL`. Power loss may discard recent
 commits, which is acceptable for an index of hints. Hash lists identify
 their own content and are persisted independently (section 5.6).
 
+Configure the writer connection with `cache_size=-65536` (64 MiB; negative
+values are KiB) and `threads=8` (up to eight auxiliary sorting workers).
+Worker readers keep SQLite's default cache size.
+
 **Process access.** SQLite's `unix-excl` VFS provides exclusion without a
 separate lock file:
 
