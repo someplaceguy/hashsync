@@ -432,11 +432,11 @@ dependencies = [
  "bstr",
  "clap",
  "crossbeam-channel",
- "foldhash",
  "gix-glob",
  "libc",
  "libmimalloc-sys",
  "linux-raw-sys",
+ "lru",
  "mimalloc",
  "proptest",
  "rayon",
@@ -521,6 +521,15 @@ name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
+
+[[package]]
+name = "lru"
+version = "0.18.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef9ac18847474e638e3702b76c65d4eb93428471a74778ef0f1be711717f89b5"
+dependencies = [
+ "hashbrown 0.17.1",
+]
 
 [[package]]
 name = "memchr"

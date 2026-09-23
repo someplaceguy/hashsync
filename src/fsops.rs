@@ -11,8 +11,9 @@
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 use std::path::Path;
 
-use rustix::fs::{AtFlags, Dir, DirEntry, FileType, Mode, OFlags, StatxFlags};
+use rustix::fs::{AtFlags, Dir, DirEntry, FileType, Mode, OFlags, ResolveFlags, StatxFlags};
 use rustix::io::{Errno, retry_on_intr};
+use rustix::process::{Resource, getrlimit, setrlimit};
 
 /// Flags for the initial open of any entry.
 pub const PATH_FLAGS: OFlags = OFlags::PATH.union(OFlags::NOFOLLOW).union(OFlags::CLOEXEC);
@@ -46,6 +47,15 @@ pub fn open_root_dir() -> Result<OwnedFd, Errno> {
 /// classification only.
 pub fn open_path(dir: BorrowedFd<'_>, name: &[u8]) -> Result<OwnedFd, Errno> {
     retry_on_intr(|| rustix::fs::openat(dir, name, PATH_FLAGS, Mode::empty()))
+}
+
+/// Open the relative path `rel` beneath the directory `dir` for
+/// classification only, without following a symlink in any component and
+/// without leaving `dir` (DESIGN.md §6.4). A final symlink yields a
+/// descriptor of the link itself.
+pub fn open_beneath(dir: BorrowedFd<'_>, rel: &[u8]) -> Result<OwnedFd, Errno> {
+    let resolve = ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS;
+    retry_on_intr(|| rustix::fs::openat2(dir, rel, PATH_FLAGS, Mode::empty(), resolve))
 }
 
 /// Reopen the object behind an `O_PATH` descriptor for I/O.
@@ -118,11 +128,12 @@ pub fn retry_interrupted<T>(mut op: impl FnMut() -> std::io::Result<T>) -> std::
     }
 }
 
-/// Create `dir` and its missing ancestors. `std::fs::create_dir_all` is
-/// unsuitable: it confirms an existing directory with a check that
-/// swallows an interruption and then misreports the directory as a
-/// conflicting entry.
-pub fn create_dir_all(dir: &Path) -> std::io::Result<()> {
+/// Create `dir` and its missing ancestors. `dir` itself gets `mode`, the
+/// ancestors 0777; the umask applies to both, and existing directories
+/// keep their modes. `std::fs::create_dir_all` is unsuitable: it confirms
+/// an existing directory with a check that swallows an interruption and
+/// then misreports the directory as a conflicting entry.
+pub fn create_dir_all(dir: &Path, mode: u32) -> std::io::Result<()> {
     // The empty parent of a bare relative filename needs no directories,
     // as for `std::fs::create_dir_all`.
     if dir.as_os_str().is_empty() {
@@ -137,7 +148,8 @@ pub fn create_dir_all(dir: &Path) -> std::io::Result<()> {
         if prefix.as_os_str().is_empty() {
             continue;
         }
-        match retry_on_intr(|| rustix::fs::mkdir(prefix, Mode::from_raw_mode(0o777))) {
+        let mode = if prefix == dir { mode } else { 0o777 };
+        match retry_on_intr(|| rustix::fs::mkdir(prefix, Mode::from_raw_mode(mode))) {
             Ok(()) | Err(Errno::EXIST) => {}
             Err(errno) => return Err(errno.into()),
         }
@@ -147,6 +159,18 @@ pub fn create_dir_all(dir: &Path) -> std::io::Result<()> {
         Ok(())
     } else {
         Err(std::io::ErrorKind::NotADirectory.into())
+    }
+}
+
+/// Raise the soft descriptor limit to the hard limit (DESIGN.md §4.6):
+/// traversal tasks hold their parents' descriptors, and root locations
+/// hold theirs for a whole run.
+pub fn raise_descriptor_limit() {
+    let mut limit = getrlimit(Resource::Nofile);
+    if limit.current != limit.maximum {
+        limit.current = limit.maximum;
+        // Failure only means fewer descriptors; opens report it later.
+        let _ = retry_on_intr(|| setrlimit(Resource::Nofile, limit));
     }
 }
 
@@ -239,22 +263,55 @@ mod tests {
 
     #[test]
     fn create_dir_all_handles_existing_entries() {
+        use std::os::unix::fs::PermissionsExt;
+
         let dir = tempfile::tempdir().unwrap();
         let nested = dir.path().join("a/b/c");
-        create_dir_all(&nested).unwrap();
-        create_dir_all(&nested).unwrap();
+        create_dir_all(&nested, 0o700).unwrap();
+        create_dir_all(&nested, 0o777).unwrap();
         assert!(nested.is_dir());
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&nested), 0o700, "the directory itself gets the mode");
+        assert_ne!(mode(&dir.path().join("a")), 0o700, "ancestors do not");
         let file = dir.path().join("f");
         std::fs::write(&file, b"x").unwrap();
-        let error = create_dir_all(&file).unwrap_err();
+        let error = create_dir_all(&file, 0o777).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::NotADirectory);
-        assert!(create_dir_all(&file.join("d")).is_err());
+        assert!(create_dir_all(&file.join("d"), 0o777).is_err());
     }
 
     #[test]
     fn create_dir_all_accepts_an_empty_path() {
         // The parent of a bare relative filename.
-        create_dir_all(Path::new("")).unwrap();
+        create_dir_all(Path::new(""), 0o777).unwrap();
+    }
+
+    #[test]
+    fn open_beneath_rejects_symlinks_and_escapes() {
+        use std::os::fd::AsFd;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("root/sub")).unwrap();
+        std::fs::write(dir.path().join("root/sub/file"), b"data").unwrap();
+        std::fs::write(dir.path().join("outside"), b"secret").unwrap();
+        std::os::unix::fs::symlink("sub", dir.path().join("root/link")).unwrap();
+        std::os::unix::fs::symlink("file", dir.path().join("root/sub/filelink")).unwrap();
+        let root = rustix::fs::open(
+            dir.path().join("root").as_path(),
+            PATH_FLAGS | OFlags::DIRECTORY,
+            Mode::empty(),
+        )
+        .unwrap();
+
+        let kind = |rel: &[u8]| stat(open_beneath(root.as_fd(), rel)?.as_fd()).map(|m| m.kind);
+        assert_eq!(kind(b"sub/file"), Ok(FileType::RegularFile));
+        // A symlink in the middle cannot be traversed; a final one is not
+        // followed.
+        assert!(kind(b"link/file").is_err());
+        assert_eq!(kind(b"sub/filelink"), Ok(FileType::Symlink));
+        for escape in [&b"../outside"[..], b"sub/../../outside", b"/etc/passwd"] {
+            assert!(kind(escape).is_err(), "{}", String::from_utf8_lossy(escape));
+        }
     }
 
     #[test]

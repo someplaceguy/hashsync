@@ -163,12 +163,11 @@ must be distinct directories. A change to a copy's root-directory filesystem
 identity or inode handle does not invalidate the completed group or trigger
 a rescan.
 
-All current locations of an immutable group live in memory. Earlier
-`[[roots]]` entries take priority; order within a glob is unspecified. The
-database stores one representative path, while candidate reads can try any
-current copy. With `--no-update`, map completed rows by identifier and NULL
-rows by stored path and current configuration; unmatched rows have no usable
-location. A single-file root has an empty `rel_path`.
+All current locations of an immutable group live in memory. The database
+stores one representative path, while candidate reads search every current
+copy (section 6.4). With `--no-update`, map completed rows by identifier and
+NULL rows by stored path and current configuration; unmatched rows have no
+usable location. A single-file root has an empty `rel_path`.
 
 Per-root options:
 
@@ -206,7 +205,7 @@ Before scanning, reconcile roots in one transaction:
    Remove incomplete inodes' remaining paths, blocks, and rows. Preserve
    complete inodes, including orphans, for reuse.
 3. Retain completed immutable groups still configured. Keep their
-   representative path if still present, otherwise choose the first current
+   representative path if still present, otherwise choose any current
    location. Create NULL-identifier rows for roots that need scanning.
 4. Apply representative-path changes without violating `UNIQUE(path)`,
    including when roots exchange paths. Temporary staging values must remain
@@ -910,7 +909,7 @@ threads perform I/O and compression. Let `B = block_size`.
   state Not_sent, Waiting, Yes, or No. Keep entries until their offsets
   fall below `e`, even when their records are discarded.
 - A byte-bounded negative LRU cache holds full strong hashes answered no
-  (default 100 MiB). It suppresses queries for the same content at other
+  (default 128 MiB). It suppresses queries for the same content at other
   offsets, but does not avoid hashing a new window.
 - Command stdout EOF and availability of the command's exit status are
   separate conditions; both are required to finish scanning and send END.
@@ -1061,23 +1060,24 @@ For `QUERY { offset: x, strong: h }`:
 1. Under the lock, check `c`. If `x < c`, answer no without a pin.
    Otherwise try the verified-buffer cache.
 2. If uncached, select blocks matching `h[0..16]` through
-   `blocks_by_strong`. Enumerate indexed paths and current root locations,
-   preferring configured order. Repeated location/offset pairs need only
-   one attempt.
-3. Try at most `candidate_attempts` locations (default 128, positive),
-   across all blocks, paths, and copies. Failed opens/reads count, as does
-   a block with no usable location; stale rows must not evade the budget.
+   `blocks_by_strong`. Each path of a block's inode gives one candidate; a
+   block whose inode has no path is one candidate too. Try candidates in
+   any order. Repeated location/offset pairs need only one read.
+3. Try at most `candidate_attempts` candidates (default 128, positive).
+   Try each candidate at every current location of its root until one
+   verifies: all copies of an immutable group are searched, and together
+   they use one attempt. A candidate without a usable location, or whose
+   reads all fail, also uses one; stale rows must not evade the budget.
 4. Open a single-file root directly. Otherwise open its root directory and
-   resolve the relative path beneath it without symlinks
-   (`openat2` with `RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS`, or component-wise
-   `openat` on older kernels). Use the `O_PATH` classification and procfs
-   reopening rules of section 4.5: check that the opened object is a regular
-   file before obtaining its readable descriptor. Close descriptors after
-   each attempt.
+   resolve the relative path beneath it without symlinks (`openat2` with
+   `RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS`). Use the `O_PATH` classification
+   and procfs reopening rules of section 4.5: check that the opened object
+   is a regular file before obtaining its readable descriptor. Close
+   descriptors before trying the next location.
 5. Read exactly `B` bytes at `block_no * B`, accumulating short reads.
    Verify the full digest of that buffer. Errors, early EOF, and mismatches
-   try the next candidate; filesystem failures are misses, not fatal.
-   Alternate copies need not share the indexed inode identity.
+   try the next location or candidate; filesystem failures are misses, not
+   fatal. Alternate copies need not share the indexed inode identity.
 6. If nothing verified, answer no. Otherwise recheck `c` under the lock. If
    `x < c`, answer no without appending. If still needed, allocate a distinct
    append extent by advancing the file's append offset under the lock.
@@ -1087,7 +1087,7 @@ For `QUERY { offset: x, strong: h }`:
    workers write only their assigned, nonoverlapping extents. Finish every
    write before publishing the pin or answering yes.
 8. Reacquire the lock and recheck `x < c`. If now obsolete, leave the extent
-   unpublished, punch it outside the lock, and answer no. Otherwise publish
+   unpublished, release it to the reclaimer, and answer no. Otherwise publish
    `{ file_offset, strong: h }` at `x` and queue yes nonblockingly under the
    lock. Release the worker's buffer. The Completing state prevents new
    appends or pin publication; late workers discard their results and the
@@ -1110,11 +1110,13 @@ Process data frames in order at `c`:
   or a digest mismatch end the run unsuccessfully without emitting that
   block or attempting to reread the source file.
 - After each frame's output is written, advance `c` under the lock. In
-  bounded batches, detach pins whose query offsets are below it and punch
-  their extents outside the lock, including pins covered by literals or
-  runs. Finish this reclamation before processing the next frame, even if
-  no further frame arrives. An unpublished write that becomes obsolete is
-  cleaned up by its lookup worker after that write finishes.
+  bounded batches, detach pins whose query offsets are below it, including
+  pins covered by literals or runs, and release their extents to the
+  reclaimer. An unpublished write that becomes obsolete is released by its
+  lookup worker after that write finishes. The reclaimer punches released
+  extents outside the lock and merges adjacent extents into one call. To
+  merge more, it can hold released extents back until they total 128 MiB.
+  Neither reconstruction nor the lookups wait for it.
 - END carries the command status into shutdown. Validate compression
   completion and flush stdout before END_ACK (section 6.7). EOF without
   END or before the compressed stream is complete is failure.
@@ -1170,6 +1172,7 @@ coordination chosen by the implementation, subject to section 6.7.
 | Sender control reader/writer | Receive answers and send queries promptly, independently of data output. |
 | Receiver main | Start SSH sessions, reconstruct stdout, validate completion, and send END_ACK. |
 | Receiver control reader/writer | Dispatch queries to lookup workers and send answers promptly. |
+| Receiver reclaimer | Punch the extents of released pins. |
 | Receiver signal thread | Handle SIGINT/SIGTERM with status `128 + signal`. |
 | Attach relay | Copy both directions; half-close on stdin EOF, exit after flushing on socket EOF. |
 
@@ -1271,13 +1274,13 @@ Use `$XDG_CONFIG_HOME/hashsync/config.toml`, or `--config PATH`:
 ```toml
 block_size     = "32KiB"   # at least 4 KiB; changes rebuild the index
 strong_hash    = "blake3"  # blake3 or sha256
-candidate_attempts = 128  # total attempts per query, at least 1
+candidate_attempts = 128  # candidates tried per query, at least 1
 hashlist_max_age = "90d"
 index_path     = "~/.local/state/hashsync/index.sqlite"
 threads        = 0         # 0 = 4 × cores, clamped to 16–64
 lookahead      = "256MiB"  # at least block_size
 pin_directory  = "~/.cache/hashsync/pins"  # receiver file storage; supports hole punching
-negative_cache = "100MiB"
+negative_cache = "128MiB"
 compression_level   = 9    # zstd 1–19; 0 disables
 compression_threads = 0    # 0 = half the sender's cores, at least one
 ssh            = "ssh"     # shell-split command; appends -o Compression=no

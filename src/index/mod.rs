@@ -119,6 +119,11 @@ pub struct Stats {
 /// keeper of a read-only process.
 pub struct Index {
     conn: Connection,
+    /// The database path, for the other connections of this process.
+    path: Vec<u8>,
+    /// This process modifies the index, which decides how its other
+    /// connections open (DESIGN.md §4.4).
+    modifying: bool,
 }
 
 /// Busy handler: wait, then retry, forever.
@@ -162,7 +167,7 @@ fn open_unix_excl(path: &[u8], extra: OpenFlags) -> rusqlite::Result<Connection>
 /// Open the writer of a modifying process, waiting for exclusive access.
 pub fn open_modifying(path: &[u8]) -> Index {
     if let Some(parent) = os_path(path).parent()
-        && let Err(e) = fsops::create_dir_all(parent)
+        && let Err(e) = fsops::create_dir_all(parent, 0o777)
     {
         die(format!(
             "cannot create index directory {}: {e}",
@@ -184,7 +189,11 @@ pub fn open_modifying(path: &[u8]) -> Index {
                 // A negative cache_size specifies KiB.
                 db(conn.pragma_update(None, "cache_size", -64 * 1024));
                 db(conn.pragma_update(None, "threads", 8));
-                return Index { conn };
+                return Index {
+                    conn,
+                    path: path.to_vec(),
+                    modifying: true,
+                };
             }
             // Busy without the handler running: retry with a fresh connection.
             Err(e) if is_busy(&e) => {
@@ -207,9 +216,37 @@ pub fn open_worker_reader(path: &[u8]) -> Reader {
     Reader { conn }
 }
 
-/// A scan worker's read-only view of the index during an update.
+/// Open a reader of a read-only process: an ordinary read-only
+/// connection, which the keeper's transaction protects from writers
+/// (DESIGN.md §4.4).
+fn open_plain_reader(path: &[u8]) -> Reader {
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = db(Connection::open_with_flags(os_path(path), flags));
+    db(conn.busy_handler(Some(wait_forever)));
+    Reader { conn }
+}
+
+/// A read-only view of the index for one worker thread: a scan worker
+/// during an update, or a lookup worker during a transfer. Queries run in
+/// autocommit, so a reader never pins a WAL snapshot.
 pub struct Reader {
     conn: Connection,
+}
+
+/// The candidates of the blocks with one strong-hash prefix.
+const CANDIDATES: &str = "
+SELECT blocks.block_no, paths.root_id, paths.rel_path FROM blocks
+LEFT JOIN paths ON paths.inode_id = blocks.inode_id
+WHERE blocks.strong = ?
+ORDER BY blocks.inode_id, blocks.block_no";
+
+/// A candidate (DESIGN.md §6.4): an indexed block with one path of its
+/// inode.
+pub struct Candidate {
+    pub block_no: u64,
+    /// The `roots.id` and relative path of one path of the block's inode;
+    /// `None` for an inode without paths.
+    pub path: Option<(i64, Vec<u8>)>,
 }
 
 impl Reader {
@@ -236,6 +273,31 @@ impl Reader {
                 row.get(0)
             })
             .optional())
+    }
+
+    /// At most `limit` candidates of the blocks whose strong-hash prefix is
+    /// `prefix`: one for every path of each block's inode, and one for each
+    /// block whose inode has no path. Any order would do; this one is
+    /// fixed, by inode row, then by block number, so that the same index
+    /// always gives the same candidates.
+    ///
+    /// The rows come from `blocks_by_strong` in that order without a sort,
+    /// so reading stops after `limit` rows. A `LIMIT ?` parameter would do
+    /// the same, but SQLite prepares a statement again whenever such a
+    /// parameter changes.
+    pub fn candidates(&self, prefix: &[u8], limit: u32) -> Vec<Candidate> {
+        let mut stmt = db(self.conn.prepare_cached(CANDIDATES));
+        let rows = db(stmt.query_map(params![prefix], |row| {
+            let root_id: Option<i64> = row.get(1)?;
+            Ok(Candidate {
+                block_no: row.get::<_, i64>(0)? as u64,
+                path: match root_id {
+                    Some(root_id) => Some((root_id, row.get(2)?)),
+                    None => None,
+                },
+            })
+        }));
+        rows.take(limit as usize).map(db).collect()
     }
 }
 
@@ -267,7 +329,13 @@ pub fn open_read_only(path: &[u8]) -> Option<Index> {
             .execute_batch("BEGIN")
             .and_then(|()| schema_read(&conn))
         {
-            Ok(()) => return Some(Index { conn }),
+            Ok(()) => {
+                return Some(Index {
+                    conn,
+                    path: path.to_vec(),
+                    modifying: false,
+                });
+            }
             Err(e) if is_busy(&e) => {
                 drop(conn);
                 thread::sleep(RETRY_INTERVAL);
@@ -278,6 +346,23 @@ pub fn open_read_only(path: &[u8]) -> Option<Index> {
 }
 
 impl Index {
+    /// A reader connection for another thread of this process, opened the
+    /// way this process's access requires (DESIGN.md §4.4).
+    pub fn reader(&self) -> Reader {
+        if self.modifying {
+            open_worker_reader(&self.path)
+        } else {
+            open_plain_reader(&self.path)
+        }
+    }
+
+    /// Every root row: its ID and its representative path.
+    pub fn root_paths(&self) -> Vec<(i64, Vec<u8>)> {
+        let mut stmt = db(self.conn.prepare("SELECT id, path FROM roots"));
+        let rows = db(stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?))));
+        rows.map(db).collect()
+    }
+
     /// The stored metadata, or `None` before the schema exists.
     pub fn read_meta(&self) -> Option<Meta> {
         let tables: i64 = db(self.conn.query_row(
@@ -583,6 +668,68 @@ mod tests {
         assert_eq!(
             index.export_weak_hashes(),
             vec![0, 7, i64::MAX as u64, 1 << 63, u64::MAX]
+        );
+    }
+
+    /// Candidates follow the inode rows and block numbers, include blocks
+    /// of inodes without paths, stop at the limit, and come from the
+    /// `blocks_by_strong` index without a sort (DESIGN.md §4.4 and §6.4).
+    #[test]
+    fn candidates_are_ordered_and_limited() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.sqlite");
+        let index = open_modifying(path.as_os_str().as_bytes());
+        index.reset(&settings());
+        index.ensure_deferred_block_indexes();
+        db(index.conn.execute_batch(
+            "BEGIN IMMEDIATE;
+             INSERT INTO filesystems (id, fsid) VALUES (1, x'01');
+             INSERT INTO roots (id, identifier, path) VALUES (1, NULL, x'2f72');
+             INSERT INTO inodes (id, fs_id, handle, size, ctime_ns)
+             VALUES (1, 1, x'01', 8192, 1), (2, 1, x'02', 8192, 1);
+             INSERT INTO paths (root_id, rel_path, inode_id)
+             VALUES (1, x'61', 2), (1, x'62', 2);
+             INSERT INTO blocks (inode_id, block_no, weak, strong) VALUES
+               (2, 1, 0, x'11111111111111111111111111111111'),
+               (2, 0, 0, x'11111111111111111111111111111111'),
+               (1, 5, 0, x'11111111111111111111111111111111'),
+               (1, 6, 0, x'22222222222222222222222222222222');
+             COMMIT;",
+        ));
+        let reader = index.reader();
+        let prefix = [0x11u8; 16];
+        let found: Vec<String> = reader
+            .candidates(&prefix, 10)
+            .into_iter()
+            .map(|c| match c.path {
+                Some((root, rel)) => format!("{} {root}/{}", c.block_no, rel.as_bstr()),
+                None => format!("{} -", c.block_no),
+            })
+            .collect();
+        assert_eq!(found, ["5 -", "0 1/a", "0 1/b", "1 1/a", "1 1/b"]);
+        assert_eq!(reader.candidates(&prefix, 2).len(), 2);
+        assert!(reader.candidates(&[0x33; 16], 10).is_empty());
+        // Each lookup reuses the prepared statement.
+        let stmt = reader.conn.prepare_cached(CANDIDATES).unwrap();
+        assert_eq!(stmt.get_status(rusqlite::StatementStatus::RePrepare), 0);
+
+        let plan: Vec<String> = {
+            let mut stmt = index
+                .conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {CANDIDATES}"))
+                .unwrap();
+            stmt.query_map(params![&prefix[..]], |row| row.get::<_, String>(3))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        assert!(
+            plan.iter().any(|step| step.contains("blocks_by_strong")),
+            "{plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|step| step.contains("TEMP B-TREE")),
+            "{plan:?}"
         );
     }
 

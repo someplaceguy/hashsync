@@ -20,13 +20,14 @@ process-isolation tests, and protocol fuzzing from DESIGN.md §11. Run
 `cargo fmt`, `cargo clippy --all-targets`, and `cargo test` for implementation
 changes.
 
-**Status:** Steps 1 to 3 are implemented: `update` (with `--rebuild` and
+**Status:** Steps 1 to 4 are implemented: `update` (with `--rebuild` and
 `-j`) and `stats` maintain the index for mutable roots, reuse unchanged
 files by identity, size, and ctime, and recover interrupted work; `run`
 (with `--no-update` and `--ssh`), `serve`, and `attach` transfer a remote
-command's output as literals over two SSH sessions, with the full
-hash-list exchange, account identities, and durable list caches. Step 4 is
-the next milestone.
+command's output over two SSH sessions, with the full hash-list exchange,
+account identities, and durable list caches, and replace indexed blocks
+with references verified through the pin file. Step 5 is the next
+milestone.
 
 ## 1. Build and inspect a local index
 
@@ -173,10 +174,10 @@ Design coverage: §§6.2–6.7, 7–8.
   root-path and hard-link rules across mutable and immutable roots. Detect
   directory overlap on a best-effort basis during actual traversal; completed
   groups and unused copies have no tasks or opens solely for overlap checks.
-- Make current copies available for candidate reads in configured priority
-  order, including during `--no-update` runs. Try other configured copies
-  when a candidate is unavailable or fails verification, within the
-  `candidate_attempts` limit.
+- Make current copies available for candidate reads, including during
+  `--no-update` runs. When a copy is unavailable or fails verification,
+  try the candidate in the other current copies; together, the copies use
+  one of the query's `candidate_attempts`.
 - Retry incomplete immutable indexing, including failures or interruptions
   involving files shared with mutable roots.
 - Publish new immutable completion markers only after all scan tasks finish

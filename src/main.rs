@@ -1,8 +1,9 @@
 //! `hashsync` copies a remote command's stdout, replacing blocks that the
 //! receiver already holds with verified local content. See `DESIGN.md`.
 //!
-//! This build implements PLAN.md steps 1–3: `update` and `stats` for
-//! mutable roots, and `run` transfers that send all output as literals.
+//! This build implements PLAN.md steps 1–4: `update` and `stats` for
+//! mutable roots, and `run` transfers that replace indexed blocks with
+//! verified references.
 
 mod attach;
 mod blocks;
@@ -16,11 +17,14 @@ mod hash;
 mod hashlist;
 mod hashtable;
 mod index;
+mod lookup;
+mod pins;
 mod protocol;
 mod rendezvous;
 mod roots;
 mod run;
 mod scan;
+mod scanner;
 mod serve;
 mod ssh;
 mod stats;

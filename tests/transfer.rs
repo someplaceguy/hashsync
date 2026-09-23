@@ -1,20 +1,20 @@
-//! End-to-end `run` transfers (PLAN.md step 3) over a fake `ssh` that
-//! executes the remote command string with a local `/bin/sh`, under a
+//! End-to-end `run` transfers (PLAN.md steps 3 and 4) over a fake `ssh`
+//! that executes the remote command string with a local `/bin/sh`, under a
 //! separate HOME for the sender side. This exercises the real bootstrap
-//! quoting, the rendezvous socket, both sessions, and the cache
-//! publication rules on both sides.
+//! quoting, the rendezvous socket, both sessions, the cache publication
+//! rules on both sides, and block references with their pins.
 
 mod common;
 
 use std::ffi::{OsStr, OsString};
-use std::io::BufRead;
+use std::io::Read;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-use common::{Env, random, toml_literal};
+use common::{BLOCK, Env, random, tiled, toml_literal};
 use rustix::process::{Pid, Signal, kill_process};
 
 const HOST: &str = "testhost";
@@ -149,6 +149,34 @@ fn args(words: &[&str]) -> Vec<OsString> {
     words.iter().map(OsString::from).collect()
 }
 
+/// The first byte counts of the summary line: output, literal, reference,
+/// and run bytes.
+fn summary(output: &Output) -> [usize; 4] {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let line = stderr
+        .lines()
+        .find(|line| line.contains("bytes output"))
+        .unwrap_or_else(|| panic!("no summary:\n{stderr}"));
+    let counts: Vec<usize> = line
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|word| !word.is_empty())
+        .map(|word| word.parse().unwrap())
+        .collect();
+    [counts[0], counts[1], counts[2], counts[3]]
+}
+
+/// Require a successful run; return its output.
+fn succeeded(output: Output) -> Output {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "run failed:\n{stderr}");
+    output
+}
+
+/// The permission bits of `path`.
+fn mode(path: &std::path::Path) -> u32 {
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
 fn refs(words: &[OsString]) -> Vec<&OsStr> {
     words.iter().map(OsString::as_os_str).collect()
 }
@@ -201,6 +229,213 @@ fn output_reproduces_byte_for_byte_and_lists_are_cached() {
     transfer.run_ok(&refs(&command));
     assert_eq!(transfer.cache_files("receiver", "local-hashlists"), local);
     assert_eq!(transfer.cache_files("sender", "remote-hashlists"), remote);
+}
+
+#[test]
+fn indexed_blocks_become_references_at_any_offset() {
+    // The blocks of an indexed file appear twice in the output, at
+    // unaligned offsets. Every block becomes a reference; the lookups run
+    // concurrently, and the pins leave nothing behind (DESIGN.md §6.4).
+    let transfer = Transfer::new("");
+    let blocks = tiled(64, 7);
+    transfer.env.write("tree/blocks", &blocks);
+    let script = format!(
+        "printf abc; cat '{0}'; printf defg; cat '{0}'",
+        transfer.env.path("tree/blocks").display()
+    );
+    let output = transfer.run_ok(&refs(&args(&["sh", "-c", &script])));
+    let expected = [&b"abc"[..], &blocks, b"defg", &blocks].concat();
+    assert_eq!(output.stdout, expected);
+    assert_eq!(summary(&output), [expected.len(), 7, 2 * blocks.len(), 0]);
+
+    let pins = transfer.env.path("receiver/cache/hashsync/pins");
+    assert_eq!(mode(&pins), 0o700, "the pin directory is private");
+    assert_eq!(std::fs::read_dir(&pins).unwrap().count(), 0);
+}
+
+#[test]
+fn stale_and_unreadable_candidates_are_misses() {
+    // A `--no-update` run reads candidates from a file that changed, then
+    // became unreadable, after the update. Verification rejects those
+    // candidates, and the output stays exact (DESIGN.md §3).
+    let transfer = Transfer::new("");
+    let original = tiled(8, 11);
+    transfer.env.write("tree/file", &original);
+    let payload = transfer.env.path("payload");
+    std::fs::write(&payload, &original).unwrap();
+    transfer.env.update();
+    let command = args(&["cat", payload.to_str().unwrap()]);
+
+    let mut changed = original.clone();
+    changed[3 * BLOCK + 100] ^= 1;
+    std::fs::write(transfer.env.path("tree/file"), &changed).unwrap();
+    let output = succeeded(transfer.run(&["--no-update"], &refs(&command)));
+    assert_eq!(output.stdout, original);
+    assert_eq!(summary(&output), [8 * BLOCK, BLOCK, 7 * BLOCK, 0]);
+
+    transfer.env.chmod("tree/file", 0o000);
+    let output = succeeded(transfer.run(&["--no-update"], &refs(&command)));
+    transfer.env.chmod("tree/file", 0o644);
+    assert_eq!(output.stdout, original);
+    assert_eq!(summary(&output), [8 * BLOCK, 8 * BLOCK, 0, 0]);
+}
+
+#[test]
+fn candidate_attempts_bound_each_query() {
+    // One file holds a block twice, and its first occurrence changes after
+    // the update. Candidates follow the block numbers, an order that the
+    // index fixes but DESIGN.md §6.4 does not: one attempt reaches only
+    // the stale occurrence, two reach the intact one.
+    let transfer = Transfer::new("");
+    let block = random(BLOCK, 12);
+    transfer.env.write("tree/twice", &block.repeat(2));
+    let payload = transfer.env.path("payload");
+    std::fs::write(&payload, &block).unwrap();
+    transfer.env.update();
+    let mut changed = block.repeat(2);
+    changed[5] ^= 1;
+    std::fs::write(transfer.env.path("tree/twice"), &changed).unwrap();
+
+    let command = args(&["cat", payload.to_str().unwrap()]);
+    for (attempts, reference) in [(1, 0), (2, BLOCK)] {
+        transfer.reconfigure(
+            env!("CARGO_BIN_EXE_hashsync").as_bytes(),
+            &format!("candidate_attempts = {attempts}\n"),
+        );
+        let output = succeeded(transfer.run(&["--no-update"], &refs(&command)));
+        assert_eq!(output.stdout, block);
+        assert_eq!(summary(&output), [BLOCK, BLOCK - reference, reference, 0]);
+    }
+}
+
+#[test]
+fn a_rejected_window_does_not_hide_an_overlapping_match() {
+    // The block of a changed file hides a valid block that starts 8 bytes
+    // into it. The rejection makes the scanner rescan from the next byte,
+    // which finds the valid block (DESIGN.md §6.3).
+    let transfer = Transfer::new("");
+    let valid = random(BLOCK, 13);
+    let hider = [&random(8, 14)[..], &valid[..BLOCK - 8]].concat();
+    transfer.env.write("tree/valid", &valid);
+    transfer.env.write("tree/hider", &hider);
+    let payload = [&hider[..8], &valid[..]].concat();
+    std::fs::write(transfer.env.path("payload"), &payload).unwrap();
+    transfer.env.update();
+    transfer.env.write("tree/hider", &random(BLOCK, 15));
+
+    let command = args(&["cat", transfer.env.path("payload").to_str().unwrap()]);
+    let output = succeeded(transfer.run(&["--no-update"], &refs(&command)));
+    assert_eq!(output.stdout, payload);
+    assert_eq!(summary(&output), [8 + BLOCK, 8, BLOCK, 0]);
+}
+
+#[test]
+fn pins_live_in_the_configured_directory() {
+    let transfer = Transfer::new("");
+    let pins = transfer.env.path("pins/nested");
+    let hashsync = env!("CARGO_BIN_EXE_hashsync").as_bytes();
+    let pin_directory = |path: &std::path::Path| {
+        format!(
+            "pin_directory = '{}'\n",
+            toml_literal(path.as_os_str().as_bytes())
+        )
+    };
+    transfer.reconfigure(hashsync, &pin_directory(&pins));
+    let blocks = tiled(8, 16);
+    transfer.env.write("tree/blocks", &blocks);
+    let command = args(&["cat", transfer.env.path("tree/blocks").to_str().unwrap()]);
+    let output = transfer.run_ok(&refs(&command));
+    assert_eq!(output.stdout, blocks);
+    assert_eq!(summary(&output), [8 * BLOCK, 0, 8 * BLOCK, 0]);
+    assert_eq!(mode(&pins), 0o700);
+    assert_eq!(std::fs::read_dir(&pins).unwrap().count(), 0);
+
+    // A pin directory that cannot exist fails the run before the
+    // sessions start.
+    transfer.env.write("not-a-directory", b"x");
+    let blocked = transfer.env.path("not-a-directory/pins");
+    transfer.reconfigure(hashsync, &pin_directory(&blocked));
+    let output = transfer.run(&[], &refs(&command));
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("cannot create pin directory"), "{stderr}");
+}
+
+#[test]
+fn a_pin_directory_without_hole_punching_fails_the_run() {
+    // ramfs cannot punch holes; the setup probe finds out before the
+    // sessions start (DESIGN.md §6.4).
+    if !common::namespaces_available() {
+        eprintln!("skipped: no unprivileged user namespaces");
+        return;
+    }
+    let transfer = Transfer::new("");
+    let pins = transfer.env.path("ramfs");
+    std::fs::create_dir(&pins).unwrap();
+    transfer.reconfigure(
+        env!("CARGO_BIN_EXE_hashsync").as_bytes(),
+        &format!(
+            "pin_directory = '{}'\n",
+            toml_literal(pins.as_os_str().as_bytes())
+        ),
+    );
+    let run = transfer.invocation(&[], &refs(&args(&["true"])));
+    let mut command = Command::new("unshare");
+    command
+        .args([
+            "-Urm",
+            "sh",
+            "-c",
+            "mount -t ramfs none \"$0\" || exit 99; exec \"$@\"",
+        ])
+        .arg(&pins)
+        .arg(run.get_program())
+        .args(run.get_args());
+    for (key, value) in run.get_envs() {
+        command.env(key, value.unwrap());
+    }
+    let output = command.output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("does not support hole punching"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn a_slow_consumer_and_a_one_window_lookahead_keep_the_output_exact() {
+    // The scanner may look only one window ahead, so every query waits for
+    // its answer before scanning goes on, and stdout drains slowly.
+    // Backpressure reaches the sender; output, answers, and pin release
+    // stay in order (DESIGN.md §6.3 and §6.4).
+    let transfer = Transfer::new(&format!("lookahead = {BLOCK}\n"));
+    let blocks = tiled(256, 17);
+    transfer.env.write("tree/big", &blocks);
+    let script = format!(
+        "printf x; cat '{0}'; printf yz; cat '{0}'",
+        transfer.env.path("tree/big").display()
+    );
+    let mut receiver = transfer
+        .invocation(&[], &refs(&args(&["sh", "-c", &script])))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = receiver.stdout.take().unwrap();
+    let mut received = Vec::new();
+    let mut chunk = vec![0u8; 16 << 10];
+    loop {
+        let n = stdout.read(&mut chunk).unwrap();
+        if n == 0 {
+            break;
+        }
+        received.extend_from_slice(&chunk[..n]);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let output = succeeded(receiver.wait_with_output().unwrap());
+    assert_eq!(received, [&b"x"[..], &blocks, b"yz", &blocks].concat());
+    assert_eq!(summary(&output), [received.len(), 3, 2 * blocks.len(), 0]);
 }
 
 #[test]
@@ -434,6 +669,19 @@ fn wait_for_state(pid: u32, wanted: char) {
     }
 }
 
+/// The PID in `path`, once the file exists, within a bound: a regression
+/// must fail the test, not hang it.
+fn wait_for_pid_file(path: &str) -> u32 {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            return text.trim().parse().unwrap();
+        }
+        assert!(Instant::now() < deadline, "{path} never appeared");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 /// The children of `pid`, started by any of its threads.
 fn children(pid: u32) -> Vec<u32> {
     let mut children = Vec::new();
@@ -466,10 +714,17 @@ fn a_termination_signal_decides_the_status_even_after_the_sessions_break() {
     // order: stop the receiver, send it the signal, kill both sessions,
     // and let the receiver continue with both events already present.
     let transfer = Transfer::new("");
-    let command = args(&["sh", "-c", "echo $$; exec sleep 60"]);
+    // The command publishes its PID in a file: a line on stdout, shorter
+    // than a block, would stay in the sender's scanner until more output
+    // or EOF (DESIGN.md §6.3).
+    let pid_file = transfer.env.path("command.pid");
+    let pid_file = pid_file.to_str().expect("the test path must be plain text");
+    let script = format!("echo $$ >{pid_file}.new && mv {pid_file}.new {pid_file}; exec sleep 60");
+    let command = args(&["sh", "-c", &script]);
     for (sent, status, name) in [(Signal::INT, 130, "SIGINT"), (Signal::TERM, 143, "SIGTERM")] {
         for _ in 0..4 {
-            let mut receiver = transfer
+            let _ = std::fs::remove_file(pid_file);
+            let receiver = transfer
                 .invocation(&[], &refs(&command))
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -477,13 +732,9 @@ fn a_termination_signal_decides_the_status_even_after_the_sessions_break() {
                 .unwrap();
             let pid = receiver.id();
             let _receiver_guard = KillOnDrop(pid);
-            // The command runs once its first line arrives. Killing the
+            // The command runs once its PID file appears. Killing the
             // sessions orphans it, so kill it at the end.
-            let mut line = String::new();
-            std::io::BufReader::new(receiver.stdout.take().unwrap())
-                .read_line(&mut line)
-                .unwrap();
-            let _command_guard = KillOnDrop(line.trim().parse().unwrap());
+            let _command_guard = KillOnDrop(wait_for_pid_file(pid_file));
 
             signal(pid, Signal::STOP);
             wait_for_state(pid, 'T');

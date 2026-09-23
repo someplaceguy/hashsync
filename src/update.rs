@@ -5,13 +5,13 @@ use std::time::Instant;
 
 use bstr::ByteSlice;
 use crossbeam_channel::bounded;
-use rustix::process::{Resource, getrlimit, setrlimit};
 
 use crate::config::Config;
 use crate::die;
 use crate::fsid::FsCache;
+use crate::fsops;
 use crate::index::{self, Settings, writer};
-use crate::roots;
+use crate::roots::{self, Location};
 use crate::scan::{self, ScanRoot};
 
 /// Messages in flight between workers and the writer. Each message is
@@ -22,12 +22,14 @@ pub fn run(config: &Config, rebuild: bool, jobs: Option<u32>) {
     drop(perform(config, rebuild, jobs));
 }
 
-/// Update the index and return it still open: a normal `run` keeps this
-/// writer alive through the transfer, so there is no gap in exclusion
-/// between update and use (DESIGN.md §4.4).
-pub fn perform(config: &Config, rebuild: bool, jobs: Option<u32>) -> index::Index {
+/// Update the index and return it still open, with the current root
+/// locations that the update resolved. A normal `run` keeps this writer
+/// alive through the transfer, so there is no gap in exclusion between
+/// update and use (DESIGN.md §4.4), and it reads candidate blocks through
+/// these locations.
+pub fn perform(config: &Config, rebuild: bool, jobs: Option<u32>) -> (index::Index, Vec<Location>) {
     let start = Instant::now();
-    raise_descriptor_limit();
+    fsops::raise_descriptor_limit();
 
     // Resolve and validate the roots before the index is opened: a rejected
     // configuration must not change the index (DESIGN.md §3 and §4.2).
@@ -66,7 +68,7 @@ pub fn perform(config: &Config, rebuild: bool, jobs: Option<u32>) -> index::Inde
     let paths: Vec<&[u8]> = locations.iter().map(|l| l.path.as_slice()).collect();
     let root_ids = index.reconcile_roots(&paths);
     let roots: Vec<ScanRoot> = locations
-        .into_iter()
+        .iter()
         .zip(root_ids)
         .map(|(location, root_id)| ScanRoot { location, root_id })
         .collect();
@@ -106,16 +108,5 @@ pub fn perform(config: &Config, rebuild: bool, jobs: Option<u32>) -> index::Inde
         summary.paths,
         summary.orphans
     ));
-    index
-}
-
-/// Raise the soft descriptor limit to the hard limit: every pending task
-/// may hold its parent's descriptor.
-fn raise_descriptor_limit() {
-    let mut limit = getrlimit(Resource::Nofile);
-    if limit.current != limit.maximum {
-        limit.current = limit.maximum;
-        // Failure only means fewer descriptors; opens report it later.
-        let _ = rustix::io::retry_on_intr(|| setrlimit(Resource::Nofile, limit));
-    }
+    (index, locations)
 }

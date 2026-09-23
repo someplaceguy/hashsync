@@ -251,3 +251,12 @@ pub fn pattern16(len: usize) -> Vec<u8> {
 pub fn os(bytes: &[u8]) -> &OsStr {
     OsStr::from_bytes(bytes)
 }
+
+/// True where `unshare -Urm` works: an unprivileged user and mount
+/// namespace, in which tests can mount filesystems.
+pub fn namespaces_available() -> bool {
+    Command::new("unshare")
+        .args(["-Urm", "true"])
+        .status()
+        .is_ok_and(|status| status.success())
+}

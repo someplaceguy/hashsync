@@ -1,34 +1,40 @@
 //! `hashsync run [--no-update] [--ssh CMD] [USER@]HOST -- COMMAND ...`
 //! (DESIGN.md §3, §5.6, §6): the receiver.
 //!
-//! This milestone reconstructs stdout from literals; references and
-//! compression arrive with PLAN.md steps 4 and 5. The run updates the
-//! index (or opens it read-only), exports and publishes the hash list,
-//! starts both SSH sessions, completes the exchange, reconstructs
-//! stdout, and returns the command's status once both sessions exited
-//! successfully.
+//! The run updates the index (or opens it read-only), exports and
+//! publishes the hash list, prepares the pin file and the lookup workers,
+//! starts both SSH sessions, and completes the exchange. It then
+//! reconstructs stdout from literals, runs, and references, while the
+//! lookup workers answer the sender's queries (DESIGN.md §6.4), and it
+//! returns the command's status once both sessions exited successfully.
+//! Compression arrives with PLAN.md step 5.
 
 use std::ffi::OsStr;
-use std::io::{BufReader, Read, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::os::unix::ffi::OsStrExt;
+use std::process::{ChildStdin, ChildStdout};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed, Ordering::SeqCst};
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 use bstr::ByteSlice;
+use crossbeam_channel::{Receiver, Sender, unbounded};
 
 use crate::cache::{self, ListStore};
-use crate::config::{self, Config};
+use crate::config::Config;
 use crate::die::{self, die};
 use crate::fsid::FsCache;
 use crate::fsops;
 use crate::hash::weak;
 use crate::hashlist::{self, ListId};
 use crate::index::{self, Settings};
+use crate::lookup;
+use crate::pins::{PinFile, Pins};
 use crate::protocol::{
-    self, End, FrameReader, FrameWriter, HashList, ReceiverHello, Rle, SenderHello, frame,
+    self, Answer, End, FrameReader, FrameWriter, HashList, Query, ReceiverHello, Rle, SenderHello,
+    frame,
 };
 use crate::rendezvous;
-use crate::roots;
+use crate::roots::{self, Location};
 use crate::ssh;
 use crate::sys;
 use crate::update;
@@ -48,7 +54,7 @@ pub fn run(
 
     // Hold index access through the whole run (DESIGN.md §3): the update
     // keeps its writer, a read-only run keeps its keeper connection.
-    let index = if no_update {
+    let (index, locations) = if no_update {
         open_read_only(config)
     } else {
         update::perform(config, false, None)
@@ -63,6 +69,18 @@ pub fn run(
         digest: config.strong_hash.digest(&encoded),
     };
 
+    // The pin file and the lookup workers, which answer queries as soon as
+    // they arrive (DESIGN.md §6.4).
+    let (answer_tx, answer_rx) = unbounded();
+    let pin_file = PinFile::create(&config.pin_directory, config.block_size);
+    let pins = Arc::new(Pins::new(
+        pin_file,
+        config.strong_hash,
+        config.block_size,
+        answer_tx,
+    ));
+    let lookups = lookup::start(&index, locations, &pins, config);
+
     let account_id = cache::account_id();
     let token = rendezvous::new_token();
     sys::reset_sigchld();
@@ -76,23 +94,31 @@ pub fn run(
 
     // Both sides send their protocol version first, without waiting for
     // the peer's (DESIGN.md §6.2). The relay delivers it once `attach`
-    // connects. The write end must stay open until the sender exits, so
-    // the writer lives to the end of the run.
-    let mut control_out = FrameWriter::new(control.stdin);
+    // connects. The receiver closes neither session's stdin before it
+    // exits (DESIGN.md §6.7), so the control writer gets a reference that
+    // lives as long as the process.
+    let control_stdin: &'static ChildStdin = Box::leak(Box::new(control.stdin));
+    let mut control_out = FrameWriter::new(BufWriter::new(control_stdin));
     if let Err(e) = control_out
         .send_version()
         .and_then(|()| control_out.flush())
     {
         die(format!("control session: {e}"));
     }
-    let completing = Arc::new(AtomicBool::new(false));
     {
-        let completing = Arc::clone(&completing);
+        let pins = Arc::clone(&pins);
+        std::thread::Builder::new()
+            .name("control-writer".into())
+            .spawn(move || write_answers(control_out, &answer_rx, &pins))
+            .expect("cannot start the control writer");
+    }
+    {
+        let pins = Arc::clone(&pins);
         let control_stdout = control.stdout;
         std::thread::Builder::new()
-            .name("control".into())
-            .spawn(move || control_loop(control_stdout, &completing))
-            .expect("cannot start the control thread");
+            .name("control-reader".into())
+            .spawn(move || read_queries(control_stdout, &pins, &lookups))
+            .expect("cannot start the control reader");
     }
 
     // The data session, with received bytes counted for the summary.
@@ -112,12 +138,12 @@ pub fn run(
         target: target.digest,
         sender_cache: options.sender_cache,
         hashlist_max_age: config.hashlist_max_age,
-        lookahead: config::DEFAULT_LOOKAHEAD,
+        lookahead: config.lookahead,
         // Compression arrives with PLAN.md step 5: negotiate it
         // disabled.
         compression_level: 0,
         compression_threads: 0,
-        negative_cache: config::DEFAULT_NEGATIVE_CACHE,
+        negative_cache: config.negative_cache,
         command: command.iter().map(|arg| arg.as_bytes().to_vec()).collect(),
     };
     // HELLO follows the version at once. The sender uses its parameters
@@ -162,10 +188,16 @@ pub fn run(
     drop(published);
     cache::expire(config.hashlist_max_age);
 
-    // Reconstruct stdout in order (DESIGN.md §6.4).
+    // Reconstruct stdout in order (DESIGN.md §6.4). `output_bytes` is
+    // where the frame's output ends, checked before anything is written.
+    // Once the output is written, the pins learn the new offset, which
+    // releases the pins below it.
     let mut stdout = fsops::stdout();
+    let block_size = u64::from(config.block_size);
+    let mut block = vec![0u8; config.block_size as usize];
     let mut output_bytes = 0u64;
     let mut literal_bytes = 0u64;
+    let mut reference_bytes = 0u64;
     let mut run_bytes = 0u64;
     let end = loop {
         let received = match data_in.next() {
@@ -176,9 +208,20 @@ pub fn run(
         match received.kind {
             frame::LIT => {
                 assert!(!received.payload.is_empty(), "protocol error: empty LIT");
+                let length = received.payload.len() as u64;
+                output_bytes = advance(output_bytes, length);
                 write_output(&mut stdout, received.payload);
-                output_bytes = advance(output_bytes, received.payload.len() as u64);
-                literal_bytes += received.payload.len() as u64;
+                literal_bytes += length;
+            }
+            frame::REF => {
+                assert!(
+                    received.payload.is_empty(),
+                    "protocol error: REF with a payload"
+                );
+                output_bytes = advance(output_bytes, block_size);
+                pins.read_reference(&mut block);
+                write_output(&mut stdout, &block);
+                reference_bytes += block_size;
             }
             frame::RLE => {
                 // The sender emits runs from step 5 on; accept any
@@ -194,11 +237,10 @@ pub fn run(
                     remaining -= n as u64;
                 }
             }
-            // No pins exist before PLAN.md step 4: a REF cannot name one.
-            frame::REF => panic!("protocol error: REF without a pin at offset {output_bytes}"),
             frame::END => break End::decode(received.payload),
             kind => panic!("protocol error: unexpected data frame type {kind}"),
         }
+        pins.reached(output_bytes);
     };
 
     // Completion (DESIGN.md §6.7). Compression is disabled, so END is
@@ -207,7 +249,7 @@ pub fn run(
     if let Err(e) = stdout.flush() {
         die(format!("cannot write to stdout: {e}"));
     }
-    completing.store(true, SeqCst);
+    pins.complete();
     send_data(&mut data_out, frame::END_ACK, b"");
     flush_data(&mut data_out);
     match data_in.drain_to_eof() {
@@ -229,8 +271,8 @@ pub fn run(
         die::note(format!("remote command failed to start: {}", end.error));
     }
     die::note(format!(
-        "{output_bytes} bytes output ({literal_bytes} literal, 0 reference, {run_bytes} run), \
-         {} bytes wire, {hash_list_bytes} bytes hash list, 0 bytes delta",
+        "{output_bytes} bytes output ({literal_bytes} literal, {reference_bytes} reference, \
+         {run_bytes} run), {} bytes wire, {hash_list_bytes} bytes hash list, 0 bytes delta",
         wire_bytes.load(Relaxed),
     ));
     die::finish(end.status)
@@ -238,12 +280,12 @@ pub fn run(
 
 /// Read-only index access for `--no-update` (DESIGN.md §4.4 and §8):
 /// resolve current roots, then require a compatible index with its block
-/// indexes.
-fn open_read_only(config: &Config) -> index::Index {
-    // Resolve and validate the roots first, like an update would;
-    // candidate reads use the current locations from step 4 on.
+/// indexes. Returns the index with the current root locations, from which
+/// candidates are read.
+fn open_read_only(config: &Config) -> (index::Index, Vec<Location>) {
+    fsops::raise_descriptor_limit();
     let fs_cache = FsCache::new();
-    let _locations = roots::expand(config, &fs_cache);
+    let locations = roots::expand(config, &fs_cache);
 
     let path = config.index_path.as_bstr();
     let Some(index) = index::open_read_only(&config.index_path) else {
@@ -262,7 +304,7 @@ fn open_read_only(config: &Config) -> index::Index {
             "index {path} is missing its block indexes; run `hashsync update`"
         ));
     }
-    index
+    (index, locations)
 }
 
 /// Counts the bytes received on the data session, for the summary's
@@ -338,28 +380,58 @@ fn advance(offset: u64, length: u64) -> u64 {
         .expect("protocol error: output offset overflow")
 }
 
-/// Watch the control session: the sender's protocol version, then
-/// nothing until queries arrive with PLAN.md step 4. Loss before
-/// Completing is fatal (DESIGN.md §6.7); in Completing, EOF and broken
-/// pipes are expected closure.
-fn control_loop(stdout: std::process::ChildStdout, completing: &AtomicBool) {
+/// The owner of the control session's incoming direction: the sender's
+/// protocol version, then queries for the lookup workers. Loss before
+/// Completing is fatal (DESIGN.md §6.7); in Completing, EOF, errors, and a
+/// partial frame are expected closure. Reading goes on until closure, so
+/// that the sender's relay never blocks on a full pipe.
+fn read_queries(stdout: ChildStdout, pins: &Pins, lookups: &Sender<Query>) {
     let mut control_in = FrameReader::new(BufReader::new(stdout));
-    let expected_closure = || {
-        if !completing.load(SeqCst) {
+    let closed = || {
+        if !pins.is_completing() {
             die("the control session closed unexpectedly");
         }
     };
     match control_in.version() {
         Ok(Some(version)) => protocol::check_version(version, "sender's control session"),
-        Ok(None) | Err(_) => return expected_closure(),
+        Ok(None) | Err(_) => return closed(),
     }
-    // No control frame follows the version in this milestone: the next
-    // event is the session's closure.
-    match control_in.next() {
-        Ok(Some(received)) => panic!(
-            "protocol error: unexpected control frame type {}",
-            received.kind
-        ),
-        Ok(None) | Err(_) => expected_closure(),
+    loop {
+        match control_in.next() {
+            Ok(Some(received)) => {
+                assert!(
+                    received.kind == frame::QUERY,
+                    "protocol error: unexpected control frame type {}",
+                    received.kind
+                );
+                // The workers live as long as the process.
+                let _ = lookups.send(Query::decode(received.payload));
+            }
+            Ok(None) | Err(_) => return closed(),
+        }
+    }
+}
+
+/// The owner of the control session's outgoing direction after the
+/// version: answers in the order the workers queue them, flushed whenever
+/// the queue runs empty. In Completing, a failed write is expected
+/// closure (DESIGN.md §6.7).
+fn write_answers(
+    mut control_out: FrameWriter<BufWriter<&ChildStdin>>,
+    answers: &Receiver<Answer>,
+    pins: &Pins,
+) {
+    loop {
+        let result = match control_out.next_from(answers) {
+            Ok(Some(answer)) => control_out.send(frame::ANSWER, &answer.encode()),
+            Ok(None) => return,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = result {
+            if !pins.is_completing() {
+                die(format!("control session: {e}"));
+            }
+            return;
+        }
     }
 }

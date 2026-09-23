@@ -16,6 +16,8 @@
 
 use std::io::{Read, Write};
 
+use crossbeam_channel::{Receiver, TryRecvError};
+
 use crate::die::die;
 use crate::hash::{Strong, StrongHash};
 
@@ -133,6 +135,11 @@ impl ReceiverHello {
         };
         dec.done();
         assert!(hello.block_size > 0, "protocol error: block size 0");
+        assert!(
+            hello.lookahead >= u64::from(hello.block_size),
+            "protocol error: lookahead {} below the block size",
+            hello.lookahead
+        );
         assert!(!hello.command.is_empty(), "protocol error: empty command");
         hello
     }
@@ -217,6 +224,58 @@ impl End {
         };
         dec.done();
         end
+    }
+}
+
+/// QUERY: a request for the verified block whose full strong hash is
+/// `strong`, for the window at output offset `offset`.
+pub struct Query {
+    pub offset: u64,
+    pub strong: Strong,
+}
+
+impl Query {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut enc = Enc::new();
+        enc.u64(self.offset);
+        enc.raw(&self.strong);
+        enc.buf
+    }
+
+    pub fn decode(payload: &[u8]) -> Self {
+        let mut dec = Dec::new(payload, "QUERY");
+        let query = Query {
+            offset: dec.u64(),
+            strong: dec.array(),
+        };
+        dec.done();
+        query
+    }
+}
+
+/// ANSWER: whether the receiver pinned a verified block for the query at
+/// `offset`.
+pub struct Answer {
+    pub offset: u64,
+    pub found: bool,
+}
+
+impl Answer {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut enc = Enc::new();
+        enc.u64(self.offset);
+        enc.u8(self.found.into());
+        enc.buf
+    }
+
+    pub fn decode(payload: &[u8]) -> Self {
+        let mut dec = Dec::new(payload, "ANSWER");
+        let answer = Answer {
+            offset: dec.u64(),
+            found: dec.flag(),
+        };
+        dec.done();
+        answer
     }
 }
 
@@ -472,8 +531,9 @@ impl<R: Read> FrameReader<R> {
     }
 }
 
-/// Writes frames to a transport. Unbuffered: one header write and one
-/// payload write per frame.
+/// Writes frames to a transport: one header write and one payload write
+/// per frame. A writer that sends many small frames wraps its transport in
+/// a `BufWriter` and flushes before it waits (`next_from`).
 pub struct FrameWriter<W: Write> {
     writer: W,
 }
@@ -506,6 +566,21 @@ impl<W: Write> FrameWriter<W> {
 
     pub fn flush(&mut self) -> std::io::Result<()> {
         self.writer.flush()
+    }
+
+    /// The next item from `queue`, for a thread that writes what the
+    /// queue delivers. When nothing is queued, flush first: frames must
+    /// not stay in a buffer while this thread waits, or the peer could
+    /// wait for them forever (DESIGN.md §6.2). `None`, after a flush, once
+    /// the queue is closed and empty.
+    pub fn next_from<T>(&mut self, queue: &Receiver<T>) -> std::io::Result<Option<T>> {
+        match queue.try_recv() {
+            Ok(item) => Ok(Some(item)),
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => {
+                self.flush()?;
+                Ok(queue.recv().ok())
+            }
+        }
     }
 }
 
@@ -621,7 +696,7 @@ mod tests {
             lookahead: 256 << 20,
             compression_level: 0,
             compression_threads: 0,
-            negative_cache: 100 << 20,
+            negative_cache: 128 << 20,
             command: vec![b"printf".to_vec(), b"%s".to_vec(), b"\xff\xfe".to_vec()],
         }
     }
@@ -681,6 +756,55 @@ mod tests {
         assert!(decoded.base.is_none());
         hello.base = Some([5; 32]);
         assert_eq!(SenderHello::decode(&hello.encode()).base, Some([5; 32]));
+    }
+
+    #[test]
+    fn queries_and_answers_roundtrip() {
+        let query = Query::decode(
+            &Query {
+                offset: u64::MAX - 1,
+                strong: [6; 32],
+            }
+            .encode(),
+        );
+        assert_eq!((query.offset, query.strong), (u64::MAX - 1, [6; 32]));
+        for found in [false, true] {
+            let answer = Answer::decode(&Answer { offset: 17, found }.encode());
+            assert_eq!((answer.offset, answer.found), (17, found));
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid flag 2 in ANSWER")]
+    fn an_answer_is_zero_or_one() {
+        let mut payload = Answer {
+            offset: 0,
+            found: true,
+        }
+        .encode();
+        *payload.last_mut().unwrap() = 2;
+        Answer::decode(&payload);
+    }
+
+    #[test]
+    #[should_panic(expected = "truncated QUERY")]
+    fn a_query_carries_the_full_digest() {
+        let mut enc = Enc::new();
+        enc.u64(0);
+        enc.raw(&[0; 16]);
+        Query::decode(&enc.buf);
+    }
+
+    #[test]
+    #[should_panic(expected = "lookahead 4095 below the block size")]
+    fn the_lookahead_covers_a_window() {
+        ReceiverHello::decode(
+            &ReceiverHello {
+                lookahead: 4095,
+                ..receiver_hello()
+            }
+            .encode(),
+        );
     }
 
     #[test]

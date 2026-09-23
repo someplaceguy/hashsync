@@ -2,47 +2,65 @@
 //!
 //! `serve` first listens on the rendezvous socket, exchanges protocol
 //! versions and data HELLOs, accepts `attach`, and completes the list
-//! exchange and CACHE_RESULT before starting the command. This milestone
-//! sends all command stdout as literals; the scanner arrives with PLAN.md
-//! step 4.
+//! exchange and CACHE_RESULT before starting the command. The scanner then
+//! turns the command's stdout into literals and references.
 //!
 //! Each incoming direction has one owner for the whole run, so session
 //! loss is fatal at any moment — during rendezvous, setup, startup
 //! failure, and transfer alike (DESIGN.md §6.7). The data reader owns
 //! stdin and walks the receiver's fixed sequence: the protocol version,
-//! HELLO, HASHLIST and the list bytes, END_ACK, closure. A watcher owns the
-//! control socket from acceptance. The main thread only writes: the
-//! protocol versions, the HELLO reply, the CACHE_RESULT, the LIT pump,
-//! and END; command success and startup failure share one completion
-//! path.
+//! HELLO, HASHLIST and the list bytes, END_ACK, closure. The control reader
+//! owns the control socket from acceptance: the protocol version, then
+//! answers. The main thread writes the setup frames, then gives the data
+//! session to the data writer and runs the scanner (DESIGN.md §6.6): it
+//! takes command output from the output reader and answers from the
+//! control reader, and it queues queries for the control writer and frames
+//! for the data writer. Command success and startup failure share one
+//! completion path.
 
-use std::io::{BufReader, Read, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
-use std::process::{Command, Stdio};
+use std::process::{ChildStdout, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 
 use bstr::ByteSlice;
-use crossbeam_channel::{Sender, bounded};
+use crossbeam_channel::{Receiver, Select, Sender, TryRecvError, bounded, unbounded};
 use rustix::process::Pid;
 
 use crate::cache::{self, ListStore, PublishedList};
 use crate::die::{self, die};
-use crate::fsops::{self, retry_interrupted};
+use crate::fsops::{self, FdWriter, retry_interrupted};
 use crate::hash;
 use crate::hashlist::{self, ListId};
 use crate::hashtable::HashTable;
 use crate::protocol::{
-    self, End, FrameReader, FrameWriter, HashList, ReceiverHello, SenderHello, frame,
+    self, Answer, End, FrameReader, FrameWriter, HashList, Query, ReceiverHello, SenderHello, frame,
 };
 use crate::rendezvous;
+use crate::scanner::{Frame, Scanner};
 use crate::sys;
 
-/// The read chunk of the command pump; each chunk becomes one LIT.
-const CHUNK: usize = 1 << 20;
+/// The read size of the output reader.
+const READ_CHUNK: usize = 256 << 10;
+
+/// The size of the data session's write buffer.
+const WRITE_BUFFER: usize = 256 << 10;
+
+/// The data queue holds `max(1, QUEUED_BYTES / B)` frames; each frame
+/// carries at most `B` output bytes.
+const QUEUED_BYTES: usize = 4 << 20;
+
+type DataWriter = FrameWriter<BufWriter<FdWriter>>;
+
+/// What the data writer sends, in order.
+enum Output {
+    Scanned(Frame),
+    End(End),
+}
 
 pub fn run(token: &str) -> ! {
     // Listen before anything else, so `attach`'s retries can end.
@@ -64,7 +82,7 @@ pub fn run(token: &str) -> ! {
             })
             .expect("cannot start the data reader");
     }
-    let mut data_out = FrameWriter::new(fsops::stdout());
+    let mut data_out = FrameWriter::new(BufWriter::with_capacity(WRITE_BUFFER, fsops::stdout()));
 
     // This side's protocol version goes first, without waiting for the
     // receiver's, which the data reader checks (DESIGN.md §6.2).
@@ -86,9 +104,9 @@ pub fn run(token: &str) -> ! {
     flush_data(&mut data_out);
 
     // The control session: accept `attach`, then both sides send their
-    // protocol version immediately. The watcher owns the incoming
-    // direction and reports readiness once the receiver's version
-    // matched.
+    // protocol version immediately. The control reader owns the incoming
+    // direction; it reports readiness once the receiver's version matched,
+    // then forwards answers.
     let control = listener.accept();
     {
         let mut control_out = FrameWriter::new(&control);
@@ -100,13 +118,14 @@ pub fn run(token: &str) -> ! {
         }
     }
     let (control_ready_tx, control_ready_rx) = bounded(1);
+    let (answer_tx, answer_rx) = unbounded();
     {
         let completing = Arc::clone(&completing);
         let control_in = clone_control(&control);
         std::thread::Builder::new()
-            .name("control".into())
-            .spawn(move || control_watcher(control_in, control_ready_tx, &completing))
-            .expect("cannot start the control watcher");
+            .name("control-reader".into())
+            .spawn(move || read_answers(control_in, control_ready_tx, answer_tx, &completing))
+            .expect("cannot start the control reader");
     }
 
     // The list, assembled and digest-verified by the data reader; then the
@@ -116,9 +135,7 @@ pub fn run(token: &str) -> ! {
         .expect("the data reader ended before the hash list");
     let values = hashlist::decode(&encoded)
         .unwrap_or_else(|e| panic!("protocol error: bad full hash list: {e}"));
-    // The scanner of PLAN.md step 4 probes this table; building it here
-    // completes the setup that CACHE_RESULT promises.
-    let _table = HashTable::build(&values);
+    let table = HashTable::build(&values);
     drop(values);
 
     // Durable publication, or cleanup with caching disabled; failures
@@ -146,10 +163,28 @@ pub fn run(token: &str) -> ! {
     // The receiver's versions on both sessions must match before the
     // command starts (DESIGN.md §6.2). Both sessions stay monitored
     // during this wait: the data reader awaits END_ACK on stdin and the
-    // watcher holds the socket.
+    // control reader holds the socket.
     control_ready_rx
         .recv()
-        .expect("the control watcher ended before the protocol version");
+        .expect("the control reader ended before the protocol version");
+
+    // From here on, the data writer owns the data session's outgoing
+    // direction and the control writer the control session's.
+    let queued = (QUEUED_BYTES / hello.block_size as usize).max(1);
+    let (output_tx, output_rx) = bounded(queued);
+    std::thread::Builder::new()
+        .name("data-writer".into())
+        .spawn(move || write_output(data_out, &output_rx))
+        .expect("cannot start the data writer");
+    let (query_tx, query_rx) = unbounded();
+    {
+        let completing = Arc::clone(&completing);
+        let control_out = clone_control(&control);
+        std::thread::Builder::new()
+            .name("control-writer".into())
+            .spawn(move || write_queries(control_out, &query_rx, &completing))
+            .expect("cannot start the control writer");
+    }
 
     // The command. Keep it unreaped and in its own process group
     // (DESIGN.md §6.6); a fatal exit SIGKILLs the group, and the spawn
@@ -179,20 +214,23 @@ pub fn run(token: &str) -> ! {
                     .spawn(move || relay_stderr(&mut command_stderr))
                     .expect("cannot start the stderr relay");
 
-                // The pump: command stdout to LIT frames, in order, with
-                // backpressure from the data session. Stdout EOF and the
-                // exit status are separate conditions; wait for both
-                // (DESIGN.md §6.3).
-                let mut command_stdout = child.stdout.take().unwrap();
-                let mut buf = vec![0u8; CHUNK];
-                loop {
-                    let n = match retry_interrupted(|| command_stdout.read(&mut buf)) {
-                        Ok(0) => break,
-                        Ok(n) => n,
-                        Err(e) => die(format!("cannot read the command's output: {e}")),
-                    };
-                    send_data(&mut data_out, frame::LIT, &buf[..n]);
-                }
+                // Stdout EOF and the exit status are separate conditions;
+                // the scan needs the first, END the second (DESIGN.md
+                // §6.3).
+                let command_stdout = child.stdout.take().unwrap();
+                let (chunk_tx, chunk_rx) = bounded(1);
+                std::thread::Builder::new()
+                    .name("output-reader".into())
+                    .spawn(move || read_output(command_stdout, &chunk_tx))
+                    .expect("cannot start the output reader");
+                let mut scanner = Scanner::new(
+                    table,
+                    hello.block_size,
+                    hello.strong_hash,
+                    hello.lookahead,
+                    hello.negative_cache,
+                );
+                transfer(&mut scanner, &chunk_rx, &answer_rx, &output_tx, &query_tx);
                 let status = sys::wait_exit_status(Pid::from_child(&child));
                 (status, String::new(), Some(relay))
             }
@@ -200,15 +238,17 @@ pub fn run(token: &str) -> ! {
             // text; there are no command streams to drain.
             Err(e) => (127, format!("{}: {e}", argv[0].as_bytes().as_bstr()), None),
         };
+    // No more queries: the control writer can end.
+    drop(query_tx);
 
     // The completion conditions of DESIGN.md §6.7, one path for command
     // success and startup failure: END, one valid END_ACK, and a
     // finished stderr relay when command streams exist. Set `end_sent`
     // first so an immediate acknowledgement is valid.
     end_sent.store(true, SeqCst);
-    let end = End { status, error };
-    send_data(&mut data_out, frame::END, &end.encode());
-    flush_data(&mut data_out);
+    output_tx
+        .send(Output::End(End { status, error }))
+        .expect("the data writer ended before END");
     ack_rx
         .recv()
         .expect("the data reader ended without acknowledgement");
@@ -219,9 +259,153 @@ pub fn run(token: &str) -> ! {
     // Normal cleanup once (DESIGN.md §6.7): close the control socket so
     // `attach` flushes and exits zero, then end normally, which removes
     // the rendezvous socket. Sender stdout stays open until process exit.
+    // From here on, both control threads expect the closure: the writer
+    // can still have obsolete queries to send.
     completing.store(true, SeqCst);
     let _ = control.shutdown(Shutdown::Both);
     die::finish(0)
+}
+
+/// Run the scanner until the command's output is emitted (DESIGN.md
+/// §6.3). Each round takes the waiting answers first, then command output
+/// while the scanner's buffer has room, then scans and queues ready frames
+/// while the data queue has room. A round that moves nothing queues a
+/// short literal too, and then waits for an answer, command output, or
+/// room in the data queue.
+fn transfer(
+    scanner: &mut Scanner,
+    chunks: &Receiver<Vec<u8>>,
+    answers: &Receiver<Answer>,
+    output: &Sender<Output>,
+    queries: &Sender<Query>,
+) {
+    let mut reading = true;
+    loop {
+        let mut progress = false;
+        for answer in answers.try_iter() {
+            scanner.answer(answer.offset, answer.found);
+            progress = true;
+        }
+        while reading && scanner.has_room() {
+            match chunks.try_recv() {
+                Ok(chunk) => scanner.push(&chunk),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    scanner.end_input();
+                    reading = false;
+                }
+            }
+            progress = true;
+        }
+        progress |= scanner.scan(&mut |offset, strong| {
+            // The control writer ends only after the scanner.
+            let _ = queries.send(Query { offset, strong });
+        });
+        progress |= queue_frames(scanner, output, false);
+        if progress {
+            continue;
+        }
+        // Nothing moved: queue a short last literal too. This thread is
+        // the queue's only producer, so a queue with room keeps it. Only a
+        // queue that is full before this attempt can hold back a ready
+        // frame, so only then does the wait include room.
+        let full = output.is_full();
+        if queue_frames(scanner, output, true) {
+            continue;
+        }
+        if scanner.finished() {
+            return;
+        }
+        let mut select = Select::new();
+        select.recv(answers);
+        if reading && scanner.has_room() {
+            select.recv(chunks);
+        }
+        if full {
+            select.send(output);
+        }
+        select.ready();
+    }
+}
+
+/// Queue the scanner's ready frames while the data queue has room. A frame
+/// leaves the scanner, which advances `e`, only when the queue can take it
+/// (DESIGN.md §6.3). `flush` includes a short last literal. True when a
+/// frame was queued.
+fn queue_frames(scanner: &mut Scanner, output: &Sender<Output>, flush: bool) -> bool {
+    let mut queued = false;
+    while !output.is_full()
+        && let Some(frame) = scanner.next_frame(flush)
+    {
+        // The only producer found room.
+        output
+            .try_send(Output::Scanned(frame))
+            .expect("the data queue refused a frame");
+        queued = true;
+    }
+    queued
+}
+
+/// Read the command's stdout into chunks for the scanner, until EOF closes
+/// the queue. The bounded queue pauses reading while the scanner's buffer
+/// is full.
+fn read_output(mut stdout: ChildStdout, chunks: &Sender<Vec<u8>>) {
+    let mut buf = vec![0u8; READ_CHUNK];
+    loop {
+        match retry_interrupted(|| stdout.read(&mut buf)) {
+            Ok(0) => return,
+            Ok(n) => {
+                if chunks.send(buf[..n].to_vec()).is_err() {
+                    return;
+                }
+            }
+            Err(e) => die(format!("cannot read the command's output: {e}")),
+        }
+    }
+}
+
+/// The data session's outgoing direction after setup: frames in order,
+/// flushed whenever the queue runs empty, and END last (DESIGN.md §6.2).
+fn write_output(mut data_out: DataWriter, output: &Receiver<Output>) {
+    loop {
+        let next = data_out
+            .next_from(output)
+            .unwrap_or_else(|e| die(format!("data session: {e}")));
+        match next {
+            Some(Output::Scanned(Frame::Literal(bytes))) => {
+                send_data(&mut data_out, frame::LIT, &bytes);
+            }
+            Some(Output::Scanned(Frame::Reference)) => send_data(&mut data_out, frame::REF, b""),
+            Some(Output::End(end)) => {
+                send_data(&mut data_out, frame::END, &end.encode());
+                flush_data(&mut data_out);
+                return;
+            }
+            None => return,
+        }
+    }
+}
+
+/// The control session's outgoing direction during the transfer: queries
+/// in order, flushed whenever the queue runs empty. Obsolete queries do
+/// not delay completion (DESIGN.md §6.3), so normal cleanup can close the
+/// socket while this thread still has some to send. A failed write is
+/// then expected closure, not a failure.
+fn write_queries(stream: UnixStream, queries: &Receiver<Query>, completing: &AtomicBool) {
+    let mut control_out = FrameWriter::new(BufWriter::new(stream));
+    loop {
+        let result = match control_out.next_from(queries) {
+            Ok(Some(query)) => control_out.send(frame::QUERY, &query.encode()),
+            Ok(None) => return,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = result {
+            if !completing.load(SeqCst) {
+                die(format!("control session: {e}"));
+            }
+            return;
+        }
+    }
 }
 
 /// The single owner of the data session's incoming direction, for the
@@ -294,9 +478,14 @@ fn data_reader<R: Read>(
 }
 
 /// The owner of the control session's incoming direction: the protocol
-/// version, whose check gates command startup, then closure. No control
-/// frame follows in this milestone; answers arrive with PLAN.md step 4.
-fn control_watcher(stream: UnixStream, ready_tx: Sender<()>, completing: &AtomicBool) {
+/// version, whose check gates command startup, then answers for the
+/// scanner until closure, which is fatal before the normal exit.
+fn read_answers(
+    stream: UnixStream,
+    ready_tx: Sender<()>,
+    answers: Sender<Answer>,
+    completing: &AtomicBool,
+) {
     let mut control_in = FrameReader::new(BufReader::new(stream));
     match control_in.version() {
         Ok(Some(version)) => protocol::check_version(version, "receiver's control session"),
@@ -304,14 +493,23 @@ fn control_watcher(stream: UnixStream, ready_tx: Sender<()>, completing: &Atomic
         Err(e) => die(format!("control session: {e}")),
     }
     let _ = ready_tx.send(());
-    match control_in.next() {
-        Ok(Some(received)) => panic!(
-            "protocol error: unexpected control frame type {}",
-            received.kind
-        ),
-        Ok(None) | Err(_) => {
-            if !completing.load(SeqCst) {
-                die("the control session closed unexpectedly");
+    loop {
+        match control_in.next() {
+            Ok(Some(received)) => {
+                assert!(
+                    received.kind == frame::ANSWER,
+                    "protocol error: unexpected control frame type {}",
+                    received.kind
+                );
+                // Answers that arrive after the scanner finished change
+                // nothing.
+                let _ = answers.send(Answer::decode(received.payload));
+            }
+            Ok(None) | Err(_) => {
+                if !completing.load(SeqCst) {
+                    die("the control session closed unexpectedly");
+                }
+                return;
             }
         }
     }
@@ -342,13 +540,13 @@ fn die_data(e: &std::io::Error) -> ! {
     die(format!("data session: {e}"))
 }
 
-fn send_data<W: Write>(out: &mut FrameWriter<W>, kind: u8, payload: &[u8]) {
+fn send_data(out: &mut DataWriter, kind: u8, payload: &[u8]) {
     if let Err(e) = out.send(kind, payload) {
         die(format!("data session: {e}"));
     }
 }
 
-fn flush_data<W: Write>(out: &mut FrameWriter<W>) {
+fn flush_data(out: &mut DataWriter) {
     if let Err(e) = out.flush() {
         die(format!("data session: {e}"));
     }
@@ -398,4 +596,111 @@ fn receive_list<R: Read>(data_in: &mut FrameReader<R>, target: ListId) -> Vec<u8
         "protocol error: the full hash list does not match {target}"
     );
     encoded
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    use super::*;
+    use crate::hash::weak::WeakHasher;
+    use crate::hash::{Strong, StrongHash};
+    use crate::scanner::tests::noise;
+
+    const BS: u32 = 64;
+
+    /// `transfer` with a data queue of one frame, which the data writer
+    /// drains slowly, while the lookups answer from another thread and
+    /// reject the stale blocks. The output stays exact and in order, and
+    /// the transfer ends (DESIGN.md §6.3). The wait is bounded: a stall
+    /// must fail the test, not hang it.
+    #[test]
+    fn a_full_data_queue_keeps_the_output_exact() {
+        let valid: Vec<Vec<u8>> = (0..4).map(|i| noise(BS as usize, i)).collect();
+        let stale: Vec<Vec<u8>> = (4..6).map(|i| noise(BS as usize, i)).collect();
+        let listed: Vec<&Vec<u8>> = valid.iter().chain(&stale).collect();
+        let mut input = Vec::new();
+        for i in 0..1000 {
+            input.extend_from_slice(&noise(i % 11, 100 + i as u64));
+            input.extend_from_slice(listed[i % listed.len()]);
+        }
+        let weak = WeakHasher::new(BS as usize);
+        let mut values: Vec<u64> = listed.iter().map(|b| weak.hash(b)).collect();
+        values.sort_unstable();
+        values.dedup();
+        let blocks: HashMap<Strong, Vec<u8>> = valid
+            .iter()
+            .map(|b| (StrongHash::Blake3.digest(b), b.clone()))
+            .collect();
+
+        for lookahead in [u64::from(BS), 64 * u64::from(BS)] {
+            let (chunk_tx, chunk_rx) = bounded(1);
+            let (answer_tx, answer_rx) = unbounded();
+            let (output_tx, output_rx) = bounded(1);
+            let (query_tx, query_rx) = unbounded::<Query>();
+            let (done_tx, done_rx) = bounded(1);
+            let pins = Arc::new(Mutex::new(HashMap::new()));
+
+            let command = input.clone();
+            std::thread::spawn(move || {
+                for chunk in command.chunks(100) {
+                    chunk_tx.send(chunk.to_vec()).unwrap();
+                }
+            });
+            // A lookup publishes the pin before it answers yes.
+            let (lookup_pins, blocks) = (Arc::clone(&pins), blocks.clone());
+            std::thread::spawn(move || {
+                for (i, query) in query_rx.iter().enumerate() {
+                    if i % 3 == 0 {
+                        std::thread::sleep(Duration::from_micros(50));
+                    }
+                    let found = match blocks.get(&query.strong) {
+                        Some(block) => {
+                            let mut pins = lookup_pins.lock().unwrap();
+                            pins.insert(query.offset, block.clone());
+                            true
+                        }
+                        None => false,
+                    };
+                    let _ = answer_tx.send(Answer {
+                        offset: query.offset,
+                        found,
+                    });
+                }
+            });
+            std::thread::spawn(move || {
+                let mut output = Vec::new();
+                for (i, next) in output_rx.iter().enumerate() {
+                    if i % 7 == 0 {
+                        std::thread::sleep(Duration::from_micros(200));
+                    }
+                    match next {
+                        Output::Scanned(Frame::Literal(bytes)) => output.extend_from_slice(&bytes),
+                        Output::Scanned(Frame::Reference) => {
+                            let c = output.len() as u64;
+                            output.extend_from_slice(&pins.lock().unwrap()[&c]);
+                        }
+                        Output::End(_) => break,
+                    }
+                }
+                done_tx.send(output).unwrap();
+            });
+            let table = HashTable::build(&values);
+            std::thread::spawn(move || {
+                let mut scanner = Scanner::new(table, BS, StrongHash::Blake3, lookahead, 1 << 20);
+                transfer(&mut scanner, &chunk_rx, &answer_rx, &output_tx, &query_tx);
+                let end = End {
+                    status: 0,
+                    error: String::new(),
+                };
+                output_tx.send(Output::End(end)).unwrap();
+            });
+            let output = done_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the transfer stalled");
+            assert!(output == input, "lookahead {lookahead}: the output differs");
+        }
+    }
 }

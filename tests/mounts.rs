@@ -10,13 +10,6 @@ use common::*;
 
 const SAME_DIRECTORY: &str = "are the same directory (cycle or mount alias)";
 
-fn namespaces_available() -> bool {
-    Command::new("unshare")
-        .args(["-Urm", "true"])
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
 /// Run `hashsync update` after bind-mounting `binds` (source, target pairs)
 /// in a fresh mount namespace.
 fn update_with_binds(env: &Env, binds: &[(&str, &str)]) -> Output {

@@ -139,37 +139,43 @@ pub fn reset_sigchld() {
     }
 }
 
-/// SIGINT and SIGTERM: the signals that end a receiver's run.
-fn termination_signals() -> libc::sigset_t {
+/// A signal set with `signals`.
+fn signal_set(signals: &[c_int]) -> libc::sigset_t {
     // SAFETY: `sigemptyset` initializes the set before `sigaddset` adds
     // valid signal numbers to it.
     unsafe {
         let mut set: libc::sigset_t = mem::zeroed();
         libc::sigemptyset(&mut set);
-        libc::sigaddset(&mut set, libc::SIGINT);
-        libc::sigaddset(&mut set, libc::SIGTERM);
+        for &signal in signals {
+            libc::sigaddset(&mut set, signal);
+        }
         set
     }
 }
+
+/// SIGINT and SIGTERM: the signals that end a receiver's run.
+const TERMINATION_SIGNALS: [c_int; 2] = [libc::SIGINT, libc::SIGTERM];
 
 /// A thread's set of blocked signals.
 #[derive(Clone, Copy)]
 pub struct SignalMask(libc::sigset_t);
 
-/// Block SIGINT and SIGTERM in the calling thread. Returns the mask from
-/// before, and a `signalfd` that is readable while one of the two signals
-/// is pending. The descriptor is only polled, never read, so the signal
-/// stays pending.
+/// Block SIGINT, SIGTERM, and SIGXFSZ in the calling thread. Returns the
+/// mask from before, and a `signalfd` that is readable while SIGINT or
+/// SIGTERM is pending. The descriptor is only polled, never read, so the
+/// signal stays pending. A blocked SIGXFSZ only stays pending: the write
+/// past the file-size limit that raised it fails with `EFBIG`.
 pub fn block_termination_signals() -> (SignalMask, OwnedFd) {
-    let set = termination_signals();
-    // SAFETY: `set` is an initialized signal set, and the kernel writes
-    // the old mask to `old`.
+    let blocked = signal_set(&[libc::SIGINT, libc::SIGTERM, libc::SIGXFSZ]);
+    // SAFETY: `blocked` is an initialized signal set, and the kernel
+    // writes the old mask to `old`.
     let old = unsafe {
         let mut old: libc::sigset_t = mem::zeroed();
-        let rc = libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old);
+        let rc = libc::pthread_sigmask(libc::SIG_BLOCK, &blocked, &mut old);
         assert_eq!(rc, 0, "pthread_sigmask: {}", Errno::from_raw_os_error(rc));
         old
     };
+    let set = signal_set(&TERMINATION_SIGNALS);
     // SAFETY: `-1` requests a new descriptor for the signals in `set`.
     let fd = unsafe { libc::signalfd(-1, &set, libc::SFD_CLOEXEC) };
     assert!(fd >= 0, "signalfd: {}", last_errno());
@@ -202,7 +208,7 @@ pub fn pending_termination_signal() -> Option<i32> {
         assert_eq!(rc, 0, "sigpending: {}", last_errno());
         set
     };
-    [libc::SIGINT, libc::SIGTERM]
+    TERMINATION_SIGNALS
         .into_iter()
         // SAFETY: `pending` is an initialized signal set.
         .find(|&signal| unsafe { libc::sigismember(&pending, signal) } == 1)

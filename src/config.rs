@@ -1,7 +1,8 @@
 //! Configuration (DESIGN.md §7).
 //!
-//! This milestone accepts the options that control indexing. Options of
-//! later milestones are unknown fields and are rejected.
+//! This milestone accepts the options that control indexing, transfers,
+//! and block references. Options of later milestones are unknown fields
+//! and are rejected.
 
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
@@ -21,11 +22,9 @@ pub const DEFAULT_BLOCK_SIZE: u32 = 32 * 1024;
 /// 90 days (DESIGN.md §5.6), in seconds.
 pub const DEFAULT_HASHLIST_MAX_AGE: u64 = 90 * 24 * 3600;
 
-/// Defaults sent in HELLO until the milestones that add the options:
-/// `lookahead` arrives with references (PLAN.md step 4) and
-/// `negative_cache` with the scanner that uses it.
-pub const DEFAULT_LOOKAHEAD: u64 = 256 << 20;
-pub const DEFAULT_NEGATIVE_CACHE: u64 = 100 << 20;
+const DEFAULT_LOOKAHEAD: u64 = 256 << 20;
+const DEFAULT_NEGATIVE_CACHE: u64 = 128 << 20;
+const DEFAULT_CANDIDATE_ATTEMPTS: u32 = 128;
 
 #[derive(Debug)]
 pub struct Config {
@@ -37,6 +36,15 @@ pub struct Config {
     pub threads: u32,
     /// Hash-list cache expiry, in seconds (DESIGN.md §5.6).
     pub hashlist_max_age: u64,
+    /// How far the sender scans ahead of its output, in bytes; at least
+    /// `block_size` (DESIGN.md §6.3).
+    pub lookahead: u64,
+    /// The sender's cache of hashes answered no, in bytes.
+    pub negative_cache: u64,
+    /// Candidates tried per query; at least 1 (DESIGN.md §6.4).
+    pub candidate_attempts: u32,
+    /// Path bytes of the directory that holds the receiver's pin file.
+    pub pin_directory: Vec<u8>,
     /// The transfer options a host override can replace; read them
     /// through `transfer_options`.
     ssh: Vec<Vec<u8>>,
@@ -133,6 +141,10 @@ struct RawConfig {
     index_path: Option<String>,
     threads: Option<u32>,
     hashlist_max_age: Option<String>,
+    lookahead: Option<Size>,
+    negative_cache: Option<Size>,
+    candidate_attempts: Option<u32>,
+    pin_directory: Option<String>,
     ssh: Option<String>,
     sender_command: Option<String>,
     sender_cache: Option<bool>,
@@ -197,10 +209,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
     let block_size = match raw.block_size {
         None => DEFAULT_BLOCK_SIZE,
         Some(size) => {
-            let bytes = match size {
-                Size::Bytes(n) => n,
-                Size::Text(t) => parse_size(&t).map_err(|e| format!("block_size: {e}"))?,
-            };
+            let bytes = size.bytes().map_err(|e| format!("block_size: {e}"))?;
             if bytes < MIN_BLOCK_SIZE {
                 return Err(format!(
                     "block_size must be at least {MIN_BLOCK_SIZE} bytes"
@@ -212,12 +221,29 @@ pub fn parse(text: &str) -> Result<Config, String> {
     };
     let index_path = match raw.index_path {
         None => default_index_path(),
-        Some(text) => {
-            let decoded =
-                decode_escapes(&text, Escapes::Plain).map_err(|e| format!("index_path: {e}"))?;
-            check_no_nul(&decoded).map_err(|e| format!("index_path: {e}"))?;
-            expand_tilde(decoded)
-        }
+        Some(text) => parse_path(&text).map_err(|e| format!("index_path: {e}"))?,
+    };
+    let lookahead = match raw.lookahead {
+        None => DEFAULT_LOOKAHEAD,
+        Some(size) => size.bytes().map_err(|e| format!("lookahead: {e}"))?,
+    };
+    // A scan step needs a whole window of lookahead (DESIGN.md §6.3).
+    if lookahead < u64::from(block_size) {
+        return Err(format!(
+            "lookahead must be at least block_size ({block_size} bytes)"
+        ));
+    }
+    let negative_cache = match raw.negative_cache {
+        None => DEFAULT_NEGATIVE_CACHE,
+        Some(size) => size.bytes().map_err(|e| format!("negative_cache: {e}"))?,
+    };
+    let candidate_attempts = raw.candidate_attempts.unwrap_or(DEFAULT_CANDIDATE_ATTEMPTS);
+    if candidate_attempts == 0 {
+        return Err("candidate_attempts must be at least 1".into());
+    }
+    let pin_directory = match raw.pin_directory {
+        None => default_pin_directory(),
+        Some(text) => parse_path(&text).map_err(|e| format!("pin_directory: {e}"))?,
     };
     let hashlist_max_age = match raw.hashlist_max_age {
         None => DEFAULT_HASHLIST_MAX_AGE,
@@ -259,12 +285,32 @@ pub fn parse(text: &str) -> Result<Config, String> {
         index_path,
         threads: raw.threads.unwrap_or(0),
         hashlist_max_age,
+        lookahead,
+        negative_cache,
+        candidate_attempts,
+        pin_directory,
         ssh,
         sender_command,
         sender_cache: raw.sender_cache.unwrap_or(true),
         hosts,
         roots,
     })
+}
+
+impl Size {
+    fn bytes(self) -> Result<u64, String> {
+        match self {
+            Size::Bytes(n) => Ok(n),
+            Size::Text(text) => parse_size(&text),
+        }
+    }
+}
+
+/// A configured path: byte escapes, no NUL, and a leading `~` for HOME.
+fn parse_path(text: &str) -> Result<Vec<u8>, String> {
+    let decoded = decode_escapes(text, Escapes::Plain)?;
+    check_no_nul(&decoded)?;
+    Ok(expand_tilde(decoded))
 }
 
 /// A configured `ssh` command: shell-split first, then decode the byte
@@ -499,6 +545,12 @@ pub fn default_index_path() -> Vec<u8> {
     path
 }
 
+fn default_pin_directory() -> Vec<u8> {
+    let mut path = xdg_dir("XDG_CACHE_HOME", ".cache");
+    path.extend_from_slice(b"/hashsync/pins");
+    path
+}
+
 fn expand_tilde(path: Vec<u8>) -> Vec<u8> {
     if path == b"~" {
         return home_dir();
@@ -598,6 +650,10 @@ block_size = "64KiB"
 strong_hash = "sha256"
 index_path = '/tmp/\xFF/index.sqlite'
 threads = 24
+lookahead = "1MiB"
+negative_cache = 0
+candidate_attempts = 3
+pin_directory = '/var/\xFE/pins'
 
 [[roots]]
 path = '/srv/archive-\xFF'
@@ -613,6 +669,10 @@ one_filesystem = true
         assert_eq!(config.strong_hash, StrongHash::Sha256);
         assert_eq!(config.index_path, b"/tmp/\xff/index.sqlite");
         assert_eq!(config.threads, 24);
+        assert_eq!(config.lookahead, 1 << 20);
+        assert_eq!(config.negative_cache, 0);
+        assert_eq!(config.candidate_attempts, 3);
+        assert_eq!(config.pin_directory, b"/var/\xfe/pins");
         assert_eq!(config.roots.len(), 2);
         assert_eq!(config.roots[0].pattern, b"/srv/archive-\xff");
         let exclude = &config.roots[0].exclude;
@@ -640,6 +700,10 @@ one_filesystem = true
         assert_eq!(config.block_size, DEFAULT_BLOCK_SIZE);
         assert_eq!(config.strong_hash, StrongHash::Blake3);
         assert_eq!(config.threads, 0);
+        assert_eq!(config.lookahead, 256 << 20);
+        assert_eq!(config.negative_cache, 128 << 20);
+        assert_eq!(config.candidate_attempts, 128);
+        assert!(config.pin_directory.ends_with(b"/hashsync/pins"));
         assert_eq!(config.roots[0].pattern, b"/srv/\xff/*");
         let config = parse("[[roots]]\npath = '/srv/\\xFF/*'\n").unwrap();
         assert_eq!(config.roots[0].pattern, b"/srv/\xff/*");
@@ -661,7 +725,28 @@ one_filesystem = true
         );
         assert!(parse("strong_hash = \"md5\"").is_err());
         assert!(parse("threads = -1").is_err());
-        assert!(parse("lookahead = \"1MiB\"").is_err());
+        assert!(
+            parse("lookahead = \"4095\"")
+                .unwrap_err()
+                .contains("lookahead must be at least block_size")
+        );
+        assert!(
+            parse("block_size = \"64KiB\"\nlookahead = \"32KiB\"")
+                .unwrap_err()
+                .contains("at least block_size")
+        );
+        assert!(
+            parse("candidate_attempts = 0")
+                .unwrap_err()
+                .contains("at least 1")
+        );
+        assert!(parse("negative_cache = \"lots\"").is_err());
+        assert!(
+            parse("pin_directory = '/a\\x00b'")
+                .unwrap_err()
+                .contains("NUL")
+        );
+        assert!(parse("compression_level = 3").is_err());
         assert!(
             parse("[[roots]]\npath = \"relative\"")
                 .unwrap_err()

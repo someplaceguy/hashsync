@@ -34,8 +34,8 @@ use crate::index::writer::{FileId, Msg, RelPath};
 use crate::roots::{self, Location};
 
 /// A root location to scan and its index row.
-pub struct ScanRoot {
-    pub location: Location,
+pub struct ScanRoot<'a> {
+    pub location: &'a Location,
     pub root_id: i64,
 }
 
@@ -55,30 +55,20 @@ pub struct Counters {
 /// `-j` override.
 pub fn run(
     config: &Config,
-    roots: Vec<ScanRoot>,
+    roots: Vec<ScanRoot<'_>>,
     fs_cache: &FsCache,
     tx: Sender<Msg>,
     jobs: Option<u32>,
 ) -> Counters {
     let mut shared = Vec::with_capacity(roots.len());
     let mut starts = Vec::with_capacity(roots.len());
-    for ScanRoot {
-        location:
-            Location {
-                root,
-                path,
-                dir,
-                name,
-            },
-        root_id,
-    } in roots
-    {
+    for ScanRoot { location, root_id } in roots {
         shared.push(Root {
-            path,
-            config: &config.roots[root],
+            path: location.path.clone(),
+            config: &config.roots[location.root],
             root_id,
         });
-        starts.push((dir, name));
+        starts.push((Arc::clone(&location.dir), location.name.clone()));
     }
     let scanner = Scanner {
         roots: shared,

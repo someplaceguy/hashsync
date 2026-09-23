@@ -56,9 +56,14 @@ impl HashTable {
 
     /// True when `value`'s fingerprint is present: stop at the
     /// fingerprint or an empty slot, continue only through full buckets.
-    /// The scanner of PLAN.md step 4 probes through this; until then
-    /// only tests exercise it.
-    #[cfg_attr(not(test), expect(dead_code))]
+    ///
+    /// Insertion fills each bucket's slots in order and never empties one,
+    /// so a fingerprint before the first empty slot is a fingerprint
+    /// anywhere in the bucket. Comparing all 16 slots together, without a
+    /// branch per slot, lets the compiler use vector compares and avoids a
+    /// mispredicted branch at the unpredictable end of the filled slots.
+    /// The scanner probes once per output byte, so this is inlined.
+    #[inline]
     pub fn contains(&self, value: u64) -> bool {
         if self.buckets.is_empty() {
             return false;
@@ -66,13 +71,16 @@ impl HashTable {
         let fingerprint = fingerprint(value);
         let mut bucket = self.bucket_of(value);
         loop {
-            for &slot in &self.buckets[bucket].0 {
-                if slot == fingerprint {
-                    return true;
-                }
-                if slot == 0 {
-                    return false;
-                }
+            let slots = &self.buckets[bucket].0;
+            let found = slots
+                .iter()
+                .fold(false, |found, &slot| found | (slot == fingerprint));
+            let empty = slots.iter().fold(false, |empty, &slot| empty | (slot == 0));
+            if found {
+                return true;
+            }
+            if empty {
+                return false;
             }
             bucket = (bucket + 1) % self.buckets.len();
         }
