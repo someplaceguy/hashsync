@@ -1,5 +1,5 @@
-//! Unsafe system-call and C-library wrappers. This is the only module that
-//! may use unsafe code (DESIGN.md §11).
+//! Unsafe system-call, C-library, and CPU-instruction wrappers. This is the
+//! only module that may use unsafe code (DESIGN.md §11).
 //!
 //! Every system-call wrapper retries a call that a signal interrupts, so
 //! callers never see `EINTR`.
@@ -289,6 +289,22 @@ pub fn sqlite_use_mimalloc() {
     // SAFETY: `p` came from `sqlite3_malloc` and is freed one time.
     unsafe { ffi::sqlite3_free(p) };
     assert!(effective, "SQLite does not allocate through mimalloc");
+}
+
+/// Start to load the cache line that holds `value`, for a read soon after.
+/// This is only a hint: it cannot fault and changes no result. Other
+/// architectures ignore it.
+#[inline(always)]
+pub fn prefetch<T>(value: &T) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: a prefetch only loads a cache line, and `value` is a valid
+    // reference.
+    unsafe {
+        use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+        _mm_prefetch::<_MM_HINT_T0>(std::ptr::from_ref(value).cast());
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = value;
 }
 
 /// Test-only: set an environment variable. `set_var` is unsafe because

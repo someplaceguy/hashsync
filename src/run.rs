@@ -133,16 +133,17 @@ pub fn run(
         block_size: config.block_size,
         weak_hash_id: weak::ID.to_string(),
         strong_hash: config.strong_hash,
+        target: target.digest,
         account_id,
         index_id: meta.index_id,
-        target: target.digest,
         sender_cache: options.sender_cache,
         hashlist_max_age: config.hashlist_max_age,
-        lookahead: config.lookahead,
         // Compression arrives with PLAN.md step 5: negotiate it
         // disabled.
         compression_level: 0,
         compression_threads: 0,
+        probe_threads: config.probe_threads,
+        lookahead: config.lookahead,
         negative_cache: config.negative_cache,
         command: command.iter().map(|arg| arg.as_bytes().to_vec()).collect(),
     };

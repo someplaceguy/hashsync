@@ -830,11 +830,12 @@ repeating them.
 Payloads:
 
 - HELLO, receiver to sender: `block_size u32`, `weak_hash_id string`,
-  `strong_hash_id string`, `account_id [u8; 16]`, `index_id [u8; 16]`,
-  `target [u8; S]`, `sender_cache u8`, `hashlist_max_age u64` (seconds),
-  `lookahead u64`, `compression_level i32`, `compression_threads u32`,
-  `negative_cache u64` (bytes), and `command`, a list of argv byte strings.
-  Find argv[0] in PATH and run directly; a shell requires explicit `sh -c`.
+  `strong_hash_id string`, `target [u8; S]`, `account_id [u8; 16]`,
+  `index_id [u8; 16]`, `sender_cache u8`, `hashlist_max_age u64` (seconds),
+  `compression_level i32`, `compression_threads u32`, `probe_threads u32`,
+  `lookahead u64`, `negative_cache u64` (bytes), and `command`, a list of
+  argv byte strings. Find argv[0] in PATH and run directly; a shell requires
+  explicit `sh -c`.
 - HELLO, sender to receiver: `account_id [u8; 16]` and an optional
   `base [u8; S]`.
 - HASHLIST: `length u64`. That many encoded bytes of the target follow the
@@ -891,7 +892,8 @@ frames inside the compressor. Compression settings are in section 7.
 ### 6.3 The sender's scanner
 
 One scanner owns all output decisions, records, and query states. Other
-threads perform I/O and compression. Let `B = block_size`.
+threads perform I/O and compression, and probe threads probe the weak table
+for the scanner. Let `B = block_size`.
 
 **State and invariants.**
 
@@ -949,6 +951,21 @@ At EOF, a tail shorter than `B` extends the last Run for as long as bytes
 match; the remainder is literal. If that Run was already emitted, its short
 continuation is literal. Earlier unresolved queries can still force this
 tail to be scanned again.
+
+**Probe threads.**
+
+A weak-table probe depends only on the bytes of its window. When the
+scanner looks for the next hit, it can split a long stretch of windows into
+consecutive parts and probe them on `probe_threads` threads at once. Each
+part computes the polynomial of its first window directly. The first hit in
+offset order ends the stretch, and parts after a found hit may stop early,
+so the result equals probing each window in order. After each weak hit,
+new or known, the scanner scans at most a short stretch on its own thread
+before it processes answers again. With more than one probe thread, each
+following stretch without a hit doubles the next one, up to a bound per
+thread. Short gaps between matches thus stay on one thread, and a long run
+of misses soon uses all probe threads. HELLO's `probe_threads` sets the
+thread count; 0 selects half the sender's cores, at least one.
 
 **Answers and rescanning.**
 
@@ -1168,6 +1185,7 @@ coordination chosen by the implementation, subject to section 6.7.
 | Sender command reader | Fill lookahead until stdout EOF; obtain the command's exit status without reaping. |
 | Sender stderr relay | Copy command stderr to sender stderr through EOF and flush. |
 | Sender scanner | Own records and query states; queue queries and output. |
+| Sender probe threads | Probe the parts of long stretches of windows for the scanner (section 6.3). |
 | Sender data writer | Drain output in order, compress, and finish and flush the stream after END. |
 | Sender control reader/writer | Receive answers and send queries promptly, independently of data output. |
 | Receiver main | Start SSH sessions, reconstruct stdout, validate completion, and send END_ACK. |
@@ -1281,6 +1299,7 @@ threads        = 0         # 0 = 4 × cores, clamped to 16–64
 lookahead      = "256MiB"  # at least block_size
 pin_directory  = "~/.cache/hashsync/pins"  # receiver file storage; supports hole punching
 negative_cache = "128MiB"
+probe_threads  = 0         # 0 = half the sender's cores, at least one
 compression_level   = 9    # zstd 1–19; 0 disables
 compression_threads = 0    # 0 = half the sender's cores, at least one
 ssh            = "ssh"     # shell-split command; appends -o Compression=no
@@ -1391,7 +1410,7 @@ SIMD support require a target C compiler. There is no separate pure-Rust build.
 | SQLite | `rusqlite` with bundled SQLite |
 | Strong hashes | `blake3`, `sha2`, behind one shared strong-hash interface |
 | System calls | `rustix`; `libc` and `linux-raw-sys` for missing wrappers/constants |
-| Indexing pool and channels | `rayon`, `crossbeam-channel`; blocking standard threads for transfer |
+| Thread pools and channels | `rayon` for indexing and sender probes, `crossbeam-channel`; blocking standard threads for transfer |
 | Compression | `zstd` binding libzstd with worker-thread support |
 | Anonymous pin files | `tempfile`; hole punching through `rustix` |
 | Configuration and CLI | `serde`, `toml`, `clap`; `gix-glob` for byte patterns and paths |
@@ -1422,6 +1441,11 @@ decision history is in version control.
 - **Independent scanner segments:** skipped windows can cross a reference
   chosen by another segment and leave possible matches unexamined. One
   scanner owns all offset decisions.
+- **Content-defined anchors for weak probes:** probing only the windows
+  that a short-context rolling hash selects makes the scanner's cost per
+  byte independent of the list size. It changes the list, the index, and
+  the scanner, and very repetitive blocks without an anchor cannot be
+  found. Probe threads keep one table probe per window.
 - **A separate index lock file:** possible, but all read/write `unix-excl`
   connections with `query_only` worker readers preserve process exclusion
   without a second persistent locking object. Mixing VFSes or read-only
@@ -1452,7 +1476,8 @@ decision history is in version control.
   implementation changes.
 - Validate hashing/encoding properties, empty-table misses, and absence of
   table false negatives;
-  byte-exact reconstruction under rescans, late answers, and backpressure;
+  byte-exact reconstruction under rescans, late answers, backpressure,
+  and any split of a stretch among probe threads;
   pin-file appends and reclamation with slow stdout, concurrent lookups,
   rejected-query rescans, and late answers; obsolete writes, unaligned block
   sizes, neighbor preservation during hole punching, pin-file failures,

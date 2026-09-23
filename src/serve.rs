@@ -14,9 +14,9 @@
 //! answers. The main thread writes the setup frames, then gives the data
 //! session to the data writer and runs the scanner (DESIGN.md §6.6): it
 //! takes command output from the output reader and answers from the
-//! control reader, and it queues queries for the control writer and frames
-//! for the data writer. Command success and startup failure share one
-//! completion path.
+//! control reader, lends long stretches of windows to the probe threads,
+//! and queues queries for the control writer and frames for the data
+//! writer. Command success and startup failure share one completion path.
 
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::net::Shutdown;
@@ -186,6 +186,10 @@ pub fn run(token: &str) -> ! {
             .expect("cannot start the control writer");
     }
 
+    // The scanner's probe threads (DESIGN.md §6.3) start before the
+    // command.
+    let probe_pool = probe_pool(hello.probe_threads);
+
     // The command. Keep it unreaped and in its own process group
     // (DESIGN.md §6.6); a fatal exit SIGKILLs the group, and the spawn
     // is atomic with that registration.
@@ -229,6 +233,7 @@ pub fn run(token: &str) -> ! {
                     hello.strong_hash,
                     hello.lookahead,
                     hello.negative_cache,
+                    probe_pool.as_ref(),
                 );
                 transfer(&mut scanner, &chunk_rx, &answer_rx, &output_tx, &query_tx);
                 let status = sys::wait_exit_status(Pid::from_child(&child));
@@ -264,6 +269,23 @@ pub fn run(token: &str) -> ! {
     completing.store(true, SeqCst);
     let _ = control.shutdown(Shutdown::Both);
     die::finish(0)
+}
+
+/// The threads that probe the scanner's long stretches of windows:
+/// `requested`, or half the cores, at least one, for 0 (DESIGN.md §6.3).
+/// One thread needs no pool: the scanner probes on its own thread.
+fn probe_pool(requested: u32) -> Option<rayon::ThreadPool> {
+    let threads = match requested {
+        0 => std::thread::available_parallelism().map_or(1, |n| (n.get() / 2).max(1)),
+        n => n as usize,
+    };
+    (threads > 1).then(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|i| format!("probe{i}"))
+            .build()
+            .expect("cannot start the probe pool")
+    })
 }
 
 /// Run the scanner until the command's output is emitted (DESIGN.md
@@ -689,7 +711,8 @@ mod tests {
             });
             let table = HashTable::build(&values);
             std::thread::spawn(move || {
-                let mut scanner = Scanner::new(table, BS, StrongHash::Blake3, lookahead, 1 << 20);
+                let mut scanner =
+                    Scanner::new(table, BS, StrongHash::Blake3, lookahead, 1 << 20, None);
                 transfer(&mut scanner, &chunk_rx, &answer_rx, &output_tx, &query_tx);
                 let end = End {
                     status: 0,

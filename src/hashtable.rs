@@ -62,8 +62,8 @@ impl HashTable {
     /// anywhere in the bucket. Comparing all 16 slots together, without a
     /// branch per slot, lets the compiler use vector compares and avoids a
     /// mispredicted branch at the unpredictable end of the filled slots.
-    /// The scanner probes once per output byte, so this is inlined.
-    #[inline]
+    /// The scanner probes once per output byte, so this is always inlined.
+    #[inline(always)]
     pub fn contains(&self, value: u64) -> bool {
         if self.buckets.is_empty() {
             return false;
@@ -83,6 +83,15 @@ impl HashTable {
                 return false;
             }
             bucket = (bucket + 1) % self.buckets.len();
+        }
+    }
+
+    /// Start to load the bucket where `contains(value)` begins, so that a
+    /// later call finds it in the cache.
+    #[inline(always)]
+    pub fn prefetch(&self, value: u64) {
+        if let Some(bucket) = self.buckets.get(self.bucket_of(value)) {
+            crate::sys::prefetch(bucket);
         }
     }
 

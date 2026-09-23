@@ -41,6 +41,9 @@ pub struct Config {
     pub lookahead: u64,
     /// The sender's cache of hashes answered no, in bytes.
     pub negative_cache: u64,
+    /// The sender's weak-table probe threads; 0 selects half the sender's
+    /// cores, at least one (DESIGN.md §6.3).
+    pub probe_threads: u32,
     /// Candidates tried per query; at least 1 (DESIGN.md §6.4).
     pub candidate_attempts: u32,
     /// Path bytes of the directory that holds the receiver's pin file.
@@ -143,6 +146,7 @@ struct RawConfig {
     hashlist_max_age: Option<String>,
     lookahead: Option<Size>,
     negative_cache: Option<Size>,
+    probe_threads: Option<u32>,
     candidate_attempts: Option<u32>,
     pin_directory: Option<String>,
     ssh: Option<String>,
@@ -287,6 +291,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
         hashlist_max_age,
         lookahead,
         negative_cache,
+        probe_threads: raw.probe_threads.unwrap_or(0),
         candidate_attempts,
         pin_directory,
         ssh,
@@ -652,6 +657,7 @@ index_path = '/tmp/\xFF/index.sqlite'
 threads = 24
 lookahead = "1MiB"
 negative_cache = 0
+probe_threads = 5
 candidate_attempts = 3
 pin_directory = '/var/\xFE/pins'
 
@@ -671,6 +677,7 @@ one_filesystem = true
         assert_eq!(config.threads, 24);
         assert_eq!(config.lookahead, 1 << 20);
         assert_eq!(config.negative_cache, 0);
+        assert_eq!(config.probe_threads, 5);
         assert_eq!(config.candidate_attempts, 3);
         assert_eq!(config.pin_directory, b"/var/\xfe/pins");
         assert_eq!(config.roots.len(), 2);
@@ -702,6 +709,7 @@ one_filesystem = true
         assert_eq!(config.threads, 0);
         assert_eq!(config.lookahead, 256 << 20);
         assert_eq!(config.negative_cache, 128 << 20);
+        assert_eq!(config.probe_threads, 0);
         assert_eq!(config.candidate_attempts, 128);
         assert!(config.pin_directory.ends_with(b"/hashsync/pins"));
         assert_eq!(config.roots[0].pattern, b"/srv/\xff/*");
@@ -741,6 +749,7 @@ one_filesystem = true
                 .contains("at least 1")
         );
         assert!(parse("negative_cache = \"lots\"").is_err());
+        assert!(parse("probe_threads = -1").is_err());
         assert!(
             parse("pin_directory = '/a\\x00b'")
                 .unwrap_err()

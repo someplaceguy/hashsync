@@ -112,14 +112,15 @@ fn hello_prefix(block_size: u32, strong: &[u8]) -> Vec<u8> {
 /// hash.
 fn hello_payload(block_size: u32, list: &[u8], command: &[&str]) -> Vec<u8> {
     let mut hello = hello_prefix(block_size, b"blake3");
+    hello.extend_from_slice(blake3::hash(list).as_bytes()); // target
     hello.extend_from_slice(&[0xaa; 16]); // account ID
     hello.extend_from_slice(&[0xbb; 16]); // index ID
-    hello.extend_from_slice(blake3::hash(list).as_bytes()); // target
     hello.push(1); // sender_cache
     hello.extend_from_slice(&(90 * 24 * 3600u64).to_le_bytes()); // hashlist_max_age
-    hello.extend_from_slice(&(256u64 << 20).to_le_bytes()); // lookahead
     hello.extend_from_slice(&0i32.to_le_bytes()); // compression level
     hello.extend_from_slice(&0u32.to_le_bytes()); // compression threads
+    hello.extend_from_slice(&0u32.to_le_bytes()); // probe threads
+    hello.extend_from_slice(&(256u64 << 20).to_le_bytes()); // lookahead
     hello.extend_from_slice(&(128u64 << 20).to_le_bytes()); // negative cache
     hello.extend_from_slice(&(command.len() as u32).to_le_bytes());
     for arg in command {

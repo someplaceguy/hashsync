@@ -11,7 +11,9 @@
 //!
 //! The scanner does no I/O and starts no threads. Its driver (`serve`)
 //! feeds it command output and answers, sends the queries that it makes,
-//! and takes its data frames while the data queue has room.
+//! and takes its data frames while the data queue has room. The driver can
+//! lend it a pool of probe threads, which probe the parts of a long stretch
+//! of windows at once.
 //!
 //! Offsets count output bytes from zero. `e` is the next byte to emit, `p`
 //! the next byte to scan, and `r` the end of the bytes read, with
@@ -27,16 +29,24 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 use lru::LruCache;
+use rayon::ThreadPool;
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 use crate::hash::weak::{WeakHasher, mix64};
 use crate::hash::{Strong, StrongHash};
 use crate::hashtable::HashTable;
 
 /// The bytes that one call of `scan` examines at most, so that answers and
-/// emission keep up with a long stretch of misses.
+/// emission keep up with a long stretch of misses. With probe threads, this
+/// is the budget after a hit.
 const SCAN_BUDGET: u64 = 64 << 10;
+
+/// With probe threads, each stretch without a hit doubles the budget, up to
+/// this many bytes per thread.
+const PART_BUDGET: u64 = 1 << 20;
 
 /// The memory that one hash in the negative cache costs: the digest, the
 /// links of the recency list, and the slot of the hash table.
@@ -104,7 +114,7 @@ enum Roll {
     Behind { poly: u64, out: u8 },
 }
 
-pub struct Scanner {
+pub struct Scanner<'a> {
     /// `B`.
     block_size: u64,
     lookahead: u64,
@@ -127,22 +137,43 @@ pub struct Scanner {
     /// Full strong hashes answered no; `None` when the configured size
     /// holds no hash.
     negative: Option<LruCache<Strong, ()>>,
+    /// The threads that probe the parts of a long stretch; `None` probes
+    /// on the scanner's thread.
+    pool: Option<&'a ThreadPool>,
+    /// The bytes that a call of `scan` examines at most. Each hit sets it
+    /// to `min_budget` and limits the rest of that call to it; each stretch
+    /// without a hit doubles it, up to `max_budget`.
+    budget: u64,
+    min_budget: u64,
+    max_budget: u64,
+    /// The fewest windows in one part. Each part computes the polynomial
+    /// of its first window from its bytes.
+    min_part: usize,
 }
 
-impl Scanner {
+impl<'a> Scanner<'a> {
     /// A scanner for windows of `block_size` bytes, which probes `table`,
     /// scans at most `lookahead` bytes ahead of its output, and remembers
-    /// up to `negative_cache` bytes of rejected hashes.
+    /// up to `negative_cache` bytes of rejected hashes. `pool` probes long
+    /// stretches in parts.
     pub fn new(
         table: HashTable,
         block_size: u32,
         strong: StrongHash,
         lookahead: u64,
         negative_cache: u64,
+        pool: Option<&'a ThreadPool>,
     ) -> Self {
         assert!(block_size > 0 && lookahead >= u64::from(block_size));
         let negative_hashes =
             usize::try_from(negative_cache / NEGATIVE_ENTRY_BYTES).unwrap_or(usize::MAX);
+        let min_part = SCAN_BUDGET.max(u64::from(block_size));
+        let max_budget = match pool {
+            Some(pool) => {
+                (pool.current_num_threads() as u64).saturating_mul(PART_BUDGET.max(min_part))
+            }
+            None => SCAN_BUDGET,
+        };
         Scanner {
             block_size: u64::from(block_size),
             lookahead,
@@ -159,6 +190,11 @@ impl Scanner {
             queries: VecDeque::new(),
             entries: BTreeMap::new(),
             negative: NonZeroUsize::new(negative_hashes).map(LruCache::sparse),
+            pool,
+            budget: SCAN_BUDGET,
+            min_budget: SCAN_BUDGET,
+            max_budget,
+            min_part: min_part as usize,
         }
     }
 
@@ -218,12 +254,12 @@ impl Scanner {
         }
     }
 
-    /// Resolve the answered queries, then scan up to `SCAN_BUDGET` bytes.
+    /// Resolve the answered queries, then scan up to `budget` bytes.
     /// `query` receives the offset and full strong hash of each new query.
     /// True when anything changed.
     pub fn scan(&mut self, query: &mut impl FnMut(u64, Strong)) -> bool {
         let mut progress = self.resolve();
-        let budget_end = self.p.saturating_add(SCAN_BUDGET);
+        let mut budget_end = self.p.saturating_add(self.budget);
         while self.p - self.e < self.lookahead && self.p < budget_end {
             let available = self.end() - self.p;
             if available < self.block_size {
@@ -250,12 +286,17 @@ impl Scanner {
                     .min(budget_end)
                     .min(next_entry.unwrap_or(u64::MAX));
                 if !self.skip_misses(limit) {
+                    self.budget = self.budget.saturating_mul(2).min(self.max_budget);
                     continue;
                 }
                 let strong = self.strong.digest(self.bytes(self.p, self.block_size));
                 let state = State::NotSent;
                 self.entries.insert(self.p, Entry { strong, state });
             }
+            // A hit, new or known, limits the rest of this call too: closely
+            // spaced hits stay on this thread, and answers wait little.
+            self.budget = self.min_budget;
+            budget_end = budget_end.min(self.p.saturating_add(self.budget));
             self.apply_entry(query);
         }
         progress
@@ -263,28 +304,35 @@ impl Scanner {
 
     /// Record literal bytes from `p` while their windows miss the weak
     /// table. True at a hit, with `p` at its window; false once `p`
-    /// reaches `limit`, which must be above `p`.
+    /// reaches `limit`, which must be above `p`. The probe threads probe a
+    /// long stretch in parts.
     fn skip_misses(&mut self, limit: u64) -> bool {
         let start = self.p;
-        let mut poly = self.polynomial();
+        let poly = self.polynomial();
         let window = self.block_size as usize;
-        let buffer = &self.buffer;
-        let mut i = (start - self.base) as usize;
-        let end = (limit - self.base) as usize;
-        let hit = loop {
-            if self.table.contains(mix64(poly)) {
-                self.roll = Roll::Current(poly);
-                break true;
+        let first = (start - self.base) as usize;
+        let n = (limit - start) as usize;
+        let bytes = &self.buffer[first..first + n - 1 + window];
+        let found = match self.pool {
+            Some(pool) if n >= 2 * self.min_part => {
+                let parts = (n / self.min_part).min(pool.current_num_threads());
+                first_hit_in_parts(pool, parts, &self.table, &self.weak, bytes, poly)
             }
-            let out = buffer[i];
-            i += 1;
-            if i == end {
-                self.roll = Roll::Behind { poly, out };
-                break false;
-            }
-            poly = self.weak.roll(poly, out, buffer[i + window - 1]);
+            _ => first_hit(&self.table, &self.weak, bytes, poly, || false),
         };
-        self.p = self.base + i as u64;
+        let hit = match found {
+            Ok((k, poly)) => {
+                self.p = start + k as u64;
+                self.roll = Roll::Current(poly);
+                true
+            }
+            Err(poly) => {
+                self.p = limit;
+                let out = self.buffer[first + n - 1];
+                self.roll = Roll::Behind { poly, out };
+                false
+            }
+        };
         if self.p > start {
             self.push_literal(start, self.p - start);
         }
@@ -444,6 +492,108 @@ impl Scanner {
     }
 }
 
+/// The first window of `bytes` whose weak hash may be in `table`, with its
+/// polynomial; `poly` is the polynomial of the first window. Without a hit,
+/// the polynomial of the last window. `stop`, checked every 4096 windows,
+/// can end the search early, and the result is then meaningless.
+///
+/// Probes of different windows are independent, so the loop computes the
+/// hashes of the next `AHEAD` windows before it probes the first of them,
+/// and their buckets load meanwhile: a table larger than the caches costs
+/// one memory latency per `AHEAD` probes instead of one per probe.
+fn first_hit(
+    table: &HashTable,
+    weak: &WeakHasher,
+    bytes: &[u8],
+    mut poly: u64,
+    stop: impl Fn() -> bool,
+) -> Result<(usize, u64), u64> {
+    const AHEAD: usize = 16;
+    let window = weak.block_size();
+    let n = bytes.len() + 1 - window;
+    // `ring[j % AHEAD]` holds the polynomial and the weak hash of window
+    // `j`, for the next `AHEAD` windows.
+    let mut ring = [(0u64, 0u64); AHEAD];
+    for (j, slot) in ring[..n.min(AHEAD)].iter_mut().enumerate() {
+        let hash = mix64(poly);
+        table.prefetch(hash);
+        *slot = (poly, hash);
+        if j + 1 < n {
+            poly = weak.roll(poly, bytes[j], bytes[j + window]);
+        }
+    }
+    // Probe window `k`, and replace it in the ring with window
+    // `k + AHEAD`, whose polynomial `poly` holds.
+    let mut k = 0;
+    while k + AHEAD < n {
+        let (current, hash) = ring[k % AHEAD];
+        let ahead = mix64(poly);
+        table.prefetch(ahead);
+        ring[k % AHEAD] = (poly, ahead);
+        if k + AHEAD + 1 < n {
+            poly = weak.roll(poly, bytes[k + AHEAD], bytes[k + AHEAD + window]);
+        }
+        if table.contains(hash) {
+            return Ok((k, current));
+        }
+        k += 1;
+        if k % 4096 == 0 && stop() {
+            return Err(0);
+        }
+    }
+    // The ring holds the remaining windows.
+    match (k..n).find(|&k| table.contains(ring[k % AHEAD].1)) {
+        Some(k) => Ok((k, ring[k % AHEAD].0)),
+        None => Err(ring[(n - 1) % AHEAD].0),
+    }
+}
+
+/// `first_hit` over `parts` consecutive parts of `bytes` at once, one task
+/// per part on `pool`. Every part but the first computes the polynomial of
+/// its first window from its bytes. The first hit in window order wins,
+/// and the parts after a found hit stop early.
+fn first_hit_in_parts(
+    pool: &ThreadPool,
+    parts: usize,
+    table: &HashTable,
+    weak: &WeakHasher,
+    bytes: &[u8],
+    poly: u64,
+) -> Result<(usize, u64), u64> {
+    let window = weak.block_size();
+    let n = bytes.len() + 1 - window;
+    // Each part holds `n / parts` windows, and the first `n % parts`
+    // parts one more.
+    let (size, extra) = (n / parts, n % parts);
+    let earliest = AtomicUsize::new(usize::MAX);
+    let found: Vec<Result<(usize, u64), u64>> = pool.install(|| {
+        (0..parts)
+            .into_par_iter()
+            .map(|i| {
+                let start = i * size + i.min(extra);
+                let length = size + usize::from(i < extra);
+                let part = &bytes[start..start + length - 1 + window];
+                let poly = match i {
+                    0 => poly,
+                    _ => weak.polynomial(&part[..window]),
+                };
+                let found = first_hit(table, weak, part, poly, || earliest.load(Relaxed) < start);
+                if let Ok((k, _)) = found {
+                    earliest.fetch_min(start + k, Relaxed);
+                }
+                found.map(|(k, poly)| (start + k, poly))
+            })
+            .collect()
+    });
+    // Only a part after a hit stops early. Without hits, the last part
+    // ends with the last window.
+    found
+        .iter()
+        .copied()
+        .find(Result::is_ok)
+        .unwrap_or(found[parts - 1])
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use std::collections::{HashMap, HashSet};
@@ -543,24 +693,47 @@ pub(crate) mod tests {
         }
     }
 
+    /// Three probe threads, shared by the tests.
+    fn probe_pool() -> &'static ThreadPool {
+        static POOL: std::sync::OnceLock<ThreadPool> = std::sync::OnceLock::new();
+        POOL.get_or_init(|| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(3)
+                .build()
+                .unwrap()
+        })
+    }
+
     /// A transfer driven by `choices`, which decide chunk sizes, answer
     /// order and timing, and data-queue room; they are reused cyclically.
     struct Run<'a> {
-        scanner: Scanner,
+        scanner: Scanner<'a>,
         receiver: Receiver,
         input: &'a [u8],
         pushed: usize,
     }
 
     impl<'a> Run<'a> {
-        fn new(input: &'a [u8], receiver: Receiver, lookahead: u64, negative_cache: u64) -> Self {
-            let scanner = Scanner::new(
+        /// `min_part` lends the scanner the probe pool, with parts of at
+        /// least that many windows.
+        fn new(
+            input: &'a [u8],
+            receiver: Receiver,
+            lookahead: u64,
+            negative_cache: u64,
+            min_part: Option<usize>,
+        ) -> Self {
+            let mut scanner = Scanner::new(
                 receiver.table(),
                 BS,
                 StrongHash::Blake3,
                 lookahead,
                 negative_cache,
+                min_part.map(|_| probe_pool()),
             );
+            if let Some(min_part) = min_part {
+                scanner.min_part = min_part;
+            }
             Run {
                 scanner,
                 receiver,
@@ -667,7 +840,7 @@ pub(crate) mod tests {
 
     /// Transfer `input` with prompt answers; return the receiver.
     fn transfer_promptly(input: &[u8], blocks: &[Vec<u8>], stale: &[Vec<u8>]) -> Receiver {
-        let mut run = Run::new(input, Receiver::new(blocks, stale), 1 << 20, 1 << 20);
+        let mut run = Run::new(input, Receiver::new(blocks, stale), 1 << 20, 1 << 20, None);
         run.transfer_promptly();
         run.receiver
     }
@@ -688,7 +861,14 @@ pub(crate) mod tests {
     fn an_empty_list_sends_everything_as_literals() {
         let input = noise(1000, 2);
         let receiver = Receiver::new(&[], &[]);
-        let mut scanner = Scanner::new(receiver.table(), BS, StrongHash::Blake3, 1 << 20, 1 << 20);
+        let mut scanner = Scanner::new(
+            receiver.table(),
+            BS,
+            StrongHash::Blake3,
+            1 << 20,
+            1 << 20,
+            None,
+        );
         scanner.push(&input);
         scanner.end_input();
         while scanner.scan(&mut |_, _| panic!("no query without a list")) {}
@@ -738,7 +918,7 @@ pub(crate) mod tests {
 
         // Without a negative cache, every occurrence is queried.
         let receiver = Receiver::new(&[], std::slice::from_ref(&stale));
-        let mut run = Run::new(&input, receiver, 1 << 20, 0);
+        let mut run = Run::new(&input, receiver, 1 << 20, 0, None);
         run.transfer_promptly();
         assert_eq!(run.receiver.output, input);
         assert_eq!(run.receiver.queries.len(), 4);
@@ -752,10 +932,45 @@ pub(crate) mod tests {
             .flat_map(|b| [b.clone(), b"xy".to_vec()])
             .flatten()
             .collect();
-        let mut run = Run::new(&input, Receiver::new(&blocks, &[]), BS.into(), 1 << 20);
+        let mut run = Run::new(
+            &input,
+            Receiver::new(&blocks, &[]),
+            BS.into(),
+            1 << 20,
+            None,
+        );
         run.transfer(&[7, 2, 200, 1, 3, 3, 9]);
         assert_eq!(run.receiver.output, input);
         assert_eq!(run.receiver.queries.len(), 5);
+    }
+
+    /// A hit limits the rest of its call of `scan` to `min_budget` bytes,
+    /// also after a long stretch without hits has grown the budget
+    /// (DESIGN.md §6.3): closely spaced matches then stay on the scanner's
+    /// thread, and the driver processes answers again soon.
+    #[test]
+    fn a_hit_limits_the_rest_of_the_scan() {
+        let blocks: Vec<Vec<u8>> = (0..20).map(|i| noise(BS as usize, 40 + i)).collect();
+        let mut input = noise(200 * BS as usize, 39);
+        let first = input.len() as u64;
+        input.extend(blocks.iter().flatten());
+        let receiver = Receiver::new(&blocks, &[]);
+        let mut run = Run::new(&input, receiver, 1 << 20, 1 << 20, Some(2));
+        let min_budget = 4 * u64::from(BS);
+        run.scanner.min_budget = min_budget;
+        run.scanner.budget = min_budget;
+        run.scanner.max_budget = 64 * min_budget;
+        while run.push(input.len()) {}
+        // Scan without answers until the first query.
+        while run.receiver.queries.is_empty() {
+            assert!(run.scan(), "the scanner stalled");
+        }
+        assert_eq!(run.receiver.queries[0].0, first);
+        assert!(
+            run.scanner.p < first + min_budget + u64::from(BS),
+            "the call scanned on to {} after the hit at {first}",
+            run.scanner.p
+        );
     }
 
     /// Valid and stale blocks that overlap each other, and an input piece
@@ -787,7 +1002,13 @@ pub(crate) mod tests {
         // The answer for the skipped window arrives after the output
         // passed it (see `overlapping_blocks`).
         let (valid, stale, input) = overlapping_blocks(30);
-        let mut run = Run::new(&input, Receiver::new(&valid, &stale), 1 << 20, 1 << 20);
+        let mut run = Run::new(
+            &input,
+            Receiver::new(&valid, &stale),
+            1 << 20,
+            1 << 20,
+            None,
+        );
         run.push(input.len());
         run.push(0);
         run.scan();
@@ -821,14 +1042,45 @@ pub(crate) mod tests {
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(300))]
 
+        /// Probing in parts finds the first hit that probing each window in
+        /// order finds, with its polynomial, or else the polynomial of the
+        /// last window, for any number of parts (DESIGN.md §6.3).
+        #[test]
+        fn parts_find_the_first_hit_in_order(
+            windows in 1usize..20_000,
+            listed in proptest::collection::vec(any::<prop::sample::Index>(), 0..4),
+            parts in 1usize..8,
+            seed in any::<u64>(),
+        ) {
+            let window = BS as usize;
+            let bytes = noise(windows - 1 + window, seed);
+            let weak = WeakHasher::new(window);
+            let hash = |k: usize| weak.hash(&bytes[k..k + window]);
+            let values: Vec<u64> = listed.iter().map(|i| hash(i.index(windows))).collect();
+            let table = HashTable::build(&values);
+            let poly = weak.polynomial(&bytes[..window]);
+            let found = first_hit(&table, &weak, &bytes, poly, || false);
+            let expected = (0..windows).find(|&k| table.contains(hash(k)));
+            prop_assert_eq!(found.ok().map(|(k, _)| k), expected);
+            let last = expected.unwrap_or(windows - 1);
+            let polynomial = weak.polynomial(&bytes[last..last + window]);
+            prop_assert_eq!(found.map_or_else(|poly| poly, |(_, poly)| poly), polynomial);
+            let parts = parts.min(windows);
+            let in_parts = first_hit_in_parts(probe_pool(), parts, &table, &weak, &bytes, poly);
+            prop_assert_eq!(in_parts, found);
+        }
+
         /// Byte-exact reconstruction under any chunking, answer order and
-        /// delay, rejection, rescan, and backpressure (DESIGN.md §11).
+        /// delay, rejection, rescan, backpressure, scan budget, and split
+        /// of stretches among probe threads (DESIGN.md §11).
         #[test]
         fn output_is_reproduced_exactly(
             (pieces, seed) in input_strategy(),
             choices in proptest::collection::vec(any::<u8>(), 1..64),
             lookahead_windows in 1u64..6,
             negative in any::<bool>(),
+            min_part in proptest::option::of(1usize..100),
+            min_budget in 1u64..300,
         ) {
             let (valid, stale, piece) = overlapping_blocks(seed);
             let mut input = Vec::new();
@@ -854,7 +1106,16 @@ pub(crate) mod tests {
             }
             let negative_cache = if negative { 1 << 20 } else { 0 };
             let receiver = Receiver::new(&valid, &stale);
-            let mut run = Run::new(&input, receiver, lookahead_windows * u64::from(BS), negative_cache);
+            let mut run = Run::new(
+                &input,
+                receiver,
+                lookahead_windows * u64::from(BS),
+                negative_cache,
+                min_part,
+            );
+            run.scanner.min_budget = min_budget;
+            run.scanner.budget = min_budget;
+            run.scanner.max_budget = if min_part.is_some() { 16 * min_budget } else { min_budget };
             run.transfer(&choices);
             prop_assert_eq!(&run.receiver.output, &input);
             prop_assert!(run.scanner.records.is_empty() && run.scanner.entries.is_empty());

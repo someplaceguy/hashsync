@@ -66,16 +66,19 @@ pub struct ReceiverHello {
     pub block_size: u32,
     pub weak_hash_id: String,
     pub strong_hash: StrongHash,
-    pub account_id: [u8; 16],
-    pub index_id: [u8; 16],
     /// The digest of the receiver's hash list.
     pub target: Strong,
+    pub account_id: [u8; 16],
+    pub index_id: [u8; 16],
     pub sender_cache: bool,
     /// Seconds.
     pub hashlist_max_age: u64,
-    pub lookahead: u64,
     pub compression_level: i32,
     pub compression_threads: u32,
+    /// Threads that probe the weak table for the scanner; 0 selects half
+    /// the sender's cores, at least one (DESIGN.md §6.3).
+    pub probe_threads: u32,
+    pub lookahead: u64,
     /// Bytes.
     pub negative_cache: u64,
     /// The command's argv; argv[0] is found in PATH and run directly.
@@ -88,14 +91,15 @@ impl ReceiverHello {
         enc.u32(self.block_size);
         enc.bytes(self.weak_hash_id.as_bytes());
         enc.bytes(self.strong_hash.id().as_bytes());
+        enc.raw(&self.target);
         enc.raw(&self.account_id);
         enc.raw(&self.index_id);
-        enc.raw(&self.target);
         enc.u8(self.sender_cache.into());
         enc.u64(self.hashlist_max_age);
-        enc.u64(self.lookahead);
         enc.i32(self.compression_level);
         enc.u32(self.compression_threads);
+        enc.u32(self.probe_threads);
+        enc.u64(self.lookahead);
         enc.u64(self.negative_cache);
         enc.u32(list_len(self.command.len()));
         for arg in &self.command {
@@ -122,14 +126,15 @@ impl ReceiverHello {
             block_size,
             weak_hash_id,
             strong_hash,
+            target: dec.array(),
             account_id: dec.array(),
             index_id: dec.array(),
-            target: dec.array(),
             sender_cache: dec.flag(),
             hashlist_max_age: dec.u64(),
-            lookahead: dec.u64(),
             compression_level: dec.i32(),
             compression_threads: dec.u32(),
+            probe_threads: dec.u32(),
+            lookahead: dec.u64(),
             negative_cache: dec.u64(),
             command: dec.list(Dec::string_bytes),
         };
@@ -688,14 +693,15 @@ mod tests {
             block_size: 4096,
             weak_hash_id: "weak".into(),
             strong_hash: StrongHash::Sha256,
+            target: [3; 32],
             account_id: [7; 16],
             index_id: [9; 16],
-            target: [3; 32],
             sender_cache: true,
             hashlist_max_age: 90 * 24 * 3600,
-            lookahead: 256 << 20,
             compression_level: 0,
             compression_threads: 0,
+            probe_threads: 5,
+            lookahead: 256 << 20,
             negative_cache: 128 << 20,
             command: vec![b"printf".to_vec(), b"%s".to_vec(), b"\xff\xfe".to_vec()],
         }
@@ -742,6 +748,7 @@ mod tests {
         assert_eq!(decoded.account_id, [7; 16]);
         assert_eq!(decoded.target, hello.target);
         assert!(decoded.sender_cache);
+        assert_eq!(decoded.probe_threads, 5);
         assert_eq!(decoded.command, hello.command);
     }
 
