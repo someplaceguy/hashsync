@@ -9,14 +9,21 @@
 //! needs a bound beyond its field: a corrupt value costs only the bytes
 //! that really follow it.
 //!
-//! Malformed payloads and violated frame rules are bugs in a compatible
-//! peer: parsers panic (DESIGN.md §6.5). Transport failures, including EOF
-//! inside a frame, surface as `io::Error` for the caller to turn into
-//! `die`.
+//! After its HELLO, the sender's data-session frames share one zstd stream
+//! unless compression is disabled: `Compressor` writes it and
+//! `Decompressor` reads it.
+//!
+//! Malformed payloads, invalid compressed data, and violated frame rules
+//! are bugs in a compatible peer: parsers panic (DESIGN.md §6.5). Transport
+//! failures, including EOF inside a frame, surface as `io::Error` for the
+//! caller to turn into `die`.
 
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
+use std::ops::RangeInclusive;
 
 use crossbeam_channel::{Receiver, TryRecvError};
+use zstd::stream::raw::{CParameter, InBuffer, Operation, OutBuffer};
+use zstd::zstd_safe::{CCtx, DCtx};
 
 use crate::die::die;
 use crate::hash::{Strong, StrongHash};
@@ -291,6 +298,13 @@ pub struct Rle {
 }
 
 impl Rle {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut enc = Enc::new();
+        enc.u8(self.byte);
+        enc.u64(self.length);
+        enc.buf
+    }
+
     pub fn decode(payload: &[u8]) -> Self {
         let mut dec = Dec::new(payload, "RLE");
         let rle = Rle {
@@ -457,6 +471,12 @@ impl<R: Read> FrameReader<R> {
         }
     }
 
+    /// The transport. Nothing after the last frame read is lost: frames
+    /// are read without reading ahead.
+    pub fn into_inner(self) -> R {
+        self.reader
+    }
+
     /// The peer's protocol version, which precedes its first frame;
     /// `None` at a clean EOF before it. A truncated version is
     /// `UnexpectedEof`.
@@ -520,18 +540,18 @@ impl<R: Read> FrameReader<R> {
         self.reader.read_exact(&mut buf[1..])?;
         Ok(true)
     }
+}
 
-    /// Read to EOF, requiring that no byte follows. `false` when trailing
-    /// bytes arrived.
-    pub fn drain_to_eof(&mut self) -> std::io::Result<bool> {
-        let mut buf = [0u8; 4096];
-        loop {
-            match self.reader.read(&mut buf) {
-                Ok(0) => return Ok(true),
-                Ok(_) => return Ok(false),
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(e),
-            }
+/// Read `reader` to EOF, requiring that no byte arrives. `false` when
+/// trailing bytes arrived.
+pub fn drain_to_eof(mut reader: impl Read) -> std::io::Result<bool> {
+    let mut buf = [0u8; 4096];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => return Ok(true),
+            Ok(_) => return Ok(false),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
         }
     }
 }
@@ -546,6 +566,10 @@ pub struct FrameWriter<W: Write> {
 impl<W: Write> FrameWriter<W> {
     pub fn new(writer: W) -> Self {
         FrameWriter { writer }
+    }
+
+    pub fn into_inner(self) -> W {
+        self.writer
     }
 
     /// This side's protocol version: the session's first bytes, sent
@@ -587,6 +611,247 @@ impl<W: Write> FrameWriter<W> {
             }
         }
     }
+}
+
+/// The compression levels that a sender supports (DESIGN.md §7): zstd
+/// levels 1 to 19, and 0, which disables compression.
+pub const COMPRESSION_LEVELS: RangeInclusive<i32> = 0..=19;
+
+/// The sender's data session after its HELLO (DESIGN.md §6.2): one zstd
+/// stream for all frames, or the frames as they are when compression is
+/// disabled. `flush` makes every byte written so far decodable by the
+/// receiver, for a frame that it must answer, and `finish` ends the stream
+/// after END. The zstd frame has a checksum: the trailer that the receiver
+/// checks (DESIGN.md §6.7).
+///
+/// Transport failures are `io::Error`s for the caller's `die`. A failure of
+/// zstd itself panics.
+pub struct Compressor<W: Write> {
+    transport: W,
+    /// `None` when compression is disabled.
+    zstd: Option<Encoding>,
+}
+
+struct Encoding {
+    encoder: zstd::stream::raw::Encoder<'static>,
+    /// Compressed bytes on their way to the transport.
+    buffer: Box<[u8]>,
+}
+
+impl<W: Write> Compressor<W> {
+    /// Compress at zstd `level` on `threads` worker threads; level 0
+    /// disables compression.
+    pub fn new(transport: W, level: i32, threads: u32) -> Self {
+        assert!(
+            COMPRESSION_LEVELS.contains(&level),
+            "compression level {level}"
+        );
+        let zstd = (level != 0).then(|| {
+            let mut encoder = zstd::stream::raw::Encoder::new(level).unwrap_or_else(zstd_failed);
+            for parameter in [
+                CParameter::ChecksumFlag(true),
+                CParameter::NbWorkers(threads),
+            ] {
+                encoder.set_parameter(parameter).unwrap_or_else(zstd_failed);
+            }
+            Encoding {
+                encoder,
+                buffer: vec![0; CCtx::out_size()].into_boxed_slice(),
+            }
+        });
+        Compressor { transport, zstd }
+    }
+
+    /// End the stream, flush the transport, and return it.
+    pub fn finish(mut self) -> std::io::Result<W> {
+        if let Some(zstd) = &mut self.zstd {
+            zstd.drain(&mut self.transport, |encoder, out| {
+                encoder.finish(out, true)
+            })?;
+        }
+        self.transport.flush()?;
+        Ok(self.transport)
+    }
+}
+
+impl Encoding {
+    /// Repeat `step`, which writes output and returns how many bytes zstd
+    /// still holds, and pass the output to `transport`, until zstd holds
+    /// none.
+    fn drain(
+        &mut self,
+        transport: &mut impl Write,
+        mut step: impl FnMut(
+            &mut zstd::stream::raw::Encoder<'static>,
+            &mut OutBuffer<'_, [u8]>,
+        ) -> std::io::Result<usize>,
+    ) -> std::io::Result<()> {
+        loop {
+            let mut out = OutBuffer::around(&mut self.buffer[..]);
+            let held = step(&mut self.encoder, &mut out).unwrap_or_else(zstd_failed);
+            let written = out.pos();
+            transport.write_all(&self.buffer[..written])?;
+            if held == 0 {
+                return Ok(());
+            }
+        }
+    }
+}
+
+impl<W: Write> Write for Compressor<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let Some(zstd) = &mut self.zstd else {
+            return self.transport.write(buf);
+        };
+        // Each call takes input or, when every worker is busy, waits for
+        // output.
+        let mut input = InBuffer::around(buf);
+        while input.pos() < buf.len() {
+            let mut out = OutBuffer::around(&mut zstd.buffer[..]);
+            zstd.encoder
+                .run(&mut input, &mut out)
+                .unwrap_or_else(zstd_failed);
+            let written = out.pos();
+            self.transport.write_all(&zstd.buffer[..written])?;
+        }
+        Ok(buf.len())
+    }
+
+    /// Make every byte written so far decodable, then flush the transport.
+    fn flush(&mut self) -> std::io::Result<()> {
+        if let Some(zstd) = &mut self.zstd {
+            zstd.drain(&mut self.transport, |encoder, out| encoder.flush(out))?;
+        }
+        self.transport.flush()
+    }
+}
+
+/// The receiver's end of the sender's data session after HELLO
+/// (DESIGN.md §6.2): the decoded bytes of one zstd frame, or the bytes of
+/// the transport when compression is disabled. After END, `finish` checks
+/// that the frame ends there.
+///
+/// EOF of the transport inside the frame is `UnexpectedEof`: a truncated
+/// stream. Other transport failures are `io::Error`s too, for the caller's
+/// `die`. Invalid compressed data, including a wrong checksum, and a frame
+/// that ends before END are protocol errors and panic (DESIGN.md §6.5): a
+/// truncated stream cannot end a frame, because its end needs the last
+/// block and the checksum.
+pub struct Decompressor<R: BufRead> {
+    transport: R,
+    /// `None` when compression is disabled.
+    zstd: Option<Decoding>,
+}
+
+struct Decoding {
+    decoder: zstd::stream::raw::Decoder<'static>,
+    /// Decoded bytes, of which `[start, end)` are not read yet.
+    buffer: Box<[u8]>,
+    start: usize,
+    end: usize,
+    /// zstd decoded the whole frame and verified its checksum.
+    ended: bool,
+}
+
+impl<R: BufRead> Decompressor<R> {
+    pub fn new(transport: R, compressed: bool) -> Self {
+        let zstd = compressed.then(|| Decoding {
+            decoder: zstd::stream::raw::Decoder::new().unwrap_or_else(zstd_failed),
+            buffer: vec![0; DCtx::out_size()].into_boxed_slice(),
+            start: 0,
+            end: 0,
+            ended: false,
+        });
+        Decompressor { transport, zstd }
+    }
+
+    /// After END: read the rest of the zstd frame, which must hold no more
+    /// decoded bytes, and return the transport, right after the frame
+    /// (DESIGN.md §6.7). Only the frame is read: this does not wait for the
+    /// transport's EOF. Without compression, END ends the stream.
+    pub fn finish(mut self) -> std::io::Result<R> {
+        if let Some(zstd) = &mut self.zstd {
+            let more = zstd.available(&mut self.transport)?;
+            assert!(!more, "protocol error: data after END");
+        }
+        Ok(self.transport)
+    }
+}
+
+impl Decoding {
+    /// True when decoded bytes wait to be read, after decoding more if the
+    /// buffer holds none; false at the end of the frame. Interrupted
+    /// transport reads are retried (DESIGN.md §3).
+    fn available(&mut self, transport: &mut impl BufRead) -> std::io::Result<bool> {
+        if self.start < self.end {
+            return Ok(true);
+        }
+        // zstd can hold decoded bytes back. Ask for them without input
+        // first, so that they never wait for more of the transport.
+        let mut input_needed = false;
+        while !self.ended {
+            let input = if input_needed {
+                // Retry here, not in the callers: zstd fails after 16 steps
+                // without progress, and each call begins with a step
+                // without input.
+                loop {
+                    match transport.fill_buf() {
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                        result => break result?,
+                    }
+                }
+            } else {
+                &[]
+            };
+            if input_needed && input.is_empty() {
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            }
+            let mut input = InBuffer::around(input);
+            let mut out = OutBuffer::around(&mut self.buffer[..]);
+            let hint = self
+                .decoder
+                .run(&mut input, &mut out)
+                .unwrap_or_else(|e| panic!("protocol error: invalid compressed data: {e}"));
+            let (consumed, decoded) = (input.pos(), out.pos());
+            transport.consume(consumed);
+            // At the end of the frame, zstd consumed nothing after it.
+            self.ended = hint == 0;
+            (self.start, self.end) = (0, decoded);
+            if decoded > 0 {
+                return Ok(true);
+            }
+            input_needed = true;
+        }
+        Ok(false)
+    }
+}
+
+impl<R: BufRead> Read for Decompressor<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let Some(zstd) = &mut self.zstd else {
+            return self.transport.read(buf);
+        };
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        // The sender ends the frame only after END, and only `finish`
+        // reads after END.
+        assert!(
+            zstd.available(&mut self.transport)?,
+            "protocol error: the compressed stream ended before END"
+        );
+        let n = buf.len().min(zstd.end - zstd.start);
+        buf[..n].copy_from_slice(&zstd.buffer[zstd.start..zstd.start + n]);
+        zstd.start += n;
+        Ok(n)
+    }
+}
+
+/// zstd reports its own failures, such as a failed allocation, as
+/// `io::Error`s. They are not transport failures: like a failed Rust
+/// allocation, they end the process with a core dump.
+fn zstd_failed<T>(e: std::io::Error) -> T {
+    panic!("zstd: {e}")
 }
 
 /// Append exactly `length` bytes from `reader` to `out`. `out` grows only
@@ -824,6 +1089,239 @@ mod tests {
         .encode();
         payload.push(0);
         End::decode(&payload);
+    }
+
+    #[test]
+    fn rle_roundtrips() {
+        let rle = Rle::decode(
+            &Rle {
+                byte: 0xfe,
+                length: u64::MAX,
+            }
+            .encode(),
+        );
+        assert_eq!((rle.byte, rle.length), (0xfe, u64::MAX));
+    }
+
+    fn end_payload() -> Vec<u8> {
+        End {
+            status: 3,
+            error: String::new(),
+        }
+        .encode()
+    }
+
+    /// The frames of the sender's data session after HELLO, through a
+    /// `Compressor`, and the finished stream.
+    fn compressed(level: i32, threads: u32, frames: &[(u8, &[u8])]) -> Vec<u8> {
+        let mut writer = FrameWriter::new(Compressor::new(Vec::new(), level, threads));
+        for &(kind, payload) in frames {
+            writer.send(kind, payload).unwrap();
+        }
+        writer.into_inner().finish().unwrap()
+    }
+
+    #[test]
+    fn frames_roundtrip_through_the_compressed_stream() {
+        let zeros = vec![0; 100_000];
+        let run = Rle {
+            byte: 7,
+            length: 1 << 40,
+        }
+        .encode();
+        let frames = [
+            (frame::CACHE_RESULT, &b""[..]),
+            (frame::LIT, &zeros),
+            (frame::RLE, &run),
+            (frame::END, &end_payload()),
+        ];
+        let plain = compressed(0, 0, &frames);
+        for (level, threads) in [(0, 0), (1, 1), (19, 3)] {
+            let mut stream = compressed(level, threads, &frames);
+            if level != 0 {
+                assert!(stream.len() < plain.len() / 10, "level {level}");
+            }
+            // Bytes that follow the stream stay in the transport.
+            stream.extend_from_slice(b"after");
+            let mut reader = FrameReader::new(Decompressor::new(&stream[..], level != 0));
+            for &(kind, payload) in &frames {
+                assert_eq!(reader.expect(kind, "a frame").unwrap(), payload);
+            }
+            let mut rest = Vec::new();
+            let mut transport = reader.into_inner().finish().unwrap();
+            transport.read_to_end(&mut rest).unwrap();
+            assert_eq!(rest, b"after", "level {level}");
+        }
+    }
+
+    /// A transport whose bytes stay visible while it is in use.
+    #[derive(Clone, Default)]
+    struct Shared(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+
+    impl Write for Shared {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_flush_makes_every_frame_so_far_decodable() {
+        // The bytes sent until a flush decode to every frame written
+        // before it, although the stream goes on: the sender flushes
+        // before it waits for a reply (DESIGN.md §6.2).
+        for threads in [1, 3] {
+            let sent = Shared::default();
+            let mut writer = FrameWriter::new(Compressor::new(sent.clone(), 9, threads));
+            writer.send(frame::CACHE_RESULT, b"").unwrap();
+            writer.send(frame::LIT, &[1; 1000]).unwrap();
+            writer.flush().unwrap();
+            let so_far = sent.0.borrow().clone();
+            let mut reader = FrameReader::new(Decompressor::new(&so_far[..], true));
+            assert_eq!(reader.expect(frame::CACHE_RESULT, "").unwrap(), b"");
+            assert_eq!(reader.expect(frame::LIT, "LIT").unwrap(), [1; 1000]);
+            let error = reader.next().unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+        }
+    }
+
+    #[test]
+    fn a_truncated_stream_is_unexpected_eof() {
+        // Wherever the stream ends early, even inside the trailer after
+        // END, reading reports UnexpectedEof, never a clean end
+        // (DESIGN.md §6.7).
+        let stream = compressed(
+            3,
+            1,
+            &[(frame::LIT, b"literal"), (frame::END, &end_payload())],
+        );
+        for cut in 0..stream.len() {
+            let mut reader = FrameReader::new(Decompressor::new(&stream[..cut], true));
+            let result = (move || {
+                reader.expect(frame::LIT, "LIT")?;
+                reader.expect(frame::END, "END")?;
+                reader.into_inner().finish()
+            })();
+            let error = result.err().unwrap_or_else(|| panic!("cut at {cut}"));
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::UnexpectedEof,
+                "cut at {cut}"
+            );
+        }
+    }
+
+    /// A transport that gives one byte at a time, and whose reads are
+    /// interrupted 20 times before each byte.
+    struct Interrupting<'a> {
+        bytes: &'a [u8],
+        interruptions: usize,
+        /// The first byte is in the buffer.
+        buffered: bool,
+    }
+
+    impl Read for Interrupting<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.fill_buf()?.len().min(buf.len());
+            buf[..n].copy_from_slice(&self.bytes[..n]);
+            self.consume(n);
+            Ok(n)
+        }
+    }
+
+    impl BufRead for Interrupting<'_> {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            if !self.buffered {
+                if self.interruptions > 0 {
+                    self.interruptions -= 1;
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                (self.interruptions, self.buffered) = (20, true);
+            }
+            Ok(&self.bytes[..self.bytes.len().min(1)])
+        }
+
+        fn consume(&mut self, n: usize) {
+            self.bytes = &self.bytes[n..];
+            self.buffered &= n == 0;
+        }
+    }
+
+    #[test]
+    fn interrupted_transport_reads_are_retried() {
+        // Before each byte, also in the trailer, the transport is
+        // interrupted more times in a row than zstd accepts steps without
+        // progress (DESIGN.md §3).
+        let stream = compressed(
+            3,
+            1,
+            &[(frame::LIT, b"literal"), (frame::END, &end_payload())],
+        );
+        let transport = Interrupting {
+            bytes: &stream,
+            interruptions: 20,
+            buffered: false,
+        };
+        let mut reader = FrameReader::new(Decompressor::new(transport, true));
+        assert_eq!(reader.expect(frame::LIT, "LIT").unwrap(), b"literal");
+        assert_eq!(reader.expect(frame::END, "END").unwrap(), end_payload());
+        let transport = reader.into_inner().finish().unwrap();
+        assert!(transport.bytes.is_empty(), "the frame did not end");
+    }
+
+    #[test]
+    #[should_panic(expected = "protocol error: data after END")]
+    fn data_after_end_is_a_protocol_error() {
+        let stream = compressed(3, 1, &[(frame::END, &end_payload()), (frame::LIT, b"late")]);
+        let mut reader = FrameReader::new(Decompressor::new(&stream[..], true));
+        reader.expect(frame::END, "END").unwrap();
+        let _ = reader.into_inner().finish();
+    }
+
+    /// LIT, then `partial`, in a zstd frame that ends without END.
+    fn ended_before_end(partial: &[u8]) -> Vec<u8> {
+        let mut writer = FrameWriter::new(Compressor::new(Vec::new(), 3, 1));
+        writer.send(frame::LIT, b"literal").unwrap();
+        let mut compressor = writer.into_inner();
+        compressor.write_all(partial).unwrap();
+        compressor.finish().unwrap()
+    }
+
+    /// Read LIT, then try to read the next frame.
+    fn read_after_lit(stream: &[u8]) {
+        let mut reader = FrameReader::new(Decompressor::new(stream, true));
+        reader.expect(frame::LIT, "LIT").unwrap();
+        let _ = reader.next();
+    }
+
+    #[test]
+    #[should_panic(expected = "protocol error: the compressed stream ended before END")]
+    fn a_frame_that_ends_before_end_is_a_protocol_error() {
+        // Only the sender ends the zstd frame, after END; a truncated
+        // stream cannot end it (DESIGN.md §6.5).
+        read_after_lit(&ended_before_end(b""));
+    }
+
+    #[test]
+    #[should_panic(expected = "protocol error: the compressed stream ended before END")]
+    fn a_frame_that_ends_inside_a_frame_is_a_protocol_error() {
+        // Two bytes of a frame header, which a check after the frame
+        // reader would see as UnexpectedEof, like a truncation.
+        read_after_lit(&ended_before_end(&[frame::END, 0]));
+    }
+
+    #[test]
+    #[should_panic(expected = "protocol error: invalid compressed data")]
+    fn a_wrong_checksum_is_a_protocol_error() {
+        let mut stream = compressed(3, 1, &[(frame::END, &end_payload())]);
+        *stream.last_mut().unwrap() ^= 1;
+        let mut reader = FrameReader::new(Decompressor::new(&stream[..], true));
+        reader.expect(frame::END, "END").unwrap();
+        let _ = reader.into_inner().finish();
     }
 
     #[test]

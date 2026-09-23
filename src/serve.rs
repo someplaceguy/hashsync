@@ -3,7 +3,9 @@
 //! `serve` first listens on the rendezvous socket, exchanges protocol
 //! versions and data HELLOs, accepts `attach`, and completes the list
 //! exchange and CACHE_RESULT before starting the command. The scanner then
-//! turns the command's stdout into literals and references.
+//! turns the command's stdout into literals, runs, and references. After
+//! its HELLO, this side's data frames share one zstd stream unless
+//! compression is disabled (DESIGN.md §6.2).
 //!
 //! Each incoming direction has one owner for the whole run, so session
 //! loss is fatal at any moment — during rendezvous, setup, startup
@@ -38,7 +40,8 @@ use crate::hash;
 use crate::hashlist::{self, ListId};
 use crate::hashtable::HashTable;
 use crate::protocol::{
-    self, Answer, End, FrameReader, FrameWriter, HashList, Query, ReceiverHello, SenderHello, frame,
+    self, Answer, COMPRESSION_LEVELS, Compressor, End, FrameReader, FrameWriter, HashList, Query,
+    ReceiverHello, Rle, SenderHello, frame,
 };
 use crate::rendezvous;
 use crate::scanner::{Frame, Scanner};
@@ -51,10 +54,11 @@ const READ_CHUNK: usize = 256 << 10;
 const WRITE_BUFFER: usize = 256 << 10;
 
 /// The data queue holds `max(1, QUEUED_BYTES / B)` frames; each frame
-/// carries at most `B` output bytes.
+/// holds at most `B` bytes.
 const QUEUED_BYTES: usize = 4 << 20;
 
-type DataWriter = FrameWriter<BufWriter<FdWriter>>;
+/// The data session after HELLO: frames through the compression stream.
+type DataWriter = FrameWriter<Compressor<BufWriter<FdWriter>>>;
 
 /// What the data writer sends, in order.
 enum Output {
@@ -100,8 +104,18 @@ pub fn run(token: &str) -> ! {
         // explicit absence and expect a full list.
         base: None,
     };
+    // The receiver needs HELLO to send the list.
     send_data(&mut data_out, frame::HELLO, &reply.encode());
     flush_data(&mut data_out);
+    // After HELLO, this side's data frames share one zstd stream unless
+    // compression is disabled. Output latency does not matter, so the
+    // stream is flushed only before this side waits for a reply, and
+    // finished after END (DESIGN.md §6.2).
+    let mut data_out = FrameWriter::new(Compressor::new(
+        data_out.into_inner(),
+        hello.compression_level,
+        thread_count(hello.compression_threads),
+    ));
 
     // The control session: accept `attach`, then both sides send their
     // protocol version immediately. The control reader owns the incoming
@@ -153,8 +167,9 @@ pub fn run(token: &str) -> ! {
         None
     };
     drop(encoded);
+    // The receiver does not reply to CACHE_RESULT, so it can wait in the
+    // stream for the command's output.
     send_data(&mut data_out, frame::CACHE_RESULT, b"");
-    flush_data(&mut data_out);
     if let Some(list) = &published {
         list.renew();
     }
@@ -271,14 +286,21 @@ pub fn run(token: &str) -> ! {
     die::finish(0)
 }
 
-/// The threads that probe the scanner's long stretches of windows:
-/// `requested`, or half the cores, at least one, for 0 (DESIGN.md §6.3).
-/// One thread needs no pool: the scanner probes on its own thread.
+/// `requested` threads, or half the cores, at least one, for 0: the
+/// count of probe threads and of compression threads (DESIGN.md §7).
+fn thread_count(requested: u32) -> u32 {
+    match requested {
+        0 => std::thread::available_parallelism()
+            .map_or(1, |n| u32::try_from(n.get() / 2).unwrap_or(u32::MAX).max(1)),
+        n => n,
+    }
+}
+
+/// The threads that probe the scanner's long stretches of windows
+/// (DESIGN.md §6.3). One thread needs no pool: the scanner probes on its
+/// own thread.
 fn probe_pool(requested: u32) -> Option<rayon::ThreadPool> {
-    let threads = match requested {
-        0 => std::thread::available_parallelism().map_or(1, |n| (n.get() / 2).max(1)),
-        n => n as usize,
-    };
+    let threads = thread_count(requested) as usize;
     (threads > 1).then(|| {
         rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
@@ -291,9 +313,8 @@ fn probe_pool(requested: u32) -> Option<rayon::ThreadPool> {
 /// Run the scanner until the command's output is emitted (DESIGN.md
 /// §6.3). Each round takes the waiting answers first, then command output
 /// while the scanner's buffer has room, then scans and queues ready frames
-/// while the data queue has room. A round that moves nothing queues a
-/// short literal too, and then waits for an answer, command output, or
-/// room in the data queue.
+/// while the data queue has room. A round that moves nothing waits for an
+/// answer, command output, or room in the data queue.
 fn transfer(
     scanner: &mut Scanner,
     chunks: &Receiver<Vec<u8>>,
@@ -323,16 +344,12 @@ fn transfer(
             // The control writer ends only after the scanner.
             let _ = queries.send(Query { offset, strong });
         });
-        progress |= queue_frames(scanner, output, false);
-        if progress {
-            continue;
-        }
-        // Nothing moved: queue a short last literal too. This thread is
-        // the queue's only producer, so a queue with room keeps it. Only a
-        // queue that is full before this attempt can hold back a ready
-        // frame, so only then does the wait include room.
+        // This thread is the queue's only producer, so a queue with room
+        // keeps it. Only a queue that is full before this attempt can hold
+        // back a ready frame, so only then does the wait include room.
         let full = output.is_full();
-        if queue_frames(scanner, output, true) {
+        progress |= queue_frames(scanner, output);
+        if progress {
             continue;
         }
         if scanner.finished() {
@@ -352,12 +369,11 @@ fn transfer(
 
 /// Queue the scanner's ready frames while the data queue has room. A frame
 /// leaves the scanner, which advances `e`, only when the queue can take it
-/// (DESIGN.md §6.3). `flush` includes a short last literal. True when a
-/// frame was queued.
-fn queue_frames(scanner: &mut Scanner, output: &Sender<Output>, flush: bool) -> bool {
+/// (DESIGN.md §6.3). True when a frame was queued.
+fn queue_frames(scanner: &mut Scanner, output: &Sender<Output>) -> bool {
     let mut queued = false;
     while !output.is_full()
-        && let Some(frame) = scanner.next_frame(flush)
+        && let Some(frame) = scanner.next_frame()
     {
         // The only producer found room.
         output
@@ -387,23 +403,24 @@ fn read_output(mut stdout: ChildStdout, chunks: &Sender<Vec<u8>>) {
 }
 
 /// The data session's outgoing direction after setup: frames in order,
-/// flushed whenever the queue runs empty, and END last (DESIGN.md §6.2).
+/// then END, which finishes the stream (DESIGN.md §6.2). Nothing flushes
+/// the stream before END: the receiver replies to no frame before it.
 fn write_output(mut data_out: DataWriter, output: &Receiver<Output>) {
     loop {
-        let next = data_out
-            .next_from(output)
-            .unwrap_or_else(|e| die(format!("data session: {e}")));
-        match next {
-            Some(Output::Scanned(Frame::Literal(bytes))) => {
-                send_data(&mut data_out, frame::LIT, &bytes);
+        match output.recv().expect("the scanner ended before END") {
+            Output::Scanned(Frame::Literal(bytes)) => send_data(&mut data_out, frame::LIT, &bytes),
+            Output::Scanned(Frame::Reference) => send_data(&mut data_out, frame::REF, b""),
+            Output::Scanned(Frame::Run { byte, length }) => {
+                send_data(&mut data_out, frame::RLE, &Rle { byte, length }.encode());
             }
-            Some(Output::Scanned(Frame::Reference)) => send_data(&mut data_out, frame::REF, b""),
-            Some(Output::End(end)) => {
+            Output::End(end) => {
                 send_data(&mut data_out, frame::END, &end.encode());
-                flush_data(&mut data_out);
+                // Sender stdout stays open until process exit.
+                if let Err(e) = data_out.into_inner().finish() {
+                    die(format!("data session: {e}"));
+                }
                 return;
             }
-            None => return,
         }
     }
 }
@@ -562,13 +579,13 @@ fn die_data(e: &std::io::Error) -> ! {
     die(format!("data session: {e}"))
 }
 
-fn send_data(out: &mut DataWriter, kind: u8, payload: &[u8]) {
+fn send_data<W: Write>(out: &mut FrameWriter<W>, kind: u8, payload: &[u8]) {
     if let Err(e) = out.send(kind, payload) {
         die(format!("data session: {e}"));
     }
 }
 
-fn flush_data(out: &mut DataWriter) {
+fn flush_data<W: Write>(out: &mut FrameWriter<W>) {
     if let Err(e) = out.flush() {
         die(format!("data session: {e}"));
     }
@@ -592,12 +609,12 @@ fn validate_hello(hello: &ReceiverHello) {
             hash::weak::ID
         ));
     }
-    // Compression arrives with PLAN.md step 5; this version negotiates
-    // it disabled.
-    if hello.compression_level != 0 {
+    if !COMPRESSION_LEVELS.contains(&hello.compression_level) {
         die(format!(
-            "incompatible receiver: compression level {} (this sender supports none)",
-            hello.compression_level
+            "incompatible receiver: compression level {} (this sender supports {} to {})",
+            hello.compression_level,
+            COMPRESSION_LEVELS.start(),
+            COMPRESSION_LEVELS.end()
         ));
     }
 }
@@ -647,6 +664,8 @@ mod tests {
         for i in 0..1000 {
             input.extend_from_slice(&noise(i % 11, 100 + i as u64));
             input.extend_from_slice(listed[i % listed.len()]);
+            // Equal bytes, now and then enough for runs.
+            input.extend(std::iter::repeat_n(i as u8, i % 7 * 50));
         }
         let weak = WeakHasher::new(BS as usize);
         let mut values: Vec<u64> = listed.iter().map(|b| weak.hash(b)).collect();
@@ -703,6 +722,9 @@ mod tests {
                         Output::Scanned(Frame::Reference) => {
                             let c = output.len() as u64;
                             output.extend_from_slice(&pins.lock().unwrap()[&c]);
+                        }
+                        Output::Scanned(Frame::Run { byte, length }) => {
+                            output.extend(std::iter::repeat_n(byte, length as usize));
                         }
                         Output::End(_) => break,
                     }

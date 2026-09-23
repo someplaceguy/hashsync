@@ -769,8 +769,8 @@ The receiver generates token `T` and starts both sessions together:
 `serve` first listens on `$XDG_RUNTIME_DIR/hashsync/T.sock` (fallback: a
 private directory under `/tmp`), mode 0600. It exchanges protocol versions
 and data HELLOs, accepts `attach`, and completes the list exchange and
-CACHE_RESULT before starting the command. Flush setup responses before
-waiting.
+CACHE_RESULT before starting the command. Before it waits for a reply, it
+flushes the frames that the receiver must read to reply.
 
 `attach` retries a not-yet-listening socket while its stdin remains open,
 with no deadline. It relays stdin to the socket and the socket to stdout,
@@ -854,7 +854,6 @@ Payloads:
   enabled. With `sender_cache = false`, send it after removing earlier
   files for this receiver/index. Cache operation failures are fatal as
   specified in section 5.6. Repeated acknowledgements are protocol errors.
-  Flush before starting the command.
 - LIT: literal bytes.
 - REF: empty; use the pin at the current output offset.
 - RLE: `byte u8, length u64`.
@@ -884,10 +883,12 @@ stdin pipes open until the sender and relay exit.
 After HELLO, all sender-to-receiver data-session frames share one zstd stream,
 unless compression is disabled. This includes HASHFULL and CACHE_RESULT.
 Control traffic and all receiver-to-sender traffic are uncompressed.
-The data writer flushes setup responses and, when requested by the scanner,
-flushes compression after its queue drains. Finish the stream after END.
-These flushes ensure that waiting for answers or command output cannot trap
-frames inside the compressor. Compression settings are in section 7.
+Output latency does not matter, only bandwidth. So the sender flushes the
+stream only before it waits for a reply, after HASHFULL, and finishes the
+stream after END. Other frames can stay in the compressor and the transport
+buffer until more output fills them or the stream ends. No wait depends on
+them: queries and answers use the control session. Compression settings are
+in section 7.
 
 ### 6.3 The sender's scanner
 
@@ -996,7 +997,7 @@ Emit from the front until blocked by a Query or a full data queue:
 - Run becomes RLE for its known length and advances `e` by that length.
   A new Run starts at `B` bytes and need not wait to grow.
 - Literal emits up to `B` bytes per LIT. Emit a short Literal when another
-  record follows, before waiting, or at EOF; otherwise let it grow.
+  record follows or at EOF; otherwise let it grow.
 
 Advance `e` only after the frame is accepted by the data writer. LIT owns
 a copy before those buffer bytes are released. Remove emitted record portions
@@ -1008,9 +1009,8 @@ queue and remain ordered even when offsets go backwards. Discarded records
 can leave obsolete requests; lookahead is not a bound on all outstanding
 queries or receiver pins.
 
-When progress requires input, answers, or data-queue space, first emit ready
-short literals and request a compressor flush after the queue drains. Wait
-on notifications for those events, continuing to prioritize answers.
+When progress requires input, answers, or data-queue space, wait on
+notifications for those events, continuing to prioritize answers.
 Backpressure propagates from the data writer through the lookahead buffer
 to the command. Pin allocation and release are entirely receiver-local.
 
@@ -1153,9 +1153,9 @@ No extent is punched while its append or REF read is still using it.
   SIGINT/SIGTERM end the run unsuccessfully without a core dump.
 - Stderr relay read, write, or flush failures also end the run with `die`
   without a core dump.
-- Invalid frames, unexpected answers, missing pins, protocol arithmetic
-  overflow, database errors, and invariant violations are bugs: panic and
-  abort.
+- Invalid frames, a compressed stream that ends before END, unexpected
+  answers, missing pins, protocol arithmetic overflow, database errors, and
+  invariant violations are bugs: panic and abort.
 - Conflicting immutable-copy policies, duplicate or nested root paths, and
   repeated directory identities detected during expansion or traversal call
   `die` without a core dump.
@@ -1458,6 +1458,10 @@ decision history is in version control.
   Use buffered `pread`.
 - **Opening candidates by inode handle:** requires privileges. Open indexed
   paths and verify the resulting bytes instead.
+- **Flushing the compression stream when the scanner waits:** kept output
+  responsive when the command pauses, but each flush ends a zstd block or
+  job early. With a command paced at 2 MB/s, level 9 sent 5.7% more bytes
+  and used 53% more compression CPU. Output latency does not matter here.
 
 ## 11. Repository conventions
 

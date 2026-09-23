@@ -4,11 +4,12 @@
 //! exit (DESIGN.md §6.7): during rendezvous, while `serve` waits for the
 //! control session, and while command stderr still drains after END_ACK.
 //! Queries and answers travel on the control session (DESIGN.md §6.2);
-//! obsolete queries still unsent at the normal end do not fail it.
+//! obsolete queries still unsent at the normal end do not fail it. After
+//! HELLO, the data frames of `serve` form one zstd frame.
 
 mod common;
 
-use std::io::{Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -109,15 +110,15 @@ fn hello_prefix(block_size: u32, strong: &[u8]) -> Vec<u8> {
 }
 
 /// The receiver's HELLO payload for `list`, with BLAKE3 as its strong
-/// hash.
-fn hello_payload(block_size: u32, list: &[u8], command: &[&str]) -> Vec<u8> {
+/// hash and zstd compression at `level`, 0 for none.
+fn hello_payload(block_size: u32, list: &[u8], command: &[&str], level: i32) -> Vec<u8> {
     let mut hello = hello_prefix(block_size, b"blake3");
     hello.extend_from_slice(blake3::hash(list).as_bytes()); // target
     hello.extend_from_slice(&[0xaa; 16]); // account ID
     hello.extend_from_slice(&[0xbb; 16]); // index ID
     hello.push(1); // sender_cache
     hello.extend_from_slice(&(90 * 24 * 3600u64).to_le_bytes()); // hashlist_max_age
-    hello.extend_from_slice(&0i32.to_le_bytes()); // compression level
+    hello.extend_from_slice(&level.to_le_bytes()); // compression level
     hello.extend_from_slice(&0u32.to_le_bytes()); // compression threads
     hello.extend_from_slice(&0u32.to_le_bytes()); // probe threads
     hello.extend_from_slice(&(256u64 << 20).to_le_bytes()); // lookahead
@@ -256,12 +257,12 @@ impl Serve {
     /// The versions, then the data HELLOs: the receiver's, for the empty
     /// list and 4 KiB blocks, then the sender's reply.
     fn hello(&mut self, command: &[&str]) {
-        self.hello_with(4096, &empty_list(), command);
+        self.hello_with(4096, &empty_list(), command, 0);
     }
 
-    fn hello_with(&mut self, block_size: u32, list: &[u8], command: &[&str]) {
+    fn hello_with(&mut self, block_size: u32, list: &[u8], command: &[&str], level: i32) {
         self.send_raw(&version());
-        self.send(HELLO, &hello_payload(block_size, list, command));
+        self.send(HELLO, &hello_payload(block_size, list, command, level));
         assert_eq!(self.recv_version(), version());
         assert_eq!(self.recv().0, HELLO);
     }
@@ -275,16 +276,39 @@ impl Serve {
         UnixStream::connect(address).unwrap()
     }
 
-    /// The full empty list, whose bytes follow HASHLIST directly, and its
-    /// acknowledgement, which has no payload.
-    fn exchange_list(&mut self) {
-        self.exchange(&empty_list());
+    /// The full empty list, whose bytes follow HASHLIST directly.
+    fn send_empty_list(&mut self) {
+        self.send_list(&empty_list());
     }
 
-    fn exchange(&mut self, list: &[u8]) {
+    fn send_list(&mut self, list: &[u8]) {
         self.send(HASHLIST, &(list.len() as u64).to_le_bytes());
         self.send_raw(list);
+    }
+
+    /// CACHE_RESULT, the first data frame after the list, without a
+    /// payload. `serve` does not flush it: it can arrive with the
+    /// command's output (DESIGN.md §6.2).
+    fn recv_result(&mut self) {
         assert_eq!(self.recv(), (CACHE_RESULT, Vec::new()));
+    }
+
+    /// Wait until `serve` has published the list in its cache, which it
+    /// does right before CACHE_RESULT (DESIGN.md §5.6), within a bound: a
+    /// regression must fail the test, not hang it.
+    fn wait_for_published_list(&self) {
+        let dir = self.home.path().join("cache/hashsync/remote-hashlists");
+        let published = || {
+            let peers = std::fs::read_dir(&dir).into_iter().flatten().flatten();
+            peers
+                .flat_map(|peer| std::fs::read_dir(peer.path()))
+                .any(|files| {
+                    files
+                        .flatten()
+                        .any(|file| file.file_name().to_string_lossy().ends_with(".cache"))
+                })
+        };
+        assert!(wait_until(published), "serve published no list");
     }
 
     /// Require the normal exit, with status 0.
@@ -353,6 +377,17 @@ fn an_unknown_strong_hash_is_rejected_before_the_target() {
 }
 
 #[test]
+fn an_unsupported_compression_level_is_rejected() {
+    // The receiver's HELLO sets the run's parameters; the sender ends the
+    // run before command startup if it does not support them
+    // (DESIGN.md §6.2).
+    let mut serve = Serve::start();
+    serve.send_raw(&version());
+    serve.send(HELLO, &hello_payload(4096, &empty_list(), &["true"], 20));
+    serve.expect_death("incompatible receiver: compression level 20");
+}
+
+#[test]
 fn receiver_loss_during_rendezvous_is_fatal() {
     let mut serve = Serve::start();
     serve.hello(&["true"]);
@@ -377,11 +412,13 @@ fn control_loss_before_the_list_is_fatal() {
 #[test]
 fn receiver_loss_while_serve_waits_for_the_control_version_is_fatal() {
     // The command starts only after the receiver's versions on both
-    // sessions matched (DESIGN.md §6.2).
+    // sessions matched (DESIGN.md §6.2). After it published the list,
+    // `serve` waits for the control session's version.
     let mut serve = Serve::start();
     serve.hello(&["true"]);
     let _control = serve.attach();
-    serve.exchange_list();
+    serve.send_empty_list();
+    serve.wait_for_published_list();
     serve.lose_data_session();
     serve.expect_death("the receiver disappeared");
 }
@@ -396,7 +433,8 @@ fn receiver_loss_after_end_ack_is_fatal_while_stderr_drains() {
     serve.hello(&["sh", "-c", "( exec >/dev/null; exec sleep 60 ) & echo $!"]);
     let mut control = serve.attach();
     control.write_all(&version()).unwrap();
-    serve.exchange_list();
+    serve.send_empty_list();
+    serve.recv_result();
     let mut output = Vec::new();
     loop {
         match serve.recv() {
@@ -430,10 +468,10 @@ fn an_answer_decides_between_a_reference_and_literals() {
         let file = serve.home.path().join("block");
         std::fs::write(&file, &block).unwrap();
         let list = encode_list(&[weak_hash(&block)]);
-        serve.hello_with(4096, &list, &["cat", file.to_str().unwrap()]);
+        serve.hello_with(4096, &list, &["cat", file.to_str().unwrap()], 0);
         let mut control = serve.attach();
         control.write_all(&version()).unwrap();
-        serve.exchange(&list);
+        serve.send_list(&list);
 
         let mut theirs = [0u8; 4];
         control.read_exact(&mut theirs).unwrap();
@@ -446,6 +484,7 @@ fn an_answer_decides_between_a_reference_and_literals() {
         answer.push(found.into());
         control.write_all(&frame(ANSWER, &answer)).unwrap();
 
+        serve.recv_result();
         let mut literal = Vec::new();
         let mut references = 0;
         loop {
@@ -503,10 +542,10 @@ fn obsolete_queries_in_flight_do_not_fail_the_normal_end() {
     let mut serve = on_one_cpu(Serve::start);
     let file = serve.home.path().join("output");
     std::fs::write(&file, &data).unwrap();
-    serve.hello_with(B as u32, &list, &["cat", file.to_str().unwrap()]);
+    serve.hello_with(B as u32, &list, &["cat", file.to_str().unwrap()], 0);
     let mut control = serve.attach();
     control.write_all(&version()).unwrap();
-    serve.exchange(&list);
+    serve.send_list(&list);
     let mut theirs = [0u8; 4];
     control.read_exact(&mut theirs).unwrap();
     assert_eq!(theirs, version());
@@ -534,6 +573,7 @@ fn obsolete_queries_in_flight_do_not_fail_the_normal_end() {
     std::thread::sleep(Duration::from_millis(300));
     control.write_all(&answer(20, false)).unwrap();
 
+    serve.recv_result();
     let mut output = Vec::new();
     loop {
         match serve.recv() {
@@ -545,5 +585,36 @@ fn obsolete_queries_in_flight_do_not_fail_the_normal_end() {
     }
     assert!(output == data, "the output differs");
     serve.send(END_ACK, b"");
+    serve.expect_success();
+}
+
+#[test]
+fn compressed_frames_form_one_zstd_frame_that_ends_with_end() {
+    // After HELLO, the data frames share one zstd frame with a checksum,
+    // which ends right after END, and nothing follows it (DESIGN.md §6.2).
+    let mut serve = Serve::start();
+    serve.hello_with(4096, &empty_list(), &["printf", "%s", "compressed"], 3);
+    let mut control = serve.attach();
+    control.write_all(&version()).unwrap();
+    serve.send_empty_list();
+    let Serve {
+        data_in, data_out, ..
+    } = &mut serve;
+    let mut decoder = zstd::stream::read::Decoder::with_buffer(BufReader::new(data_out))
+        .unwrap()
+        .single_frame();
+    assert_eq!(recv_frame(&mut decoder), (CACHE_RESULT, Vec::new()));
+    assert_eq!(recv_frame(&mut decoder), (LIT, b"compressed".to_vec()));
+    assert_eq!(recv_frame(&mut decoder).0, END);
+    assert_eq!(decoder.read(&mut [0]).unwrap(), 0, "the frame goes on");
+    let mut transport = decoder.finish();
+    data_in
+        .as_mut()
+        .unwrap()
+        .write_all(&frame(END_ACK, b""))
+        .unwrap();
+    let mut rest = Vec::new();
+    transport.read_to_end(&mut rest).unwrap();
+    assert!(rest.is_empty(), "bytes after the zstd frame");
     serve.expect_success();
 }

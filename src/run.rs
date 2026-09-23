@@ -4,10 +4,10 @@
 //! The run updates the index (or opens it read-only), exports and
 //! publishes the hash list, prepares the pin file and the lookup workers,
 //! starts both SSH sessions, and completes the exchange. It then
-//! reconstructs stdout from literals, runs, and references, while the
-//! lookup workers answer the sender's queries (DESIGN.md §6.4), and it
-//! returns the command's status once both sessions exited successfully.
-//! Compression arrives with PLAN.md step 5.
+//! reconstructs stdout from literals, runs, and references, which arrive
+//! through the compression stream, while the lookup workers answer the
+//! sender's queries (DESIGN.md §6.4). It returns the command's status once
+//! both sessions exited successfully.
 
 use std::ffi::OsStr;
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -30,14 +30,20 @@ use crate::index::{self, Settings};
 use crate::lookup;
 use crate::pins::{PinFile, Pins};
 use crate::protocol::{
-    self, Answer, End, FrameReader, FrameWriter, HashList, Query, ReceiverHello, Rle, SenderHello,
-    frame,
+    self, Answer, Decompressor, End, FrameReader, FrameWriter, HashList, Query, ReceiverHello, Rle,
+    SenderHello, frame,
 };
 use crate::rendezvous;
 use crate::roots::{self, Location};
 use crate::ssh;
 use crate::sys;
 use crate::update;
+
+/// The size of the data session's read buffer.
+const READ_BUFFER: usize = 256 << 10;
+
+/// The largest write of a run's bytes to stdout.
+const RUN_CHUNK: u64 = 256 << 10;
 
 pub fn run(
     config: &Config,
@@ -124,10 +130,13 @@ pub fn run(
     // The data session, with received bytes counted for the summary.
     let wire_bytes = Arc::new(AtomicU64::new(0));
     let mut data_out = FrameWriter::new(data.stdin);
-    let mut data_in = FrameReader::new(BufReader::new(CountingReader {
-        inner: data.stdout,
-        count: Arc::clone(&wire_bytes),
-    }));
+    let mut data_in = FrameReader::new(BufReader::with_capacity(
+        READ_BUFFER,
+        CountingReader {
+            inner: data.stdout,
+            count: Arc::clone(&wire_bytes),
+        },
+    ));
 
     let hello = ReceiverHello {
         block_size: config.block_size,
@@ -138,10 +147,8 @@ pub fn run(
         index_id: meta.index_id,
         sender_cache: options.sender_cache,
         hashlist_max_age: config.hashlist_max_age,
-        // Compression arrives with PLAN.md step 5: negotiate it
-        // disabled.
-        compression_level: 0,
-        compression_threads: 0,
+        compression_level: config.compression_level,
+        compression_threads: config.compression_threads,
         probe_threads: config.probe_threads,
         lookahead: config.lookahead,
         negative_cache: config.negative_cache,
@@ -157,6 +164,10 @@ pub fn run(
 
     check_sender_version(&mut data_in, host);
     let sender = SenderHello::decode(expect_data(&mut data_in, frame::HELLO, "HELLO"));
+    // After its HELLO, the sender's data frames share one zstd stream
+    // unless compression is disabled (DESIGN.md §6.2).
+    let compressed = hello.compression_level != 0;
+    let mut data_in = FrameReader::new(Decompressor::new(data_in.into_inner(), compressed));
 
     // Durably publish the target in the sender's peer directory before
     // sending list data; a publication failure is fatal and ends setup
@@ -189,71 +200,23 @@ pub fn run(
     drop(published);
     cache::expire(config.hashlist_max_age);
 
-    // Reconstruct stdout in order (DESIGN.md §6.4). `output_bytes` is
-    // where the frame's output ends, checked before anything is written.
-    // Once the output is written, the pins learn the new offset, which
-    // releases the pins below it.
     let mut stdout = fsops::stdout();
-    let block_size = u64::from(config.block_size);
-    let mut block = vec![0u8; config.block_size as usize];
-    let mut output_bytes = 0u64;
-    let mut literal_bytes = 0u64;
-    let mut reference_bytes = 0u64;
-    let mut run_bytes = 0u64;
-    let end = loop {
-        let received = match data_in.next() {
-            Ok(Some(received)) => received,
-            Ok(None) => die("the data session ended before END"),
-            Err(e) => die_data(&e),
-        };
-        match received.kind {
-            frame::LIT => {
-                assert!(!received.payload.is_empty(), "protocol error: empty LIT");
-                let length = received.payload.len() as u64;
-                output_bytes = advance(output_bytes, length);
-                write_output(&mut stdout, received.payload);
-                literal_bytes += length;
-            }
-            frame::REF => {
-                assert!(
-                    received.payload.is_empty(),
-                    "protocol error: REF with a payload"
-                );
-                output_bytes = advance(output_bytes, block_size);
-                pins.read_reference(&mut block);
-                write_output(&mut stdout, &block);
-                reference_bytes += block_size;
-            }
-            frame::RLE => {
-                // The sender emits runs from step 5 on; accept any
-                // positive length (DESIGN.md §6.4).
-                let rle = Rle::decode(received.payload);
-                output_bytes = advance(output_bytes, rle.length);
-                run_bytes += rle.length;
-                let chunk = vec![rle.byte; rle.length.min(64 * 1024) as usize];
-                let mut remaining = rle.length;
-                while remaining > 0 {
-                    let n = remaining.min(chunk.len() as u64) as usize;
-                    write_output(&mut stdout, &chunk[..n]);
-                    remaining -= n as u64;
-                }
-            }
-            frame::END => break End::decode(received.payload),
-            kind => panic!("protocol error: unexpected data frame type {kind}"),
-        }
-        pins.reached(output_bytes);
-    };
+    let (end, counts) = reconstruct(&mut data_in, &pins, &mut stdout, config.block_size);
 
-    // Completion (DESIGN.md §6.7). Compression is disabled, so END is
-    // sufficient framing; flush reconstructed stdout, enter Completing,
-    // send the single END_ACK, and drain the session to a clean EOF.
+    // Completion (DESIGN.md §6.7): the compression stream must end right
+    // after END. Then flush reconstructed stdout, enter Completing, send
+    // the single END_ACK, and drain the session to a clean EOF.
+    let transport = data_in
+        .into_inner()
+        .finish()
+        .unwrap_or_else(|e| die_data(&e));
     if let Err(e) = stdout.flush() {
         die(format!("cannot write to stdout: {e}"));
     }
     pins.complete();
     send_data(&mut data_out, frame::END_ACK, b"");
     flush_data(&mut data_out);
-    match data_in.drain_to_eof() {
+    match protocol::drain_to_eof(transport) {
         Ok(true) => {}
         Ok(false) => die("trailing data after END"),
         Err(e) => die_data(&e),
@@ -272,11 +235,84 @@ pub fn run(
         die::note(format!("remote command failed to start: {}", end.error));
     }
     die::note(format!(
-        "{output_bytes} bytes output ({literal_bytes} literal, {reference_bytes} reference, \
-         {run_bytes} run), {} bytes wire, {hash_list_bytes} bytes hash list, 0 bytes delta",
+        "{} bytes output ({} literal, {} reference, {} run), {} bytes wire, \
+         {hash_list_bytes} bytes hash list, 0 bytes delta",
+        counts.output,
+        counts.literal,
+        counts.reference,
+        counts.run,
         wire_bytes.load(Relaxed),
     ));
     die::finish(end.status)
+}
+
+/// The bytes of reconstructed output, for the summary.
+#[derive(Default)]
+struct Counts {
+    output: u64,
+    literal: u64,
+    reference: u64,
+    run: u64,
+}
+
+/// Reconstruct stdout in order from the data frames until END, and return
+/// END with the counts (DESIGN.md §6.4). Offset overflow is checked before
+/// a frame's output is written. Once it is written, the pins learn the new
+/// offset, which releases the pins below it.
+fn reconstruct<R: Read>(
+    data_in: &mut FrameReader<R>,
+    pins: &Pins,
+    stdout: &mut fsops::FdWriter,
+    block_size: u32,
+) -> (End, Counts) {
+    let mut counts = Counts::default();
+    let mut block = vec![0u8; block_size as usize];
+    // Repeated bytes for runs.
+    let mut run = Vec::new();
+    loop {
+        let received = match data_in.next() {
+            Ok(Some(received)) => received,
+            Ok(None) => die("the data session ended before END"),
+            Err(e) => die_data(&e),
+        };
+        match received.kind {
+            frame::LIT => {
+                assert!(!received.payload.is_empty(), "protocol error: empty LIT");
+                let length = received.payload.len() as u64;
+                counts.output = advance(counts.output, length);
+                write_output(stdout, received.payload);
+                counts.literal += length;
+            }
+            frame::REF => {
+                assert!(
+                    received.payload.is_empty(),
+                    "protocol error: REF with a payload"
+                );
+                counts.output = advance(counts.output, block_size.into());
+                pins.read_reference(&mut block);
+                write_output(stdout, &block);
+                counts.reference += u64::from(block_size);
+            }
+            frame::RLE => {
+                // Accept any positive length, though the sender emits runs
+                // of at least `B` bytes (DESIGN.md §6.4).
+                let rle = Rle::decode(received.payload);
+                counts.output = advance(counts.output, rle.length);
+                run.clear();
+                run.resize(rle.length.min(RUN_CHUNK) as usize, rle.byte);
+                let mut remaining = rle.length;
+                while remaining > 0 {
+                    let n = remaining.min(run.len() as u64) as usize;
+                    write_output(stdout, &run[..n]);
+                    remaining -= n as u64;
+                }
+                counts.run += rle.length;
+            }
+            frame::END => return (End::decode(received.payload), counts),
+            kind => panic!("protocol error: unexpected data frame type {kind}"),
+        }
+        pins.reached(counts.output);
+    }
 }
 
 /// Read-only index access for `--no-update` (DESIGN.md §4.4 and §8):

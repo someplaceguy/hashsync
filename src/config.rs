@@ -1,8 +1,8 @@
 //! Configuration (DESIGN.md §7).
 //!
 //! This milestone accepts the options that control indexing, transfers,
-//! and block references. Options of later milestones are unknown fields
-//! and are rejected.
+//! block references, and compression. Options of later milestones are
+//! unknown fields and are rejected.
 
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
@@ -14,6 +14,7 @@ use crate::die::die;
 use crate::fsops;
 use crate::glob;
 use crate::hash::StrongHash;
+use crate::protocol::COMPRESSION_LEVELS;
 use crate::ssh;
 
 pub const MIN_BLOCK_SIZE: u64 = 4096;
@@ -25,6 +26,7 @@ pub const DEFAULT_HASHLIST_MAX_AGE: u64 = 90 * 24 * 3600;
 const DEFAULT_LOOKAHEAD: u64 = 256 << 20;
 const DEFAULT_NEGATIVE_CACHE: u64 = 128 << 20;
 const DEFAULT_CANDIDATE_ATTEMPTS: u32 = 128;
+const DEFAULT_COMPRESSION_LEVEL: i32 = 9;
 
 #[derive(Debug)]
 pub struct Config {
@@ -46,6 +48,12 @@ pub struct Config {
     pub probe_threads: u32,
     /// Candidates tried per query; at least 1 (DESIGN.md §6.4).
     pub candidate_attempts: u32,
+    /// The zstd level of the sender's data stream; 0 disables compression
+    /// (DESIGN.md §6.2).
+    pub compression_level: i32,
+    /// The sender's compression threads; 0 selects half the sender's
+    /// cores, at least one.
+    pub compression_threads: u32,
     /// Path bytes of the directory that holds the receiver's pin file.
     pub pin_directory: Vec<u8>,
     /// The transfer options a host override can replace; read them
@@ -148,6 +156,8 @@ struct RawConfig {
     negative_cache: Option<Size>,
     probe_threads: Option<u32>,
     candidate_attempts: Option<u32>,
+    compression_level: Option<i32>,
+    compression_threads: Option<u32>,
     pin_directory: Option<String>,
     ssh: Option<String>,
     sender_command: Option<String>,
@@ -245,6 +255,14 @@ pub fn parse(text: &str) -> Result<Config, String> {
     if candidate_attempts == 0 {
         return Err("candidate_attempts must be at least 1".into());
     }
+    let compression_level = raw.compression_level.unwrap_or(DEFAULT_COMPRESSION_LEVEL);
+    if !COMPRESSION_LEVELS.contains(&compression_level) {
+        return Err(format!(
+            "compression_level must be from {} to {}",
+            COMPRESSION_LEVELS.start(),
+            COMPRESSION_LEVELS.end()
+        ));
+    }
     let pin_directory = match raw.pin_directory {
         None => default_pin_directory(),
         Some(text) => parse_path(&text).map_err(|e| format!("pin_directory: {e}"))?,
@@ -293,6 +311,8 @@ pub fn parse(text: &str) -> Result<Config, String> {
         negative_cache,
         probe_threads: raw.probe_threads.unwrap_or(0),
         candidate_attempts,
+        compression_level,
+        compression_threads: raw.compression_threads.unwrap_or(0),
         pin_directory,
         ssh,
         sender_command,
@@ -659,6 +679,8 @@ lookahead = "1MiB"
 negative_cache = 0
 probe_threads = 5
 candidate_attempts = 3
+compression_level = 19
+compression_threads = 2
 pin_directory = '/var/\xFE/pins'
 
 [[roots]]
@@ -679,6 +701,8 @@ one_filesystem = true
         assert_eq!(config.negative_cache, 0);
         assert_eq!(config.probe_threads, 5);
         assert_eq!(config.candidate_attempts, 3);
+        assert_eq!(config.compression_level, 19);
+        assert_eq!(config.compression_threads, 2);
         assert_eq!(config.pin_directory, b"/var/\xfe/pins");
         assert_eq!(config.roots.len(), 2);
         assert_eq!(config.roots[0].pattern, b"/srv/archive-\xff");
@@ -711,7 +735,10 @@ one_filesystem = true
         assert_eq!(config.negative_cache, 128 << 20);
         assert_eq!(config.probe_threads, 0);
         assert_eq!(config.candidate_attempts, 128);
+        assert_eq!(config.compression_level, 9);
+        assert_eq!(config.compression_threads, 0);
         assert!(config.pin_directory.ends_with(b"/hashsync/pins"));
+        assert_eq!(parse("compression_level = 0").unwrap().compression_level, 0);
         assert_eq!(config.roots[0].pattern, b"/srv/\xff/*");
         let config = parse("[[roots]]\npath = '/srv/\\xFF/*'\n").unwrap();
         assert_eq!(config.roots[0].pattern, b"/srv/\xff/*");
@@ -755,7 +782,14 @@ one_filesystem = true
                 .unwrap_err()
                 .contains("NUL")
         );
-        assert!(parse("compression_level = 3").is_err());
+        for level in ["-1", "20"] {
+            assert!(
+                parse(&format!("compression_level = {level}"))
+                    .unwrap_err()
+                    .contains("compression_level must be from 0 to 19")
+            );
+        }
+        assert!(parse("compression_threads = -1").is_err());
         assert!(
             parse("[[roots]]\npath = \"relative\"")
                 .unwrap_err()

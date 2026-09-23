@@ -1,13 +1,13 @@
 //! The sender's scanner (DESIGN.md §6.3): the single owner of all output
 //! decisions.
 //!
-//! The scanner rolls the weak hash over the command's output. A window
-//! whose weak hash may be in the receiver's list becomes a query for the
-//! window's full strong hash; a yes answer turns it into a reference, and
-//! everything else is literal. Output leaves strictly in order: a query
-//! blocks the records behind it until its answer arrives, and a no answer
-//! discards every record after the rejected window, which is scanned again
-//! from its next byte. Runs of repeated bytes arrive with PLAN.md step 5.
+//! The scanner rolls the weak hash over the command's output. A window of
+//! equal bytes becomes part of a run. A window whose weak hash may be in
+//! the receiver's list becomes a query for the window's full strong hash; a
+//! yes answer turns it into a reference, and everything else is literal.
+//! Output leaves strictly in order: a query blocks the records behind it
+//! until its answer arrives, and a no answer discards every record after
+//! the rejected window, which is scanned again from its next byte.
 //!
 //! The scanner does no I/O and starts no threads. Its driver (`serve`)
 //! feeds it command output and answers, sends the queries that it makes,
@@ -33,7 +33,6 @@ use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 use lru::LruCache;
 use rayon::ThreadPool;
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 use crate::hash::weak::{WeakHasher, mix64};
 use crate::hash::{Strong, StrongHash};
@@ -59,6 +58,8 @@ pub enum Frame {
     Literal(Vec<u8>),
     /// REF: the pin at the current output offset.
     Reference,
+    /// RLE: `length` copies of `byte`.
+    Run { byte: u8, length: u64 },
 }
 
 /// Scanned output that is not emitted yet (DESIGN.md §6.3).
@@ -67,6 +68,12 @@ enum Record {
     Literal {
         offset: u64,
         length: u64,
+    },
+    /// Constant windows, and at EOF the tail bytes that continue them.
+    Run {
+        offset: u64,
+        length: u64,
+        byte: u8,
     },
     /// A window whose query waits for its answer.
     Query {
@@ -81,9 +88,10 @@ enum Record {
 impl Record {
     fn offset(&self) -> u64 {
         match *self {
-            Record::Literal { offset, .. } | Record::Query { offset } | Record::Ref { offset } => {
-                offset
-            }
+            Record::Literal { offset, .. }
+            | Record::Run { offset, .. }
+            | Record::Query { offset }
+            | Record::Ref { offset } => offset,
         }
     }
 }
@@ -102,16 +110,48 @@ struct Entry {
     state: State,
 }
 
-/// What is known of the weak-hash polynomial of the window at `p`.
+/// What rolls from one window to the next in O(1) (DESIGN.md §6.3): the
+/// window's weak-hash polynomial, and the length of the run of equal bytes
+/// that ends with its last byte, which can begin before the window. The
+/// window is constant when that run is at least as long as the window.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Rolling {
+    poly: u64,
+    equal: usize,
+}
+
+impl Rolling {
+    /// The state of `window`, from its bytes; `None` when the window is
+    /// constant, which needs no polynomial.
+    fn of(weak: &WeakHasher, window: &[u8]) -> Option<Rolling> {
+        let equal = trailing_equal(window);
+        (equal < window.len()).then(|| Rolling {
+            poly: weak.polynomial(window),
+            equal,
+        })
+    }
+
+    /// The state of the next window. `out` is the first byte of this
+    /// window, `last` its last byte, and `new` the last byte of the next.
+    #[inline(always)]
+    fn roll(self, weak: &WeakHasher, out: u8, last: u8, new: u8) -> Rolling {
+        Rolling {
+            poly: weak.roll(self.poly, out, new),
+            equal: if new == last { self.equal + 1 } else { 1 },
+        }
+    }
+}
+
+/// The rolling state of the window at `offset`, which is not constant:
+/// a constant window becomes a run and needs none. A state describes its
+/// own window, so jumps and rescans leave nothing to reset.
 #[derive(Clone, Copy)]
-enum Roll {
-    /// Nothing: compute it from the window's bytes.
-    Stale,
-    /// The polynomial of the window at `p`.
-    Current(u64),
-    /// The polynomial of the window at `p - 1`, whose first byte was
-    /// `out`; that byte may have left the buffer since.
-    Behind { poly: u64, out: u8 },
+struct Known {
+    offset: u64,
+    /// The window's first byte, which the next roll removes; the buffer
+    /// may have released it since.
+    first: u8,
+    rolling: Rolling,
 }
 
 pub struct Scanner<'a> {
@@ -128,7 +168,9 @@ pub struct Scanner<'a> {
     p: u64,
     /// The command's stdout reached EOF.
     ended: bool,
-    roll: Roll,
+    /// The rolling state of a recent window: the window at `p` uses it,
+    /// or rolls it on from the window before.
+    known: Option<Known>,
     records: VecDeque<Record>,
     /// The offsets of the Query records, in record order.
     queries: VecDeque<u64>,
@@ -142,13 +184,14 @@ pub struct Scanner<'a> {
     pool: Option<&'a ThreadPool>,
     /// The bytes that a call of `scan` examines at most. Each hit sets it
     /// to `min_budget` and limits the rest of that call to it; each stretch
-    /// without a hit doubles it, up to `max_budget`.
+    /// that reaches its limit without a hit or a constant window doubles
+    /// it, up to `max_budget`.
     budget: u64,
     min_budget: u64,
     max_budget: u64,
-    /// The fewest windows in one part. Each part computes the polynomial
-    /// of its first window from its bytes.
-    min_part: usize,
+    /// The windows of one part of a long stretch. Each part computes the
+    /// rolling state of its first window from its bytes.
+    part: usize,
 }
 
 impl<'a> Scanner<'a> {
@@ -167,11 +210,9 @@ impl<'a> Scanner<'a> {
         assert!(block_size > 0 && lookahead >= u64::from(block_size));
         let negative_hashes =
             usize::try_from(negative_cache / NEGATIVE_ENTRY_BYTES).unwrap_or(usize::MAX);
-        let min_part = SCAN_BUDGET.max(u64::from(block_size));
+        let part = SCAN_BUDGET.max(u64::from(block_size));
         let max_budget = match pool {
-            Some(pool) => {
-                (pool.current_num_threads() as u64).saturating_mul(PART_BUDGET.max(min_part))
-            }
+            Some(pool) => (pool.current_num_threads() as u64).saturating_mul(PART_BUDGET.max(part)),
             None => SCAN_BUDGET,
         };
         Scanner {
@@ -185,7 +226,7 @@ impl<'a> Scanner<'a> {
             e: 0,
             p: 0,
             ended: false,
-            roll: Roll::Stale,
+            known: None,
             records: VecDeque::new(),
             queries: VecDeque::new(),
             entries: BTreeMap::new(),
@@ -194,7 +235,7 @@ impl<'a> Scanner<'a> {
             budget: SCAN_BUDGET,
             min_budget: SCAN_BUDGET,
             max_budget,
-            min_part: min_part as usize,
+            part: part as usize,
         }
     }
 
@@ -206,6 +247,10 @@ impl<'a> Scanner<'a> {
     fn bytes(&self, offset: u64, length: u64) -> &[u8] {
         let start = (offset - self.base) as usize;
         &self.buffer[start..start + length as usize]
+    }
+
+    fn byte(&self, offset: u64) -> u8 {
+        self.buffer[(offset - self.base) as usize]
     }
 
     /// True while the buffer accepts more command output.
@@ -263,11 +308,8 @@ impl<'a> Scanner<'a> {
         while self.p - self.e < self.lookahead && self.p < budget_end {
             let available = self.end() - self.p;
             if available < self.block_size {
-                // At EOF, a tail shorter than a window is literal.
                 if self.ended && available > 0 {
-                    self.push_literal(self.p, available);
-                    self.p = self.end();
-                    self.roll = Roll::Stale;
+                    self.scan_tail();
                     progress = true;
                 }
                 break;
@@ -278,6 +320,10 @@ impl<'a> Scanner<'a> {
                 .range(self.p..)
                 .next()
                 .map(|(&offset, _)| offset);
+            // Only windows that are not constant get query states, because
+            // the search for weak hits stops at constant windows. So a
+            // window with a state needs no check for a run (DESIGN.md §6.3,
+            // step 1).
             if next_entry != Some(self.p) {
                 // Positions before `limit` have a whole window and are
                 // neither beyond the lookahead nor a known entry.
@@ -285,9 +331,20 @@ impl<'a> Scanner<'a> {
                     .min(self.e.saturating_add(self.lookahead))
                     .min(budget_end)
                     .min(next_entry.unwrap_or(u64::MAX));
-                if !self.skip_misses(limit) {
-                    self.budget = self.budget.saturating_mul(2).min(self.max_budget);
-                    continue;
+                match self.skip_misses(limit) {
+                    Stop::Listed(..) => {}
+                    // A stretch that a constant window cut short did not
+                    // use up its budget, so it is no sign of a long run of
+                    // misses. A run leaves no query to wait for either, so
+                    // the budget stays.
+                    Stop::Constant(_) => {
+                        self.run_window();
+                        continue;
+                    }
+                    Stop::Neither(_) => {
+                        self.budget = self.budget.saturating_mul(2).min(self.max_budget);
+                        continue;
+                    }
                 }
                 let strong = self.strong.digest(self.bytes(self.p, self.block_size));
                 let state = State::NotSent;
@@ -302,55 +359,79 @@ impl<'a> Scanner<'a> {
         progress
     }
 
-    /// Record literal bytes from `p` while their windows miss the weak
-    /// table. True at a hit, with `p` at its window; false once `p`
-    /// reaches `limit`, which must be above `p`. The probe threads probe a
-    /// long stretch in parts.
-    fn skip_misses(&mut self, limit: u64) -> bool {
-        let start = self.p;
-        let poly = self.polynomial();
-        let window = self.block_size as usize;
-        let first = (start - self.base) as usize;
-        let n = (limit - start) as usize;
-        let bytes = &self.buffer[first..first + n - 1 + window];
-        let found = match self.pool {
-            Some(pool) if n >= 2 * self.min_part => {
-                let parts = (n / self.min_part).min(pool.current_num_threads());
-                first_hit_in_parts(pool, parts, &self.table, &self.weak, bytes, poly)
+    /// The rolling state of the window at `p`, which must be whole: rolled
+    /// from the state of the window before, or computed from the window's
+    /// bytes. `None` when the window is constant.
+    fn rolling(&mut self) -> Option<Rolling> {
+        let p = self.p;
+        let rolling = match self.known {
+            Some(known) if known.offset == p => known.rolling,
+            // A window of one byte is constant, so the window before has
+            // at least two, and its last byte is at `p` or later.
+            Some(known) if known.offset + 1 == p => {
+                let &[last, new] = self.bytes(p + self.block_size - 2, 2) else {
+                    unreachable!()
+                };
+                known.rolling.roll(&self.weak, known.first, last, new)
             }
-            _ => first_hit(&self.table, &self.weak, bytes, poly, || false),
+            _ => Rolling::of(&self.weak, self.bytes(p, self.block_size))?,
         };
-        let hit = match found {
-            Ok((k, poly)) => {
-                self.p = start + k as u64;
-                self.roll = Roll::Current(poly);
-                true
-            }
-            Err(poly) => {
-                self.p = limit;
-                let out = self.buffer[first + n - 1];
-                self.roll = Roll::Behind { poly, out };
-                false
-            }
-        };
-        if self.p > start {
-            self.push_literal(start, self.p - start);
+        if rolling.equal as u64 >= self.block_size {
+            return None;
         }
-        hit
+        self.known = Some(Known {
+            offset: p,
+            first: self.byte(p),
+            rolling,
+        });
+        Some(rolling)
     }
 
-    /// The polynomial of the window at `p`, which must be whole.
-    fn polynomial(&mut self) -> u64 {
-        let poly = match self.roll {
-            Roll::Current(poly) => poly,
-            Roll::Behind { poly, out } => {
-                let new = self.bytes(self.p + self.block_size - 1, 1)[0];
-                self.weak.roll(poly, out, new)
-            }
-            Roll::Stale => self.weak.polynomial(self.bytes(self.p, self.block_size)),
+    /// Record literal bytes from `p` while their windows are neither
+    /// constant nor weak hits. Stops with `p` at the first window that is
+    /// constant or a weak hit, or at `limit`, which must be above `p`, and
+    /// returns the stop, whose window counts from the old `p`. The window
+    /// at `p` must be whole. The probe threads search a long stretch in
+    /// parts.
+    fn skip_misses(&mut self, limit: u64) -> Stop {
+        let Some(first) = self.rolling() else {
+            return Stop::Constant(0);
         };
-        self.roll = Roll::Current(poly);
-        poly
+        let start = self.p;
+        let window = self.block_size as usize;
+        let at = (start - self.base) as usize;
+        let n = (limit - start) as usize;
+        let bytes = &self.buffer[at..at + n - 1 + window];
+        let stop = match self.pool {
+            Some(pool) if n >= 2 * self.part => {
+                first_stop_in_parts(pool, self.part, &self.table, &self.weak, bytes, first)
+            }
+            _ => first_stop(&self.table, &self.weak, bytes, first, || false),
+        };
+        let skipped = match stop {
+            Stop::Listed(k, rolling) => {
+                self.known = Some(Known {
+                    offset: start + k as u64,
+                    first: bytes[k],
+                    rolling,
+                });
+                k
+            }
+            Stop::Constant(k) => k,
+            Stop::Neither(rolling) => {
+                self.known = Some(Known {
+                    offset: limit - 1,
+                    first: bytes[n - 1],
+                    rolling,
+                });
+                n
+            }
+        };
+        if skipped > 0 {
+            self.push_literal(start, skipped as u64);
+            self.p += skipped as u64;
+        }
+        stop
     }
 
     /// Apply the query state at `p` (DESIGN.md §6.3, step 3).
@@ -384,16 +465,45 @@ impl<'a> Scanner<'a> {
         }
         self.records.push_back(record);
         self.p += self.block_size;
-        self.roll = Roll::Stale;
+    }
+
+    /// Append the constant window at `p` to a run, and move past it
+    /// (DESIGN.md §6.3, step 1).
+    fn run_window(&mut self) {
+        let byte = self.byte(self.p);
+        self.push_run(self.p, self.block_size, byte);
+        self.p += self.block_size;
     }
 
     /// Record the byte at `p` as literal, and move on to the next window.
     fn literal_byte(&mut self) {
-        let poly = self.polynomial();
-        let out = self.bytes(self.p, 1)[0];
-        self.roll = Roll::Behind { poly, out };
         self.push_literal(self.p, 1);
         self.p += 1;
+    }
+
+    /// At EOF, record the tail at `p`, shorter than a window: it continues
+    /// a last Run while its bytes match, and the rest is literal. A Run
+    /// already emitted is not continued (DESIGN.md §6.3).
+    fn scan_tail(&mut self) {
+        let tail = self.bytes(self.p, self.end() - self.p);
+        let (matching, byte) = match self.records.back() {
+            Some(&Record::Run {
+                offset,
+                length,
+                byte,
+            }) if offset + length == self.p => {
+                (tail.iter().take_while(|&&b| b == byte).count(), byte)
+            }
+            _ => (0, 0),
+        };
+        let rest = tail.len() - matching;
+        if matching > 0 {
+            self.push_run(self.p, matching as u64, byte);
+        }
+        if rest > 0 {
+            self.push_literal(self.p + matching as u64, rest as u64);
+        }
+        self.p = self.end();
     }
 
     /// Append literal bytes, extending a Literal that ends where they
@@ -409,6 +519,27 @@ impl<'a> Scanner<'a> {
             return;
         }
         self.records.push_back(Record::Literal { offset, length });
+    }
+
+    /// Append `length` copies of `byte`, extending a Run of that byte that
+    /// ends where they start.
+    fn push_run(&mut self, offset: u64, length: u64, byte: u8) {
+        if let Some(Record::Run {
+            offset: last,
+            length: last_length,
+            byte: last_byte,
+        }) = self.records.back_mut()
+            && *last + *last_length == offset
+            && *last_byte == byte
+        {
+            *last_length += length;
+            return;
+        }
+        self.records.push_back(Record::Run {
+            offset,
+            length,
+            byte,
+        });
     }
 
     /// Resolve the Query records in order (DESIGN.md §6.3): a yes turns
@@ -431,7 +562,6 @@ impl<'a> Scanner<'a> {
                     self.records.truncate(i);
                     self.push_literal(offset, 1);
                     self.p = offset + 1;
-                    self.roll = Roll::Stale;
                 }
                 State::NotSent => unreachable!("a Query record without a request"),
             }
@@ -447,21 +577,24 @@ impl<'a> Scanner<'a> {
     }
 
     /// The next data frame, if the first record is ready (DESIGN.md §6.3):
-    /// a Ref, or up to `B` literal bytes. A last Literal shorter than `B`
-    /// waits to grow, unless `flush` is set, which the driver does before
-    /// it waits, or the output is complete. A Query blocks everything
-    /// behind it.
-    pub fn next_frame(&mut self, flush: bool) -> Option<Frame> {
+    /// a Ref, a Run for its known length, or up to `B` literal bytes. A
+    /// last Literal shorter than `B` waits to grow until the output is
+    /// complete. A Query blocks everything behind it.
+    pub fn next_frame(&mut self) -> Option<Frame> {
         let (frame, length) = match *self.records.front()? {
             Record::Query { .. } => return None,
             Record::Ref { .. } => {
                 self.records.pop_front();
                 (Frame::Reference, self.block_size)
             }
+            Record::Run { length, byte, .. } => {
+                self.records.pop_front();
+                (Frame::Run { byte, length }, length)
+            }
             Record::Literal { offset, length } => {
                 let last = self.records.len() == 1;
                 let complete = self.ended && self.p == self.end();
-                if length < self.block_size && last && !flush && !complete {
+                if length < self.block_size && last && !complete {
                     return None;
                 }
                 let n = length.min(self.block_size);
@@ -492,106 +625,192 @@ impl<'a> Scanner<'a> {
     }
 }
 
-/// The first window of `bytes` whose weak hash may be in `table`, with its
-/// polynomial; `poly` is the polynomial of the first window. Without a hit,
-/// the polynomial of the last window. `stop`, checked every 4096 windows,
-/// can end the search early, and the result is then meaningless.
-///
-/// Probes of different windows are independent, so the loop computes the
-/// hashes of the next `AHEAD` windows before it probes the first of them,
-/// and their buckets load meanwhile: a table larger than the caches costs
-/// one memory latency per `AHEAD` probes instead of one per probe.
-fn first_hit(
-    table: &HashTable,
-    weak: &WeakHasher,
-    bytes: &[u8],
-    mut poly: u64,
-    stop: impl Fn() -> bool,
-) -> Result<(usize, u64), u64> {
-    const AHEAD: usize = 16;
-    let window = weak.block_size();
-    let n = bytes.len() + 1 - window;
-    // `ring[j % AHEAD]` holds the polynomial and the weak hash of window
-    // `j`, for the next `AHEAD` windows.
-    let mut ring = [(0u64, 0u64); AHEAD];
-    for (j, slot) in ring[..n.min(AHEAD)].iter_mut().enumerate() {
-        let hash = mix64(poly);
-        table.prefetch(hash);
-        *slot = (poly, hash);
-        if j + 1 < n {
-            poly = weak.roll(poly, bytes[j], bytes[j + window]);
+/// The length of the run of equal bytes at the end of `window`, which must
+/// not be empty. Whole chunks are compared first, so that a long run takes
+/// few steps.
+fn trailing_equal(window: &[u8]) -> usize {
+    const CHUNK: usize = 32;
+    let last = window[window.len() - 1];
+    let mut chunks = window.rchunks_exact(CHUNK);
+    let mut equal = 0;
+    for chunk in &mut chunks {
+        // Compare every byte of the chunk, without a branch per byte.
+        if chunk.iter().fold(false, |differ, &b| differ | (b != last)) {
+            return equal + chunk.iter().rev().take_while(|&&b| b == last).count();
+        }
+        equal += CHUNK;
+    }
+    equal
+        + chunks
+            .remainder()
+            .iter()
+            .rev()
+            .take_while(|&&b| b == last)
+            .count()
+}
+
+/// Where `first_stop` ended in its windows.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Stop {
+    /// Window `k` is constant.
+    Constant(usize),
+    /// Window `k` may be in the table; its rolling state.
+    Listed(usize, Rolling),
+    /// No window was either: the rolling state of the last one.
+    Neither(Rolling),
+}
+
+impl Stop {
+    /// The window of a Constant or Listed stop.
+    fn window(self) -> Option<usize> {
+        match self {
+            Stop::Constant(k) | Stop::Listed(k, _) => Some(k),
+            Stop::Neither(_) => None,
         }
     }
-    // Probe window `k`, and replace it in the ring with window
-    // `k + AHEAD`, whose polynomial `poly` holds.
-    let mut k = 0;
-    while k + AHEAD < n {
-        let (current, hash) = ring[k % AHEAD];
-        let ahead = mix64(poly);
-        table.prefetch(ahead);
-        ring[k % AHEAD] = (poly, ahead);
-        if k + AHEAD + 1 < n {
-            poly = weak.roll(poly, bytes[k + AHEAD], bytes[k + AHEAD + window]);
+
+    /// This stop, with its window counted from `start` windows earlier:
+    /// the stop of a part, as a stop of the whole stretch.
+    fn after(self, start: usize) -> Stop {
+        match self {
+            Stop::Constant(k) => Stop::Constant(start + k),
+            Stop::Listed(k, rolling) => Stop::Listed(start + k, rolling),
+            neither => neither,
         }
-        if table.contains(hash) {
-            return Ok((k, current));
-        }
-        k += 1;
-        if k % 4096 == 0 && stop() {
-            return Err(0);
-        }
-    }
-    // The ring holds the remaining windows.
-    match (k..n).find(|&k| table.contains(ring[k % AHEAD].1)) {
-        Some(k) => Ok((k, ring[k % AHEAD].0)),
-        None => Err(ring[(n - 1) % AHEAD].0),
     }
 }
 
-/// `first_hit` over `parts` consecutive parts of `bytes` at once, one task
-/// per part on `pool`. Every part but the first computes the polynomial of
-/// its first window from its bytes. The first hit in window order wins,
-/// and the parts after a found hit stop early.
-fn first_hit_in_parts(
-    pool: &ThreadPool,
-    parts: usize,
+/// The first window of `bytes` that is constant or whose weak hash may be
+/// in `table`; `first` is the rolling state of the first window, which must
+/// not be constant. `stop`, checked every 4096 windows, can end the search
+/// early, and the result is then meaningless.
+///
+/// Probes of different windows are independent, so the loop rolls on to the
+/// next `AHEAD` windows before it probes the first of them, and their
+/// buckets load meanwhile: a table larger than the caches costs one memory
+/// latency per `AHEAD` probes instead of one per probe. A constant window
+/// is found when its turn comes, before its probe, so rolling can go past
+/// it by up to `AHEAD` windows.
+fn first_stop(
     table: &HashTable,
     weak: &WeakHasher,
     bytes: &[u8],
-    poly: u64,
-) -> Result<(usize, u64), u64> {
+    first: Rolling,
+    stop: impl Fn() -> bool,
+) -> Stop {
+    const AHEAD: usize = 16;
     let window = weak.block_size();
     let n = bytes.len() + 1 - window;
-    // Each part holds `n / parts` windows, and the first `n % parts`
-    // parts one more.
-    let (size, extra) = (n / parts, n % parts);
+    // The state of window `j + 1` from that of window `j`.
+    let roll = |rolling: Rolling, j: usize| {
+        rolling.roll(weak, bytes[j], bytes[j + window - 1], bytes[j + window])
+    };
+    // The stop at window `k`, from its rolling state and weak hash.
+    let check = |k: usize, (rolling, hash): (Rolling, u64)| {
+        if rolling.equal >= window {
+            Some(Stop::Constant(k))
+        } else if table.contains(hash) {
+            Some(Stop::Listed(k, rolling))
+        } else {
+            None
+        }
+    };
+    // `ring[j % AHEAD]` holds the rolling state and the weak hash of window
+    // `j`, for the next `AHEAD` windows.
+    let mut ring = [(first, 0u64); AHEAD];
+    // The state of the window after the last one in the ring.
+    let mut rolling = first;
+    for (j, slot) in ring[..n.min(AHEAD)].iter_mut().enumerate() {
+        let hash = mix64(rolling.poly);
+        table.prefetch(hash);
+        *slot = (rolling, hash);
+        if j + 1 < n {
+            rolling = roll(rolling, j);
+        }
+    }
+    // Check window `k`, and replace it in the ring with window
+    // `k + AHEAD`, whose state `rolling` holds.
+    let mut k = 0;
+    while k + AHEAD < n {
+        let current = ring[k % AHEAD];
+        let ahead = mix64(rolling.poly);
+        table.prefetch(ahead);
+        ring[k % AHEAD] = (rolling, ahead);
+        if k + AHEAD + 1 < n {
+            rolling = roll(rolling, k + AHEAD);
+        }
+        if let Some(found) = check(k, current) {
+            return found;
+        }
+        k += 1;
+        if k % 4096 == 0 && stop() {
+            return Stop::Neither(first);
+        }
+    }
+    // The ring holds the remaining windows.
+    (k..n)
+        .find_map(|k| check(k, ring[k % AHEAD]))
+        .unwrap_or(Stop::Neither(ring[(n - 1) % AHEAD].0))
+}
+
+/// `first_stop` over consecutive parts of `part` windows of `bytes`, on
+/// the threads of `pool`. The threads take the parts in window order, so
+/// all of them search the windows before the first stop, wherever it is.
+/// The first stop in window order wins; a part after a found stop is
+/// skipped, or ends early. Every part but the first computes the rolling
+/// state of its first window from its bytes.
+fn first_stop_in_parts(
+    pool: &ThreadPool,
+    part: usize,
+    table: &HashTable,
+    weak: &WeakHasher,
+    bytes: &[u8],
+    first: Rolling,
+) -> Stop {
+    let window = weak.block_size();
+    let n = bytes.len() + 1 - window;
+    let parts = n.div_ceil(part);
+    // The next part to search, and the earliest window with a stop yet.
+    let next = AtomicUsize::new(0);
     let earliest = AtomicUsize::new(usize::MAX);
-    let found: Vec<Result<(usize, u64), u64>> = pool.install(|| {
-        (0..parts)
-            .into_par_iter()
-            .map(|i| {
-                let start = i * size + i.min(extra);
-                let length = size + usize::from(i < extra);
-                let part = &bytes[start..start + length - 1 + window];
-                let poly = match i {
-                    0 => poly,
-                    _ => weak.polynomial(&part[..window]),
-                };
-                let found = first_hit(table, weak, part, poly, || earliest.load(Relaxed) < start);
-                if let Ok((k, _)) = found {
-                    earliest.fetch_min(start + k, Relaxed);
+    let found: Vec<Option<Stop>> = pool.broadcast(|_| {
+        loop {
+            let i = next.fetch_add(1, Relaxed);
+            let start = i * part;
+            if i >= parts || earliest.load(Relaxed) < start {
+                return None;
+            }
+            let end = (start + part).min(n);
+            let bytes = &bytes[start..end - 1 + window];
+            let first = match i {
+                0 => Some(first),
+                _ => Rolling::of(weak, &bytes[..window]),
+            };
+            let stop = match first {
+                None => Stop::Constant(0),
+                Some(first) => {
+                    first_stop(table, weak, bytes, first, || earliest.load(Relaxed) < start)
                 }
-                found.map(|(k, poly)| (start + k, poly))
-            })
-            .collect()
+            };
+            if let Some(k) = stop.window() {
+                earliest.fetch_min(start + k, Relaxed);
+                // The parts that this thread could take next begin after
+                // this stop, so they need no search.
+                return Some(stop.after(start));
+            }
+            // Without stops, the last part ends the stretch.
+            if end == n {
+                return Some(stop);
+            }
+        }
     });
-    // Only a part after a hit stops early. Without hits, the last part
-    // ends with the last window.
+    // A part ends early only after a stop, so without stops the last one
+    // ended with the last window.
     found
-        .iter()
-        .copied()
-        .find(Result::is_ok)
-        .unwrap_or(found[parts - 1])
+        .into_iter()
+        .flatten()
+        .min_by_key(|stop| stop.window().unwrap_or(usize::MAX))
+        .expect("the parts ended without the last one")
 }
 
 #[cfg(test)]
@@ -687,6 +906,11 @@ pub(crate) mod tests {
                     let pin = self.pins.get(&c).unwrap_or_else(|| panic!("no pin at {c}"));
                     self.output.extend_from_slice(pin);
                 }
+                Frame::Run { byte, length } => {
+                    assert!(length > 0);
+                    self.output
+                        .extend(std::iter::repeat_n(byte, length as usize));
+                }
             }
             let c = self.output.len() as u64;
             self.pins.retain(|&offset, _| offset >= c);
@@ -714,14 +938,14 @@ pub(crate) mod tests {
     }
 
     impl<'a> Run<'a> {
-        /// `min_part` lends the scanner the probe pool, with parts of at
-        /// least that many windows.
+        /// `part` lends the scanner the probe pool, with parts of that many
+        /// windows.
         fn new(
             input: &'a [u8],
             receiver: Receiver,
             lookahead: u64,
             negative_cache: u64,
-            min_part: Option<usize>,
+            part: Option<usize>,
         ) -> Self {
             let mut scanner = Scanner::new(
                 receiver.table(),
@@ -729,10 +953,10 @@ pub(crate) mod tests {
                 StrongHash::Blake3,
                 lookahead,
                 negative_cache,
-                min_part.map(|_| probe_pool()),
+                part.map(|_| probe_pool()),
             );
-            if let Some(min_part) = min_part {
-                scanner.min_part = min_part;
+            if let Some(part) = part {
+                scanner.part = part;
             }
             Run {
                 scanner,
@@ -764,8 +988,8 @@ pub(crate) mod tests {
                 .scan(&mut |offset, strong| receiver.query(offset, strong))
         }
 
-        fn take_frame(&mut self, flush: bool) -> bool {
-            match self.scanner.next_frame(flush) {
+        fn take_frame(&mut self) -> bool {
+            match self.scanner.next_frame() {
                 Some(frame) => {
                     self.receiver.take(frame);
                     true
@@ -796,21 +1020,18 @@ pub(crate) mod tests {
                 progress |= self.scan();
                 // A data queue with room for 0 to 3 frames.
                 for _ in 0..choose(4) {
-                    progress |= self.take_frame(false);
+                    progress |= self.take_frame();
                 }
                 if progress {
                     continue;
                 }
-                // Nothing moved: emit a short literal, as before a wait,
-                // or let the slowest event happen. A scanner that needs
-                // none of them has stalled.
-                let moved = self.take_frame(true)
-                    || (!self.receiver.pending.is_empty() && {
-                        self.receiver.answer(0, &mut self.scanner);
-                        true
-                    })
-                    || self.push(1)
-                    || self.take_frame(false);
+                // Nothing moved: let the slowest event happen. A scanner
+                // that needs none of them has stalled.
+                let moved = (!self.receiver.pending.is_empty() && {
+                    self.receiver.answer(0, &mut self.scanner);
+                    true
+                }) || self.push(1)
+                    || self.take_frame();
                 assert!(moved, "the scanner stalled");
             }
         }
@@ -826,10 +1047,10 @@ pub(crate) mod tests {
                         self.receiver.answer(0, &mut self.scanner);
                         progress = true;
                     }
-                    while self.take_frame(false) {
+                    while self.take_frame() {
                         progress = true;
                     }
-                    if !progress && !self.take_frame(true) {
+                    if !progress {
                         break;
                     }
                 }
@@ -873,7 +1094,7 @@ pub(crate) mod tests {
         scanner.end_input();
         while scanner.scan(&mut |_, _| panic!("no query without a list")) {}
         let mut output = Vec::new();
-        while let Some(frame) = scanner.next_frame(false) {
+        while let Some(frame) = scanner.next_frame() {
             let Frame::Literal(bytes) = frame else {
                 panic!("a reference without a list");
             };
@@ -882,6 +1103,112 @@ pub(crate) mod tests {
         }
         assert_eq!(output, input);
         assert!(scanner.finished());
+    }
+
+    /// Scan all of `scanner`'s input without a list, and take every frame.
+    fn frames_without_a_list(scanner: &mut Scanner) -> Vec<Frame> {
+        while scanner.scan(&mut |_, _| panic!("no query without a list")) {}
+        std::iter::from_fn(|| scanner.next_frame()).collect()
+    }
+
+    fn scanner_without_a_list() -> Scanner<'static> {
+        let table = Receiver::new(&[], &[]).table();
+        Scanner::new(table, BS, StrongHash::Blake3, 1 << 20, 1 << 20, None)
+    }
+
+    #[test]
+    fn constant_windows_become_runs() {
+        // Each run covers whole constant windows. Bytes after the last
+        // whole window of a run are scanned like any others and become
+        // literal, except for a tail at EOF, which continues the run
+        // (DESIGN.md §6.3).
+        let b = BS as usize;
+        let input = [
+            noise(10, 50),
+            vec![7; 2 * b + 5],
+            noise(10, 51),
+            vec![9; 3 * b + 4],
+        ]
+        .concat();
+        let mut scanner = scanner_without_a_list();
+        scanner.push(&input);
+        scanner.end_input();
+        let frames = frames_without_a_list(&mut scanner);
+        let runs: Vec<(u8, u64)> = frames
+            .iter()
+            .filter_map(|frame| match *frame {
+                Frame::Run { byte, length } => Some((byte, length)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(runs, [(7, 2 * u64::from(BS)), (9, 3 * u64::from(BS) + 4)]);
+        let mut receiver = Receiver::new(&[], &[]);
+        frames.into_iter().for_each(|frame| receiver.take(frame));
+        assert_eq!(receiver.output, input);
+        assert!(scanner.finished());
+    }
+
+    #[test]
+    fn a_tail_continues_only_a_run_that_waits() {
+        // A run of three windows and a short tail of the same byte.
+        let b = BS as usize;
+        let run = |length: u64| Frame::Run { byte: 5, length };
+        let mut scanner = scanner_without_a_list();
+        scanner.push(&vec![5; 3 * b + 7]);
+        scanner.end_input();
+        assert_eq!(
+            frames_without_a_list(&mut scanner),
+            [run(3 * u64::from(BS) + 7)]
+        );
+
+        // The run left before the tail arrived: the tail is literal.
+        let mut scanner = scanner_without_a_list();
+        scanner.push(&vec![5; 3 * b]);
+        assert_eq!(
+            frames_without_a_list(&mut scanner),
+            [run(3 * u64::from(BS))]
+        );
+        scanner.push(&[5; 7]);
+        scanner.end_input();
+        assert_eq!(
+            frames_without_a_list(&mut scanner),
+            [Frame::Literal(vec![5; 7])]
+        );
+        assert!(scanner.finished());
+    }
+
+    #[test]
+    fn a_short_last_literal_waits_for_more_output_or_eof() {
+        // Before EOF, the last `B - 1` bytes wait for a whole window, and a
+        // Literal shorter than `B` at the end waits to grow: output latency
+        // does not matter (DESIGN.md §6.3).
+        let b = BS as usize;
+        let input = noise(2 * b + 10, 60);
+        let mut scanner = scanner_without_a_list();
+        scanner.push(&input);
+        let frames = frames_without_a_list(&mut scanner);
+        assert_eq!(frames, [Frame::Literal(input[..b].to_vec())]);
+        scanner.end_input();
+        let frames = frames_without_a_list(&mut scanner);
+        assert_eq!(
+            frames,
+            [
+                Frame::Literal(input[b..2 * b].to_vec()),
+                Frame::Literal(input[2 * b..].to_vec())
+            ]
+        );
+        assert!(scanner.finished());
+    }
+
+    #[test]
+    fn a_constant_window_is_a_run_even_when_listed() {
+        // The list holds the weak hash of the constant window; the run
+        // takes precedence, so there is no query (DESIGN.md §6.3, step 1).
+        let block = vec![7; BS as usize];
+        let input = [&block[..], &block, b"xy"].concat();
+        let receiver = transfer_promptly(&input, std::slice::from_ref(&block), &[]);
+        assert_eq!(receiver.output, input);
+        assert!(receiver.queries.is_empty());
     }
 
     #[test]
@@ -1021,7 +1348,7 @@ pub(crate) mod tests {
         assert_eq!(offsets(&run), vec![0, 36, 8]);
         let w_query = run.receiver.pending.iter().position(|q| q.0 == 8).unwrap();
         run.receiver.answer(w_query, &mut run.scanner);
-        while run.scan() || run.take_frame(true) {}
+        while run.scan() || run.take_frame() {}
         assert!(run.scanner.finished());
         // V's answer is obsolete now: the receiver answers no, and the
         // scanner ignores it.
@@ -1030,8 +1357,8 @@ pub(crate) mod tests {
         assert_eq!(run.receiver.output, input);
     }
 
-    /// Input pieces: noise, whole blocks, parts of blocks, and the piece
-    /// of `overlapping_blocks`.
+    /// Input pieces: noise, whole blocks, parts of blocks, the piece of
+    /// `overlapping_blocks`, and equal bytes.
     fn input_strategy() -> impl Strategy<Value = (Vec<(u8, u8)>, u64)> {
         (
             proptest::collection::vec((any::<u8>(), any::<u8>()), 0..40),
@@ -1042,58 +1369,93 @@ pub(crate) mod tests {
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(300))]
 
-        /// Probing in parts finds the first hit that probing each window in
-        /// order finds, with its polynomial, or else the polynomial of the
-        /// last window, for any number of parts (DESIGN.md §6.3).
+        /// Rolling and probing, also in parts, stop at the first window in
+        /// order that is constant or may be listed, with its rolling state,
+        /// or else end with the state of the last window, for any part size
+        /// (DESIGN.md §6.3).
         #[test]
-        fn parts_find_the_first_hit_in_order(
+        fn parts_find_the_first_stop_in_order(
             windows in 1usize..20_000,
             listed in proptest::collection::vec(any::<prop::sample::Index>(), 0..4),
-            parts in 1usize..8,
+            equal in proptest::option::of(
+                (any::<prop::sample::Index>(), 0..3 * BS as usize, any::<u8>()),
+            ),
+            part in 1usize..5000,
             seed in any::<u64>(),
         ) {
             let window = BS as usize;
-            let bytes = noise(windows - 1 + window, seed);
+            let mut bytes = noise(windows - 1 + window, seed);
+            // Equal bytes, which make constant windows when there are enough.
+            if let Some((at, length, byte)) = equal {
+                let at = at.index(bytes.len());
+                let end = (at + length).min(bytes.len());
+                bytes[at..end].fill(byte);
+            }
             let weak = WeakHasher::new(window);
-            let hash = |k: usize| weak.hash(&bytes[k..k + window]);
-            let values: Vec<u64> = listed.iter().map(|i| hash(i.index(windows))).collect();
+            let bytes_of = |k: usize| &bytes[k..k + window];
+            let values: Vec<u64> = listed
+                .iter()
+                .map(|i| weak.hash(bytes_of(i.index(windows))))
+                .collect();
             let table = HashTable::build(&values);
-            let poly = weak.polynomial(&bytes[..window]);
-            let found = first_hit(&table, &weak, &bytes, poly, || false);
-            let expected = (0..windows).find(|&k| table.contains(hash(k)));
-            prop_assert_eq!(found.ok().map(|(k, _)| k), expected);
-            let last = expected.unwrap_or(windows - 1);
-            let polynomial = weak.polynomial(&bytes[last..last + window]);
-            prop_assert_eq!(found.map_or_else(|poly| poly, |(_, poly)| poly), polynomial);
-            let parts = parts.min(windows);
-            let in_parts = first_hit_in_parts(probe_pool(), parts, &table, &weak, &bytes, poly);
-            prop_assert_eq!(in_parts, found);
+            // Each window from its own bytes, in order.
+            let state = |k: usize| Rolling {
+                poly: weak.polynomial(bytes_of(k)),
+                equal: bytes_of(k).iter().rev().take_while(|&&b| b == bytes[k + window - 1]).count(),
+            };
+            let expected = (0..windows)
+                .find_map(|k| {
+                    if state(k).equal == window {
+                        Some(Stop::Constant(k))
+                    } else if table.contains(weak.hash(bytes_of(k))) {
+                        Some(Stop::Listed(k, state(k)))
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| Stop::Neither(state(windows - 1)));
+            // The scanner searches only from a window that is not constant.
+            let Some(first) = Rolling::of(&weak, bytes_of(0)) else {
+                prop_assert_eq!(expected, Stop::Constant(0));
+                return Ok(());
+            };
+            prop_assert_eq!(first, state(0));
+            prop_assert_eq!(first_stop(&table, &weak, &bytes, first, || false), expected);
+            let in_parts = first_stop_in_parts(probe_pool(), part, &table, &weak, &bytes, first);
+            prop_assert_eq!(in_parts, expected);
         }
 
         /// Byte-exact reconstruction under any chunking, answer order and
-        /// delay, rejection, rescan, backpressure, scan budget, and split
-        /// of stretches among probe threads (DESIGN.md §11).
+        /// delay, rejection, rescan, runs across chunks, backpressure, scan
+        /// budget, and split of stretches among probe threads
+        /// (DESIGN.md §11).
         #[test]
         fn output_is_reproduced_exactly(
             (pieces, seed) in input_strategy(),
             choices in proptest::collection::vec(any::<u8>(), 1..64),
             lookahead_windows in 1u64..6,
             negative in any::<bool>(),
-            min_part in proptest::option::of(1usize..100),
+            part in proptest::option::of(1usize..100),
             min_budget in 1u64..300,
         ) {
             let (valid, stale, piece) = overlapping_blocks(seed);
             let mut input = Vec::new();
             for (kind, n) in pieces {
-                let block = match kind % 4 {
+                let block = match kind % 5 {
                     0 => &valid[usize::from(n) % valid.len()],
                     1 => &stale[usize::from(n) % stale.len()],
                     2 => {
                         input.extend_from_slice(&noise(usize::from(n % 50), seed ^ u64::from(n)));
                         continue;
                     }
-                    _ => {
+                    3 => {
                         input.extend_from_slice(&piece);
+                        continue;
+                    }
+                    _ => {
+                        // Equal bytes: shorter or longer than a window.
+                        let length = usize::from(n) % (3 * BS as usize) + 1;
+                        input.extend(std::iter::repeat_n(n, length));
                         continue;
                     }
                 };
@@ -1111,11 +1473,11 @@ pub(crate) mod tests {
                 receiver,
                 lookahead_windows * u64::from(BS),
                 negative_cache,
-                min_part,
+                part,
             );
             run.scanner.min_budget = min_budget;
             run.scanner.budget = min_budget;
-            run.scanner.max_budget = if min_part.is_some() { 16 * min_budget } else { min_budget };
+            run.scanner.max_budget = if part.is_some() { 16 * min_budget } else { min_budget };
             run.transfer(&choices);
             prop_assert_eq!(&run.receiver.output, &input);
             prop_assert!(run.scanner.records.is_empty() && run.scanner.entries.is_empty());

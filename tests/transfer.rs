@@ -1,8 +1,9 @@
-//! End-to-end `run` transfers (PLAN.md steps 3 and 4) over a fake `ssh`
+//! End-to-end `run` transfers (PLAN.md steps 3 to 5) over a fake `ssh`
 //! that executes the remote command string with a local `/bin/sh`, under a
 //! separate HOME for the sender side. This exercises the real bootstrap
 //! quoting, the rendezvous socket, both sessions, the cache publication
-//! rules on both sides, and block references with their pins.
+//! rules on both sides, block references with their pins, runs, and the
+//! compression stream.
 
 mod common;
 
@@ -149,20 +150,30 @@ fn args(words: &[&str]) -> Vec<OsString> {
     words.iter().map(OsString::from).collect()
 }
 
-/// The first byte counts of the summary line: output, literal, reference,
-/// and run bytes.
-fn summary(output: &Output) -> [usize; 4] {
+/// The byte counts of the summary line: output, literal, reference, run,
+/// wire, hash-list, and delta bytes.
+fn summary_counts(output: &Output) -> Vec<usize> {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let line = stderr
         .lines()
         .find(|line| line.contains("bytes output"))
         .unwrap_or_else(|| panic!("no summary:\n{stderr}"));
-    let counts: Vec<usize> = line
-        .split(|c: char| !c.is_ascii_digit())
+    line.split(|c: char| !c.is_ascii_digit())
         .filter(|word| !word.is_empty())
         .map(|word| word.parse().unwrap())
-        .collect();
+        .collect()
+}
+
+/// The first byte counts of the summary line: output, literal, reference,
+/// and run bytes.
+fn summary(output: &Output) -> [usize; 4] {
+    let counts = summary_counts(output);
     [counts[0], counts[1], counts[2], counts[3]]
+}
+
+/// The bytes that the data session received, from the summary line.
+fn wire_bytes(output: &Output) -> usize {
+    summary_counts(output)[4]
 }
 
 /// Require a successful run; return its output.
@@ -436,6 +447,58 @@ fn a_slow_consumer_and_a_one_window_lookahead_keep_the_output_exact() {
     let output = succeeded(receiver.wait_with_output().unwrap());
     assert_eq!(received, [&b"x"[..], &blocks, b"yz", &blocks].concat());
     assert_eq!(summary(&output), [received.len(), 3, 2 * blocks.len(), 0]);
+}
+
+#[test]
+fn runs_and_compression_shrink_the_wire() {
+    // Zeros become runs of whole windows, and the zstd stream compresses
+    // the repetitive text. Random bytes shrink neither way (DESIGN.md §6.2
+    // and §6.3).
+    const ZEROS: usize = 4 << 20;
+    for (config, compressed) in [("", true), ("compression_level = 0\n", false)] {
+        let transfer = Transfer::new(config);
+        let text = "hashsync compresses repetitive text\n".repeat(30_000);
+        let noise = random(1 << 20, 23);
+        transfer.env.write("text", text.as_bytes());
+        transfer.env.write("noise", &noise);
+        let script = format!(
+            "head -c {ZEROS} /dev/zero; cat '{}' '{}'",
+            transfer.env.path("text").display(),
+            transfer.env.path("noise").display()
+        );
+        let output = transfer.run_ok(&refs(&args(&["sh", "-c", &script])));
+        let expected = [&vec![0; ZEROS][..], text.as_bytes(), &noise].concat();
+        assert!(output.stdout == expected, "the output differs");
+        let literal = text.len() + noise.len();
+        assert_eq!(summary(&output), [expected.len(), literal, 0, ZEROS]);
+        let wire = wire_bytes(&output);
+        if compressed {
+            assert!(
+                (noise.len()..noise.len() + (64 << 10)).contains(&wire),
+                "{wire} bytes wire"
+            );
+        } else {
+            assert!(wire > literal, "{wire} bytes wire");
+        }
+    }
+}
+
+#[test]
+fn a_command_that_pauses_transfers_exactly() {
+    // The command stops for a while, with queries for its indexed blocks in
+    // flight. Its frames can wait in the compressor meanwhile: the sender
+    // does not flush the stream for the receiver's sake, and no wait
+    // depends on those frames (DESIGN.md §6.2).
+    let transfer = Transfer::new("");
+    let blocks = tiled(16, 25);
+    transfer.env.write("tree/blocks", &blocks);
+    let script = format!(
+        "cat '{0}'; sleep 0.5; cat '{0}'",
+        transfer.env.path("tree/blocks").display()
+    );
+    let output = transfer.run_ok(&refs(&args(&["sh", "-c", &script])));
+    assert_eq!(output.stdout, blocks.repeat(2));
+    assert_eq!(summary(&output), [2 * blocks.len(), 0, 2 * blocks.len(), 0]);
 }
 
 #[test]

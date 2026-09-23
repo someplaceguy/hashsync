@@ -20,13 +20,14 @@ process-isolation tests, and protocol fuzzing from DESIGN.md §11. Run
 `cargo fmt`, `cargo clippy --all-targets`, and `cargo test` for implementation
 changes.
 
-**Status:** Steps 1 to 4 are implemented: `update` (with `--rebuild` and
+**Status:** Steps 1 to 5 are implemented: `update` (with `--rebuild` and
 `-j`) and `stats` maintain the index for mutable roots, reuse unchanged
 files by identity, size, and ctime, and recover interrupted work; `run`
 (with `--no-update` and `--ssh`), `serve`, and `attach` transfer a remote
 command's output over two SSH sessions, with the full hash-list exchange,
-account identities, and durable list caches, and replace indexed blocks
-with references verified through the pin file. Step 5 is the next
+account identities, and durable list caches, replace indexed blocks with
+references verified through the pin file, send constant-byte runs
+compactly, and compress the data stream with zstd. Step 6 is the next
 milestone.
 
 ## 1. Build and inspect a local index
@@ -151,8 +152,9 @@ Design coverage: §§3, 4.5, 5.1–5.3, 5.5, 6.2–6.7, 7–8.
   boundaries and the end-of-stream behavior specified in the design.
 - Support zstd compression with the configured level and thread count,
   including the option to disable compression.
-- Keep setup, short output, and query progress responsive when compression
-  and output backpressure are present.
+- Favor bandwidth over output latency: flush the compression stream only
+  before the sender waits for a reply, and finish it after END. Keep query
+  progress independent of compression and output backpressure.
 - Detect truncated or invalid compressed streams before declaring success.
   Preserve complete stderr forwarding and command-status handling.
 - Report run byte counts and account for compression in the summary's wire
