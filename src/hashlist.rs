@@ -1,18 +1,41 @@
-//! The canonical hash-list encoding (DESIGN.md §5.4).
+//! The canonical hash-list encoding and the list ID (DESIGN.md §5.4).
 //!
 //! Sorted distinct 64-bit values become gaps, and each gap is Golomb-Rice
 //! coded: `g >> k` one bits, a zero, then the low `k` bits, packed
-//! least-significant-bit first and zero-padded to a whole byte. Equal sets
-//! must produce equal bytes, so the decoder enforces the canonical form:
-//! the exact header, the exact `k` for `N`, no value overflow, zero
-//! padding, and the exact byte length.
+//! least-significant-bit first and zero-padded to a whole byte. The header
+//! is `N` alone; both sides derive `k` from it. Equal sets must produce
+//! equal bytes, so the decoder enforces the canonical form: no value
+//! overflow, zero padding, and the exact byte length.
 
-use crate::protocol::WIDTH;
+use crate::hash::{Strong, StrongHash};
 
-pub const FORMAT_VERSION: u8 = 1;
+/// The value width `W`: no hash bits are dropped.
+const WIDTH: u8 = 64;
 
-/// `format_version u8, W u8, k u8, N u64`.
-const HEADER_LEN: usize = 11;
+/// `N u64`.
+const HEADER_LEN: usize = 8;
+
+/// A hash list's identity: its strong-hash algorithm and the full digest
+/// of its encoding. Cache file names carry both; the protocol carries only
+/// the digest, because every list of a run uses the negotiated algorithm
+/// (DESIGN.md §6.2).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ListId {
+    pub algorithm: StrongHash,
+    pub digest: Strong,
+}
+
+/// `<algorithm>-<digest>`, the digest in lowercase hex. Messages show this
+/// form, and cache file names hold it (DESIGN.md §5.6).
+impl std::fmt::Display for ListId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}-", self.algorithm.id())?;
+        for byte in self.digest {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
 
 /// The canonical Rice parameter: `k = W - ceil(log2(N))`, and `k = 0` for
 /// an empty list.
@@ -35,9 +58,6 @@ pub fn encode(values: &[u64]) -> Vec<u8> {
     let n = values.len() as u64;
     let k = rice_k(n);
     let mut writer = BitWriter::new(values.len(), k);
-    writer.out.push(FORMAT_VERSION);
-    writer.out.push(WIDTH);
-    writer.out.push(k);
     writer.out.extend_from_slice(&n.to_le_bytes());
     let mut previous = None;
     for &value in values {
@@ -63,17 +83,8 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<u64>, String> {
     if bytes.len() < HEADER_LEN {
         return Err("truncated header".into());
     }
-    let (format, width, k) = (bytes[0], bytes[1], bytes[2]);
-    let n = u64::from_le_bytes(bytes[3..11].try_into().unwrap());
-    if format != FORMAT_VERSION {
-        return Err(format!("unsupported format version {format}"));
-    }
-    if width != WIDTH {
-        return Err(format!("unsupported width {width}"));
-    }
-    if k != rice_k(n) {
-        return Err(format!("non-canonical k {k} for {n} values"));
-    }
+    let n = u64::from_le_bytes(bytes[..HEADER_LEN].try_into().unwrap());
+    let k = rice_k(n);
     let body = &bytes[HEADER_LEN..];
     // Each value takes at least one bit, so this also bounds `n` before
     // any allocation.
@@ -242,16 +253,18 @@ mod tests {
     #[test]
     fn empty_list_is_the_header_alone() {
         let encoded = roundtrip(&[]);
-        assert_eq!(encoded, [FORMAT_VERSION, 64, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(encoded, [0; HEADER_LEN]);
     }
 
     #[test]
     fn single_value_uses_k_64() {
         for value in [0, 1, u64::MAX, 0x0123_4567_89AB_CDEF] {
             let encoded = roundtrip(&[value]);
-            assert_eq!(encoded[2], 64);
             // A zero bit, 64 value bits, and 7 padding bits.
             assert_eq!(encoded.len(), HEADER_LEN + 9);
+            let mut bits = [0u8; 16];
+            bits[..9].copy_from_slice(&encoded[HEADER_LEN..]);
+            assert_eq!(u128::from_le_bytes(bits), u128::from(value) << 1);
         }
     }
 
@@ -281,15 +294,11 @@ mod tests {
     #[test]
     fn deviations_are_rejected() {
         assert!(decode(&[]).unwrap_err().contains("truncated"));
-        let mut bad_version = encode(&[]);
-        bad_version[0] = 2;
-        assert!(decode(&bad_version).unwrap_err().contains("version"));
-        let mut bad_width = encode(&[]);
-        bad_width[1] = 32;
-        assert!(decode(&bad_width).unwrap_err().contains("width"));
-        let mut bad_k = encode(&[7, 8, 9]);
-        bad_k[2] += 1;
-        assert!(decode(&bad_k).unwrap_err().contains("non-canonical k"));
+        assert!(
+            decode(&[0; HEADER_LEN - 1])
+                .unwrap_err()
+                .contains("truncated")
+        );
 
         let encoded = encode(&[7, 8, 9]);
         let truncated = &encoded[..encoded.len() - 1];
@@ -305,10 +314,10 @@ mod tests {
         assert!(decode(&padding).unwrap_err().contains("padding"));
 
         // Two maximal values cannot both be represented: the second gap
-        // overflows. k = 63; the gap `u64::MAX >> 63 = 1` needs quotient
-        // 0; force a quotient of 2 with ones before the terminating zero.
-        let mut header = vec![FORMAT_VERSION, 64, 63];
-        header.extend_from_slice(&2u64.to_le_bytes());
+        // overflows. N = 2 gives k = 63; the gap `u64::MAX >> 63 = 1`
+        // needs quotient 0; force a quotient of 2 with ones before the
+        // terminating zero.
+        let mut header = 2u64.to_le_bytes().to_vec();
         let mut writer = BitWriter::new(2, 63);
         writer.bits(0, 1);
         writer.bits(u64::MAX, 63);
@@ -320,9 +329,11 @@ mod tests {
 
         // An announced count larger than the bits can hold must fail
         // before allocating for it.
-        let mut huge = vec![FORMAT_VERSION, 64, 0];
-        huge.extend_from_slice(&u64::MAX.to_le_bytes());
-        assert!(decode(&huge).unwrap_err().contains("more values"));
+        assert!(
+            decode(&u64::MAX.to_le_bytes())
+                .unwrap_err()
+                .contains("more values")
+        );
     }
 
     proptest! {

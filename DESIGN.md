@@ -51,11 +51,11 @@ asynchronous runtime or event loop.
    is held throughout the run.
 2. It exports the hash list from one database snapshot, prepares the temporary
    pin file, and starts data and control SSH sessions to the sender.
-3. HELLO negotiates parameters and cached lists. The receiver durably
-   publishes its target list, then sends a full list, a delta, or confirmation
-   that the sender's list is current. The sender verifies it, builds its
-   table, durably publishes it when caching is enabled, and acknowledges
-   the accepted target.
+3. After both sides exchange protocol versions, HELLO negotiates parameters
+   and cached lists. The receiver durably publishes its target list, then
+   sends a full list, a delta, or confirmation that the sender's list is
+   current. The sender verifies it, builds its table, durably publishes it
+   when caching is enabled, and acknowledges the accepted target.
 4. The sender starts the command. Its scanner sends literals for misses,
    runs for repeated bytes, and queries for possible block matches.
 5. The receiver reads and verifies candidates, appending their bytes to its
@@ -79,6 +79,14 @@ descriptor, or process goes away. Slow systems must not fail because of a
 deadline; a stalled process can be inspected with a debugger. Fatal errors
 end the process (section 6.7). Retry intervals and cache age bounds are not
 operation deadlines.
+
+**No artificial size limits.** Valid input never fails because of an
+arbitrary size constant. Only the width of the field that carries a length
+or count, such as a frame's `u32` length, and the resources of the host
+bound it. Readers grow buffers only as bytes arrive, so a corrupt length
+costs no more memory than the bytes that really follow it. Chunk sizes and
+budgets that tune performance, without making valid input fail, are not
+limits.
 
 **Retry interrupted calls.** Every system call that fails with `EINTR` is
 retried indefinitely; an interruption is never a failure. The exception is
@@ -512,8 +520,8 @@ transactions, including orphans left by earlier interrupted cleanup.
 
 ### 5.1 Weak hash: mixed polynomial rolling hash modulo 2^64
 
-The definition is shared by both roles and is part of the protocol. All
-arithmetic is unsigned 64-bit modulo 2^64.
+The definition is shared by both roles. All arithmetic is unsigned 64-bit
+modulo 2^64.
 
 - `a` is a fixed odd multiplier with `a ≡ 5 (mod 8)`, for example
   `0x9E3779B97F4A7C15`.
@@ -524,7 +532,9 @@ arithmetic is unsigned 64-bit modulo 2^64.
   `Tout[b] = b * a^B` is precomputed for the block size.
 
 Rolling uses the unmixed `P`; indexing, list encoding, and table lookup use
-the mixed value. `weak_hash_id` records the algorithm, multiplier, and mixer.
+the mixed value. `weak_hash_id` names the algorithm, multiplier, and mixer
+in the index, in cached lists, and in HELLO. A change to any of them makes
+a new weak hash with a new ID, not a new protocol version (section 11).
 
 ### 5.2 `mix64`: the bit mixer
 
@@ -543,14 +553,16 @@ fn mix64(mut z: u64) -> u64 {
 }
 ```
 
-This function is a protocol constant and is not rolling-compatible.
+This function is part of the weak hash that `weak_hash_id` names, and it
+is not rolling-compatible.
 
 ### 5.3 Strong hashes
 
 Initially support `blake3` (default) and `sha256`, both with 32-byte outputs.
 Each supported algorithm has one fixed output length `S >= 16` bytes.
 Configuration cannot truncate digests or choose an arbitrary XOF length.
-HELLO requires agreement on the algorithm; changing it rebuilds the index.
+HELLO names the receiver's algorithm, and the sender must support it;
+changing it rebuilds the index.
 
 Treat full strong-hash equality as byte equality. Only the index stores
 16-byte prefixes. Queries, content caches, and list IDs use full digests.
@@ -569,12 +581,14 @@ Export distinct weak hashes through `blocks_by_weak`, sort as unsigned
 3. Encode each gap using Golomb-Rice coding: `g >> k` one bits, a zero,
    then the low `k` bits. Pack least-significant-bit first and pad the last
    byte with zeros.
-4. Prefix `format_version u8, W u8, k u8, N u64`.
-   Set `k = W - ceil(log2(N))`. For `N = 0`, use `k = 0` and the
+4. Prefix `N u64`. The encoder and the decoder derive
+   `k = W - ceil(log2(N))` from it. For `N = 0`, use `k = 0` and the
    header alone. For `N = 1`, `k = 64`: a zero bit followed by all
    64 value bits, without performing an invalid 64-bit shift.
 
-Equal sets must produce equal bytes. The list ID is the strong algorithm
+Equal sets must produce equal bytes. The list has no format version of its
+own: the protocol version covers it on the wire, and the cache wrapper's
+format covers it on disk (section 5.6). The list ID is the strong algorithm
 and full digest of those bytes. Export on every run; there is no
 generation-based shortcut.
 
@@ -602,8 +616,8 @@ membership semantics.
 
 Full lists are immutable and named by content. Account and index IDs
 partition cache directories; they do not identify list content. Compute a
-direct delta from any available compatible base, without generations,
-delta logs, or segment chains.
+direct delta from any available base, without generations, delta logs, or
+segment chains.
 
 **Identity and storage.**
 
@@ -623,9 +637,13 @@ receiver index, encoded as fixed-width lowercase hex. Under
 | Receiver | `local-hashlists/B-I/<algorithm>-<digest>.cache` |
 | Sender | `remote-hashlists/A-I/<algorithm>-<digest>.cache` |
 
-Directories are private (0700), files 0600. A versioned wrapper stores the
-list ID, block size, weak-hash parameters, and encoded length. Hash only the
-canonical list bytes, excluding the wrapper and peer identities.
+Directories are private (0700), files 0600. A file is a versioned wrapper,
+a magic string and a format byte, followed by the list bytes; the file name
+holds the list ID. The lists in one peer/index directory all come from one
+index, so they share its block size, weak hash, and strong hash: a change
+to any of them rebuilds the index with a new index ID (section 4.4). Files
+therefore store none of these parameters. Hash only the canonical list
+bytes, excluding the wrapper and peer identities.
 
 **Cache failures and validation.**
 
@@ -643,12 +661,11 @@ required file remain fatal.
 
 Unexpected cached file contents are also a cache miss: remove the file and
 continue without it. This includes malformed or truncated wrappers or list
-encodings, unsupported formats, and list-ID or checksum mismatches. Failure
-to remove the file is fatal unless it is already gone. An I/O error while
-reading a file is fatal; successfully reading invalid contents is not.
-Valid lists with incompatible block size or weak-hash parameters are simply
-ineligible bases. Validation failures in lists received over the protocol
-follow the exchange rules below.
+encodings, unsupported formats, and list bytes whose digest does not match
+the list ID in the file name. Failure to remove the file is fatal unless it
+is already gone. An I/O error while reading a file is fatal; successfully
+reading invalid contents is not. Validation failures in lists received over
+the protocol follow the exchange rules below.
 
 **Exchange.**
 
@@ -656,11 +673,9 @@ follow the exchange rules below.
    account is known, durably publish the target in its receiver-side peer
    directory before sending list data. Retain bytes or an open fd.
    Failure to persist the receiver's target ends setup.
-2. The sender advertises its valid compatible list with greatest `ctime`,
-   breaking ties by filename byte order, or explicit absence. Verify files
-   before use and retain the selected base. Compatibility requires supported
-   encoding and matching block size and weak hash; the base's strong
-   algorithm may differ from the target's.
+2. The sender advertises its valid list with greatest `ctime`, breaking
+   ties by filename byte order, or explicit absence. Verify files before use
+   and retain the selected base.
 3. Equal IDs use HASHKEEP. Otherwise the receiver searches all its
    `local-hashlists/*/*.cache` directories for the advertised base and
    verifies it. A missing or damaged base uses HASHLIST. With a base, merge
@@ -671,7 +686,7 @@ follow the exchange rules below.
    HASHFULL; a bad full list is a protocol error. HASHKEEP uses the retained,
    verified base.
 5. Build the table and durably publish the verified target on the sender.
-   Reply `CACHE_RESULT { target }` only after publication.
+   Reply CACHE_RESULT only after publication.
    Then remove the advertised old file from that peer/index directory if
    its ID differs.
 6. On CACHE_RESULT, the receiver may remove that exchange's old list from
@@ -680,8 +695,8 @@ follow the exchange rules below.
    from other peer/index directories as part of this cleanup.
 
 `sender_cache = false` advertises no base, stores nothing, removes earlier
-files in that receiver/index directory, and sends the same
-`CACHE_RESULT { target }` after verification, table construction, and removal.
+files in that receiver/index directory, and sends the same CACHE_RESULT
+after verification, table construction, and removal.
 The receiver still durably publishes its target. The negotiated setting
 determines whether the sender publishes; no storage-success flag is needed.
 
@@ -753,9 +768,10 @@ The receiver generates token `T` and starts both sessions together:
 - Control: `SSH HOST hashsync attach --token T`.
 
 `serve` first listens on `$XDG_RUNTIME_DIR/hashsync/T.sock` (fallback: a
-private directory under `/tmp`), mode 0600. It exchanges data HELLOs, accepts
-`attach`, and completes the list exchange and CACHE_RESULT before starting
-the command. Flush setup responses before waiting.
+private directory under `/tmp`), mode 0600. It exchanges protocol versions
+and data HELLOs, accepts `attach`, and completes the list exchange and
+CACHE_RESULT before starting the command. Flush setup responses before
+waiting.
 
 `attach` retries a not-yet-listening socket while its stdin remains open,
 with no deadline. It relays stdin to the socket and the socket to stdout,
@@ -781,58 +797,64 @@ hashsync protocol and compression stream. Successful sender exit requires
 relay completion; its coordination with stdout completion is an implementation
 decision (section 6.7). The receiver waits for both SSH exits before returning.
 
-### 6.2 Frames
+### 6.2 Protocol version and frames
+
+Each side sends `protocol_version u32`, little endian, as the first bytes of
+each session. It does not wait for the peer's version before it sends its
+own. It reads the peer's version before it reads any frame, and it ends the
+run with `die` if the versions are different; the message names both
+versions. The sender starts the command only after it has checked the
+receiver's version on both sessions. The remote commands of section 6.1 and
+this version exchange never change. Everything after the exchange belongs to
+one protocol version (section 11).
 
 Every frame is `type u8, length u32, payload`. Integers are little endian.
 Strings and byte strings have a `u32` byte length; lists have a `u32` item
 count. Output offsets and lengths are `u64`; overflow is a protocol error.
+Readers grow their buffers only as bytes arrive, so no length has a bound
+other than the size of its field (section 3).
 
-`S` is the negotiated strong algorithm's full digest length. A `list_id`
-is an algorithm string followed by its fixed-length full digest. Optional
-IDs begin with a 0/1 presence byte. Base and target lists may use different
-supported strong algorithms.
+`S` is the negotiated strong algorithm's full digest length. Every digest of
+the run uses that algorithm, including the list IDs of the target and the
+base, so a list ID travels as its digest alone, `[u8; S]`. An optional
+digest begins with a 0/1 presence byte. A run has one target and at most
+one base; the HELLOs name them, and later frames refer to them without
+repeating them.
 
 | Session | Direction | Types |
 |---|---|---|
-| data | receiver to sender | HELLO, HASHLIST, HASHDELTA, HASHKEEP, LISTDATA, END_ACK |
+| data | receiver to sender | HELLO, HASHLIST, HASHDELTA, HASHKEEP, END_ACK |
 | data | sender to receiver | HELLO, HASHFULL, CACHE_RESULT, LIT, REF, RLE, END |
-| control | sender to receiver | HELLO, QUERY |
-| control | receiver to sender | HELLO, ANSWER |
+| control | sender to receiver | QUERY |
+| control | receiver to sender | ANSWER |
 
 Payloads:
 
-- HELLO, receiver to sender (data): `protocol_version u32`,
-  `program_version string`, `block_size u32`, `weak_hash_id string`,
-  `strong_hash_id string`, `W u8`, `account_id [u8; 16]`,
-  `index_id [u8; 16]`, `target list_id`, `sender_cache u8`,
-  `hashlist_max_age u64` (seconds), `lookahead u64`,
-  `compression_level i32`, `compression_threads u32`, `negative_cache u64`
-  (bytes), and `command`, a list of argv byte strings. Find argv[0] in PATH
-  and run directly; a shell requires explicit `sh -c`.
-- HELLO, sender to receiver (data): `protocol_version u32`,
-  `program_version string`, `block_size u32`, `weak_hash_id string`,
-  `strong_hash_id string`, `W u8`, `account_id [u8; 16]`,
-  `base optional_list_id`.
-- HELLO, both directions (control): `protocol_version u32`,
-  `program_version string`. Both sides send immediately.
-- HASHLIST: `target list_id, length u64`, followed by that many encoded
-  bytes in LISTDATA frames.
-- HASHDELTA: `base list_id, target list_id, removed_length u64,
-  added_length u64`, followed by removed and added encoded lists in
-  LISTDATA frames. IDs must match the advertised base and target.
-- HASHKEEP: `target list_id`, equal to both advertised IDs. No data follows.
-- LISTDATA: at most 1 MiB of the announced bytes. Enforce exact lengths and
-  canonical encoding, including ordering and padding. Unexpected frames or
-  excess bytes are protocol errors.
-- HASHFULL: `target list_id`. Request a full list once after a delta
-  digest mismatch, before command output. The response is HASHLIST for that
-  target. Failed results are never published or used for the final table.
-- CACHE_RESULT: `target list_id`. A single acknowledgement after target
-  verification, table construction, and durable sender publication when
-  caching is enabled. With `sender_cache = false`, send it after removing
-  earlier files for this receiver/index. Cache operation failures are fatal
-  as specified in section 5.6. Wrong targets or repeated acknowledgements
-  are protocol errors. Flush before starting the command.
+- HELLO, receiver to sender: `block_size u32`, `weak_hash_id string`,
+  `strong_hash_id string`, `account_id [u8; 16]`, `index_id [u8; 16]`,
+  `target [u8; S]`, `sender_cache u8`, `hashlist_max_age u64` (seconds),
+  `lookahead u64`, `compression_level i32`, `compression_threads u32`,
+  `negative_cache u64` (bytes), and `command`, a list of argv byte strings.
+  Find argv[0] in PATH and run directly; a shell requires explicit `sh -c`.
+- HELLO, sender to receiver: `account_id [u8; 16]` and an optional
+  `base [u8; S]`.
+- HASHLIST: `length u64`. That many encoded bytes of the target follow the
+  frame directly.
+- HASHDELTA: `removed_length u64, added_length u64`. The removed and added
+  encoded lists follow the frame directly. They change the advertised base
+  into the target.
+- HASHKEEP: empty. The advertised base is the target; no data follows.
+- List bytes after HASHLIST and HASHDELTA are not frames. Enforce exact
+  lengths and canonical encoding, including ordering and padding.
+- HASHFULL: empty. Request a full list once after a delta digest mismatch,
+  before command output. The response is HASHLIST. Failed results are
+  never published or used for the final table.
+- CACHE_RESULT: empty. A single acknowledgement after target verification,
+  table construction, and durable sender publication when caching is
+  enabled. With `sender_cache = false`, send it after removing earlier
+  files for this receiver/index. Cache operation failures are fatal as
+  specified in section 5.6. Repeated acknowledgements are protocol errors.
+  Flush before starting the command.
 - LIT: literal bytes.
 - REF: empty; use the pin at the current output offset.
 - RLE: `byte u8, length u64`.
@@ -846,17 +868,18 @@ Payloads:
   go backwards after rescanning.
 - ANSWER: `offset u64, found u8` (0 or 1). Answers may arrive out of order.
 
-Before command startup, require compatible program/protocol versions and
-equal block size, weak hash, strong hash, and width. The target uses the
-negotiated strong algorithm. Reject unsupported algorithms and invalid digest
-lengths.
+The receiver's HELLO sets the block size, weak hash, and strong hash of the
+run. The sender uses them, or it ends the run with `die` before command
+startup if it does not support them. It checks the strong hash before it
+reads the target, whose length depends on it. Its HELLO does not repeat
+them.
 
-The data handshake is receiver HELLO, sender HELLO, durable receiver
-publication, then HASHLIST/HASHDELTA/HASHKEEP and its data. The sender replies
-with CACHE_RESULT, possibly after one HASHFULL fallback. The receiver handles
-the result and cache cleanup before entering its output loop. Its only
-remaining data-session frame is END_ACK; it keeps both session stdin pipes
-open until the sender and relay exit.
+The data handshake is the version exchange, receiver HELLO, sender HELLO,
+durable receiver publication, then HASHLIST/HASHDELTA/HASHKEEP and its data.
+The sender replies with CACHE_RESULT, possibly after one HASHFULL fallback.
+The receiver handles the result and cache cleanup before entering its output
+loop. Its only remaining data-session frame is END_ACK; it keeps both session
+stdin pipes open until the sender and relay exit.
 
 After HELLO, all sender-to-receiver data-session frames share one zstd stream,
 unless compression is disabled. This includes HASHFULL and CACHE_RESULT.
@@ -1103,7 +1126,8 @@ No extent is punched while its append or REF read is still using it.
 
 ### 6.5 Failures and trust
 
-- Incompatible HELLO parameters fail before command startup.
+- Different protocol versions and unsupported HELLO parameters fail before
+  command startup.
 - Command failure still transfers all output and returns its status in END.
   Startup failure sends status 127 and error text.
 - Truncated streams, broken sessions or receiver stdout, and receiver
@@ -1138,7 +1162,7 @@ coordination chosen by the implementation, subject to section 6.7.
 | Role | Responsibilities |
 |---|---|
 | Sender main | Handshake and command startup, then wait for the completion conditions of section 6.7. |
-| Sender data reader | Read data-session frames for the whole run: HELLO, the list, and END_ACK. EOF before the normal exit means that the receiver disappeared. |
+| Sender data reader | Read the data session for the whole run: the protocol version, HELLO, the list, and END_ACK. EOF before the normal exit means that the receiver disappeared. |
 | Sender command reader | Fill lookahead until stdout EOF; obtain the command's exit status without reaping. |
 | Sender stderr relay | Copy command stderr to sender stderr through EOF and flush. |
 | Sender scanner | Own records and query states; queue queries and output. |
@@ -1283,8 +1307,9 @@ exclude = ["*.tmp", ".cache"]
 one_filesystem = true
 ```
 
-Width, weak-hash multiplier, and mixer are protocol constants. Account IDs
-are persistent state, not TOML options.
+The list width is a protocol constant, and `weak_hash_id` fixes the
+weak-hash multiplier and mixer. Account IDs are persistent state. None of
+these are TOML options.
 
 **Byte strings.** TOML strings contain Unicode characters, not arbitrary
 bytes. Even TOML 1.1's `"\xFF"` denotes U+00FF, whose UTF-8 bytes are
@@ -1412,9 +1437,14 @@ decision history is in version control.
 - One crate, one binary, committed `Cargo.lock`. All profiles use
   `panic = "abort"`; install cleanup hooks before starting threads.
 - Isolate unsafe syscall wrappers and SIMD code; deny unsafe code elsewhere.
-- Share protocol definitions between both roles. Changing frame layouts,
-  hash constants, list encoding, or HELLO fields requires a protocol version
-  bump.
+- Share protocol definitions between both roles. The protocol version is 1
+  until the first release. After that, any change that a peer can observe
+  after the version exchange requires a protocol version bump, for example a
+  change to frame layouts, frame order or meaning, the list encoding, or the
+  frames that the zstd stream carries. New weak and strong hashes are the
+  exception: HELLO names both, and a sender that does not support them
+  ends the run before command startup. The remote commands and the version
+  exchange never change (sections 6.1 and 6.2).
 - Run `cargo fmt`, `cargo clippy --all-targets`, and `cargo test` for
   implementation changes.
 - Validate hashing/encoding properties, empty-table misses, and absence of
@@ -1437,6 +1467,7 @@ decision history is in version control.
   pruning a vanished immutable root and indexing it again when it returns;
   SSH option precedence and bootstrap quoting of executable paths containing
   whitespace, quotes, shell metacharacters, and non-UTF-8 bytes;
+  a different protocol version on either side, detected before any frame;
   crash recovery and SQLite process exclusion and snapshots after worker
   connections open; cache publication and cleanup races, fatal cache I/O
   failures, and removal of invalid cached lists with fallback to a full list;

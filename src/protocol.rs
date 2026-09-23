@@ -1,8 +1,13 @@
-//! The transfer protocol's frames and payload layouts (DESIGN.md §6.2).
+//! The transfer protocol's version exchange, frames, and payload layouts
+//! (DESIGN.md §6.2).
 //!
-//! Both roles share these definitions (DESIGN.md §11). Changing a frame
-//! layout, a hash constant, the list encoding, or a HELLO field requires a
-//! protocol version bump.
+//! Both roles share these definitions. The version exchange never
+//! changes; DESIGN.md §11 says which other changes require a protocol
+//! version bump.
+//!
+//! Readers grow their buffers only as bytes arrive, so no length or count
+//! needs a bound beyond its field: a corrupt value costs only the bytes
+//! that really follow it.
 //!
 //! Malformed payloads and violated frame rules are bugs in a compatible
 //! peer: parsers panic (DESIGN.md §6.5). Transport failures, including EOF
@@ -11,14 +16,12 @@
 
 use std::io::{Read, Write};
 
-use crate::hash::{STRONG_LEN, Strong, StrongHash};
+use crate::die::die;
+use crate::hash::{Strong, StrongHash};
 
-pub const PROTOCOL_VERSION: u32 = 2;
-pub const PROGRAM_VERSION: &str = env!("CARGO_PKG_VERSION");
-
-/// The hash-list value width `W` (DESIGN.md §5.4): no hash bits are
-/// dropped.
-pub const WIDTH: u8 = 64;
+/// The first bytes of each session, in both directions, as a
+/// little-endian `u32`.
+pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Frame types. `type u8, length u32, payload`, integers little endian.
 pub mod frame {
@@ -30,69 +33,41 @@ pub mod frame {
     pub const HASHLIST: u8 = 2;
     pub const HASHDELTA: u8 = 3;
     pub const HASHKEEP: u8 = 4;
-    pub const LISTDATA: u8 = 5;
-    pub const HASHFULL: u8 = 6;
-    pub const CACHE_RESULT: u8 = 7;
-    pub const LIT: u8 = 8;
-    pub const REF: u8 = 9;
-    pub const RLE: u8 = 10;
-    pub const END: u8 = 11;
-    pub const END_ACK: u8 = 12;
-    pub const QUERY: u8 = 13;
-    pub const ANSWER: u8 = 14;
+    pub const HASHFULL: u8 = 5;
+    pub const CACHE_RESULT: u8 = 6;
+    pub const LIT: u8 = 7;
+    pub const REF: u8 = 8;
+    pub const RLE: u8 = 9;
+    pub const END: u8 = 10;
+    pub const END_ACK: u8 = 11;
+    pub const QUERY: u8 = 12;
+    pub const ANSWER: u8 = 13;
 }
 
-/// A LISTDATA frame carries at most 1 MiB of the announced bytes.
-pub const MAX_LISTDATA: usize = 1 << 20;
-
-/// Bound on any frame payload this implementation produces or accepts.
-/// LIT payloads stay within the sender's read chunk, and a HELLO is
-/// bounded by the command line the receiver's kernel accepted.
-pub const MAX_FRAME: usize = 8 << 20;
-
-/// The peer's protocol version leads every HELLO payload: check it
-/// before trusting the rest of the layout, which another version may
-/// have changed. `who` names the peer for the failure message.
-pub fn check_protocol_version(payload: &[u8], who: &str) {
-    assert!(payload.len() >= 4, "protocol error: truncated HELLO frame");
-    let version = u32::from_le_bytes(payload[..4].try_into().unwrap());
+/// Require the peer's protocol version, read before any frame, to equal
+/// this side's; another version can change everything that follows.
+/// `who` names the peer for the failure message.
+pub fn check_version(version: u32, who: &str) {
     if version != PROTOCOL_VERSION {
-        crate::die::die(format!(
+        die(format!(
             "the {who} speaks protocol version {version}, \
-             this hashsync {PROGRAM_VERSION} speaks {PROTOCOL_VERSION}"
+             this hashsync {} speaks {PROTOCOL_VERSION}",
+            env!("CARGO_PKG_VERSION")
         ));
     }
 }
 
-/// A hash list's identity: its strong-hash algorithm and full digest
-/// (DESIGN.md §5.4).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct ListId {
-    pub algorithm: StrongHash,
-    pub digest: Strong,
-}
-
-impl std::fmt::Display for ListId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}-", self.algorithm.id())?;
-        for byte in self.digest {
-            write!(f, "{byte:02x}")?;
-        }
-        Ok(())
-    }
-}
-
-/// HELLO, receiver to sender, on the data session.
+/// HELLO, receiver to sender. Its block size and hashes are the run's:
+/// the sender uses them or ends the run. Every digest of the run,
+/// including the target's, uses `strong_hash` (DESIGN.md §6.2).
 pub struct ReceiverHello {
-    pub protocol_version: u32,
-    pub program_version: String,
     pub block_size: u32,
     pub weak_hash_id: String,
-    pub strong_hash_id: String,
-    pub width: u8,
+    pub strong_hash: StrongHash,
     pub account_id: [u8; 16],
     pub index_id: [u8; 16],
-    pub target: ListId,
+    /// The digest of the receiver's hash list.
+    pub target: Strong,
     pub sender_cache: bool,
     /// Seconds.
     pub hashlist_max_age: u64,
@@ -108,15 +83,12 @@ pub struct ReceiverHello {
 impl ReceiverHello {
     pub fn encode(&self) -> Vec<u8> {
         let mut enc = Enc::new();
-        enc.u32(self.protocol_version);
-        enc.bytes(self.program_version.as_bytes());
         enc.u32(self.block_size);
         enc.bytes(self.weak_hash_id.as_bytes());
-        enc.bytes(self.strong_hash_id.as_bytes());
-        enc.u8(self.width);
+        enc.bytes(self.strong_hash.id().as_bytes());
         enc.raw(&self.account_id);
         enc.raw(&self.index_id);
-        enc.list_id(&self.target);
+        enc.raw(&self.target);
         enc.u8(self.sender_cache.into());
         enc.u64(self.hashlist_max_age);
         enc.u64(self.lookahead);
@@ -130,64 +102,59 @@ impl ReceiverHello {
         enc.buf
     }
 
+    /// The target's length depends on the strong hash, so an unsupported
+    /// strong hash ends the run here, before the target is read
+    /// (DESIGN.md §6.2). The sender checks the other parameters after
+    /// decoding.
     pub fn decode(payload: &[u8]) -> Self {
         let mut dec = Dec::new(payload, "HELLO");
+        let block_size = dec.u32();
+        let weak_hash_id = dec.string();
+        let strong_hash_id = dec.string();
+        let Some(strong_hash) = StrongHash::from_id(&strong_hash_id) else {
+            die(format!(
+                "incompatible receiver: strong hash {strong_hash_id}"
+            ));
+        };
         let hello = ReceiverHello {
-            protocol_version: dec.u32(),
-            program_version: dec.string(),
-            block_size: dec.u32(),
-            weak_hash_id: dec.string(),
-            strong_hash_id: dec.string(),
-            width: dec.u8(),
+            block_size,
+            weak_hash_id,
+            strong_hash,
             account_id: dec.array(),
             index_id: dec.array(),
-            target: dec.list_id(),
+            target: dec.array(),
             sender_cache: dec.flag(),
             hashlist_max_age: dec.u64(),
             lookahead: dec.u64(),
             compression_level: dec.i32(),
             compression_threads: dec.u32(),
             negative_cache: dec.u64(),
-            command: {
-                let count = dec.u32();
-                (0..count).map(|_| dec.string_bytes()).collect()
-            },
+            command: dec.list(Dec::string_bytes),
         };
         dec.done();
+        assert!(hello.block_size > 0, "protocol error: block size 0");
         assert!(!hello.command.is_empty(), "protocol error: empty command");
         hello
     }
 }
 
-/// HELLO, sender to receiver, on the data session. It echoes the
-/// parameters the sender accepted, so the receiver checks them for
-/// equality.
+/// HELLO, sender to receiver. The sender sends it only after it
+/// accepted the receiver's HELLO, so it does not repeat those
+/// parameters. The base's digest uses the run's strong hash.
 pub struct SenderHello {
-    pub protocol_version: u32,
-    pub program_version: String,
-    pub block_size: u32,
-    pub weak_hash_id: String,
-    pub strong_hash_id: String,
-    pub width: u8,
     pub account_id: [u8; 16],
-    pub base: Option<ListId>,
+    pub base: Option<Strong>,
 }
 
 impl SenderHello {
     pub fn encode(&self) -> Vec<u8> {
         let mut enc = Enc::new();
-        enc.u32(self.protocol_version);
-        enc.bytes(self.program_version.as_bytes());
-        enc.u32(self.block_size);
-        enc.bytes(self.weak_hash_id.as_bytes());
-        enc.bytes(self.strong_hash_id.as_bytes());
-        enc.u8(self.width);
         enc.raw(&self.account_id);
         match &self.base {
             None => enc.u8(0),
             Some(base) => {
                 enc.u8(1);
-                enc.list_id(base);
+                enc.raw(base);
             }
         }
         enc.buf
@@ -196,16 +163,10 @@ impl SenderHello {
     pub fn decode(payload: &[u8]) -> Self {
         let mut dec = Dec::new(payload, "HELLO");
         let hello = SenderHello {
-            protocol_version: dec.u32(),
-            program_version: dec.string(),
-            block_size: dec.u32(),
-            weak_hash_id: dec.string(),
-            strong_hash_id: dec.string(),
-            width: dec.u8(),
             account_id: dec.array(),
             base: match dec.flag() {
                 false => None,
-                true => Some(dec.list_id()),
+                true => Some(dec.array()),
             },
         };
         dec.done();
@@ -213,87 +174,24 @@ impl SenderHello {
     }
 }
 
-/// HELLO, both directions, on the control session. Both sides send it
-/// immediately.
-pub struct ControlHello {
-    pub protocol_version: u32,
-    pub program_version: String,
-}
-
-impl ControlHello {
-    pub fn current() -> Self {
-        ControlHello {
-            protocol_version: PROTOCOL_VERSION,
-            program_version: PROGRAM_VERSION.to_string(),
-        }
-    }
-
-    pub fn encode(&self) -> Vec<u8> {
-        let mut enc = Enc::new();
-        enc.u32(self.protocol_version);
-        enc.bytes(self.program_version.as_bytes());
-        enc.buf
-    }
-
-    pub fn decode(payload: &[u8]) -> Self {
-        let mut dec = Dec::new(payload, "HELLO");
-        let hello = ControlHello {
-            protocol_version: dec.u32(),
-            program_version: dec.string(),
-        };
-        dec.done();
-        hello
-    }
-}
-
-/// HASHLIST: the announced target and encoded length; the bytes follow in
-/// LISTDATA frames.
+/// HASHLIST: the encoded length of the target list, whose bytes follow the
+/// frame directly.
 pub struct HashList {
-    pub target: ListId,
     pub length: u64,
 }
 
 impl HashList {
     pub fn encode(&self) -> Vec<u8> {
         let mut enc = Enc::new();
-        enc.list_id(&self.target);
         enc.u64(self.length);
         enc.buf
     }
 
     pub fn decode(payload: &[u8]) -> Self {
         let mut dec = Dec::new(payload, "HASHLIST");
-        let header = HashList {
-            target: dec.list_id(),
-            length: dec.u64(),
-        };
+        let header = HashList { length: dec.u64() };
         dec.done();
         header
-    }
-}
-
-/// CACHE_RESULT: the sender's single acknowledgement of the accepted
-/// target, after verification, table construction, and, with caching
-/// enabled, durable publication. There is no storage-success flag: cache
-/// failures are fatal (DESIGN.md §5.6).
-pub struct CacheResult {
-    pub target: ListId,
-}
-
-impl CacheResult {
-    pub fn encode(&self) -> Vec<u8> {
-        let mut enc = Enc::new();
-        enc.list_id(&self.target);
-        enc.buf
-    }
-
-    pub fn decode(payload: &[u8]) -> Self {
-        let mut dec = Dec::new(payload, "CACHE_RESULT");
-        let result = CacheResult {
-            target: dec.list_id(),
-        };
-        dec.done();
-        result
     }
 }
 
@@ -381,11 +279,6 @@ impl Enc {
     pub fn raw(&mut self, v: &[u8]) {
         self.buf.extend_from_slice(v);
     }
-
-    pub fn list_id(&mut self, id: &ListId) {
-        self.bytes(id.algorithm.id().as_bytes());
-        self.raw(&id.digest);
-    }
 }
 
 /// A payload parser. Truncation, trailing bytes, and invalid values are
@@ -446,7 +339,7 @@ impl<'a> Dec<'a> {
         self.take(len).to_vec()
     }
 
-    /// A length-prefixed UTF-8 string, such as an algorithm or version.
+    /// A length-prefixed UTF-8 string, such as an algorithm or error text.
     pub fn string(&mut self) -> String {
         String::from_utf8(self.string_bytes()).unwrap_or_else(|_| {
             panic!(
@@ -456,18 +349,17 @@ impl<'a> Dec<'a> {
         })
     }
 
-    pub fn list_id(&mut self) -> ListId {
-        let name = self.string();
-        let algorithm = StrongHash::from_id(&name).unwrap_or_else(|| {
-            panic!(
-                "protocol error: unsupported strong hash {name:?} in {} frame",
-                self.what
-            )
-        });
-        // Every supported algorithm has one fixed digest length
-        // (DESIGN.md §5.3).
-        let digest = self.array::<STRONG_LEN>();
-        ListId { algorithm, digest }
+    /// A `u32` item count, then the items. The list grows only as items
+    /// parse: `collect` would reserve space for the announced count
+    /// first, so a corrupt count could cost far more memory than the
+    /// payload holds (DESIGN.md §3).
+    pub fn list<T>(&mut self, mut item: impl FnMut(&mut Self) -> T) -> Vec<T> {
+        let count = self.u32();
+        let mut items = Vec::new();
+        for _ in 0..count {
+            items.push(item(self));
+        }
+        items
     }
 
     /// Require that the whole payload was consumed.
@@ -501,34 +393,41 @@ impl<R: Read> FrameReader<R> {
         }
     }
 
+    /// The peer's protocol version, which precedes its first frame;
+    /// `None` at a clean EOF before it. A truncated version is
+    /// `UnexpectedEof`.
+    pub fn version(&mut self) -> std::io::Result<Option<u32>> {
+        let mut bytes = [0u8; 4];
+        Ok(self
+            .read_whole(&mut bytes)?
+            .then(|| u32::from_le_bytes(bytes)))
+    }
+
     /// The next frame; `None` at a clean EOF between frames. EOF inside a
     /// frame is `UnexpectedEof`: a truncated stream, for the caller's
-    /// `die`. An oversized frame is a protocol error.
+    /// `die`.
     pub fn next(&mut self) -> std::io::Result<Option<Frame<'_>>> {
         let mut header = [0u8; 5];
-        // Read the first byte separately to tell a clean EOF from a
-        // truncated header.
-        loop {
-            match self.reader.read(&mut header[..1]) {
-                Ok(0) => return Ok(None),
-                Ok(_) => break,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(e),
-            }
+        if !self.read_whole(&mut header)? {
+            return Ok(None);
         }
-        self.reader.read_exact(&mut header[1..])?;
         let kind = header[0];
-        let length = u32::from_le_bytes(header[1..].try_into().unwrap()) as usize;
-        assert!(
-            length <= MAX_FRAME,
-            "protocol error: frame type {kind} with {length} bytes"
-        );
-        self.payload.resize(length, 0);
-        self.reader.read_exact(&mut self.payload)?;
+        let length = u32::from_le_bytes(header[1..].try_into().unwrap());
+        self.payload.clear();
+        read_exactly(&mut self.reader, length.into(), &mut self.payload)?;
         Ok(Some(Frame {
             kind,
             payload: &self.payload,
         }))
+    }
+
+    /// Exactly `length` bytes that follow a frame outside any frame: the
+    /// list bytes after HASHLIST or HASHDELTA. EOF first is
+    /// `UnexpectedEof`.
+    pub fn bytes(&mut self, length: u64) -> std::io::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        read_exactly(&mut self.reader, length, &mut bytes)?;
+        Ok(bytes)
     }
 
     /// The next frame, which must exist and have this type.
@@ -540,6 +439,22 @@ impl<R: Read> FrameReader<R> {
             frame.kind
         );
         Ok(frame.payload)
+    }
+
+    /// Fill `buf`; `false` at a clean EOF before its first byte. The first
+    /// byte is read separately to tell that EOF from a truncated `buf`,
+    /// which is `UnexpectedEof`.
+    fn read_whole(&mut self, buf: &mut [u8]) -> std::io::Result<bool> {
+        loop {
+            match self.reader.read(&mut buf[..1]) {
+                Ok(0) => return Ok(false),
+                Ok(_) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        self.reader.read_exact(&mut buf[1..])?;
+        Ok(true)
     }
 
     /// Read to EOF, requiring that no byte follows. `false` when trailing
@@ -568,21 +483,42 @@ impl<W: Write> FrameWriter<W> {
         FrameWriter { writer }
     }
 
+    /// This side's protocol version: the session's first bytes, sent
+    /// without waiting for the peer's.
+    pub fn send_version(&mut self) -> std::io::Result<()> {
+        self.writer.write_all(&PROTOCOL_VERSION.to_le_bytes())
+    }
+
     pub fn send(&mut self, kind: u8, payload: &[u8]) -> std::io::Result<()> {
-        assert!(
-            payload.len() <= MAX_FRAME,
-            "frame type {kind} with {} bytes",
-            payload.len()
-        );
+        let length = u32::try_from(payload.len())
+            .unwrap_or_else(|_| panic!("frame type {kind} with {} bytes", payload.len()));
         let mut header = [kind, 0, 0, 0, 0];
-        header[1..].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        header[1..].copy_from_slice(&length.to_le_bytes());
         self.writer.write_all(&header)?;
         self.writer.write_all(payload)
+    }
+
+    /// Bytes that follow a frame outside any frame: the list bytes after
+    /// HASHLIST or HASHDELTA.
+    pub fn send_bytes(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.writer.write_all(bytes)
     }
 
     pub fn flush(&mut self) -> std::io::Result<()> {
         self.writer.flush()
     }
+}
+
+/// Append exactly `length` bytes from `reader` to `out`. `out` grows only
+/// as bytes arrive, so a corrupt length costs no more memory than the
+/// bytes that really follow it. EOF first is `UnexpectedEof`.
+fn read_exactly<R: Read>(reader: R, length: u64, out: &mut Vec<u8>) -> std::io::Result<()> {
+    let start = out.len();
+    reader.take(length).read_to_end(out)?;
+    if ((out.len() - start) as u64) < length {
+        return Err(std::io::ErrorKind::UnexpectedEof.into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -625,20 +561,61 @@ mod tests {
     }
 
     #[test]
-    fn receiver_hello_roundtrips() {
-        let hello = ReceiverHello {
-            protocol_version: PROTOCOL_VERSION,
-            program_version: "0.1.0".into(),
+    fn a_corrupt_length_costs_only_the_bytes_that_arrive() {
+        // The header announces 4 GiB, but only three payload bytes follow.
+        let bytes = [frame::LIT, 0xff, 0xff, 0xff, 0xff, 1, 2, 3];
+        let mut reader = FrameReader::new(&bytes[..]);
+        let error = reader.next().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(reader.payload.capacity() < 1 << 20);
+    }
+
+    #[test]
+    fn list_bytes_follow_their_frame_directly() {
+        let mut out = Vec::new();
+        let mut writer = FrameWriter::new(&mut out);
+        let header = HashList { length: 3 };
+        writer.send(frame::HASHLIST, &header.encode()).unwrap();
+        writer.send_bytes(b"abc").unwrap();
+        writer.send(frame::END_ACK, b"").unwrap();
+
+        let mut reader = FrameReader::new(&out[..]);
+        let payload = reader.expect(frame::HASHLIST, "HASHLIST").unwrap();
+        let length = HashList::decode(payload).length;
+        assert_eq!(reader.bytes(length).unwrap(), b"abc");
+        assert_eq!(reader.next().unwrap().unwrap().kind, frame::END_ACK);
+
+        let mut short = FrameReader::new(&b"ab"[..]);
+        let error = short.bytes(3).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn the_version_precedes_the_first_frame() {
+        let mut out = Vec::new();
+        let mut writer = FrameWriter::new(&mut out);
+        writer.send_version().unwrap();
+        writer.send(frame::HELLO, b"x").unwrap();
+        assert_eq!(out[..4], PROTOCOL_VERSION.to_le_bytes());
+        let mut reader = FrameReader::new(&out[..]);
+        assert_eq!(reader.version().unwrap(), Some(PROTOCOL_VERSION));
+        assert_eq!(reader.next().unwrap().unwrap().kind, frame::HELLO);
+
+        assert_eq!(FrameReader::new(&out[..0]).version().unwrap(), None);
+        for cut in 1..4 {
+            let error = FrameReader::new(&out[..cut]).version().unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+        }
+    }
+
+    fn receiver_hello() -> ReceiverHello {
+        ReceiverHello {
             block_size: 4096,
             weak_hash_id: "weak".into(),
-            strong_hash_id: "blake3".into(),
-            width: WIDTH,
+            strong_hash: StrongHash::Sha256,
             account_id: [7; 16],
             index_id: [9; 16],
-            target: ListId {
-                algorithm: StrongHash::Blake3,
-                digest: [3; 32],
-            },
+            target: [3; 32],
             sender_cache: true,
             hashlist_max_age: 90 * 24 * 3600,
             lookahead: 256 << 20,
@@ -646,10 +623,47 @@ mod tests {
             compression_threads: 0,
             negative_cache: 100 << 20,
             command: vec![b"printf".to_vec(), b"%s".to_vec(), b"\xff\xfe".to_vec()],
+        }
+    }
+
+    /// The peak virtual size of this process in bytes. It includes
+    /// reservations that overcommit grants without memory.
+    fn peak_virtual_size() -> u64 {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let line = status.lines().find(|l| l.starts_with("VmPeak:")).unwrap();
+        let kib: u64 = line.split_whitespace().nth(1).unwrap().parse().unwrap();
+        kib << 10
+    }
+
+    #[test]
+    fn a_corrupt_argument_count_costs_only_the_arguments_that_arrive() {
+        // The count announces u32::MAX arguments, but none follow. A list
+        // reserved for that count takes 96 GiB, which overcommit can grant
+        // without memory, so compare the peak virtual size. Tests that
+        // run in parallel add much less than the bound.
+        let mut payload = ReceiverHello {
+            command: Vec::new(),
+            ..receiver_hello()
+        }
+        .encode();
+        let count = payload.len() - 4;
+        payload[count..].copy_from_slice(&u32::MAX.to_le_bytes());
+        let before = peak_virtual_size();
+        let Err(unwound) = std::panic::catch_unwind(|| ReceiverHello::decode(&payload)) else {
+            panic!("a HELLO without its arguments must not decode");
         };
+        let message = unwound.downcast::<String>().unwrap();
+        assert!(message.contains("truncated HELLO frame"), "{message}");
+        assert!(peak_virtual_size() - before < 16 << 30);
+    }
+
+    #[test]
+    fn receiver_hello_roundtrips() {
+        let hello = receiver_hello();
         let decoded = ReceiverHello::decode(&hello.encode());
-        assert_eq!(decoded.program_version, "0.1.0");
         assert_eq!(decoded.block_size, 4096);
+        assert_eq!(decoded.weak_hash_id, "weak");
+        assert_eq!(decoded.strong_hash, StrongHash::Sha256);
         assert_eq!(decoded.account_id, [7; 16]);
         assert_eq!(decoded.target, hello.target);
         assert!(decoded.sender_cache);
@@ -659,51 +673,26 @@ mod tests {
     #[test]
     fn sender_hello_roundtrips_with_and_without_base() {
         let mut hello = SenderHello {
-            protocol_version: PROTOCOL_VERSION,
-            program_version: PROGRAM_VERSION.into(),
-            block_size: 8192,
-            weak_hash_id: "weak".into(),
-            strong_hash_id: "sha256".into(),
-            width: WIDTH,
             account_id: [1; 16],
             base: None,
         };
-        assert!(SenderHello::decode(&hello.encode()).base.is_none());
-        let base = ListId {
-            algorithm: StrongHash::Sha256,
-            digest: [5; 32],
-        };
-        hello.base = Some(base);
-        assert_eq!(SenderHello::decode(&hello.encode()).base, Some(base));
+        let decoded = SenderHello::decode(&hello.encode());
+        assert_eq!(decoded.account_id, [1; 16]);
+        assert!(decoded.base.is_none());
+        hello.base = Some([5; 32]);
+        assert_eq!(SenderHello::decode(&hello.encode()).base, Some([5; 32]));
     }
 
     #[test]
     #[should_panic(expected = "excess bytes")]
     fn trailing_payload_bytes_are_rejected() {
-        let mut payload = ControlHello::current().encode();
-        payload.push(0);
-        ControlHello::decode(&payload);
-    }
-
-    #[test]
-    #[should_panic(expected = "unsupported strong hash")]
-    fn unsupported_algorithms_are_rejected() {
-        let mut enc = Enc::new();
-        enc.list_id(&ListId {
-            algorithm: StrongHash::Blake3,
-            digest: [0; 32],
-        });
-        enc.u64(1);
-        let mut payload = HashList {
-            target: ListId {
-                algorithm: StrongHash::Blake3,
-                digest: [0; 32],
-            },
-            length: 1,
+        let mut payload = End {
+            status: 0,
+            error: String::new(),
         }
         .encode();
-        payload[4..10].copy_from_slice(b"md5NO!");
-        HashList::decode(&payload);
+        payload.push(0);
+        End::decode(&payload);
     }
 
     #[test]

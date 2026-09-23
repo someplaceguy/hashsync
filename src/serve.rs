@@ -1,18 +1,20 @@
 //! `hashsync serve --token T` (DESIGN.md §3, §5.6, §6): the sender.
 //!
-//! `serve` first listens on the rendezvous socket, exchanges data HELLOs,
-//! accepts `attach`, and completes the list exchange and CACHE_RESULT
-//! before starting the command. This milestone sends all command stdout
-//! as literals; the scanner arrives with PLAN.md step 4.
+//! `serve` first listens on the rendezvous socket, exchanges protocol
+//! versions and data HELLOs, accepts `attach`, and completes the list
+//! exchange and CACHE_RESULT before starting the command. This milestone
+//! sends all command stdout as literals; the scanner arrives with PLAN.md
+//! step 4.
 //!
 //! Each incoming direction has one owner for the whole run, so session
 //! loss is fatal at any moment — during rendezvous, setup, startup
 //! failure, and transfer alike (DESIGN.md §6.7). The data reader owns
-//! stdin and walks the receiver's fixed frame sequence: HELLO, HASHLIST
-//! and its LISTDATA, END_ACK, closure. A watcher owns the control socket
-//! from acceptance. The main thread only writes: the HELLO reply, the
-//! CACHE_RESULT, the LIT pump, and END; command success and startup
-//! failure share one completion path.
+//! stdin and walks the receiver's fixed sequence: the protocol version,
+//! HELLO, HASHLIST and the list bytes, END_ACK, closure. A watcher owns the
+//! control socket from acceptance. The main thread only writes: the
+//! protocol versions, the HELLO reply, the CACHE_RESULT, the LIT pump,
+//! and END; command success and startup failure share one completion
+//! path.
 
 use std::io::{BufReader, Read, Write};
 use std::net::Shutdown;
@@ -27,18 +29,17 @@ use bstr::ByteSlice;
 use crossbeam_channel::{Sender, bounded};
 use rustix::process::Pid;
 
-use crate::cache::{self, ListMeta, ListStore, PublishedList};
+use crate::cache::{self, ListStore, PublishedList};
 use crate::die::{self, die};
 use crate::fsops::{self, retry_interrupted};
-use crate::hash::StrongHash;
+use crate::hash;
+use crate::hashlist::{self, ListId};
 use crate::hashtable::HashTable;
 use crate::protocol::{
-    self, CacheResult, ControlHello, End, FrameReader, FrameWriter, HashList, ListId,
-    ReceiverHello, SenderHello, frame,
+    self, End, FrameReader, FrameWriter, HashList, ReceiverHello, SenderHello, frame,
 };
 use crate::rendezvous;
 use crate::sys;
-use crate::{hash, hashlist};
 
 /// The read chunk of the command pump; each chunk becomes one LIT.
 const CHUNK: usize = 1 << 20;
@@ -65,22 +66,17 @@ pub fn run(token: &str) -> ! {
     }
     let mut data_out = FrameWriter::new(fsops::stdout());
 
-    // Data HELLOs: the receiver speaks first, this side replies.
+    // This side's protocol version goes first, without waiting for the
+    // receiver's, which the data reader checks (DESIGN.md §6.2).
+    if let Err(e) = data_out.send_version().and_then(|()| data_out.flush()) {
+        die(format!("data session: {e}"));
+    }
+
+    // Data HELLOs: the receiver speaks first, this side replies only
+    // after it accepted the receiver's parameters.
     let hello: ReceiverHello = hello_rx.recv().expect("the data reader ended before HELLO");
-    let strong = validate_hello(&hello);
-    assert!(
-        hello.target.algorithm == strong,
-        "protocol error: the target list uses {}, not the negotiated {}",
-        hello.target.algorithm.id(),
-        strong.id()
-    );
+    validate_hello(&hello);
     let reply = SenderHello {
-        protocol_version: protocol::PROTOCOL_VERSION,
-        program_version: protocol::PROGRAM_VERSION.to_string(),
-        block_size: hello.block_size,
-        weak_hash_id: hello.weak_hash_id.clone(),
-        strong_hash_id: hello.strong_hash_id.clone(),
-        width: hello.width,
         account_id: cache::account_id(),
         // Cached-list reuse arrives with PLAN.md step 8: advertise
         // explicit absence and expect a full list.
@@ -90,13 +86,14 @@ pub fn run(token: &str) -> ! {
     flush_data(&mut data_out);
 
     // The control session: accept `attach`, then both sides send their
-    // HELLO immediately. The watcher owns the incoming direction and
-    // reports readiness once the receiver's HELLO validated.
+    // protocol version immediately. The watcher owns the incoming
+    // direction and reports readiness once the receiver's version
+    // matched.
     let control = listener.accept();
     {
         let mut control_out = FrameWriter::new(&control);
         if let Err(e) = control_out
-            .send(frame::HELLO, &ControlHello::current().encode())
+            .send_version()
             .and_then(|()| control_out.flush())
         {
             die(format!("control session: {e}"));
@@ -129,34 +126,30 @@ pub fn run(token: &str) -> ! {
     // the accepted target only afterwards, then renew and expire.
     let store = ListStore::sender_side(&hello.account_id, &hello.index_id);
     let published: Option<PublishedList> = if hello.sender_cache {
-        let meta = ListMeta {
-            block_size: hello.block_size,
-            weak_hash_id: hello.weak_hash_id.clone(),
-            id: hello.target,
+        let target = ListId {
+            algorithm: hello.strong_hash,
+            digest: hello.target,
         };
-        Some(store.publish(&meta, &encoded))
+        Some(store.publish(&target, &encoded))
     } else {
         store.remove_all();
         None
     };
     drop(encoded);
-    let result = CacheResult {
-        target: hello.target,
-    };
-    send_data(&mut data_out, frame::CACHE_RESULT, &result.encode());
+    send_data(&mut data_out, frame::CACHE_RESULT, b"");
     flush_data(&mut data_out);
     if let Some(list) = &published {
         list.renew();
     }
     cache::expire(hello.hashlist_max_age);
 
-    // Both HELLOs must be validated before the command starts
-    // (DESIGN.md §6.2). Both sessions stay monitored during this wait:
-    // the data reader awaits END_ACK on stdin and the watcher holds the
-    // socket.
+    // The receiver's versions on both sessions must match before the
+    // command starts (DESIGN.md §6.2). Both sessions stay monitored
+    // during this wait: the data reader awaits END_ACK on stdin and the
+    // watcher holds the socket.
     control_ready_rx
         .recv()
-        .expect("the control watcher ended before HELLO");
+        .expect("the control watcher ended before the protocol version");
 
     // The command. Keep it unreaped and in its own process group
     // (DESIGN.md §6.6); a fatal exit SIGKILLs the group, and the spawn
@@ -232,9 +225,9 @@ pub fn run(token: &str) -> ! {
 }
 
 /// The single owner of the data session's incoming direction, for the
-/// whole run: HELLO, then the list, then END_ACK, then closure. EOF
-/// before the normal exit is the receiver's disappearance and is fatal
-/// (DESIGN.md §6.7).
+/// whole run: the protocol version, HELLO, the list, END_ACK, then
+/// closure. EOF before the normal exit is the receiver's disappearance
+/// and is fatal (DESIGN.md §6.7).
 fn data_reader<R: Read>(
     mut data_in: FrameReader<R>,
     hello_tx: Sender<ReceiverHello>,
@@ -243,12 +236,19 @@ fn data_reader<R: Read>(
     end_sent: &AtomicBool,
     completing: &AtomicBool,
 ) {
+    match data_in.version() {
+        Ok(Some(version)) => protocol::check_version(version, "receiver"),
+        Ok(None) => die("the receiver disappeared"),
+        Err(e) => die_data(&e),
+    }
     let payload = data_in
         .expect(frame::HELLO, "HELLO")
         .unwrap_or_else(|e| die_data(&e));
-    protocol::check_protocol_version(payload, "receiver");
     let hello = ReceiverHello::decode(payload);
-    let target = hello.target;
+    let target = ListId {
+        algorithm: hello.strong_hash,
+        digest: hello.target,
+    };
     let _ = hello_tx.send(hello);
 
     // The receiver sends the list only after this side's HELLO reply;
@@ -293,22 +293,14 @@ fn data_reader<R: Read>(
     }
 }
 
-/// The owner of the control session's incoming direction: the HELLO,
-/// whose validation gates command startup, then closure. No control
-/// frame follows in this milestone; queries arrive with PLAN.md step 4.
+/// The owner of the control session's incoming direction: the protocol
+/// version, whose check gates command startup, then closure. No control
+/// frame follows in this milestone; answers arrive with PLAN.md step 4.
 fn control_watcher(stream: UnixStream, ready_tx: Sender<()>, completing: &AtomicBool) {
     let mut control_in = FrameReader::new(BufReader::new(stream));
-    match control_in.next() {
-        Ok(Some(received)) => {
-            assert!(
-                received.kind == frame::HELLO,
-                "protocol error: expected HELLO, received frame type {}",
-                received.kind
-            );
-            protocol::check_protocol_version(received.payload, "receiver's control session");
-            ControlHello::decode(received.payload);
-        }
-        Ok(None) => die("the control session closed before HELLO"),
+    match control_in.version() {
+        Ok(Some(version)) => protocol::check_version(version, "receiver's control session"),
+        Ok(None) => die("the control session closed before the protocol version"),
         Err(e) => die(format!("control session: {e}")),
     }
     let _ = ready_tx.send(());
@@ -369,72 +361,38 @@ fn clone_control(control: &UnixStream) -> UnixStream {
     }
 }
 
-/// Incompatible HELLO parameters fail before command startup
-/// (DESIGN.md §6.5). Returns the negotiated strong hash.
-fn validate_hello(hello: &ReceiverHello) -> StrongHash {
-    let mut problems = Vec::new();
+/// The receiver's HELLO parameters are the run's: use them, or end the
+/// run before command startup (DESIGN.md §6.2, §6.5). Decoding already
+/// checked the strong hash.
+fn validate_hello(hello: &ReceiverHello) {
     if hello.weak_hash_id != hash::weak::ID {
-        problems.push(format!(
-            "weak hash {} (this sender: {})",
+        die(format!(
+            "incompatible receiver: weak hash {} (this sender: {})",
             hello.weak_hash_id,
             hash::weak::ID
         ));
     }
-    let strong = StrongHash::from_id(&hello.strong_hash_id);
-    if strong.is_none() {
-        problems.push(format!("strong hash {}", hello.strong_hash_id));
-    }
-    if hello.width != protocol::WIDTH {
-        problems.push(format!("width {}", hello.width));
-    }
-    if hello.block_size == 0 {
-        problems.push("block size 0".into());
-    }
     // Compression arrives with PLAN.md step 5; this version negotiates
     // it disabled.
     if hello.compression_level != 0 {
-        problems.push(format!(
-            "compression level {} (this sender supports none)",
+        die(format!(
+            "incompatible receiver: compression level {} (this sender supports none)",
             hello.compression_level
         ));
     }
-    if let Some(problem) = problems.first() {
-        die(format!(
-            "incompatible receiver (hashsync {}): {problem}",
-            hello.program_version
-        ));
-    }
-    strong.unwrap()
 }
 
-/// Receive the full canonical list: HASHLIST, then its bytes in LISTDATA
-/// frames, verified against the target digest (DESIGN.md §5.6).
+/// Receive the full canonical list: HASHLIST, then the list bytes that
+/// follow it directly, verified against the target digest
+/// (DESIGN.md §5.6).
 fn receive_list<R: Read>(data_in: &mut FrameReader<R>, target: ListId) -> Vec<u8> {
     let payload = data_in
         .expect(frame::HASHLIST, "HASHLIST")
         .unwrap_or_else(|e| die_data(&e));
     let header = HashList::decode(payload);
-    assert!(
-        header.target == target,
-        "protocol error: HASHLIST for {}, expected {target}",
-        header.target
-    );
-    let mut encoded = Vec::new();
-    while (encoded.len() as u64) < header.length {
-        let payload = data_in
-            .expect(frame::LISTDATA, "LISTDATA")
-            .unwrap_or_else(|e| die_data(&e));
-        assert!(
-            !payload.is_empty() && payload.len() <= protocol::MAX_LISTDATA,
-            "protocol error: LISTDATA with {} bytes",
-            payload.len()
-        );
-        assert!(
-            payload.len() as u64 <= header.length - encoded.len() as u64,
-            "protocol error: excess LISTDATA bytes"
-        );
-        encoded.extend_from_slice(payload);
-    }
+    let encoded = data_in
+        .bytes(header.length)
+        .unwrap_or_else(|e| die_data(&e));
     assert!(
         target.algorithm.digest(&encoded) == target.digest,
         "protocol error: the full hash list does not match {target}"

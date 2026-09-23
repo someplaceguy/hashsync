@@ -211,11 +211,11 @@ Design coverage: §§4.2, 4.4, 8.
 ## 8. Reuse hash lists across transfers
 
 - Reuse a verified unchanged list without retransmitting it. For a changed
-  list, use a compatible cached base and a direct delta when it is smaller
-  than the full transfer.
-- Advertise the sender's most recent verified compatible list and find
-  bases across the receiver's cached peer histories as specified, including
-  bases using a different supported strong hash.
+  list, use a cached base and a direct delta when it is smaller than the
+  full transfer.
+- Advertise the sender's most recent verified list and find bases across
+  the receiver's cached peer histories as specified. A base uses the same
+  strong hash as the target.
 - Fall back to a full list when a base is missing or invalid, or when delta
   verification requests the permitted retry. Remove invalid cached files;
   removal failures are fatal unless the file is already gone. Other cache

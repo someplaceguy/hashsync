@@ -16,17 +16,16 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed, Ordering::SeqC
 
 use bstr::ByteSlice;
 
-use crate::cache::{self, ListMeta, ListStore};
+use crate::cache::{self, ListStore};
 use crate::config::{self, Config};
 use crate::die::{self, die};
 use crate::fsid::FsCache;
 use crate::fsops;
 use crate::hash::weak;
-use crate::hashlist;
+use crate::hashlist::{self, ListId};
 use crate::index::{self, Settings};
 use crate::protocol::{
-    self, CacheResult, ControlHello, End, FrameReader, FrameWriter, HashList, ListId,
-    ReceiverHello, Rle, SenderHello, frame,
+    self, End, FrameReader, FrameWriter, HashList, ReceiverHello, Rle, SenderHello, frame,
 };
 use crate::rendezvous;
 use crate::roots;
@@ -75,13 +74,13 @@ pub fn run(
     );
     let sessions = [(data.pid(), "data"), (control.pid(), "control")];
 
-    // Both control sides send their HELLO immediately (DESIGN.md §6.2).
-    // The relay delivers it once `attach` connects. The write end must
-    // stay open until the sender exits, so the writer lives to the end
-    // of the run.
+    // Both sides send their protocol version first, without waiting for
+    // the peer's (DESIGN.md §6.2). The relay delivers it once `attach`
+    // connects. The write end must stay open until the sender exits, so
+    // the writer lives to the end of the run.
     let mut control_out = FrameWriter::new(control.stdin);
     if let Err(e) = control_out
-        .send(frame::HELLO, &ControlHello::current().encode())
+        .send_version()
         .and_then(|()| control_out.flush())
     {
         die(format!("control session: {e}"));
@@ -105,15 +104,12 @@ pub fn run(
     }));
 
     let hello = ReceiverHello {
-        protocol_version: protocol::PROTOCOL_VERSION,
-        program_version: protocol::PROGRAM_VERSION.to_string(),
         block_size: config.block_size,
         weak_hash_id: weak::ID.to_string(),
-        strong_hash_id: config.strong_hash.id().to_string(),
-        width: protocol::WIDTH,
+        strong_hash: config.strong_hash,
         account_id,
         index_id: meta.index_id,
-        target,
+        target: target.digest,
         sender_cache: options.sender_cache,
         hashlist_max_age: config.hashlist_max_age,
         lookahead: config::DEFAULT_LOOKAHEAD,
@@ -124,43 +120,41 @@ pub fn run(
         negative_cache: config::DEFAULT_NEGATIVE_CACHE,
         command: command.iter().map(|arg| arg.as_bytes().to_vec()).collect(),
     };
+    // HELLO follows the version at once. The sender uses its parameters
+    // or ends the run, so its reply does not repeat them.
+    if let Err(e) = data_out.send_version() {
+        die(format!("data session: {e}"));
+    }
     send_data(&mut data_out, frame::HELLO, &hello.encode());
     flush_data(&mut data_out);
 
-    let payload = read_hello(&mut data_in, host);
-    let sender = SenderHello::decode(payload);
-    check_sender_hello(&hello, &sender);
+    check_sender_version(&mut data_in, host);
+    let sender = SenderHello::decode(expect_data(&mut data_in, frame::HELLO, "HELLO"));
 
     // Durably publish the target in the sender's peer directory before
     // sending list data; a publication failure is fatal and ends setup
     // (DESIGN.md §5.6).
     let store = ListStore::receiver_side(&sender.account_id, &meta.index_id);
-    let list_meta = ListMeta {
-        block_size: config.block_size,
-        weak_hash_id: weak::ID.to_string(),
-        id: target,
-    };
-    let published = store.publish(&list_meta, &encoded);
+    let published = store.publish(&target, &encoded);
 
-    // The full list; cached bases and deltas arrive with PLAN.md step 8.
+    // The full list, whose bytes follow HASHLIST directly; cached bases
+    // and deltas arrive with PLAN.md step 8.
     let header = HashList {
-        target,
         length: encoded.len() as u64,
     };
     send_data(&mut data_out, frame::HASHLIST, &header.encode());
-    for chunk in encoded.chunks(protocol::MAX_LISTDATA) {
-        send_data(&mut data_out, frame::LISTDATA, chunk);
+    if let Err(e) = data_out.send_bytes(&encoded) {
+        die(format!("data session: {e}"));
     }
     flush_data(&mut data_out);
     let hash_list_bytes = encoded.len() as u64;
     drop(encoded);
 
+    // The run has one target, so the acknowledgement names none.
     let payload = expect_data(&mut data_in, frame::CACHE_RESULT, "CACHE_RESULT");
-    let result = CacheResult::decode(payload);
     assert!(
-        result.target == target,
-        "protocol error: CACHE_RESULT for {}, expected {target}",
-        result.target
+        payload.is_empty(),
+        "protocol error: CACHE_RESULT with a payload"
     );
     // Renew the target after CACHE_RESULT; with a base this would renew
     // it too (DESIGN.md §5.6). Then expire both cache trees.
@@ -316,55 +310,17 @@ fn expect_data<'a, R: Read>(
     }
 }
 
-fn read_hello<'a, R: Read>(data_in: &'a mut FrameReader<R>, host: &OsStr) -> &'a [u8] {
-    let received = match data_in.next() {
-        Ok(Some(received)) => received,
+/// The sender's protocol version, which it sends before anything else
+/// (DESIGN.md §6.2). EOF before it means that no usable `hashsync` ran.
+fn check_sender_version<R: Read>(data_in: &mut FrameReader<R>, host: &OsStr) {
+    match data_in.version() {
+        Ok(Some(version)) => protocol::check_version(version, "sender"),
         Ok(None) => die(format!(
-            "the data session ended before the sender's HELLO; \
+            "the data session ended before the sender's protocol version; \
              is a compatible hashsync installed on {}?",
             host.as_bytes().as_bstr()
         )),
         Err(e) => die_data(&e),
-    };
-    assert!(
-        received.kind == frame::HELLO,
-        "protocol error: expected HELLO, received frame type {}",
-        received.kind
-    );
-    protocol::check_protocol_version(received.payload, "sender");
-    received.payload
-}
-
-/// Require the equal parameters of DESIGN.md §6.2 before command
-/// startup.
-fn check_sender_hello(sent: &ReceiverHello, sender: &SenderHello) {
-    let mut problems = Vec::new();
-    if sender.block_size != sent.block_size {
-        problems.push(format!(
-            "block size {} (this receiver: {})",
-            sender.block_size, sent.block_size
-        ));
-    }
-    if sender.weak_hash_id != sent.weak_hash_id {
-        problems.push(format!(
-            "weak hash {} (this receiver: {})",
-            sender.weak_hash_id, sent.weak_hash_id
-        ));
-    }
-    if sender.strong_hash_id != sent.strong_hash_id {
-        problems.push(format!(
-            "strong hash {} (this receiver: {})",
-            sender.strong_hash_id, sent.strong_hash_id
-        ));
-    }
-    if sender.width != sent.width {
-        problems.push(format!("width {}", sender.width));
-    }
-    if let Some(problem) = problems.first() {
-        die(format!(
-            "incompatible sender (hashsync {}): {problem}",
-            sender.program_version
-        ));
     }
 }
 
@@ -382,10 +338,10 @@ fn advance(offset: u64, length: u64) -> u64 {
         .expect("protocol error: output offset overflow")
 }
 
-/// Watch the control session: HELLO, then nothing until answers arrive
-/// with PLAN.md step 4. Loss before Completing is fatal
-/// (DESIGN.md §6.7); in Completing, EOF and broken pipes are expected
-/// closure.
+/// Watch the control session: the sender's protocol version, then
+/// nothing until queries arrive with PLAN.md step 4. Loss before
+/// Completing is fatal (DESIGN.md §6.7); in Completing, EOF and broken
+/// pipes are expected closure.
 fn control_loop(stdout: std::process::ChildStdout, completing: &AtomicBool) {
     let mut control_in = FrameReader::new(BufReader::new(stdout));
     let expected_closure = || {
@@ -393,20 +349,12 @@ fn control_loop(stdout: std::process::ChildStdout, completing: &AtomicBool) {
             die("the control session closed unexpectedly");
         }
     };
-    match control_in.next() {
-        Ok(Some(received)) => {
-            assert!(
-                received.kind == frame::HELLO,
-                "protocol error: expected HELLO, received frame type {}",
-                received.kind
-            );
-            protocol::check_protocol_version(received.payload, "sender's control session");
-            ControlHello::decode(received.payload);
-        }
+    match control_in.version() {
+        Ok(Some(version)) => protocol::check_version(version, "sender's control session"),
         Ok(None) | Err(_) => return expected_closure(),
     }
-    // No control frame follows HELLO in this milestone: the next event
-    // is the session's closure.
+    // No control frame follows the version in this milestone: the next
+    // event is the session's closure.
     match control_in.next() {
         Ok(Some(received)) => panic!(
             "protocol error: unexpected control frame type {}",

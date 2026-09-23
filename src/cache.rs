@@ -27,8 +27,7 @@ use rustix::io::{Errno, retry_on_intr};
 use crate::config;
 use crate::die::die;
 use crate::fsops::retry_interrupted;
-use crate::hash::StrongHash;
-use crate::protocol::ListId;
+use crate::hashlist::ListId;
 
 pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -250,18 +249,12 @@ fn rename_temporary(temp: &Path, path: &Path) {
     }
 }
 
-/// The versioned wrapper of a stored list (DESIGN.md §5.6): magic and
-/// format, the compatibility parameters, the list ID, and the encoded
-/// length. Only the canonical list bytes are hashed, never the wrapper.
-const WRAPPER_MAGIC: &[u8; 8] = b"hsynlist";
-const WRAPPER_FORMAT: u8 = 1;
-
-/// A published list's wrapper fields.
-pub struct ListMeta {
-    pub block_size: u32,
-    pub weak_hash_id: String,
-    pub id: ListId,
-}
+/// The versioned wrapper of a stored list (DESIGN.md §5.6): the magic
+/// `hsynlist`, then format 1. The list bytes fill the rest of the file,
+/// and the file name holds the list ID. The directory's index fixes the
+/// block size, weak hash, and strong hash, so the file stores none of
+/// them. Only the canonical list bytes are hashed, never the wrapper.
+const WRAPPER: &[u8; 9] = b"hsynlist\x01";
 
 /// A durably published list. The open descriptor keeps the verified
 /// bytes reachable even if the file is replaced or removed.
@@ -319,34 +312,22 @@ impl ListStore {
     }
 
     fn file_name(id: &ListId) -> String {
-        format!("{}-{}.cache", id.algorithm.id(), hex(&id.digest))
+        format!("{id}.cache")
     }
 
     /// Durably publish `encoded` under its content-derived name.
     /// Republishes an existing name rather than trusting it. Failures
     /// are fatal; a failure can leave the hidden temporary for expiry
     /// (DESIGN.md §6.7).
-    pub fn publish(&self, meta: &ListMeta, encoded: &[u8]) -> PublishedList {
+    pub fn publish(&self, id: &ListId, encoded: &[u8]) -> PublishedList {
         create_dirs(&self.base, &self.dir, 0o700);
         let temp = self.dir.join(format!(".{}", hex(&random_bytes::<8>())));
         let file = write_file(&temp, 0o600, |file| {
-            let mut header = Vec::with_capacity(64);
-            header.extend_from_slice(WRAPPER_MAGIC);
-            header.push(WRAPPER_FORMAT);
-            header.extend_from_slice(&meta.block_size.to_le_bytes());
-            let weak = meta.weak_hash_id.as_bytes();
-            header.extend_from_slice(&(weak.len() as u32).to_le_bytes());
-            header.extend_from_slice(weak);
-            let algorithm = meta.id.algorithm.id().as_bytes();
-            header.extend_from_slice(&(algorithm.len() as u32).to_le_bytes());
-            header.extend_from_slice(algorithm);
-            header.extend_from_slice(&meta.id.digest);
-            header.extend_from_slice(&(encoded.len() as u64).to_le_bytes());
-            file.write_all(&header)?;
+            file.write_all(WRAPPER)?;
             file.write_all(encoded)
         })
         .unwrap_or_else(|e| fatal("write", &temp, e));
-        let path = self.dir.join(Self::file_name(&meta.id));
+        let path = self.dir.join(Self::file_name(id));
         rename_temporary(&temp, &path);
         sync_entries(&self.base, &path);
         PublishedList { file, path }
@@ -359,7 +340,7 @@ impl ListStore {
     /// step 8; until then only tests verify the stored format through
     /// this.
     #[cfg_attr(not(test), expect(dead_code))]
-    pub fn read(&self, id: &ListId) -> Option<(ListMeta, Vec<u8>)> {
+    pub fn read(&self, id: &ListId) -> Option<Vec<u8>> {
         let path = self.dir.join(Self::file_name(id));
         let bytes = match retry_interrupted(|| std::fs::read(&path)) {
             Ok(bytes) => bytes,
@@ -388,34 +369,12 @@ impl ListStore {
     }
 }
 
-/// Parse and verify a stored list's bytes. `None` for any deviation:
-/// reading invalid contents is a miss, not a failure.
-fn parse_list(bytes: &[u8], id: &ListId) -> Option<(ListMeta, Vec<u8>)> {
-    let mut r = WrapperReader(bytes);
-    if r.take(8)? != WRAPPER_MAGIC || r.take(1)? != [WRAPPER_FORMAT] {
-        return None;
-    }
-    let block_size = u32::from_le_bytes(r.take(4)?.try_into().unwrap());
-    let weak_len = u32::from_le_bytes(r.take(4)?.try_into().unwrap());
-    let weak_hash_id = String::from_utf8(r.take(weak_len as usize)?.to_vec()).ok()?;
-    let algorithm_len = u32::from_le_bytes(r.take(4)?.try_into().unwrap());
-    let algorithm = std::str::from_utf8(r.take(algorithm_len as usize)?).ok()?;
-    let algorithm = StrongHash::from_id(algorithm)?;
-    let digest: [u8; 32] = r.take(32)?.try_into().unwrap();
-    let length = u64::from_le_bytes(r.take(8)?.try_into().unwrap());
-    if r.0.len() as u64 != length {
-        return None;
-    }
-    let encoded = r.0.to_vec();
-    if algorithm.digest(&encoded) != digest {
-        return None;
-    }
-    let meta = ListMeta {
-        block_size,
-        weak_hash_id,
-        id: ListId { algorithm, digest },
-    };
-    (meta.id == *id).then_some((meta, encoded))
+/// The list bytes of a stored file, verified against `id`, the ID in its
+/// file name. `None` for any deviation: reading invalid contents is a
+/// miss, not a failure.
+fn parse_list(bytes: &[u8], id: &ListId) -> Option<Vec<u8>> {
+    let encoded = bytes.strip_prefix(WRAPPER)?;
+    (id.algorithm.digest(encoded) == id.digest).then(|| encoded.to_vec())
 }
 
 /// Iterate a directory's entries, retrying interrupted reads; any other
@@ -429,19 +388,6 @@ fn for_each_entry(dir: &Path, mut each: impl FnMut(std::fs::DirEntry)) -> std::i
             Some(Err(e)) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Some(Err(e)) => return Err(e),
         }
-    }
-}
-
-struct WrapperReader<'a>(&'a [u8]);
-
-impl<'a> WrapperReader<'a> {
-    fn take(&mut self, len: usize) -> Option<&'a [u8]> {
-        if len > self.0.len() {
-            return None;
-        }
-        let (taken, rest) = self.0.split_at(len);
-        self.0 = rest;
-        Some(taken)
     }
 }
 
@@ -558,12 +504,7 @@ mod tests {
                 algorithm: StrongHash::Blake3,
                 digest: StrongHash::Blake3.digest(&encoded),
             };
-            let meta = ListMeta {
-                block_size: 4096,
-                weak_hash_id: "weak".into(),
-                id,
-            };
-            let published = store.publish(&meta, &encoded);
+            let published = store.publish(&id, &encoded);
             published.renew();
 
             let dir = home.join(format!(
@@ -577,11 +518,12 @@ mod tests {
             let mode = std::fs::metadata(&file).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600, "cache files are private");
 
-            let (read_meta, read_encoded) = store.read(&id).unwrap();
-            assert_eq!(read_encoded, encoded);
-            assert_eq!(read_meta.block_size, 4096);
-            assert_eq!(read_meta.weak_hash_id, "weak");
-            assert_eq!(read_meta.id, id);
+            // The file is the wrapper, then the list bytes.
+            assert_eq!(
+                std::fs::read(&file).unwrap(),
+                [&WRAPPER[..], &encoded].concat()
+            );
+            assert_eq!(store.read(&id).unwrap(), encoded);
             assert!(store.read(&list_id(9)).is_none(), "absence is a miss");
 
             // A damaged file is a miss and is removed (DESIGN.md §5.6).
@@ -606,12 +548,7 @@ mod tests {
                     algorithm: StrongHash::Blake3,
                     digest: StrongHash::Blake3.digest(&encoded),
                 };
-                let meta = ListMeta {
-                    block_size: 4096,
-                    weak_hash_id: "weak".into(),
-                    id,
-                };
-                store.publish(&meta, &encoded);
+                store.publish(&id, &encoded);
             }
             ours.remove_all();
             assert_eq!(std::fs::read_dir(&ours.dir).unwrap().count(), 0);
@@ -650,12 +587,7 @@ mod tests {
                 algorithm: StrongHash::Blake3,
                 digest: StrongHash::Blake3.digest(&encoded),
             };
-            let meta = ListMeta {
-                block_size: 4096,
-                weak_hash_id: "weak".into(),
-                id,
-            };
-            store.publish(&meta, &encoded);
+            store.publish(&id, &encoded);
             std::fs::write(store.dir.join(".abandoned-temp"), b"x").unwrap();
 
             // A fresh file survives any positive age bound, and `ctime`

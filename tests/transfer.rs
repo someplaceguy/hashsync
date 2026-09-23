@@ -385,6 +385,30 @@ fn bootstrap_quoting_survives_a_hostile_sender_command_path() {
     assert_eq!(output.stdout, b"quoted-ok");
 }
 
+#[test]
+fn a_sender_with_another_protocol_version_is_rejected() {
+    // A fake sender that sends only its version, 0xFFFFFFFF, on both
+    // sessions: the receiver ends the run before any frame
+    // (DESIGN.md §6.2).
+    let transfer = Transfer::new("");
+    let sender = transfer.env.path("other-version");
+    std::fs::write(
+        &sender,
+        "#!/bin/sh\nprintf '\\377\\377\\377\\377'\nexec cat >/dev/null\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&sender, std::fs::Permissions::from_mode(0o755)).unwrap();
+    transfer.reconfigure(sender.as_os_str().as_bytes(), "");
+    let command = args(&["true"]);
+    let output = transfer.run(&[], &refs(&command));
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("speaks protocol version 4294967295, this hashsync"),
+        "version mismatch:\n{stderr}"
+    );
+}
+
 fn signal(pid: u32, signal: Signal) {
     let pid = Pid::from_raw(pid as i32).unwrap();
     kill_process(pid, signal).unwrap();
