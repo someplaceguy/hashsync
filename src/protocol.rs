@@ -806,18 +806,15 @@ impl Decoding {
             if input_needed && input.is_empty() {
                 return Err(std::io::ErrorKind::UnexpectedEof.into());
             }
-            let mut input = InBuffer::around(input);
-            let mut out = OutBuffer::around(&mut self.buffer[..]);
-            let hint = self
+            let status = self
                 .decoder
-                .run(&mut input, &mut out)
+                .run_on_buffers(input, &mut self.buffer)
                 .unwrap_or_else(|e| panic!("protocol error: invalid compressed data: {e}"));
-            let (consumed, decoded) = (input.pos(), out.pos());
-            transport.consume(consumed);
+            transport.consume(status.bytes_read);
             // At the end of the frame, zstd consumed nothing after it.
-            self.ended = hint == 0;
-            (self.start, self.end) = (0, decoded);
-            if decoded > 0 {
+            self.ended = status.remaining == 0;
+            (self.start, self.end) = (0, status.bytes_written);
+            if self.end > 0 {
                 return Ok(true);
             }
             input_needed = true;

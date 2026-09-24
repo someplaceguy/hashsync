@@ -369,9 +369,8 @@ impl<'a> Scanner<'a> {
             // A window of one byte is constant, so the window before has
             // at least two, and its last byte is at `p` or later.
             Some(known) if known.offset + 1 == p => {
-                let &[last, new] = self.bytes(p + self.block_size - 2, 2) else {
-                    unreachable!()
-                };
+                let last = self.byte(p + self.block_size - 2);
+                let new = self.byte(p + self.block_size - 1);
                 known.rolling.roll(&self.weak, known.first, last, new)
             }
             _ => Rolling::of(&self.weak, self.bytes(p, self.block_size))?,
@@ -476,7 +475,12 @@ impl<'a> Scanner<'a> {
     }
 
     /// Record the byte at `p` as literal, and move on to the next window.
+    /// The rolling state moves to this window first, so that the next
+    /// window rolls on from it instead of hashing all its bytes
+    /// (DESIGN.md §6.3): a stretch that stops at the entry here leaves the
+    /// state of the window before.
     fn literal_byte(&mut self) {
+        self.rolling();
         self.push_literal(self.p, 1);
         self.p += 1;
     }
@@ -487,11 +491,7 @@ impl<'a> Scanner<'a> {
     fn scan_tail(&mut self) {
         let tail = self.bytes(self.p, self.end() - self.p);
         let (matching, byte) = match self.records.back() {
-            Some(&Record::Run {
-                offset,
-                length,
-                byte,
-            }) if offset + length == self.p => {
+            Some(&Record::Run { byte, .. }) => {
                 (tail.iter().take_while(|&&b| b == byte).count(), byte)
             }
             _ => (0, 0),
@@ -506,14 +506,13 @@ impl<'a> Scanner<'a> {
         self.p = self.end();
     }
 
-    /// Append literal bytes, extending a Literal that ends where they
-    /// start.
+    /// Append literal bytes at `offset`, where the records end, extending
+    /// a last Literal.
     fn push_literal(&mut self, offset: u64, length: u64) {
         if let Some(Record::Literal {
-            offset: last,
             length: last_length,
+            ..
         }) = self.records.back_mut()
-            && *last + *last_length == offset
         {
             *last_length += length;
             return;
@@ -521,15 +520,14 @@ impl<'a> Scanner<'a> {
         self.records.push_back(Record::Literal { offset, length });
     }
 
-    /// Append `length` copies of `byte`, extending a Run of that byte that
-    /// ends where they start.
+    /// Append `length` copies of `byte` at `offset`, where the records end,
+    /// extending a last Run of that byte.
     fn push_run(&mut self, offset: u64, length: u64, byte: u8) {
         if let Some(Record::Run {
-            offset: last,
             length: last_length,
             byte: last_byte,
+            ..
         }) = self.records.back_mut()
-            && *last + *last_length == offset
             && *last_byte == byte
         {
             *last_length += length;
@@ -1298,6 +1296,37 @@ pub(crate) mod tests {
             "the call scanned on to {} after the hit at {first}",
             run.scanner.p
         );
+    }
+
+    /// A window answered no records one literal byte, and the rolling
+    /// state moves to it, so that the next window rolls on from it
+    /// (DESIGN.md §6.3). The rescan here reaches the window's entry at the
+    /// end of a stretch, which leaves the state of the window before.
+    #[test]
+    fn the_window_after_one_answered_no_rolls_on() {
+        let b = BS as usize;
+        let (first, second) = (noise(b, 70), noise(b, 71));
+        let input = [&first[..], &noise(5, 72), &second].concat();
+        let mut run = Run::new(
+            &input,
+            Receiver::new(&[], &[first, second]),
+            1 << 20,
+            1 << 20,
+            None,
+        );
+        run.push(input.len());
+        run.scan();
+        let at = (b + 5) as u64;
+        let pending: Vec<u64> = run.receiver.pending.iter().map(|q| q.0).collect();
+        assert_eq!(pending, [0, at]);
+        // Reject the second window, then the first: the rescan from 1
+        // reaches the second window's entry.
+        run.receiver.answer(1, &mut run.scanner);
+        run.receiver.answer(0, &mut run.scanner);
+        run.scan();
+        // The window after the entry is not whole yet.
+        assert_eq!(run.scanner.p, at + 1);
+        assert_eq!(run.scanner.known.map(|known| known.offset), Some(at));
     }
 
     /// Valid and stale blocks that overlap each other, and an input piece
