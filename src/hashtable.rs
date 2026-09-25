@@ -15,6 +15,17 @@ pub struct HashTable {
     buckets: Vec<Bucket>,
 }
 
+/// A lookup of one value: the bucket where it begins and the fingerprint
+/// that it looks for. `HashTable::start_lookup` makes it, and
+/// `HashTable::finish_lookup` of the same table finishes it. The default
+/// lookup finds nothing, in every table.
+#[derive(Clone, Copy, Default)]
+pub struct Lookup {
+    bucket: usize,
+    /// Zero, which no value has, only in a lookup that finds nothing.
+    fingerprint: u32,
+}
+
 impl HashTable {
     /// Build the table from the list's values, in any order.
     pub fn build(values: &[u64]) -> Self {
@@ -54,44 +65,63 @@ impl HashTable {
         }
     }
 
-    /// True when `value`'s fingerprint is present: stop at the
-    /// fingerprint or an empty slot, continue only through full buckets.
-    ///
-    /// Insertion fills each bucket's slots in order and never empties one,
-    /// so a fingerprint before the first empty slot is a fingerprint
-    /// anywhere in the bucket. Comparing all 16 slots together, without a
-    /// branch per slot, lets the compiler use vector compares and avoids a
-    /// mispredicted branch at the unpredictable end of the filled slots.
-    /// The scanner probes once per output byte, so this is always inlined.
+    /// Start the lookup of `value`: compute its bucket and fingerprint
+    /// once, and start to load the bucket, so that `finish_lookup` finds it
+    /// in the cache later. In the empty table, the lookup computes no bucket
+    /// address and finds nothing.
     #[inline(always)]
-    pub fn contains(&self, value: u64) -> bool {
+    pub fn start_lookup(&self, value: u64) -> Lookup {
         if self.buckets.is_empty() {
-            return false;
+            return Lookup::default();
         }
-        let fingerprint = fingerprint(value);
-        let mut bucket = self.bucket_of(value);
-        loop {
-            let slots = &self.buckets[bucket].0;
-            let found = slots
-                .iter()
-                .fold(false, |found, &slot| found | (slot == fingerprint));
-            let empty = slots.iter().fold(false, |empty, &slot| empty | (slot == 0));
-            if found {
-                return true;
-            }
-            if empty {
-                return false;
-            }
-            bucket = (bucket + 1) % self.buckets.len();
+        let bucket = self.bucket_of(value);
+        crate::sys::prefetch(&self.buckets[bucket]);
+        Lookup {
+            bucket,
+            fingerprint: fingerprint(value),
         }
     }
 
-    /// Start to load the bucket where `contains(value)` begins, so that a
-    /// later call finds it in the cache.
+    /// True when the lookup's fingerprint is present: stop at the
+    /// fingerprint or an empty slot, continue only through full buckets.
+    ///
+    /// `lookup` must come from `start_lookup` of this table, or be the
+    /// default lookup. A lookup from a different table can start at an
+    /// incorrect bucket and give a false negative, or start after the last
+    /// bucket and panic.
+    ///
+    /// Insertion fills each bucket's slots in order and never empties one.
+    /// So the filled slots of a bucket come before its empty slots: the
+    /// fingerprint is in the bucket exactly when it is before the first
+    /// empty slot, and a bucket has an empty slot exactly when its last
+    /// slot is empty. Comparing all 16 slots together, without a branch
+    /// per slot, lets the compiler use vector compares and avoids a
+    /// mispredicted branch at the unpredictable end of the filled slots.
+    /// The scanner probes once per output byte, so this is always inlined.
     #[inline(always)]
-    pub fn prefetch(&self, value: u64) {
-        if let Some(bucket) = self.buckets.get(self.bucket_of(value)) {
-            crate::sys::prefetch(bucket);
+    pub fn finish_lookup(&self, lookup: Lookup) -> bool {
+        // The default lookup, and every lookup in the empty table.
+        if lookup.fingerprint == 0 {
+            return false;
+        }
+        let mut bucket = lookup.bucket;
+        loop {
+            let slots = &self.buckets[bucket].0;
+            if slots
+                .iter()
+                .fold(false, |found, &slot| found | (slot == lookup.fingerprint))
+            {
+                return true;
+            }
+            if slots[slots.len() - 1] == 0 {
+                return false;
+            }
+            // About one lookup in eight passes a full bucket: wrap without
+            // a division.
+            bucket += 1;
+            if bucket == self.buckets.len() {
+                bucket = 0;
+            }
         }
     }
 
@@ -115,12 +145,46 @@ mod tests {
 
     use super::*;
 
+    /// A whole lookup of `value`.
+    fn look_up(table: &HashTable, value: u64) -> bool {
+        table.finish_lookup(table.start_lookup(value))
+    }
+
+    /// The lookup of DESIGN.md §5.5, slot by slot: stop at the fingerprint
+    /// or an empty slot, continue only through full buckets.
+    fn look_up_by_slots(table: &HashTable, value: u64) -> bool {
+        if table.buckets.is_empty() {
+            return false;
+        }
+        let fingerprint = fingerprint(value);
+        let mut bucket = table.bucket_of(value);
+        loop {
+            for &slot in &table.buckets[bucket].0 {
+                if slot == fingerprint {
+                    return true;
+                }
+                if slot == 0 {
+                    return false;
+                }
+            }
+            bucket = (bucket + 1) % table.buckets.len();
+        }
+    }
+
     #[test]
     fn the_empty_table_has_no_buckets_and_only_misses() {
         let table = HashTable::build(&[]);
         assert!(table.buckets.is_empty());
-        assert!(!table.contains(0));
-        assert!(!table.contains(u64::MAX));
+        assert!(!look_up(&table, 0));
+        assert!(!look_up(&table, u64::MAX));
+    }
+
+    #[test]
+    fn the_default_lookup_finds_nothing() {
+        // Bucket 0 has empty slots, which the default fingerprint must
+        // not match.
+        let table = HashTable::build(&[1, 2, 3]);
+        assert!(!table.finish_lookup(Lookup::default()));
     }
 
     #[test]
@@ -129,8 +193,8 @@ mod tests {
         // empty slot.
         let value = 0xABCD_0000_0000_0000;
         let table = HashTable::build(&[value, 0]);
-        assert!(table.contains(value));
-        assert!(table.contains(0));
+        assert!(look_up(&table, value));
+        assert!(look_up(&table, 0));
     }
 
     #[test]
@@ -140,8 +204,11 @@ mod tests {
         let values: Vec<u64> = (0..100).collect();
         let table = HashTable::build(&values);
         for &value in &values {
-            assert!(table.contains(value), "{value} lost");
+            assert!(look_up(&table, value), "{value} lost");
         }
+        // An absent fingerprint passes the full buckets and stops at the
+        // first bucket with an empty slot.
+        assert!(!look_up(&table, 1000));
     }
 
     proptest! {
@@ -150,7 +217,29 @@ mod tests {
         fn no_false_negatives(values in proptest::collection::vec(any::<u64>(), 1..500)) {
             let table = HashTable::build(&values);
             for &value in &values {
-                prop_assert!(table.contains(value));
+                prop_assert!(look_up(&table, value));
+            }
+        }
+
+        /// Lookups give the result of the slot-by-slot rule. Small values
+        /// share the first bucket and large values the last bucket, and
+        /// overflow them; the last bucket overflows into the first. Queries
+        /// near the values share their fingerprints, so the lookups pass
+        /// full buckets and wrap.
+        #[test]
+        fn lookups_follow_the_slot_rule(
+            values in proptest::collection::vec(
+                prop_oneof![0u64..4096, u64::MAX - 4095..=u64::MAX, any::<u64>()],
+                0..1000,
+            ),
+            queries in proptest::collection::vec(
+                prop_oneof![0u64..8192, u64::MAX - 8191..=u64::MAX, any::<u64>()],
+                0..200,
+            ),
+        ) {
+            let table = HashTable::build(&values);
+            for &query in queries.iter().chain(&values) {
+                prop_assert_eq!(look_up(&table, query), look_up_by_slots(&table, query));
             }
         }
 

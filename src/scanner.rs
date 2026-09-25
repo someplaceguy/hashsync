@@ -36,7 +36,7 @@ use rayon::ThreadPool;
 
 use crate::hash::weak::{WeakHasher, mix64};
 use crate::hash::{Strong, StrongHash};
-use crate::hashtable::HashTable;
+use crate::hashtable::{HashTable, Lookup};
 
 /// The bytes that one call of `scan` examines at most, so that answers and
 /// emission keep up with a long stretch of misses. With probe threads, this
@@ -703,25 +703,26 @@ fn first_stop(
     let roll = |rolling: Rolling, j: usize| {
         rolling.roll(weak, bytes[j], bytes[j + window - 1], bytes[j + window])
     };
-    // The stop at window `k`, from its rolling state and weak hash.
-    let check = |k: usize, (rolling, hash): (Rolling, u64)| {
+    // The stop at window `k`, from its rolling state and its lookup.
+    let check = |k: usize, (rolling, lookup): (Rolling, Lookup)| {
         if rolling.equal >= window {
             Some(Stop::Constant(k))
-        } else if table.contains(hash) {
+        } else if table.finish_lookup(lookup) {
             Some(Stop::Listed(k, rolling))
         } else {
             None
         }
     };
-    // `ring[j % AHEAD]` holds the rolling state and the weak hash of window
-    // `j`, for the next `AHEAD` windows.
-    let mut ring = [(first, 0u64); AHEAD];
+    // The ring entry of a window: its rolling state, and the lookup of its
+    // weak hash, whose bucket starts to load now.
+    let entry = |rolling: Rolling| (rolling, table.start_lookup(mix64(rolling.poly)));
+    // `ring[j % AHEAD]` holds the entry of window `j`, for the next `AHEAD`
+    // windows.
+    let mut ring = [(first, Lookup::default()); AHEAD];
     // The state of the window after the last one in the ring.
     let mut rolling = first;
     for (j, slot) in ring[..n.min(AHEAD)].iter_mut().enumerate() {
-        let hash = mix64(rolling.poly);
-        table.prefetch(hash);
-        *slot = (rolling, hash);
+        *slot = entry(rolling);
         if j + 1 < n {
             rolling = roll(rolling, j);
         }
@@ -731,9 +732,7 @@ fn first_stop(
     let mut k = 0;
     while k + AHEAD < n {
         let current = ring[k % AHEAD];
-        let ahead = mix64(rolling.poly);
-        table.prefetch(ahead);
-        ring[k % AHEAD] = (rolling, ahead);
+        ring[k % AHEAD] = entry(rolling);
         if k + AHEAD + 1 < n {
             rolling = roll(rolling, k + AHEAD);
         }
@@ -1436,7 +1435,7 @@ pub(crate) mod tests {
                 .find_map(|k| {
                     if state(k).equal == window {
                         Some(Stop::Constant(k))
-                    } else if table.contains(weak.hash(bytes_of(k))) {
+                    } else if table.finish_lookup(table.start_lookup(weak.hash(bytes_of(k)))) {
                         Some(Stop::Listed(k, state(k)))
                     } else {
                         None

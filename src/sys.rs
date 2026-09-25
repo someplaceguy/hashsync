@@ -562,7 +562,20 @@ pub fn prefetch<T>(value: &T) {
         use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
         _mm_prefetch::<_MM_HINT_T0>(std::ptr::from_ref(value).cast());
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    // `core::arch::aarch64::_prefetch` is unstable, so issue the
+    // instruction: `pldl1keep` loads into L1 for a read, like
+    // `_MM_HINT_T0`.
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: `prfm` only loads a cache line: it cannot fault and writes
+    // no register, memory, or flag. `value` is a valid reference.
+    unsafe {
+        std::arch::asm!(
+            "prfm pldl1keep, [{0}]",
+            in(reg) std::ptr::from_ref(value),
+            options(nostack, readonly, preserves_flags),
+        );
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     let _ = value;
 }
 
