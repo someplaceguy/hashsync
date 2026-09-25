@@ -59,11 +59,10 @@ DROP TABLE IF EXISTS filesystems;
 DROP TABLE IF EXISTS meta;
 ";
 
-/// Created after population; repaired by every update.
-const DEFERRED_BLOCK_INDEXES: &str = "
-CREATE INDEX IF NOT EXISTS blocks_by_weak   ON blocks (weak);
-CREATE INDEX IF NOT EXISTS blocks_by_strong ON blocks (strong);
-";
+/// Created after population; repaired by every update. No index orders
+/// the blocks by weak hash: the export sorts them in memory (DESIGN.md
+/// §5.4).
+const DEFERRED_BLOCK_INDEX: &str = "CREATE INDEX IF NOT EXISTS blocks_by_strong ON blocks (strong)";
 
 /// Unwrap a database result. Database errors are fatal bugs or failures
 /// and abort (DESIGN.md §6.5).
@@ -112,7 +111,7 @@ pub struct Stats {
     pub blocks: u64,
     pub distinct_weak: u64,
     pub indexed_bytes: u64,
-    pub deferred_block_indexes: bool,
+    pub deferred_block_index: bool,
 }
 
 /// An open index connection: the writer of a modifying process, or the
@@ -405,8 +404,8 @@ impl Index {
     }
 
     /// Reset schema and metadata in one transaction, with a new index ID.
-    /// Deferred block indexes are created after population by
-    /// `ensure_deferred_block_indexes`.
+    /// The deferred block index is created after population by
+    /// `ensure_deferred_block_index`.
     pub fn reset(&self, settings: &Settings) {
         let mut index_id = [0u8; 16];
         rustix::io::retry_on_intr(|| {
@@ -428,49 +427,34 @@ impl Index {
         db(self.conn.execute_batch("COMMIT"));
     }
 
-    pub fn ensure_deferred_block_indexes(&self) {
-        db(self.conn.execute_batch(DEFERRED_BLOCK_INDEXES));
+    pub fn ensure_deferred_block_index(&self) {
+        db(self.conn.execute_batch(DEFERRED_BLOCK_INDEX));
     }
 
-    /// True when both deferred block indexes exist. A read-only run needs
-    /// `blocks_by_weak` for the export and requests an update otherwise
+    /// True when the deferred block index exists. A read-only run needs
+    /// it for candidate lookups and requests an update otherwise
     /// (DESIGN.md §4.4).
-    pub fn has_block_indexes(&self) -> bool {
+    pub fn has_deferred_block_index(&self) -> bool {
         let count: i64 = db(self.conn.query_row(
-            "SELECT count(*) FROM sqlite_master WHERE type = 'index'
-             AND name IN ('blocks_by_weak', 'blocks_by_strong')",
+            "SELECT count(*) FROM sqlite_master
+             WHERE type = 'index' AND name = 'blocks_by_strong'",
             [],
             |row| row.get(0),
         ));
-        count == 2
+        count == 1
     }
 
     /// The distinct weak hashes, sorted as unsigned 64-bit values, from
-    /// one database snapshot (DESIGN.md §5.4). Values are stored as `i64`
-    /// bit patterns, so the non-negative rows are the low unsigned half
-    /// and the negative rows the high half; both scans use
-    /// `blocks_by_weak`.
+    /// one database snapshot (DESIGN.md §5.4). One statement reads one
+    /// snapshot, even outside a transaction. No index orders the rows, so
+    /// the sort is in memory.
     pub fn export_weak_hashes(&self) -> Vec<u64> {
-        // A read-only keeper is already inside its long transaction;
-        // give the autocommit writer a transaction of its own.
-        let own_transaction = self.conn.is_autocommit();
-        if own_transaction {
-            db(self.conn.execute_batch("BEGIN"));
-        }
-        let mut values: Vec<u64> = Vec::new();
-        for range in [
-            "SELECT DISTINCT weak FROM blocks WHERE weak >= 0 ORDER BY weak",
-            "SELECT DISTINCT weak FROM blocks WHERE weak < 0 ORDER BY weak",
-        ] {
-            let mut stmt = db(self.conn.prepare(range));
-            let rows = db(stmt.query_map([], |row| row.get::<_, i64>(0)));
-            for row in rows {
-                values.push(db(row) as u64);
-            }
-        }
-        if own_transaction {
-            db(self.conn.execute_batch("COMMIT"));
-        }
+        let mut stmt = db(self.conn.prepare("SELECT weak FROM blocks"));
+        let rows = db(stmt.query_map([], |row| row.get::<_, i64>(0)));
+        // Weak hashes are stored as `i64` bit patterns (DESIGN.md §4.4).
+        let mut values: Vec<u64> = rows.map(|row| db(row) as u64).collect();
+        values.sort_unstable();
+        values.dedup();
         values
     }
 
@@ -519,9 +503,11 @@ impl Index {
             inodes_incomplete: count("SELECT count(*) FROM inodes WHERE size IS NULL"),
             paths: count("SELECT count(*) FROM paths"),
             blocks: count("SELECT count(*) FROM blocks"),
-            distinct_weak: count("SELECT count(DISTINCT weak) FROM blocks"),
+            // The size of the hash list. Without an index by weak hash,
+            // `count(DISTINCT weak)` would sort in a temporary B-tree.
+            distinct_weak: self.export_weak_hashes().len() as u64,
             indexed_bytes: indexed_bytes as u64,
-            deferred_block_indexes: self.has_block_indexes(),
+            deferred_block_index: self.has_deferred_block_index(),
         }
     }
 }
@@ -680,7 +666,7 @@ mod tests {
         let path = dir.path().join("index.sqlite");
         let index = open_modifying(path.as_os_str().as_bytes());
         index.reset(&settings());
-        index.ensure_deferred_block_indexes();
+        index.ensure_deferred_block_index();
         db(index.conn.execute_batch(
             "BEGIN IMMEDIATE;
              INSERT INTO filesystems (id, fsid) VALUES (1, x'01');
@@ -770,6 +756,27 @@ mod tests {
             reader.reusable_inode(b"\x01", b"\x03", 4096, 123),
             None,
             "an incomplete row is not reusable"
+        );
+    }
+
+    /// Every connection has its own page cache (DESIGN.md §4.4).
+    /// `libsqlite3-sys` builds the bundled SQLite with
+    /// `SQLITE_ENABLE_MEMORY_MANAGEMENT`, which puts all page caches under
+    /// one mutex; `.cargo/config.toml` removes that option.
+    #[test]
+    fn page_caches_are_separate() {
+        let conn = Connection::open_in_memory().unwrap();
+        let mut stmt = conn.prepare("PRAGMA compile_options").unwrap();
+        let options: Vec<String> = stmt
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        // A known option shows that the pragma reports the options.
+        assert!(options.iter().any(|o| o == "THREADSAFE=1"), "{options:?}");
+        assert!(
+            !options.iter().any(|o| o == "ENABLE_MEMORY_MANAGEMENT"),
+            "{options:?}"
         );
     }
 }

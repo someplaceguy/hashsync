@@ -337,9 +337,9 @@ fn open_read_only(config: &Config) -> (index::Index, Vec<Location>) {
             "index {path} does not match the configuration; run `hashsync update`"
         ));
     }
-    if !index.has_block_indexes() {
+    if !index.has_deferred_block_index() {
         die(format!(
-            "index {path} is missing its block indexes; run `hashsync update`"
+            "index {path} is missing its block index; run `hashsync update`"
         ));
     }
     (index, locations)

@@ -1,0 +1,6 @@
+[env]
+# `libsqlite3-sys` builds the bundled SQLite with
+# SQLITE_ENABLE_MEMORY_MANAGEMENT, which puts the page caches of all
+# connections under one mutex and serializes the worker readers
+# (DESIGN.md §4.4).
+LIBSQLITE3_FLAGS = "-USQLITE_ENABLE_MEMORY_MANAGEMENT"

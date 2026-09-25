@@ -61,11 +61,18 @@ fn indexes_complete_useful_blocks() {
         BLOCK + (BLOCK * 2 + BLOCK / 2) + BLOCK * 3 + BLOCK * 2 + BLOCK * 3
     );
 
-    // Deferred block indexes exist after the update.
-    assert_eq!(
-        env.count("SELECT count(*) FROM sqlite_master WHERE name IN ('blocks_by_weak', 'blocks_by_strong')"),
-        2
-    );
+    // The deferred block index is the only index of the blocks; none
+    // orders them by weak hash (DESIGN.md §4.4).
+    let indexes: String = env
+        .db()
+        .query_row(
+            "SELECT group_concat(name) FROM sqlite_master
+             WHERE type = 'index' AND tbl_name = 'blocks'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(indexes, "blocks_by_strong");
 }
 
 #[test]
@@ -642,25 +649,22 @@ fn files_without_useful_blocks_are_retained_and_reused() {
 }
 
 #[test]
-fn missing_deferred_block_indexes_are_repaired() {
+fn missing_deferred_block_index_is_repaired() {
     let env = Env::new();
     env.write("tree/f", &random(BLOCK, 1));
     env.configure(&env.root("tree", ""));
     env.update();
 
-    // An interrupted rebuild can leave the deferred block indexes
-    // missing; every update repairs them (DESIGN.md §4.4).
+    // An interrupted rebuild can leave the deferred block index missing;
+    // every update repairs it (DESIGN.md §4.4).
     env.db_rw()
-        .execute_batch("DROP INDEX blocks_by_weak; DROP INDEX blocks_by_strong")
+        .execute_batch("DROP INDEX blocks_by_strong")
         .unwrap();
     let stderr = env.update();
     assert!(stderr.contains("1 unchanged"), "{stderr}");
     assert_eq!(
-        env.count(
-            "SELECT count(*) FROM sqlite_master
-             WHERE name IN ('blocks_by_weak', 'blocks_by_strong')"
-        ),
-        2
+        env.count("SELECT count(*) FROM sqlite_master WHERE name = 'blocks_by_strong'"),
+        1
     );
 }
 

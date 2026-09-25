@@ -297,7 +297,6 @@ CREATE TABLE blocks      (inode_id INTEGER NOT NULL REFERENCES inodes(id)
                           block_no INTEGER NOT NULL, weak INTEGER NOT NULL,
                           strong BLOB NOT NULL CHECK (length(strong) = 16),
                           PRIMARY KEY (inode_id, block_no)) WITHOUT ROWID;
-CREATE INDEX blocks_by_weak   ON blocks (weak);
 CREATE INDEX blocks_by_strong ON blocks (strong);
 ```
 
@@ -307,7 +306,10 @@ their own content and are persisted independently (section 5.6).
 
 Configure the writer connection with `cache_size=-65536` (64 MiB; negative
 values are KiB) and `threads=8` (up to eight auxiliary sorting workers).
-Worker readers keep SQLite's default cache size.
+Worker readers keep SQLite's default cache size. Each connection has its
+own page cache. Build the bundled SQLite without
+`SQLITE_ENABLE_MEMORY_MANAGEMENT`: that option puts the page caches of all
+connections under one mutex, which serializes the worker readers.
 
 **Process access.** SQLite's `unix-excl` VFS provides exclusion without a
 separate lock file:
@@ -357,13 +359,13 @@ to one thread; the sole writer uses `BEGIN IMMEDIATE`.
   and path rows even when no block rows were inserted. Store the size
   normally so the inode is complete and reusable.
 - `blocks_by_strong` supplies candidates using 16-byte prefixes; only a
-  full digest comparison verifies a candidate. `blocks_by_weak` serves
-  distinct weak-hash export.
+  full digest comparison verifies a candidate. No index orders blocks by
+  weak hash; the export sorts the weak hashes in memory (section 5.4).
 - Rebuild under process-exclusive access by resetting schema and metadata
-  in one transaction, then populating in batches and creating deferred
-  block indexes. Never replace the database file by rename. Every update
-  repairs missing indexes from an interrupted rebuild; read-only runs
-  requiring them request an update.
+  in one transaction, then populating in batches and creating the deferred
+  `blocks_by_strong` index. Never replace the database file by rename.
+  Every update repairs this index if an interrupted rebuild left it
+  missing; read-only runs requiring it request an update.
 - `index_id` is a random 128-bit value created with the schema and renewed
   on rebuild. It partitions caches, not list content; there is no index
   generation counter.
@@ -571,8 +573,9 @@ output.
 
 ### 5.4 The hash list
 
-Export distinct weak hashes through `blocks_by_weak`, sort as unsigned
-64-bit values, and encode canonically:
+Read the weak hashes of all block rows in one table scan, sort them in
+memory as unsigned 64-bit values, remove duplicates, and encode
+canonically:
 
 1. Width `W = 64`; no hash bits are dropped.
 2. For sorted distinct values, gaps are `g_0 = v_0` and
@@ -1455,6 +1458,13 @@ decision history is in version control.
   connections with `query_only` worker readers preserve process exclusion
   without a second persistent locking object. Mixing VFSes or read-only
   connections inside that process does not preserve this guarantee.
+- **An index by weak hash:** it gives the export its order without a
+  sort, but its keys are random. When it is larger than the writer's page
+  cache, almost every block insert changes a different page of it, and
+  SQLite writes each changed page twice: to the WAL and at the checkpoint.
+  At 20M rows, inserts without it were 2.2 times faster, and a table scan
+  with an in-memory sort exported the list in 5.2 s instead of 8.3 s.
+  Candidate lookups need `blocks_by_strong`, which has the same cost.
 - **Async runtimes and `io_uring`:** the blocking pool already serves the
   file-oriented workload, and `io_uring` availability would require a
   fallback. Keep one I/O model.

@@ -84,7 +84,7 @@ pub fn perform(config: &Config, rebuild: bool, jobs: Option<u32>) -> (index::Ind
         (counters, writer.join().expect("the writer thread panicked"))
     });
 
-    index.ensure_deferred_block_indexes();
+    index.ensure_deferred_block_index();
 
     die::note(format!(
         "{} in {:.1}s: {} directories, {} files hashed ({} bytes), \
