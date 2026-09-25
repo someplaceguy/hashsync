@@ -15,6 +15,7 @@ use std::thread;
 use std::time::Duration;
 
 use bstr::ByteSlice;
+use rayon::slice::ParallelSliceMut;
 use rusqlite::types::Value;
 use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, params};
 
@@ -447,13 +448,18 @@ impl Index {
     /// The distinct weak hashes, sorted as unsigned 64-bit values, from
     /// one database snapshot (DESIGN.md §5.4). One statement reads one
     /// snapshot, even outside a transaction. No index orders the rows, so
-    /// the sort is in memory.
+    /// the sort is in memory, with one thread per core.
     pub fn export_weak_hashes(&self) -> Vec<u64> {
         let mut stmt = db(self.conn.prepare("SELECT weak FROM blocks"));
         let rows = db(stmt.query_map([], |row| row.get::<_, i64>(0)));
         // Weak hashes are stored as `i64` bit patterns (DESIGN.md §4.4).
         let mut values: Vec<u64> = rows.map(|row| db(row) as u64).collect();
-        values.sort_unstable();
+        // The pool's threads end when it is dropped.
+        rayon::ThreadPoolBuilder::new()
+            .thread_name(|i| format!("sort{i}"))
+            .build()
+            .expect("cannot start the sort pool")
+            .install(|| values.par_sort_unstable());
         values.dedup();
         values
     }

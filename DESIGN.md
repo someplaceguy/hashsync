@@ -573,9 +573,9 @@ output.
 
 ### 5.4 The hash list
 
-Read the weak hashes of all block rows in one table scan, sort them in
-memory as unsigned 64-bit values, remove duplicates, and encode
-canonically:
+Read the weak hashes of all block rows in one table scan. Sort them in
+memory as unsigned 64-bit values, using one thread per core. Remove
+duplicates and encode canonically:
 
 1. Width `W = 64`; no hash bits are dropped.
 2. For sorted distinct values, gaps are `g_0 = v_0` and
@@ -1418,7 +1418,7 @@ SIMD support require a target C compiler. There is no separate pure-Rust build.
 | SQLite | `rusqlite` with bundled SQLite |
 | Strong hashes | `blake3`, `sha2`, behind one shared strong-hash interface |
 | System calls | `rustix`; `libc` and `linux-raw-sys` for missing wrappers/constants |
-| Thread pools and channels | `rayon` for indexing and sender probes, `crossbeam-channel`; blocking standard threads for transfer |
+| Thread pools and channels | `rayon` for indexing, the hash-list sort, and sender probes, `crossbeam-channel`; blocking standard threads for transfer |
 | Compression | `zstd` binding libzstd with worker-thread support |
 | Anonymous pin files | `tempfile`; hole punching through `rustix` |
 | Configuration and CLI | `serde`, `toml`, `clap`; `gix-glob` for byte patterns and paths |
@@ -1463,7 +1463,8 @@ decision history is in version control.
   cache, almost every block insert changes a different page of it, and
   SQLite writes each changed page twice: to the WAL and at the checkpoint.
   At 20M rows, inserts without it were 2.2 times faster, and a table scan
-  with an in-memory sort exported the list in 5.2 s instead of 8.3 s.
+  with a parallel in-memory sort exported the list in 4.2 s instead of
+  8.3 s.
   Candidate lookups need `blocks_by_strong`, which has the same cost.
 - **Async runtimes and `io_uring`:** the blocking pool already serves the
   file-oriented workload, and `io_uring` availability would require a
