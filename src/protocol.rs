@@ -81,6 +81,8 @@ pub struct ReceiverHello {
     /// Seconds.
     pub hashlist_max_age: u64,
     pub compression_level: i32,
+    /// zstd long-distance matching (DESIGN.md §7).
+    pub compression_long: bool,
     pub compression_threads: u32,
     /// Threads that probe the weak table for the scanner; 0 selects half
     /// the sender's cores, at least one (DESIGN.md §6.3).
@@ -104,6 +106,7 @@ impl ReceiverHello {
         enc.u8(self.sender_cache.into());
         enc.u64(self.hashlist_max_age);
         enc.i32(self.compression_level);
+        enc.u8(self.compression_long.into());
         enc.u32(self.compression_threads);
         enc.u32(self.probe_threads);
         enc.u64(self.lookahead);
@@ -139,6 +142,7 @@ impl ReceiverHello {
             sender_cache: dec.flag(),
             hashlist_max_age: dec.u64(),
             compression_level: dec.i32(),
+            compression_long: dec.flag(),
             compression_threads: dec.u32(),
             probe_threads: dec.u32(),
             lookahead: dec.u64(),
@@ -558,7 +562,9 @@ pub fn drain_to_eof(mut reader: impl Read) -> std::io::Result<bool> {
 
 /// Writes frames to a transport: one header write and one payload write
 /// per frame. A writer that sends many small frames wraps its transport in
-/// a `BufWriter` and flushes before it waits (`next_from`).
+/// a `BufWriter`. A control writer flushes before it waits (`next_from`).
+/// On the data session, a side flushes only before it waits for a reply
+/// (DESIGN.md §6.2).
 pub struct FrameWriter<W: Write> {
     writer: W,
 }
@@ -597,11 +603,11 @@ impl<W: Write> FrameWriter<W> {
         self.writer.flush()
     }
 
-    /// The next item from `queue`, for a thread that writes what the
-    /// queue delivers. When nothing is queued, flush first: frames must
-    /// not stay in a buffer while this thread waits, or the peer could
-    /// wait for them forever (DESIGN.md §6.2). `None`, after a flush, once
-    /// the queue is closed and empty.
+    /// The next item from `queue`, for a control writer, which writes what
+    /// the queue delivers. When nothing is queued, flush first: the
+    /// scanner waits for answers, so queries and answers must not stay in
+    /// a buffer while this thread waits (DESIGN.md §6.6). `None`, after a
+    /// flush, once the queue is closed and empty.
     pub fn next_from<T>(&mut self, queue: &Receiver<T>) -> std::io::Result<Option<T>> {
         match queue.try_recv() {
             Ok(item) => Ok(Some(item)),
@@ -616,6 +622,11 @@ impl<W: Write> FrameWriter<W> {
 /// The compression levels that a sender supports (DESIGN.md §7): zstd
 /// levels 1 to 19, and 0, which disables compression.
 pub const COMPRESSION_LEVELS: RangeInclusive<i32> = 0..=19;
+
+/// The window log of long-distance matching: a 128 MiB window, as with
+/// `zstd --long=27`. A zstd decoder accepts windows up to this size by
+/// default, so the receiver needs no setting for it.
+const LONG_WINDOW_LOG: u32 = 27;
 
 /// The sender's data session after its HELLO (DESIGN.md §6.2): one zstd
 /// stream for all frames, or the frames as they are when compression is
@@ -639,20 +650,21 @@ struct Encoding {
 }
 
 impl<W: Write> Compressor<W> {
-    /// Compress at zstd `level` on `threads` worker threads; level 0
-    /// disables compression.
-    pub fn new(transport: W, level: i32, threads: u32) -> Self {
+    /// Compress at zstd `level` on `threads` worker threads, with
+    /// long-distance matching when `long`; level 0 disables compression.
+    pub fn new(transport: W, level: i32, long: bool, threads: u32) -> Self {
         assert!(
             COMPRESSION_LEVELS.contains(&level),
             "compression level {level}"
         );
         let zstd = (level != 0).then(|| {
             let mut encoder = zstd::stream::raw::Encoder::new(level).unwrap_or_else(zstd_failed);
-            for parameter in [
-                CParameter::ChecksumFlag(true),
-                CParameter::NbWorkers(threads),
-            ] {
-                encoder.set_parameter(parameter).unwrap_or_else(zstd_failed);
+            let mut set = |parameter| encoder.set_parameter(parameter).unwrap_or_else(zstd_failed);
+            set(CParameter::ChecksumFlag(true));
+            set(CParameter::NbWorkers(threads));
+            if long {
+                set(CParameter::EnableLongDistanceMatching(true));
+                set(CParameter::WindowLog(LONG_WINDOW_LOG));
             }
             Encoding {
                 encoder,
@@ -866,6 +878,7 @@ fn read_exactly<R: Read>(reader: R, length: u64, out: &mut Vec<u8>) -> std::io::
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scanner::tests::noise;
 
     fn read_all(bytes: &[u8]) -> Vec<(u8, Vec<u8>)> {
         let mut reader = FrameReader::new(bytes);
@@ -961,6 +974,7 @@ mod tests {
             sender_cache: true,
             hashlist_max_age: 90 * 24 * 3600,
             compression_level: 0,
+            compression_long: true,
             compression_threads: 0,
             probe_threads: 5,
             lookahead: 256 << 20,
@@ -1010,6 +1024,7 @@ mod tests {
         assert_eq!(decoded.account_id, [7; 16]);
         assert_eq!(decoded.target, hello.target);
         assert!(decoded.sender_cache);
+        assert!(decoded.compression_long);
         assert_eq!(decoded.probe_threads, 5);
         assert_eq!(decoded.command, hello.command);
     }
@@ -1110,8 +1125,8 @@ mod tests {
 
     /// The frames of the sender's data session after HELLO, through a
     /// `Compressor`, and the finished stream.
-    fn compressed(level: i32, threads: u32, frames: &[(u8, &[u8])]) -> Vec<u8> {
-        let mut writer = FrameWriter::new(Compressor::new(Vec::new(), level, threads));
+    fn compressed(level: i32, long: bool, threads: u32, frames: &[(u8, &[u8])]) -> Vec<u8> {
+        let mut writer = FrameWriter::new(Compressor::new(Vec::new(), level, long, threads));
         for &(kind, payload) in frames {
             writer.send(kind, payload).unwrap();
         }
@@ -1132,9 +1147,10 @@ mod tests {
             (frame::RLE, &run),
             (frame::END, &end_payload()),
         ];
-        let plain = compressed(0, 0, &frames);
-        for (level, threads) in [(0, 0), (1, 1), (19, 3)] {
-            let mut stream = compressed(level, threads, &frames);
+        let plain = compressed(0, false, 0, &frames);
+        let cases = [(0, false, 0), (1, false, 1), (19, false, 3), (19, true, 3)];
+        for (level, long, threads) in cases {
+            let mut stream = compressed(level, long, threads, &frames);
             if level != 0 {
                 assert!(stream.len() < plain.len() / 10, "level {level}");
             }
@@ -1149,6 +1165,35 @@ mod tests {
             transport.read_to_end(&mut rest).unwrap();
             assert_eq!(rest, b"after", "level {level}");
         }
+    }
+
+    #[test]
+    fn long_distance_matching_finds_repeats_beyond_the_window_of_the_level() {
+        // Level 1 has a 512 KiB window. Without long-distance matching,
+        // noise that repeats after 4 MiB of other noise costs its full size
+        // again. The receiver decodes the 128 MiB window without a setting.
+        let repeated = noise(256 << 10, 1);
+        let gap = noise(4 << 20, 2);
+        let end = end_payload();
+        let frames = [
+            (frame::LIT, &repeated[..]),
+            (frame::LIT, &gap[..]),
+            (frame::LIT, &repeated[..]),
+            (frame::END, &end[..]),
+        ];
+        let short = compressed(1, false, 2, &frames);
+        let long = compressed(1, true, 2, &frames);
+        assert!(
+            long.len() + (200 << 10) < short.len(),
+            "{} bytes with long-distance matching, {} without",
+            long.len(),
+            short.len()
+        );
+        let mut reader = FrameReader::new(Decompressor::new(&long[..], true));
+        for &(kind, payload) in &frames {
+            assert!(reader.expect(kind, "a frame").unwrap() == payload);
+        }
+        reader.into_inner().finish().unwrap();
     }
 
     /// A transport whose bytes stay visible while it is in use.
@@ -1171,9 +1216,9 @@ mod tests {
         // The bytes sent until a flush decode to every frame written
         // before it, although the stream goes on: the sender flushes
         // before it waits for a reply (DESIGN.md §6.2).
-        for threads in [1, 3] {
+        for (long, threads) in [(false, 1), (false, 3), (true, 1), (true, 3)] {
             let sent = Shared::default();
-            let mut writer = FrameWriter::new(Compressor::new(sent.clone(), 9, threads));
+            let mut writer = FrameWriter::new(Compressor::new(sent.clone(), 9, long, threads));
             writer.send(frame::CACHE_RESULT, b"").unwrap();
             writer.send(frame::LIT, &[1; 1000]).unwrap();
             writer.flush().unwrap();
@@ -1193,6 +1238,7 @@ mod tests {
         // (DESIGN.md §6.7).
         let stream = compressed(
             3,
+            false,
             1,
             &[(frame::LIT, b"literal"), (frame::END, &end_payload())],
         );
@@ -1255,6 +1301,7 @@ mod tests {
         // progress (DESIGN.md §3).
         let stream = compressed(
             3,
+            false,
             1,
             &[(frame::LIT, b"literal"), (frame::END, &end_payload())],
         );
@@ -1273,7 +1320,12 @@ mod tests {
     #[test]
     #[should_panic(expected = "protocol error: data after END")]
     fn data_after_end_is_a_protocol_error() {
-        let stream = compressed(3, 1, &[(frame::END, &end_payload()), (frame::LIT, b"late")]);
+        let stream = compressed(
+            3,
+            false,
+            1,
+            &[(frame::END, &end_payload()), (frame::LIT, b"late")],
+        );
         let mut reader = FrameReader::new(Decompressor::new(&stream[..], true));
         reader.expect(frame::END, "END").unwrap();
         let _ = reader.into_inner().finish();
@@ -1281,7 +1333,7 @@ mod tests {
 
     /// LIT, then `partial`, in a zstd frame that ends without END.
     fn ended_before_end(partial: &[u8]) -> Vec<u8> {
-        let mut writer = FrameWriter::new(Compressor::new(Vec::new(), 3, 1));
+        let mut writer = FrameWriter::new(Compressor::new(Vec::new(), 3, false, 1));
         writer.send(frame::LIT, b"literal").unwrap();
         let mut compressor = writer.into_inner();
         compressor.write_all(partial).unwrap();
@@ -1314,7 +1366,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "protocol error: invalid compressed data")]
     fn a_wrong_checksum_is_a_protocol_error() {
-        let mut stream = compressed(3, 1, &[(frame::END, &end_payload())]);
+        let mut stream = compressed(3, false, 1, &[(frame::END, &end_payload())]);
         *stream.last_mut().unwrap() ^= 1;
         let mut reader = FrameReader::new(Decompressor::new(&stream[..], true));
         reader.expect(frame::END, "END").unwrap();

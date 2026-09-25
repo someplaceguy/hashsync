@@ -114,6 +114,7 @@ pub fn run(token: &str) -> ! {
     let mut data_out = FrameWriter::new(Compressor::new(
         data_out.into_inner(),
         hello.compression_level,
+        hello.compression_long,
         thread_count(hello.compression_threads),
     ));
 

@@ -832,10 +832,10 @@ Payloads:
 - HELLO, receiver to sender: `block_size u32`, `weak_hash_id string`,
   `strong_hash_id string`, `target [u8; S]`, `account_id [u8; 16]`,
   `index_id [u8; 16]`, `sender_cache u8`, `hashlist_max_age u64` (seconds),
-  `compression_level i32`, `compression_threads u32`, `probe_threads u32`,
-  `lookahead u64`, `negative_cache u64` (bytes), and `command`, a list of
-  argv byte strings. Find argv[0] in PATH and run directly; a shell requires
-  explicit `sh -c`.
+  `compression_level i32`, `compression_long u8`, `compression_threads u32`,
+  `probe_threads u32`, `lookahead u64`, `negative_cache u64` (bytes), and
+  `command`, a list of argv byte strings. Find argv[0] in PATH and run
+  directly; a shell requires explicit `sh -c`.
 - HELLO, sender to receiver: `account_id [u8; 16]` and an optional
   `base [u8; S]`.
 - HASHLIST: `length u64`. That many encoded bytes of the target follow the
@@ -956,16 +956,20 @@ tail to be scanned again.
 **Probe threads.**
 
 A weak-table probe depends only on the bytes of its window. When the
-scanner looks for the next hit, it can split a long stretch of windows into
-consecutive parts and probe them on `probe_threads` threads at once. Each
-part computes the polynomial of its first window directly. The first hit in
-offset order ends the stretch, and parts after a found hit may stop early,
-so the result equals probing each window in order. After each weak hit,
-new or known, the scanner scans at most a short stretch on its own thread
-before it processes answers again. With more than one probe thread, each
-following stretch without a hit doubles the next one, up to a bound per
-thread. Short gaps between matches thus stay on one thread, and a long run
-of misses soon uses all probe threads. HELLO's `probe_threads` sets the
+scanner looks for the next hit or constant window, it can split a long
+stretch of windows into consecutive parts and probe them on
+`probe_threads` threads at once. Every part but the first initializes the
+rolling hash and the constant-window check from the bytes of its first
+window. The first hit or constant window in offset order ends the stretch,
+and parts after it may stop early, so the result equals checking each
+window in order. After each weak hit, new or known, the scanner scans at
+most a short stretch on its own thread before it processes answers again.
+With more than one probe thread, each following stretch without a hit or
+a constant window doubles the next one, up to a bound per thread. A
+constant window neither doubles nor shortens the next stretch: the stretch
+that it ends did not use its full length, and the window makes no query.
+Short gaps between matches thus stay on one thread, and a long run of
+misses soon uses all probe threads. HELLO's `probe_threads` sets the
 thread count; 0 selects half the sender's cores, at least one.
 
 **Answers and rescanning.**
@@ -1301,6 +1305,7 @@ pin_directory  = "~/.cache/hashsync/pins"  # receiver file storage; supports hol
 negative_cache = "128MiB"
 probe_threads  = 0         # 0 = half the sender's cores, at least one
 compression_level   = 9    # zstd 1–19; 0 disables
+compression_long    = true # zstd long-distance matching, 128 MiB window
 compression_threads = 0    # 0 = half the sender's cores, at least one
 ssh            = "ssh"     # shell-split command; appends -o Compression=no
 sender_command = "hashsync"

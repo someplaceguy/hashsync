@@ -148,6 +148,7 @@ pub fn run(
         sender_cache: options.sender_cache,
         hashlist_max_age: config.hashlist_max_age,
         compression_level: config.compression_level,
+        compression_long: config.compression_long,
         compression_threads: config.compression_threads,
         probe_threads: config.probe_threads,
         lookahead: config.lookahead,

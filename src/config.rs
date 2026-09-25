@@ -51,6 +51,9 @@ pub struct Config {
     /// The zstd level of the sender's data stream; 0 disables compression
     /// (DESIGN.md §6.2).
     pub compression_level: i32,
+    /// zstd long-distance matching in a 128 MiB window, for repeats
+    /// farther back than the window of the level (DESIGN.md §7).
+    pub compression_long: bool,
     /// The sender's compression threads; 0 selects half the sender's
     /// cores, at least one.
     pub compression_threads: u32,
@@ -157,6 +160,7 @@ struct RawConfig {
     probe_threads: Option<u32>,
     candidate_attempts: Option<u32>,
     compression_level: Option<i32>,
+    compression_long: Option<bool>,
     compression_threads: Option<u32>,
     pin_directory: Option<String>,
     ssh: Option<String>,
@@ -312,6 +316,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
         probe_threads: raw.probe_threads.unwrap_or(0),
         candidate_attempts,
         compression_level,
+        compression_long: raw.compression_long.unwrap_or(true),
         compression_threads: raw.compression_threads.unwrap_or(0),
         pin_directory,
         ssh,
@@ -680,6 +685,7 @@ negative_cache = 0
 probe_threads = 5
 candidate_attempts = 3
 compression_level = 19
+compression_long = false
 compression_threads = 2
 pin_directory = '/var/\xFE/pins'
 
@@ -702,6 +708,7 @@ one_filesystem = true
         assert_eq!(config.probe_threads, 5);
         assert_eq!(config.candidate_attempts, 3);
         assert_eq!(config.compression_level, 19);
+        assert!(!config.compression_long);
         assert_eq!(config.compression_threads, 2);
         assert_eq!(config.pin_directory, b"/var/\xfe/pins");
         assert_eq!(config.roots.len(), 2);
@@ -736,6 +743,7 @@ one_filesystem = true
         assert_eq!(config.probe_threads, 0);
         assert_eq!(config.candidate_attempts, 128);
         assert_eq!(config.compression_level, 9);
+        assert!(config.compression_long);
         assert_eq!(config.compression_threads, 0);
         assert!(config.pin_directory.ends_with(b"/hashsync/pins"));
         assert_eq!(parse("compression_level = 0").unwrap().compression_level, 0);

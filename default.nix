@@ -26,8 +26,8 @@ rustPlatform.buildRustPackage {
   # Dependencies come from the committed lockfile; no separate hash.
   cargoLock.lockFile = ./Cargo.lock;
 
-  # SQLite and BLAKE3's SIMD code are C, compiled by the crates' build
-  # scripts with the target C compiler that rustPlatform provides.
+  # SQLite, libzstd, and BLAKE3's SIMD code are C, compiled by the crates'
+  # build scripts with the target C compiler that rustPlatform provides.
 
   nativeBuildInputs = lib.optionals shell [ clippy rustfmt ];
 

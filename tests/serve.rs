@@ -119,6 +119,7 @@ fn hello_payload(block_size: u32, list: &[u8], command: &[&str], level: i32) -> 
     hello.push(1); // sender_cache
     hello.extend_from_slice(&(90 * 24 * 3600u64).to_le_bytes()); // hashlist_max_age
     hello.extend_from_slice(&level.to_le_bytes()); // compression level
+    hello.push(1); // compression_long
     hello.extend_from_slice(&0u32.to_le_bytes()); // compression threads
     hello.extend_from_slice(&0u32.to_le_bytes()); // probe threads
     hello.extend_from_slice(&(256u64 << 20).to_le_bytes()); // lookahead
