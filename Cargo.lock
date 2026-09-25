@@ -449,6 +449,7 @@ dependencies = [
  "tempfile",
  "toml",
  "zstd",
+ "zstd-sys",
 ]
 
 [[package]]

@@ -35,10 +35,10 @@ mod update;
 use std::ffi::OsString;
 
 use clap::{Parser, Subcommand};
-use mimalloc::MiMalloc;
 
+#[cfg(feature = "mimalloc")]
 #[global_allocator]
-static GLOBAL: MiMalloc = MiMalloc;
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[derive(Parser)]
 #[command(
@@ -105,6 +105,7 @@ fn main() {
     die::install_panic_hook();
     let cli = Cli::parse();
     // SQLite accepts an allocator only before its first use.
+    #[cfg(feature = "mimalloc")]
     sys::sqlite_use_mimalloc();
     // The sender entry points run on the remote host, which needs no
     // configuration file.

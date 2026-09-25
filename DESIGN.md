@@ -1419,11 +1419,12 @@ SIMD support require a target C compiler. There is no separate pure-Rust build.
 | Strong hashes | `blake3`, `sha2`, behind one shared strong-hash interface |
 | System calls | `rustix`; `libc` and `linux-raw-sys` for missing wrappers/constants |
 | Thread pools and channels | `rayon` for indexing, the hash-list sort, and sender probes, `crossbeam-channel`; blocking standard threads for transfer |
-| Compression | `zstd` binding libzstd with worker-thread support |
+| Compression | `zstd-sys` binding libzstd with worker-thread support |
+| Memory allocation | `mimalloc` for Rust code, SQLite, and libzstd, with the `mimalloc` feature (on by default); never its `override`, so other C code keeps libc `malloc` |
 | Anonymous pin files | `tempfile`; hole punching through `rustix` |
 | Configuration and CLI | `serde`, `toml`, `clap`; `gix-glob` for byte patterns and paths |
 | Maps and caches | Standard maps with a fast hasher; `lru` for bounded caches |
-| Signals | `signal-hook` |
+| Signals | Blocked signals and a polled `signalfd` through `libc`; no signal handlers |
 | Tests | `proptest`, `tempfile`, and frame-decoder fuzzing |
 
 The weak hash, canonical list encoding, direct deltas, and fingerprint table

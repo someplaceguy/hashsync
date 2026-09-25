@@ -1,12 +1,21 @@
 {
   pkgs ? import <nixpkgs> {},
   shell ? false,
+  # The Cargo feature `mimalloc`: allocate through mimalloc.
+  mimalloc ? true,
 }:
 
 with pkgs;
 
 let
   cargoToml = lib.importTOML ./Cargo.toml;
+
+  # Cargo's default features, without `mimalloc` when the argument is false.
+  features =
+    if mimalloc then
+      cargoToml.features.default
+    else
+      lib.remove "mimalloc" cargoToml.features.default;
 
   # A development shell needs no source; a build takes the checkout without
   # ignored files and version-control directories.
@@ -25,6 +34,9 @@ rustPlatform.buildRustPackage {
 
   # Dependencies come from the committed lockfile; no separate hash.
   cargoLock.lockFile = ./Cargo.lock;
+
+  buildNoDefaultFeatures = true;
+  buildFeatures = features;
 
   # SQLite, libzstd, and BLAKE3's SIMD code are C, compiled by the crates'
   # build scripts with the target C compiler that rustPlatform provides.

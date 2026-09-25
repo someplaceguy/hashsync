@@ -5,19 +5,17 @@
 //! callers never see `EINTR`.
 #![allow(unsafe_code)]
 
-use std::ffi::{c_int, c_void};
+use std::ffi::{CStr, c_int};
 use std::mem;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
+use std::ptr::NonNull;
 
-use libmimalloc_sys::{
-    mi_free, mi_good_size, mi_is_in_heap_region, mi_malloc, mi_realloc, mi_usable_size,
-};
 use linux_raw_sys::general::fsuuid2;
-use rusqlite::ffi;
 use rustix::fs::Fsid;
 use rustix::io::Errno;
 use rustix::ioctl::{self, Getter, Opcode};
+use zstd_sys::{ZSTD_EndDirective, ZSTD_cParameter};
 
 /// The opaque inode handle of the object behind `fd`, encoded as
 /// `handle_type` (little-endian `i32`) followed by the handle bytes.
@@ -219,7 +217,15 @@ pub fn pending_termination_signal() -> Option<i32> {
 /// Call this one time, before the first use of SQLite: SQLite refuses the
 /// configuration after `sqlite3_initialize()` has run. When this returns,
 /// SQLite is initialized and verified to allocate through mimalloc.
+#[cfg(feature = "mimalloc")]
 pub fn sqlite_use_mimalloc() {
+    use std::ffi::c_void;
+
+    use libmimalloc_sys::{
+        mi_free, mi_good_size, mi_is_in_heap_region, mi_malloc, mi_realloc, mi_usable_size,
+    };
+    use rusqlite::ffi;
+
     /// SQLite passes sizes as positive `int` values.
     fn from_sqlite(size: c_int) -> usize {
         usize::try_from(size).expect("negative size from SQLite")
@@ -291,6 +297,259 @@ pub fn sqlite_use_mimalloc() {
     assert!(effective, "SQLite does not allocate through mimalloc");
 }
 
+/// mimalloc as the allocator of a zstd context (`ZSTD_customMem`). Unlike
+/// SQLite, zstd has no global allocator setting: each context gets its
+/// allocator when it is created, and uses it for the objects that it
+/// creates, such as the worker threads' contexts and buffers.
+///
+/// In libzstd 1.5.7, one exception remains: with worker threads,
+/// long-distance matching allocates its tables through libc `malloc`. zstd
+/// takes their allocator from the compression parameters, which never get
+/// the context's allocator (`ZSTDMT_serialState_reset`).
+#[cfg(feature = "mimalloc")]
+fn zstd_mimalloc() -> zstd_sys::ZSTD_customMem {
+    use std::ffi::c_void;
+
+    use libmimalloc_sys::{mi_free, mi_malloc};
+
+    unsafe extern "C" fn alloc(_opaque: *mut c_void, size: usize) -> *mut c_void {
+        // SAFETY: `mi_malloc` accepts any size.
+        let p = unsafe { mi_malloc(size) };
+        // zstd writes zeros through the null result of a failed calloc
+        // (`ZSTD_customCalloc`). End the process before that.
+        assert!(!p.is_null(), "zstd cannot allocate {size} bytes");
+        p
+    }
+
+    unsafe extern "C" fn free(_opaque: *mut c_void, p: *mut c_void) {
+        // SAFETY: zstd frees only pointers from `alloc`.
+        unsafe { mi_free(p) }
+    }
+
+    zstd_sys::ZSTD_customMem {
+        customAlloc: Some(alloc),
+        customFree: Some(free),
+        opaque: std::ptr::null_mut(),
+    }
+}
+
+/// A zstd compression context for one stream (`ZSTD_CCtx`). With the
+/// `mimalloc` feature, it allocates through mimalloc.
+///
+/// The first error ends the stream. It can leave the context in an
+/// undefined state, in which another streaming call is undefined behavior
+/// (zstd.h). So each later call returns the same error and does not call
+/// zstd.
+pub struct ZstdCCtx {
+    ptr: NonNull<zstd_sys::ZSTD_CCtx>,
+    /// The error that ended the stream.
+    error: Option<&'static str>,
+}
+
+/// A zstd decompression context for one stream (`ZSTD_DCtx`). With the
+/// `mimalloc` feature, it allocates through mimalloc. The first error ends
+/// the stream, as in `ZstdCCtx`.
+pub struct ZstdDCtx {
+    ptr: NonNull<zstd_sys::ZSTD_DCtx>,
+    /// The error that ended the stream.
+    error: Option<&'static str>,
+}
+
+// SAFETY: zstd keeps no thread-local state for a context, so each thread
+// can use it in turn. Its worker threads belong to the context.
+unsafe impl Send for ZstdCCtx {}
+// SAFETY: as for `ZstdCCtx`.
+unsafe impl Send for ZstdDCtx {}
+
+/// What one streaming call of zstd did.
+pub struct ZstdStatus {
+    /// The input bytes that zstd consumed.
+    pub read: usize,
+    /// The output bytes that zstd wrote.
+    pub written: usize,
+    /// Compression: a lower bound on the bytes that zstd still holds; 0
+    /// when the flush or the frame is complete. Decompression: 0 at the end
+    /// of a frame.
+    pub remaining: usize,
+}
+
+impl ZstdCCtx {
+    /// A context that compresses at `level` and adds a checksum to the
+    /// frame. It uses `threads` worker threads, or the calling thread when
+    /// `threads` is 0. With `long_window_log`, it also does long-distance
+    /// matching in a window of `1 << long_window_log` bytes.
+    pub fn new(
+        level: i32,
+        threads: u32,
+        long_window_log: Option<u32>,
+    ) -> Result<Self, &'static str> {
+        use ZSTD_cParameter::*;
+        #[cfg(feature = "mimalloc")]
+        // SAFETY: `zstd_mimalloc` gives a matching pair of allocation
+        // functions.
+        let cctx = unsafe { zstd_sys::ZSTD_createCCtx_advanced(zstd_mimalloc()) };
+        #[cfg(not(feature = "mimalloc"))]
+        // SAFETY: `ZSTD_createCCtx` has no preconditions.
+        let cctx = unsafe { zstd_sys::ZSTD_createCCtx() };
+        let cctx = ZstdCCtx {
+            ptr: NonNull::new(cctx).expect("zstd cannot create a compression context"),
+            error: None,
+        };
+        let set = |parameter, value| {
+            // SAFETY: `cctx.ptr` is a valid context.
+            let rc =
+                unsafe { zstd_sys::ZSTD_CCtx_setParameter(cctx.ptr.as_ptr(), parameter, value) };
+            zstd_result(rc)
+        };
+        // A value that `c_int` cannot hold saturates: zstd decreases a
+        // worker count that is too large to its maximum, and refuses a
+        // window log that is too large.
+        let saturate = |value: u32| c_int::try_from(value).unwrap_or(c_int::MAX);
+        // No experimental parameter: with some of them, zstd keeps pointers
+        // to the buffers of `compress_stream` after the call.
+        set(ZSTD_c_compressionLevel, level)?;
+        set(ZSTD_c_checksumFlag, 1)?;
+        set(ZSTD_c_nbWorkers, saturate(threads))?;
+        if let Some(log) = long_window_log {
+            set(ZSTD_c_enableLongDistanceMatching, 1)?;
+            set(ZSTD_c_windowLog, saturate(log))?;
+        }
+        Ok(cctx)
+    }
+
+    /// `ZSTD_compressStream2`: compress bytes from `input` into `output`,
+    /// then flush or end the frame as `end_op` tells.
+    pub fn compress_stream(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+        end_op: ZSTD_EndDirective,
+    ) -> Result<ZstdStatus, &'static str> {
+        if let Some(e) = self.error {
+            return Err(e);
+        }
+        let mut in_buffer = zstd_sys::ZSTD_inBuffer {
+            src: input.as_ptr().cast(),
+            size: input.len(),
+            pos: 0,
+        };
+        let mut out_buffer = zstd_sys::ZSTD_outBuffer {
+            dst: output.as_mut_ptr().cast(),
+            size: output.len(),
+            pos: 0,
+        };
+        // SAFETY: `self.ptr` is a valid context that no error left in an
+        // undefined state, and the buffers describe `input` and `output`.
+        // `new` sets no experimental parameter, so zstd keeps no pointer to
+        // them after the call.
+        let rc = unsafe {
+            zstd_sys::ZSTD_compressStream2(
+                self.ptr.as_ptr(),
+                &mut out_buffer,
+                &mut in_buffer,
+                end_op,
+            )
+        };
+        let remaining = zstd_result(rc).inspect_err(|&e| self.error = Some(e))?;
+        Ok(ZstdStatus {
+            remaining,
+            read: in_buffer.pos,
+            written: out_buffer.pos,
+        })
+    }
+
+    /// The output size for `compress_stream` that holds a full block
+    /// (`ZSTD_CStreamOutSize`).
+    pub fn out_size() -> usize {
+        // SAFETY: `ZSTD_CStreamOutSize` has no preconditions.
+        unsafe { zstd_sys::ZSTD_CStreamOutSize() }
+    }
+}
+
+impl Drop for ZstdCCtx {
+    fn drop(&mut self) {
+        // SAFETY: `self.ptr` is a valid context that is not used again.
+        // zstd frees it with the allocator that created it.
+        unsafe { zstd_sys::ZSTD_freeCCtx(self.ptr.as_ptr()) };
+    }
+}
+
+impl ZstdDCtx {
+    pub fn new() -> Self {
+        #[cfg(feature = "mimalloc")]
+        // SAFETY: `zstd_mimalloc` gives a matching pair of allocation
+        // functions.
+        let dctx = unsafe { zstd_sys::ZSTD_createDCtx_advanced(zstd_mimalloc()) };
+        #[cfg(not(feature = "mimalloc"))]
+        // SAFETY: `ZSTD_createDCtx` has no preconditions.
+        let dctx = unsafe { zstd_sys::ZSTD_createDCtx() };
+        ZstdDCtx {
+            ptr: NonNull::new(dctx).expect("zstd cannot create a decompression context"),
+            error: None,
+        }
+    }
+
+    /// `ZSTD_decompressStream`: decompress bytes from `input` into
+    /// `output`.
+    pub fn decompress_stream(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+    ) -> Result<ZstdStatus, &'static str> {
+        if let Some(e) = self.error {
+            return Err(e);
+        }
+        let mut in_buffer = zstd_sys::ZSTD_inBuffer {
+            src: input.as_ptr().cast(),
+            size: input.len(),
+            pos: 0,
+        };
+        let mut out_buffer = zstd_sys::ZSTD_outBuffer {
+            dst: output.as_mut_ptr().cast(),
+            size: output.len(),
+            pos: 0,
+        };
+        // SAFETY: `self.ptr` is a valid context that no error left in an
+        // undefined state, and the buffers describe `input` and `output`.
+        // zstd keeps no pointer to them after the call.
+        let rc = unsafe {
+            zstd_sys::ZSTD_decompressStream(self.ptr.as_ptr(), &mut out_buffer, &mut in_buffer)
+        };
+        let remaining = zstd_result(rc).inspect_err(|&e| self.error = Some(e))?;
+        Ok(ZstdStatus {
+            remaining,
+            read: in_buffer.pos,
+            written: out_buffer.pos,
+        })
+    }
+
+    /// The output size for `decompress_stream` that holds a full block
+    /// (`ZSTD_DStreamOutSize`).
+    pub fn out_size() -> usize {
+        // SAFETY: `ZSTD_DStreamOutSize` has no preconditions.
+        unsafe { zstd_sys::ZSTD_DStreamOutSize() }
+    }
+}
+
+impl Drop for ZstdDCtx {
+    fn drop(&mut self) {
+        // SAFETY: `self.ptr` is a valid context that is not used again.
+        // zstd frees it with the allocator that created it.
+        unsafe { zstd_sys::ZSTD_freeDCtx(self.ptr.as_ptr()) };
+    }
+}
+
+/// A zstd return value: a size, or the name of an error.
+fn zstd_result(code: usize) -> Result<usize, &'static str> {
+    // SAFETY: `ZSTD_isError` accepts any value.
+    if unsafe { zstd_sys::ZSTD_isError(code) } == 0 {
+        return Ok(code);
+    }
+    // SAFETY: `ZSTD_getErrorName` returns a static string for any value.
+    let name = unsafe { CStr::from_ptr(zstd_sys::ZSTD_getErrorName(code)) };
+    Err(name.to_str().expect("zstd error names are ASCII"))
+}
+
 /// Start to load the cache line that holds `value`, for a read soon after.
 /// This is only a hint: it cannot fault and changes no result. Other
 /// architectures ignore it.
@@ -318,12 +577,44 @@ pub fn set_var_for_tests(key: &str, value: &std::ffi::OsStr) {
 
 #[cfg(test)]
 mod tests {
-    use super::mi_is_in_heap_region;
+    #[cfg(feature = "mimalloc")]
+    use libmimalloc_sys::mi_is_in_heap_region;
+    use zstd_sys::ZSTD_EndDirective;
+
+    use super::{ZstdCCtx, ZstdDCtx};
+
+    /// After an error, a context returns it for each later call and does
+    /// not call zstd. Here, zstd would accept the right checksum after the
+    /// wrong one and end the frame.
+    #[test]
+    fn a_zstd_error_ends_the_stream() {
+        let mut frame = vec![0; ZstdCCtx::out_size()];
+        let status = ZstdCCtx::new(1, 0, None)
+            .unwrap()
+            .compress_stream(b"data", &mut frame, ZSTD_EndDirective::ZSTD_e_end)
+            .unwrap();
+        assert_eq!(status.remaining, 0);
+        frame.truncate(status.written);
+        // The frame ends with its 4-byte checksum.
+        let checksum = frame.split_off(frame.len() - 4);
+        let wrong: Vec<u8> = checksum.iter().map(|byte| byte ^ 1).collect();
+
+        let mut dctx = ZstdDCtx::new();
+        let mut out = vec![0; ZstdDCtx::out_size()];
+        let mut decompress = |input: &[u8]| {
+            dctx.decompress_stream(input, &mut out)
+                .map(|status| status.read)
+        };
+        assert_eq!(decompress(&frame), Ok(frame.len()));
+        let error = decompress(&wrong).unwrap_err();
+        assert_eq!(decompress(&checksum), Err(error));
+    }
 
     /// The build must not let mimalloc interpose the libc allocator: a
     /// dependency that enables `libmimalloc-sys/override` would replace
     /// `malloc` for the whole process. This check fails the build in that
     /// case.
+    #[cfg(feature = "mimalloc")]
     #[test]
     fn mimalloc_does_not_interpose_libc_malloc() {
         // SAFETY: `malloc` has no preconditions.
@@ -342,10 +633,23 @@ mod tests {
 
     /// The global allocator is mimalloc. This also shows that the
     /// interposition check above can see mimalloc memory.
+    #[cfg(feature = "mimalloc")]
     #[test]
     fn global_allocator_is_mimalloc() {
         let heap = Box::new([0u8; 64]);
         // SAFETY: `mi_is_in_heap_region` accepts any pointer.
         assert!(unsafe { mi_is_in_heap_region(heap.as_ptr().cast()) });
+    }
+
+    /// zstd allocates through mimalloc, starting with its contexts.
+    #[cfg(feature = "mimalloc")]
+    #[test]
+    fn zstd_allocates_through_mimalloc() {
+        let (cctx, dctx) = (ZstdCCtx::new(1, 0, None).unwrap(), ZstdDCtx::new());
+        // SAFETY: `mi_is_in_heap_region` accepts any pointer.
+        unsafe {
+            assert!(mi_is_in_heap_region(cctx.ptr.as_ptr().cast()));
+            assert!(mi_is_in_heap_region(dctx.ptr.as_ptr().cast()));
+        }
     }
 }

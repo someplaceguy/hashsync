@@ -22,11 +22,11 @@ use std::io::{BufRead, Read, Write};
 use std::ops::RangeInclusive;
 
 use crossbeam_channel::{Receiver, TryRecvError};
-use zstd::stream::raw::{CParameter, InBuffer, Operation, OutBuffer};
-use zstd::zstd_safe::{CCtx, DCtx};
+use zstd_sys::ZSTD_EndDirective;
 
 use crate::die::die;
 use crate::hash::{Strong, StrongHash};
+use crate::sys::{ZstdCCtx, ZstdDCtx};
 
 /// The first bytes of each session, in both directions, as a
 /// little-endian `u32`.
@@ -644,7 +644,7 @@ pub struct Compressor<W: Write> {
 }
 
 struct Encoding {
-    encoder: zstd::stream::raw::Encoder<'static>,
+    encoder: ZstdCCtx,
     /// Compressed bytes on their way to the transport.
     buffer: Box<[u8]>,
 }
@@ -657,19 +657,10 @@ impl<W: Write> Compressor<W> {
             COMPRESSION_LEVELS.contains(&level),
             "compression level {level}"
         );
-        let zstd = (level != 0).then(|| {
-            let mut encoder = zstd::stream::raw::Encoder::new(level).unwrap_or_else(zstd_failed);
-            let mut set = |parameter| encoder.set_parameter(parameter).unwrap_or_else(zstd_failed);
-            set(CParameter::ChecksumFlag(true));
-            set(CParameter::NbWorkers(threads));
-            if long {
-                set(CParameter::EnableLongDistanceMatching(true));
-                set(CParameter::WindowLog(LONG_WINDOW_LOG));
-            }
-            Encoding {
-                encoder,
-                buffer: vec![0; CCtx::out_size()].into_boxed_slice(),
-            }
+        let zstd = (level != 0).then(|| Encoding {
+            encoder: ZstdCCtx::new(level, threads, long.then_some(LONG_WINDOW_LOG))
+                .unwrap_or_else(zstd_failed),
+            buffer: vec![0; ZstdCCtx::out_size()].into_boxed_slice(),
         });
         Compressor { transport, zstd }
     }
@@ -677,9 +668,7 @@ impl<W: Write> Compressor<W> {
     /// End the stream, flush the transport, and return it.
     pub fn finish(mut self) -> std::io::Result<W> {
         if let Some(zstd) = &mut self.zstd {
-            zstd.drain(&mut self.transport, |encoder, out| {
-                encoder.finish(out, true)
-            })?;
+            zstd.drain(&mut self.transport, ZSTD_EndDirective::ZSTD_e_end)?;
         }
         self.transport.flush()?;
         Ok(self.transport)
@@ -687,23 +676,21 @@ impl<W: Write> Compressor<W> {
 }
 
 impl Encoding {
-    /// Repeat `step`, which writes output and returns how many bytes zstd
-    /// still holds, and pass the output to `transport`, until zstd holds
-    /// none.
+    /// Repeat `end_op` without input, which flushes (`ZSTD_e_flush`) or
+    /// ends the frame (`ZSTD_e_end`), and pass the output to `transport`,
+    /// until zstd holds no more.
     fn drain(
         &mut self,
         transport: &mut impl Write,
-        mut step: impl FnMut(
-            &mut zstd::stream::raw::Encoder<'static>,
-            &mut OutBuffer<'_, [u8]>,
-        ) -> std::io::Result<usize>,
+        end_op: ZSTD_EndDirective,
     ) -> std::io::Result<()> {
         loop {
-            let mut out = OutBuffer::around(&mut self.buffer[..]);
-            let held = step(&mut self.encoder, &mut out).unwrap_or_else(zstd_failed);
-            let written = out.pos();
-            transport.write_all(&self.buffer[..written])?;
-            if held == 0 {
+            let status = self
+                .encoder
+                .compress_stream(&[], &mut self.buffer, end_op)
+                .unwrap_or_else(zstd_failed);
+            transport.write_all(&self.buffer[..status.written])?;
+            if status.remaining == 0 {
                 return Ok(());
             }
         }
@@ -717,14 +704,18 @@ impl<W: Write> Write for Compressor<W> {
         };
         // Each call takes input or, when every worker is busy, waits for
         // output.
-        let mut input = InBuffer::around(buf);
-        while input.pos() < buf.len() {
-            let mut out = OutBuffer::around(&mut zstd.buffer[..]);
-            zstd.encoder
-                .run(&mut input, &mut out)
+        let mut read = 0;
+        while read < buf.len() {
+            let status = zstd
+                .encoder
+                .compress_stream(
+                    &buf[read..],
+                    &mut zstd.buffer,
+                    ZSTD_EndDirective::ZSTD_e_continue,
+                )
                 .unwrap_or_else(zstd_failed);
-            let written = out.pos();
-            self.transport.write_all(&zstd.buffer[..written])?;
+            read += status.read;
+            self.transport.write_all(&zstd.buffer[..status.written])?;
         }
         Ok(buf.len())
     }
@@ -732,7 +723,7 @@ impl<W: Write> Write for Compressor<W> {
     /// Make every byte written so far decodable, then flush the transport.
     fn flush(&mut self) -> std::io::Result<()> {
         if let Some(zstd) = &mut self.zstd {
-            zstd.drain(&mut self.transport, |encoder, out| encoder.flush(out))?;
+            zstd.drain(&mut self.transport, ZSTD_EndDirective::ZSTD_e_flush)?;
         }
         self.transport.flush()
     }
@@ -756,7 +747,7 @@ pub struct Decompressor<R: BufRead> {
 }
 
 struct Decoding {
-    decoder: zstd::stream::raw::Decoder<'static>,
+    decoder: ZstdDCtx,
     /// Decoded bytes, of which `[start, end)` are not read yet.
     buffer: Box<[u8]>,
     start: usize,
@@ -768,8 +759,8 @@ struct Decoding {
 impl<R: BufRead> Decompressor<R> {
     pub fn new(transport: R, compressed: bool) -> Self {
         let zstd = compressed.then(|| Decoding {
-            decoder: zstd::stream::raw::Decoder::new().unwrap_or_else(zstd_failed),
-            buffer: vec![0; DCtx::out_size()].into_boxed_slice(),
+            decoder: ZstdDCtx::new(),
+            buffer: vec![0; ZstdDCtx::out_size()].into_boxed_slice(),
             start: 0,
             end: 0,
             ended: false,
@@ -820,12 +811,12 @@ impl Decoding {
             }
             let status = self
                 .decoder
-                .run_on_buffers(input, &mut self.buffer)
+                .decompress_stream(input, &mut self.buffer)
                 .unwrap_or_else(|e| panic!("protocol error: invalid compressed data: {e}"));
-            transport.consume(status.bytes_read);
+            transport.consume(status.read);
             // At the end of the frame, zstd consumed nothing after it.
             self.ended = status.remaining == 0;
-            (self.start, self.end) = (0, status.bytes_written);
+            (self.start, self.end) = (0, status.written);
             if self.end > 0 {
                 return Ok(true);
             }
@@ -856,10 +847,10 @@ impl<R: BufRead> Read for Decompressor<R> {
     }
 }
 
-/// zstd reports its own failures, such as a failed allocation, as
-/// `io::Error`s. They are not transport failures: like a failed Rust
-/// allocation, they end the process with a core dump.
-fn zstd_failed<T>(e: std::io::Error) -> T {
+/// zstd reports its own failures, such as a failed allocation, as errors.
+/// They are not transport failures: like a failed Rust allocation, they
+/// end the process with a core dump.
+fn zstd_failed<T>(e: &str) -> T {
     panic!("zstd: {e}")
 }
 
