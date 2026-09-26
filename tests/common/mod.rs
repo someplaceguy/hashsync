@@ -1,5 +1,5 @@
 //! Shared helpers for integration tests: a temporary environment with a
-//! configuration file, an index path, and a tree to index.
+//! configuration file, an index directory, and a tree to index.
 #![allow(dead_code)]
 
 use std::ffi::OsStr;
@@ -8,7 +8,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use rusqlite::{Connection, OpenFlags};
+use rocksdb::{ColumnFamily, DB, IteratorMode, Options, WriteBatch};
 use tempfile::TempDir;
 
 pub const BLOCK: usize = 4096;
@@ -35,8 +35,9 @@ impl Env {
         self.path("tree")
     }
 
+    /// The index directory.
     pub fn index_path(&self) -> PathBuf {
-        self.path("index.sqlite")
+        self.path("default.db")
     }
 
     pub fn config_path(&self) -> PathBuf {
@@ -108,29 +109,43 @@ impl Env {
         String::from_utf8(output.stdout).unwrap()
     }
 
-    pub fn db(&self) -> Connection {
-        Connection::open_with_flags(self.index_path(), OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap()
+    /// The index, open read-only.
+    pub fn index(&self) -> IndexView {
+        IndexView::open(&self.index_path(), false)
     }
 
-    /// A read-write connection, for tests that manufacture index states.
-    pub fn db_rw(&self) -> Connection {
-        Connection::open_with_flags(self.index_path(), OpenFlags::SQLITE_OPEN_READ_WRITE).unwrap()
+    /// The index, open read/write, for tests that manufacture index
+    /// states.
+    pub fn index_rw(&self) -> IndexView {
+        IndexView::open(&self.index_path(), true)
     }
 
-    pub fn count(&self, sql: &str) -> i64 {
-        self.db().query_row(sql, [], |row| row.get(0)).unwrap()
+    /// The number of entries in a column family of the index.
+    pub fn count(&self, cf: &str) -> usize {
+        self.index().count(cf)
+    }
+
+    /// The column families of the index, sorted.
+    pub fn column_families(&self) -> Vec<String> {
+        let mut names = DB::list_cf(&Options::default(), self.index_path()).unwrap();
+        names.sort();
+        names
     }
 
     /// Every indexed `(root path, relative path)`, sorted.
     pub fn paths(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
-        let db = self.db();
-        let mut stmt = db
-            .prepare("SELECT roots.path, paths.rel_path FROM paths JOIN roots ON roots.id = paths.root_id")
-            .unwrap();
-        let mut rows: Vec<(Vec<u8>, Vec<u8>)> = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-            .unwrap()
-            .map(Result::unwrap)
+        let index = self.index();
+        let roots = index.roots();
+        let mut rows: Vec<(Vec<u8>, Vec<u8>)> = index
+            .paths()
+            .into_iter()
+            .map(|path| {
+                let root = roots.iter().find(|root| root.id == path.root_id);
+                (
+                    root.expect("a path without its root").path.clone(),
+                    path.rel_path,
+                )
+            })
             .collect();
         rows.sort();
         rows
@@ -146,56 +161,310 @@ impl Env {
             .collect()
     }
 
+    /// The block rows of the file at `rel` under `tree`, by block number;
+    /// none when there is no such path.
+    fn file_blocks(&self, rel: &str) -> Vec<Block> {
+        let index = self.index();
+        let tree = self.tree().as_os_str().as_bytes().to_vec();
+        let roots: Vec<u64> = index
+            .roots()
+            .into_iter()
+            .filter(|root| root.path == tree)
+            .map(|root| root.id)
+            .collect();
+        let inodes: Vec<u64> = index
+            .paths()
+            .into_iter()
+            .filter(|path| roots.contains(&path.root_id) && path.rel_path == rel.as_bytes())
+            .map(|path| path.inode_id)
+            .collect();
+        index
+            .blocks()
+            .into_iter()
+            .filter(|block| inodes.contains(&block.inode_id))
+            .collect()
+    }
+
     /// Block numbers indexed for the file at `rel` under `tree`.
-    pub fn block_numbers(&self, rel: &str) -> Vec<i64> {
-        let db = self.db();
-        let mut stmt = db
-            .prepare(
-                "SELECT blocks.block_no FROM blocks
-                 JOIN paths ON paths.inode_id = blocks.inode_id
-                 JOIN roots ON roots.id = paths.root_id
-                 WHERE roots.path = ? AND paths.rel_path = ? ORDER BY blocks.block_no",
-            )
-            .unwrap();
-        stmt.query_map(
-            rusqlite::params![self.tree().as_os_str().as_bytes(), rel.as_bytes()],
-            |row| row.get(0),
-        )
-        .unwrap()
-        .map(Result::unwrap)
-        .collect()
+    pub fn block_numbers(&self, rel: &str) -> Vec<u64> {
+        self.file_blocks(rel)
+            .into_iter()
+            .map(|block| block.block_no)
+            .collect()
     }
 
     /// The strong-hash prefixes stored for the file at `rel` under `tree`.
     pub fn strong_prefixes(&self, rel: &str) -> Vec<Vec<u8>> {
-        let db = self.db();
-        let mut stmt = db
-            .prepare(
-                "SELECT blocks.strong FROM blocks
-                 JOIN paths ON paths.inode_id = blocks.inode_id
-                 JOIN roots ON roots.id = paths.root_id
-                 WHERE roots.path = ? AND paths.rel_path = ? ORDER BY blocks.block_no",
-            )
-            .unwrap();
-        stmt.query_map(
-            rusqlite::params![self.tree().as_os_str().as_bytes(), rel.as_bytes()],
-            |row| row.get(0),
-        )
-        .unwrap()
-        .map(Result::unwrap)
-        .collect()
+        self.file_blocks(rel)
+            .into_iter()
+            .map(|block| block.strong_prefix)
+            .collect()
     }
 
     pub fn index_id(&self) -> Vec<u8> {
-        self.db()
-            .query_row("SELECT value FROM meta WHERE key = 'index_id'", [], |row| {
-                row.get(0)
-            })
-            .unwrap()
+        self.index().meta("index_id")
     }
 
     pub fn chmod(&self, rel: &str, mode: u32) {
         std::fs::set_permissions(self.path(rel), std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+}
+
+/// The column families of the index (DESIGN.md §4.4).
+pub const COLUMN_FAMILIES: [&str; 8] = [
+    "default",
+    "roots",
+    "inodes",
+    "identities",
+    "paths",
+    "inode_paths",
+    "blocks",
+    "strong",
+];
+
+/// An open index database. This is the tests' own reading of the layout
+/// in DESIGN.md §4.4, which does not use the code of `src/index`: integers
+/// are big endian, and IDs and block numbers have 8 bytes.
+pub struct IndexView {
+    db: DB,
+}
+
+/// A row of `roots`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Root {
+    pub id: u64,
+    pub identifier: Option<Vec<u8>>,
+    pub path: Vec<u8>,
+}
+
+/// A row of `inodes`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Inode {
+    pub id: u64,
+    /// `None` while processing is incomplete.
+    pub size: Option<u64>,
+    pub ctime_ns: i64,
+    /// The `identities` key of the inode.
+    pub identity: Vec<u8>,
+}
+
+impl Inode {
+    /// The `inodes` value: a state byte (0 incomplete, 1 complete), the
+    /// size (0 while incomplete), the ctime, and the identity.
+    pub fn value(&self) -> Vec<u8> {
+        let mut value = vec![u8::from(self.size.is_some())];
+        value.extend_from_slice(&self.size.unwrap_or(0).to_be_bytes());
+        value.extend_from_slice(&self.ctime_ns.to_be_bytes());
+        value.extend_from_slice(&self.identity);
+        value
+    }
+}
+
+/// A row of `paths`, whose `inode_paths` entry has the same fields.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PathRow {
+    pub root_id: u64,
+    pub rel_path: Vec<u8>,
+    pub inode_id: u64,
+}
+
+/// A row of `blocks`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Block {
+    pub inode_id: u64,
+    pub block_no: u64,
+    pub weak: u64,
+    pub strong_prefix: Vec<u8>,
+}
+
+impl Block {
+    /// The `blocks` key: the inode ID and the block number.
+    pub fn key(&self) -> Vec<u8> {
+        [self.inode_id.to_be_bytes(), self.block_no.to_be_bytes()].concat()
+    }
+
+    /// The `strong` key: the strong-hash prefix, then the `blocks` key.
+    pub fn strong_key(&self) -> Vec<u8> {
+        [self.strong_prefix.clone(), self.key()].concat()
+    }
+}
+
+/// The big-endian `u64` at `at` in `bytes`.
+pub fn u64_at(bytes: &[u8], at: usize) -> u64 {
+    u64::from_be_bytes(bytes[at..at + 8].try_into().unwrap())
+}
+
+impl IndexView {
+    fn open(path: &Path, writable: bool) -> Self {
+        let options = Options::default();
+        let db = if writable {
+            DB::open_cf(&options, path, COLUMN_FAMILIES)
+        } else {
+            DB::open_cf_for_read_only(&options, path, COLUMN_FAMILIES, false)
+        };
+        IndexView { db: db.unwrap() }
+    }
+
+    pub fn cf(&self, name: &str) -> &ColumnFamily {
+        self.db.cf_handle(name).unwrap()
+    }
+
+    /// Every entry of a column family, in key order.
+    pub fn entries(&self, cf: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
+        self.db
+            .iterator_cf(self.cf(cf), IteratorMode::Start)
+            .map(|entry| {
+                let (key, value) = entry.unwrap();
+                (key.to_vec(), value.to_vec())
+            })
+            .collect()
+    }
+
+    pub fn count(&self, cf: &str) -> usize {
+        self.entries(cf).len()
+    }
+
+    /// A metadata value, which must exist.
+    pub fn meta(&self, name: &str) -> Vec<u8> {
+        self.db
+            .get_cf(self.cf("default"), name)
+            .unwrap()
+            .unwrap_or_else(|| panic!("no metadata {name}"))
+    }
+
+    /// A numeric metadata value.
+    pub fn meta_u64(&self, name: &str) -> u64 {
+        u64_at(&self.meta(name), 0)
+    }
+
+    pub fn roots(&self) -> Vec<Root> {
+        self.entries("roots")
+            .into_iter()
+            .map(|(key, value)| {
+                let len = u32::from_be_bytes(value[..4].try_into().unwrap()) as usize;
+                Root {
+                    id: u64_at(&key, 0),
+                    identifier: (len > 0).then(|| value[4..4 + len].to_vec()),
+                    path: value[4 + len..].to_vec(),
+                }
+            })
+            .collect()
+    }
+
+    pub fn inodes(&self) -> Vec<Inode> {
+        self.entries("inodes")
+            .into_iter()
+            .map(|(key, value)| Inode {
+                id: u64_at(&key, 0),
+                size: match value[0] {
+                    0 => None,
+                    1 => Some(u64_at(&value, 1)),
+                    state => panic!("inode state {state}"),
+                },
+                ctime_ns: u64_at(&value, 9) as i64,
+                identity: value[17..].to_vec(),
+            })
+            .collect()
+    }
+
+    /// The inodes whose processing is incomplete.
+    pub fn incomplete_inodes(&self) -> usize {
+        self.inodes()
+            .iter()
+            .filter(|inode| inode.size.is_none())
+            .count()
+    }
+
+    pub fn paths(&self) -> Vec<PathRow> {
+        self.entries("paths")
+            .into_iter()
+            .map(|(key, value)| PathRow {
+                root_id: u64_at(&key, 0),
+                rel_path: key[8..].to_vec(),
+                inode_id: u64_at(&value, 0),
+            })
+            .collect()
+    }
+
+    /// The `inode_paths` entries, as paths.
+    pub fn inode_paths(&self) -> Vec<PathRow> {
+        self.entries("inode_paths")
+            .into_iter()
+            .map(|(key, value)| {
+                assert!(value.is_empty());
+                PathRow {
+                    root_id: u64_at(&key, 8),
+                    rel_path: key[16..].to_vec(),
+                    inode_id: u64_at(&key, 0),
+                }
+            })
+            .collect()
+    }
+
+    pub fn blocks(&self) -> Vec<Block> {
+        self.entries("blocks")
+            .into_iter()
+            .map(|(key, value)| Block {
+                inode_id: u64_at(&key, 0),
+                block_no: u64_at(&key, 8),
+                weak: u64_at(&value, 0),
+                strong_prefix: value[8..].to_vec(),
+            })
+            .collect()
+    }
+
+    pub fn write(&self, batch: WriteBatch) {
+        self.db.write(batch).unwrap();
+    }
+
+    /// Assert the pairs of DESIGN.md §4.4: each inode row has its
+    /// `identities` entry, each path row its `inode_paths` entry, and each
+    /// block row its `strong` entry, with no other entries. Paths and
+    /// blocks refer to rows that exist.
+    pub fn assert_consistent(&self) {
+        let inodes = self.inodes();
+        let mut identities: Vec<(Vec<u8>, u64)> = self
+            .entries("identities")
+            .into_iter()
+            .map(|(key, value)| (key, u64_at(&value, 0)))
+            .collect();
+        let mut expected: Vec<(Vec<u8>, u64)> = inodes
+            .iter()
+            .map(|inode| (inode.identity.clone(), inode.id))
+            .collect();
+        identities.sort();
+        expected.sort();
+        assert_eq!(identities, expected, "identities differ from inodes");
+
+        let inode_ids: Vec<u64> = inodes.iter().map(|inode| inode.id).collect();
+        let root_ids: Vec<u64> = self.roots().iter().map(|root| root.id).collect();
+        let by_inode = |path: &PathRow| (path.inode_id, path.root_id, path.rel_path.clone());
+        let mut paths = self.paths();
+        let mut inode_paths = self.inode_paths();
+        paths.sort_by_key(by_inode);
+        inode_paths.sort_by_key(by_inode);
+        assert_eq!(paths, inode_paths, "inode_paths differ from paths");
+        for path in &paths {
+            assert!(inode_ids.contains(&path.inode_id), "{path:?}: no inode");
+            assert!(root_ids.contains(&path.root_id), "{path:?}: no root");
+        }
+
+        let blocks = self.blocks();
+        let strong: Vec<Vec<u8>> = self
+            .entries("strong")
+            .into_iter()
+            .map(|(key, value)| {
+                assert!(value.is_empty());
+                key
+            })
+            .collect();
+        let mut expected: Vec<Vec<u8>> = blocks.iter().map(Block::strong_key).collect();
+        expected.sort();
+        assert_eq!(strong, expected, "strong differs from blocks");
+        for block in &blocks {
+            assert!(inode_ids.contains(&block.inode_id), "{block:?}: no inode");
+            assert_eq!(block.strong_prefix.len(), 16, "{block:?}");
+        }
     }
 }
 

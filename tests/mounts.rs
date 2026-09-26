@@ -114,8 +114,8 @@ fn a_file_root_aliased_inside_another_root_is_a_hard_link() {
     let output = update_with_binds(&env, &[("tree", "mirror")]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stderr}");
-    assert_eq!(env.count("SELECT count(*) FROM inodes"), 1);
-    assert_eq!(env.count("SELECT count(*) FROM paths"), 2);
+    assert_eq!(env.count("inodes"), 1);
+    assert_eq!(env.count("paths"), 2);
 }
 
 #[test]

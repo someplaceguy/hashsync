@@ -6,23 +6,27 @@
 //! message: `End`, `Unchanged`, `Omit`, or `Abandon`. A `Path` for a file
 //! whose result is not yet known waits for it. After the last message,
 //! the writer removes the inodes that no path references any more.
+//!
+//! The writer reads committed entries only. Only the messages of one file
+//! change its inode, so a read of an inode that no earlier message of the
+//! update changed needs no commit; `Abandon` commits before it removes
+//! the rows that `Begin` and `Blocks` wrote.
 
-use std::collections::HashMap;
 use std::mem;
 
 use crossbeam_channel::Receiver;
-use rusqlite::{Connection, OptionalExtension, params};
 
-use super::{Index, db};
-use crate::blocks::{BATCH_ROWS, BlockRow};
-use crate::fsid::{FsCache, FsIndex, Identity};
+use super::layout::{self, Cf, InodeRow, id_key, u64_at};
+use super::{Index, Transaction};
+use crate::blocks::BlockRow;
+use crate::fsid::{FsCache, Identity};
 
 /// Scan-local file number, dense from zero.
 pub type FileId = u32;
 
 /// A path of a file under a root.
 pub struct RelPath {
-    pub root_id: i64,
+    pub root_id: u64,
     pub rel_path: Vec<u8>,
 }
 
@@ -51,7 +55,7 @@ pub enum Msg {
     /// orphan removal starts after the last message.
     Unchanged {
         file: FileId,
-        inode_id: i64,
+        inode_id: u64,
         path: RelPath,
     },
     /// The file is too small to index; remove its rows.
@@ -70,52 +74,48 @@ pub struct Summary {
     pub orphans: u64,
 }
 
-/// Work units (messages plus rows) per transaction.
-const COMMIT_WORK: u64 = 50_000;
-
 /// What the writer knows about one claimed file.
 enum FileState {
     /// Neither `Begin` nor a terminal message yet: paths wait.
     Pending(Vec<RelPath>),
-    /// `Begin` arrived: block rows are being appended to this inode.
-    Hashing { inode_id: i64, paths: Vec<RelPath> },
+    /// `Begin` arrived: block rows are being appended to this incomplete
+    /// inode row.
+    Hashing {
+        inode_id: u64,
+        row: InodeRow,
+        paths: Vec<RelPath>,
+    },
     /// Indexed: paths link to this inode row.
-    Indexed(i64),
+    Indexed(u64),
     /// Omitted or abandoned: paths are dropped.
     Dropped,
 }
 
 struct Writer<'a> {
-    conn: &'a Connection,
+    index: &'a Index,
+    txn: Transaction<'a>,
     fs_cache: &'a FsCache,
     /// The state of every file, by `FileId`.
     files: Vec<FileState>,
-    fs_ids: HashMap<FsIndex, i64>,
-    in_transaction: bool,
-    work: u64,
+    next_inode_id: u64,
     summary: Summary,
 }
 
-/// Apply messages until every sender is gone, then hand the index back.
-pub fn run(index: Index, fs_cache: &FsCache, rx: Receiver<Msg>) -> (Index, Summary) {
-    let summary = write_all(&index.conn, fs_cache, rx);
-    (index, summary)
-}
-
-fn write_all(conn: &Connection, fs_cache: &FsCache, rx: Receiver<Msg>) -> Summary {
+/// Apply messages until every sender is gone, then remove the orphaned
+/// inodes.
+pub fn run(index: &Index, fs_cache: &FsCache, rx: Receiver<Msg>) -> Summary {
     let mut writer = Writer {
-        conn,
+        index,
+        txn: index.transaction(),
         fs_cache,
         files: Vec::new(),
-        fs_ids: HashMap::new(),
-        in_transaction: false,
-        work: 0,
+        next_inode_id: index.next_inode_id(),
         summary: Summary::default(),
     };
     while let Ok(msg) = rx.recv() {
         writer.handle(msg);
     }
-    writer.commit();
+    writer.txn.commit();
     assert!(
         writer
             .files
@@ -128,28 +128,6 @@ fn write_all(conn: &Connection, fs_cache: &FsCache, rx: Receiver<Msg>) -> Summar
 }
 
 impl Writer<'_> {
-    fn begin(&mut self) {
-        if !self.in_transaction {
-            db(self.conn.execute_batch("BEGIN IMMEDIATE"));
-            self.in_transaction = true;
-        }
-    }
-
-    fn commit(&mut self) {
-        if self.in_transaction {
-            db(self.conn.execute_batch("COMMIT"));
-            self.in_transaction = false;
-        }
-        self.work = 0;
-    }
-
-    /// Commit once the transaction holds enough work.
-    fn checkpoint(&mut self) {
-        if self.work >= COMMIT_WORK {
-            self.commit();
-        }
-    }
-
     fn file(&mut self, file: FileId) -> &mut FileState {
         let index = file as usize;
         if index >= self.files.len() {
@@ -159,8 +137,12 @@ impl Writer<'_> {
         &mut self.files[index]
     }
 
+    /// The `identities` key of a scan identity.
+    fn identity(&self, identity: &Identity) -> Vec<u8> {
+        layout::identity(&self.fs_cache.info(identity.fs).fsid, &identity.handle)
+    }
+
     fn handle(&mut self, msg: Msg) {
-        self.begin();
         match msg {
             Msg::Begin {
                 file,
@@ -171,41 +153,52 @@ impl Writer<'_> {
                     FileState::Pending(paths) => mem::take(paths),
                     _ => panic!("Begin after Begin or after the terminal message"),
                 };
-                let inode_id = self.begin_inode(&identity, ctime_ns);
-                *self.file(file) = FileState::Hashing { inode_id, paths };
+                let row = InodeRow {
+                    size: None,
+                    ctime_ns,
+                    identity: self.identity(&identity),
+                };
+                let inode_id = self.begin_inode(&row);
+                *self.file(file) = FileState::Hashing {
+                    inode_id,
+                    row,
+                    paths,
+                };
             }
             Msg::Blocks { file, rows } => {
                 let inode_id = match self.file(file) {
                     FileState::Hashing { inode_id, .. } => *inode_id,
                     _ => panic!("Blocks without Begin"),
                 };
-                let mut insert = db(self.conn.prepare_cached(
-                    "INSERT INTO blocks (inode_id, block_no, weak, strong) VALUES (?, ?, ?, ?)",
-                ));
                 for row in &rows {
-                    db(insert.execute(params![
-                        inode_id,
-                        row.block_no as i64,
-                        row.weak as i64,
-                        &row.strong_prefix[..]
-                    ]));
+                    self.txn.put(
+                        Cf::Blocks,
+                        &layout::block_key(inode_id, row.block_no),
+                        &layout::block_value(row.weak, &row.strong_prefix),
+                    );
+                    self.txn.put(
+                        Cf::Strong,
+                        &layout::strong_key(&row.strong_prefix, inode_id, row.block_no),
+                        &[],
+                    );
                 }
                 self.summary.blocks += rows.len() as u64;
-                self.work += rows.len() as u64;
             }
             Msg::End { file, size, path } => {
-                let (inode_id, paths) = match self.file(file) {
-                    FileState::Hashing { inode_id, paths } => (*inode_id, mem::take(paths)),
-                    _ => panic!("End without Begin"),
+                let FileState::Hashing {
+                    inode_id,
+                    mut row,
+                    paths,
+                } = mem::replace(self.file(file), FileState::Dropped)
+                else {
+                    panic!("End without Begin");
                 };
                 // The ctime is already there from Begin's incomplete mark.
                 // Also with no block rows, the complete inode lets the
                 // next update reuse the unchanged file without hashing
                 // it again (DESIGN.md §4.4).
-                db(self.conn.execute(
-                    "UPDATE inodes SET size = ? WHERE id = ?",
-                    params![size as i64, inode_id],
-                ));
+                row.size = Some(size);
+                self.txn.put(Cf::Inodes, &id_key(inode_id), &row.encode());
                 for path in std::iter::once(&path).chain(&paths) {
                     self.insert_path(inode_id, path);
                 }
@@ -230,9 +223,10 @@ impl Writer<'_> {
                     matches!(self.file(file), FileState::Pending(_)),
                     "Omit after Begin or after the terminal message"
                 );
-                let fs_id = self.fs_id(identity.fs);
-                if let Some(id) = self.select_inode(fs_id, &identity.handle) {
-                    self.delete_inode(id);
+                let identity = self.identity(&identity);
+                if let Some(inode_id) = self.index.inode_id(&identity) {
+                    let row = self.index.inode_row(inode_id);
+                    self.delete_inode(inode_id, row);
                 }
                 *self.file(file) = FileState::Dropped;
             }
@@ -245,86 +239,40 @@ impl Writer<'_> {
                 FileState::Dropped => {}
             },
             Msg::Abandon { file } => match mem::replace(self.file(file), FileState::Dropped) {
-                FileState::Hashing { inode_id, .. } => self.delete_inode(inode_id),
+                FileState::Hashing { inode_id, row, .. } => {
+                    // The removal reads committed rows, and the pending
+                    // changes can hold this inode's new blocks.
+                    self.txn.commit();
+                    self.delete_inode(inode_id, row);
+                }
                 FileState::Pending(_) => {}
                 _ => panic!("Abandon after the terminal message"),
             },
         }
-        self.work += 1;
-        self.checkpoint();
-    }
-
-    /// The `filesystems` row of a scan-local filesystem number.
-    fn fs_id(&mut self, fs: FsIndex) -> i64 {
-        if let Some(&id) = self.fs_ids.get(&fs) {
-            return id;
-        }
-        let fsid = &self.fs_cache.info(fs).fsid;
-        db(self.conn.execute(
-            "INSERT OR IGNORE INTO filesystems (fsid) VALUES (?)",
-            params![fsid],
-        ));
-        let id: i64 = db(self.conn.query_row(
-            "SELECT id FROM filesystems WHERE fsid = ?",
-            params![fsid],
-            |row| row.get(0),
-        ));
-        self.fs_ids.insert(fs, id);
-        id
-    }
-
-    fn select_inode(&self, fs_id: i64, handle: &[u8]) -> Option<i64> {
-        db(self
-            .conn
-            .query_row(
-                "SELECT id FROM inodes WHERE fs_id = ? AND handle = ?",
-                params![fs_id, handle],
-                |row| row.get(0),
-            )
-            .optional())
+        self.txn.checkpoint();
     }
 
     /// Start replacing the blocks of a file: mark its inode incomplete,
     /// storing the observed ctime, then remove the old blocks in bounded
-    /// transactions (DESIGN.md §4.4). Returns the inode row.
-    fn begin_inode(&mut self, identity: &Identity, ctime_ns: i64) -> i64 {
-        let fs_id = self.fs_id(identity.fs);
-        match self.select_inode(fs_id, &identity.handle) {
-            Some(id) => {
+    /// transactions (DESIGN.md §4.4). A new identity gets a new inode row.
+    /// Returns the inode ID.
+    fn begin_inode(&mut self, row: &InodeRow) -> u64 {
+        match self.index.inode_id(&row.identity) {
+            Some(inode_id) => {
                 // The mark may commit before any block is removed; recovery
                 // then removes the blocks of the incomplete inode.
-                db(self.conn.execute(
-                    "UPDATE inodes SET size = NULL, ctime_ns = ? WHERE id = ?",
-                    params![ctime_ns, id],
-                ));
-                self.remove_blocks(id);
-                id
+                self.txn.put(Cf::Inodes, &id_key(inode_id), &row.encode());
+                self.txn.remove_blocks(inode_id);
+                inode_id
             }
             None => {
-                db(self.conn.execute(
-                    "INSERT INTO inodes (fs_id, handle, size, ctime_ns) VALUES (?, ?, NULL, ?)",
-                    params![fs_id, &*identity.handle, ctime_ns],
-                ));
-                self.conn.last_insert_rowid()
+                let inode_id = self.next_inode_id;
+                self.next_inode_id += 1;
+                self.txn
+                    .put(Cf::Identities, &row.identity, &id_key(inode_id));
+                self.txn.put(Cf::Inodes, &id_key(inode_id), &row.encode());
+                inode_id
             }
-        }
-    }
-
-    /// Remove the blocks of an inode, `BATCH_ROWS` at a time, committing
-    /// between batches when the work limit requires it.
-    fn remove_blocks(&mut self, inode_id: i64) {
-        loop {
-            self.begin();
-            let removed = db(self.conn.execute(
-                "DELETE FROM blocks WHERE inode_id = ?1 AND block_no IN
-                 (SELECT block_no FROM blocks WHERE inode_id = ?1 ORDER BY block_no LIMIT ?2)",
-                params![inode_id, BATCH_ROWS as i64],
-            ));
-            self.work += removed as u64;
-            if removed < BATCH_ROWS {
-                return;
-            }
-            self.checkpoint();
         }
     }
 
@@ -332,59 +280,59 @@ impl Writer<'_> {
     /// transactions, once all results are known (DESIGN.md §4.6). This
     /// also removes orphans left by earlier interrupted cleanup.
     fn remove_orphans(&mut self) {
-        let mut after = 0i64;
-        loop {
-            let ids: Vec<i64> = {
-                let mut select = db(self.conn.prepare_cached(
-                    "SELECT id FROM inodes
-                     WHERE id > ? AND NOT EXISTS
-                       (SELECT 1 FROM paths WHERE paths.inode_id = inodes.id)
-                     ORDER BY id LIMIT 1000",
-                ));
-                let rows = db(select.query_map(params![after], |row| row.get(0)));
-                rows.map(db).collect()
-            };
-            let Some(&last) = ids.last() else {
-                break;
-            };
-            for id in ids {
-                self.begin();
-                self.delete_inode(id);
-                self.summary.orphans += 1;
-                self.work += 1;
-                self.checkpoint();
+        let index = self.index;
+        // Both scans read the snapshot of their start, which the removals
+        // do not change.
+        let mut inodes = index.shared.scan(Cf::Inodes, b"");
+        let mut paths = index.shared.scan(Cf::InodePaths, b"");
+        while let Some((key, value)) = inodes.entry() {
+            let inode_id = u64_at(key, 0);
+            while let Some((path, _)) = paths.entry()
+                && u64_at(path, 0) < inode_id
+            {
+                paths.next();
             }
-            after = last;
+            if paths
+                .entry()
+                .is_none_or(|(path, _)| u64_at(path, 0) != inode_id)
+            {
+                self.delete_inode(inode_id, InodeRow::decode(value));
+                self.summary.orphans += 1;
+                self.txn.checkpoint();
+            }
+            inodes.next();
         }
-        self.commit();
+        self.txn.commit();
     }
 
     /// Remove an inode with its paths and blocks. The inode is marked
-    /// incomplete first, in the same transaction as the first removed
-    /// blocks: block removal can commit between batches, and an
-    /// interrupted removal must not leave a complete inode with missing
-    /// blocks — a later scan would reuse it as unchanged. Recovery
-    /// removes incomplete inodes instead (DESIGN.md §4.2).
-    fn delete_inode(&mut self, id: i64) {
-        db(self
-            .conn
-            .execute("DELETE FROM paths WHERE inode_id = ?", params![id]));
-        db(self
-            .conn
-            .execute("UPDATE inodes SET size = NULL WHERE id = ?", params![id]));
-        self.remove_blocks(id);
-        db(self
-            .conn
-            .execute("DELETE FROM inodes WHERE id = ?", params![id]));
+    /// incomplete first, in the same transaction as the removal of its
+    /// paths and first blocks: block removal can commit between batches,
+    /// and an interrupted removal must not leave a complete inode with
+    /// missing blocks — a later scan would reuse it as unchanged. Recovery
+    /// removes incomplete inodes instead (DESIGN.md §4.2). The removal
+    /// reads committed entries.
+    fn delete_inode(&mut self, inode_id: u64, mut row: InodeRow) {
+        row.size = None;
+        self.txn.put(Cf::Inodes, &id_key(inode_id), &row.encode());
+        self.txn.remove_inode_paths(inode_id);
+        self.txn.remove_blocks(inode_id);
+        self.txn.delete(Cf::Inodes, &id_key(inode_id));
+        self.txn.delete(Cf::Identities, &row.identity);
     }
 
-    fn insert_path(&mut self, inode_id: i64, path: &RelPath) {
-        let mut insert = db(self
-            .conn
-            .prepare_cached("INSERT INTO paths (root_id, rel_path, inode_id) VALUES (?, ?, ?)"));
-        db(insert.execute(params![path.root_id, &path.rel_path, inode_id]));
+    fn insert_path(&mut self, inode_id: u64, path: &RelPath) {
+        self.txn.put(
+            Cf::Paths,
+            &layout::path_key(path.root_id, &path.rel_path),
+            &id_key(inode_id),
+        );
+        self.txn.put(
+            Cf::InodePaths,
+            &layout::inode_path_key(inode_id, path.root_id, &path.rel_path),
+            &[],
+        );
         self.summary.paths += 1;
-        self.work += 1;
     }
 }
 
@@ -396,75 +344,52 @@ mod tests {
     use crossbeam_channel::bounded;
 
     use super::*;
-    use crate::index::{self, Settings};
+    use crate::hash::PREFIX_LEN;
+    use crate::index::{self, tests as index_tests};
 
-    /// Rows enough that removing them commits mid-way (`COMMIT_WORK`)
-    /// while a full deletion batch (`BATCH_ROWS`) remains.
-    const MANY_BLOCKS: usize = 51_200;
+    /// Block rows enough that removing them commits mid-way: each row is
+    /// two entries, and a transaction holds `COMMIT_WORK` changes.
+    const MANY_BLOCKS: u64 = 51_200;
 
     /// An interrupted orphan cleanup must not leave a complete inode with
     /// missing blocks: a later scan of the returned file would reuse the
-    /// remaining rows as unchanged. The injected failure aborts cleanup
-    /// inside the transaction after its first commit; the committed state
-    /// must hold an incomplete inode, which reconciliation removes.
+    /// remaining rows as unchanged. The injected failure interrupts the
+    /// cleanup after its first commit; the committed state must hold an
+    /// incomplete inode, which reconciliation removes.
     #[test]
     fn interrupted_orphan_cleanup_leaves_the_inode_incomplete() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("index.sqlite");
-        let path_bytes = path.as_os_str().as_bytes().to_vec();
-
-        let index = index::open_modifying(&path_bytes);
-        index.reset(&Settings {
-            block_size: 4096,
-            weak_hash_id: "test".into(),
-            strong_hash_id: "test".into(),
-        });
-        // One complete inode without paths: an orphan. Deletion removes
-        // blocks in ascending order; the last row fails it.
-        db(index.conn.execute_batch(&format!(
-            "INSERT INTO filesystems (id, fsid) VALUES (1, x'01');
-             INSERT INTO inodes (id, fs_id, handle, size, ctime_ns)
-             VALUES (1, 1, x'02', 4096, 123);
-             WITH RECURSIVE c(n) AS (SELECT 0 UNION ALL SELECT n + 1 FROM c WHERE n + 1 < {MANY_BLOCKS})
-             INSERT INTO blocks (inode_id, block_no, weak, strong)
-             SELECT 1, n, n, zeroblob(16) FROM c;
-             CREATE TRIGGER interrupt BEFORE DELETE ON blocks
-             WHEN old.block_no = {}
-             BEGIN SELECT RAISE(ABORT, 'injected interruption'); END;",
-            MANY_BLOCKS - 1
-        )));
+        let path = dir.path().join("index");
+        let index = index_tests::new_index(dir.path());
+        // One complete inode without paths: an orphan.
+        let blocks: Vec<_> = (0..MANY_BLOCKS)
+            .map(|block_no| (1, block_no, block_no, [0; PREFIX_LEN]))
+            .collect();
+        index_tests::insert(&index, &[(1, b"\x01\x02", Some(4096))], &[], &[], &blocks);
 
         let fs_cache = FsCache::new();
         let (tx, rx) = bounded(1);
         drop(tx);
-        let result = catch_unwind(AssertUnwindSafe(|| run(index, &fs_cache, rx)));
+        index_tests::interrupt_after_commits(Some(1));
+        let result = catch_unwind(AssertUnwindSafe(|| run(&index, &fs_cache, rx)));
+        index_tests::interrupt_after_commits(None);
         assert!(result.is_err(), "the injected failure must abort cleanup");
+        drop(index);
 
-        let conn = Connection::open(&path).unwrap();
-        let (size, blocks): (Option<i64>, i64) = conn
-            .query_row(
-                "SELECT (SELECT size FROM inodes WHERE id = 1),
-                        (SELECT count(*) FROM blocks)",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(size, None, "the committed inode must be incomplete");
+        let index = index::open_modifying(path.as_os_str().as_bytes());
+        let row = index.inode_row(1);
+        assert_eq!(row.size, None, "the committed inode must be incomplete");
+        let blocks = index_tests::count(&index, Cf::Blocks) as u64;
         assert!(
-            blocks > 0 && blocks < MANY_BLOCKS as i64,
+            blocks > 0 && blocks < MANY_BLOCKS,
             "cleanup must stop between its commits: {blocks} rows left"
         );
-        conn.execute_batch("DROP TRIGGER interrupt").unwrap();
-        drop(conn);
+        assert_eq!(index_tests::count(&index, Cf::Strong) as u64, blocks);
 
         // The next update's reconciliation removes the incomplete remains.
-        let index = index::open_modifying(&path_bytes);
         index.reconcile_roots(&[]);
-        let rows: i64 = db(index.conn.query_row(
-            "SELECT (SELECT count(*) FROM inodes) + (SELECT count(*) FROM blocks)",
-            [],
-            |row| row.get(0),
-        ));
-        assert_eq!(rows, 0);
+        for cf in [Cf::Inodes, Cf::Identities, Cf::Blocks, Cf::Strong] {
+            assert_eq!(index_tests::count(&index, cf), 0, "{cf:?}");
+        }
     }
 }

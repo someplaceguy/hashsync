@@ -27,7 +27,7 @@ asynchronous runtime or event loop.
 - **Root**: a configured file or directory to index. An **immutable root**
   promises unchanging content; copies sharing an **identifier** are indexed
   as one group.
-- **Index**: the receiver's SQLite database of block hashes and locations.
+- **Index**: the receiver's RocksDB database of block hashes and locations.
 - **Weak hash**: a 64-bit rolling hash used to select possible matches.
   A **strong hash** is the configured cryptographic digest used to verify them.
 - **Hash list**: the canonical encoded set of indexed weak hashes.
@@ -153,10 +153,11 @@ Mutable roots are traversed on every update. Reuse complete inode rows when
 traversed roots, including paths of unchanged files.
 
 Immutable roots are grouped by identifier, with one root row and one set of
-relative paths from one scanned copy. A non-NULL `roots.identifier` means
+relative paths from one scanned copy. A root row with an identifier means
 the group was completely indexed. Reuse it without traversal while the
-configuration still names that identifier. NULL means a mutable root or an
-unfinished traversal; configuration supplies the intended kind and identifier.
+configuration still names that identifier. A root row without an identifier
+is a mutable root or an unfinished traversal; configuration supplies the
+intended kind and identifier.
 
 Copies sharing an identifier promise equivalent content. Directory copies
 must be distinct directories. A change to a copy's root-directory filesystem
@@ -166,8 +167,9 @@ a rescan.
 All current locations of an immutable group live in memory. The database
 stores one representative path, while candidate reads search every current
 copy (section 6.4). With `--no-update`, map completed rows by identifier and
-NULL rows by stored path and current configuration; unmatched rows have no
-usable location. A single-file root has an empty `rel_path`.
+rows without an identifier by stored path and current configuration;
+unmatched rows have no usable location. A single-file root has an empty
+relative path.
 
 Per-root options:
 
@@ -197,19 +199,22 @@ Policy changes do not invalidate completed immutable groups automatically.
 After changing exclusions or `one_filesystem`, the user must run
 `hashsync update --rebuild` to apply the new policy to those groups.
 
-Before scanning, reconcile roots in one transaction:
+Before scanning, reconcile roots. Paths and blocks to remove can be many,
+so their removal commits in bounded transactions; an interruption leaves
+work that the next reconciliation finishes. The root and inode rows then
+change in one transaction:
 
-1. Invalidate every immutable root referencing an incomplete inode
-   (`size IS NULL`) before removing any of that inode's paths.
-2. Remove paths under unfinished or unconfigured roots, then those roots.
-   Remove incomplete inodes' remaining paths, blocks, and rows. Preserve
-   complete inodes, including orphans, for reuse.
-3. Retain completed immutable groups still configured. Keep their
-   representative path if still present, otherwise choose any current
-   location. Create NULL-identifier rows for roots that need scanning.
-4. Apply representative-path changes without violating `UNIQUE(path)`,
-   including when roots exchange paths. Temporary staging values must remain
-   inside this transaction and must never be used for I/O.
+1. In one transaction, invalidate every completed immutable root that is
+   no longer configured or that references an incomplete inode: remove its
+   identifier.
+2. In bounded transactions, remove the paths of every root without an
+   identifier, and the paths and blocks of incomplete inodes.
+3. In one transaction, remove the rows of those roots and of incomplete
+   inodes. Preserve complete inodes, including orphans, for reuse. Retain
+   completed immutable groups still configured. Keep their representative
+   path if still present, otherwise choose any current location. Create
+   rows without identifiers for roots that need scanning. Two root rows
+   never share a path, also when roots exchange paths.
 
 Schedule scan tasks for every mutable root and one chosen location per
 unfinished immutable group. Completed groups and unchosen copies have no
@@ -230,9 +235,10 @@ added later. Copies may have different inode identities; unequal content
 fails verification. `prune` hashes no files and removes a path only when it
 is absent from every current copy. Inaccessibility does not prove absence.
 When a root is no longer configured or is confirmed absent from every copy,
-remove its paths and root row in the same transaction. Its immutable
-completion marker must not survive removal, so a root that later returns is
-scanned again. An existing root with no indexed paths is still valid.
+remove its immutable completion marker, then its paths, then its root row.
+The marker must not survive the removal of any path, so a root that later
+returns is scanned again. An existing root with no indexed paths is still
+valid.
 
 ### 4.3 Identity of filesystems and inodes
 
@@ -246,8 +252,9 @@ Use persistent identities:
   inode generations and btrfs subvolumes. On `EOPNOTSUPP`, fall back to a
   tagged inode number.
 
-`(fs_id, handle)` is the identity used both by the index and scan-time
-visited sets. SQLite assigns integer IDs for foreign keys.
+`(filesystem ID, handle)` is the identity used both by the index and
+scan-time visited sets. The index gives each inode an integer ID, which the
+entries of its paths and blocks use.
 
 Distinct filesystems retaining identical filesystem IDs and inode handles,
 such as block-level clones mounted together, are unsupported. They may be
@@ -268,86 +275,102 @@ descriptors.
 
 ### 4.4 Storage
 
-The index is one SQLite file, defaulting to
-`$XDG_STATE_HOME/hashsync/index.sqlite`:
+The index is one RocksDB database: a directory, defaulting to
+`$XDG_STATE_HOME/hashsync/default.db`. Each table below is a column
+family, which holds entries (keys with values) in key order. A **row** is
+one entry of `roots`, `inodes`, `paths`, or `blocks`. `identities`,
+`inode_paths`, and `strong` hold one more entry for each row of `inodes`,
+`paths`, and `blocks`, keyed for another lookup; the transaction that
+changes a row changes that entry too.
 
-```sql
-CREATE TABLE meta        (key TEXT PRIMARY KEY, value BLOB NOT NULL);
-  -- keys: schema_version, block_size, weak_hash_id, strong_hash_id, index_id
-CREATE TABLE filesystems (id INTEGER PRIMARY KEY, fsid BLOB NOT NULL UNIQUE);
-CREATE TABLE roots       (id INTEGER PRIMARY KEY, identifier BLOB UNIQUE,
-                          path BLOB NOT NULL UNIQUE);
-  -- identifier: non-NULL only for a completely indexed immutable group
-  -- path: one representative location; other copies live only in memory
-CREATE TABLE inodes      (id INTEGER PRIMARY KEY,
-                          fs_id INTEGER NOT NULL REFERENCES filesystems(id)
-                            ON DELETE RESTRICT,
-                          handle BLOB NOT NULL, size INTEGER,
-                          ctime_ns INTEGER NOT NULL, UNIQUE (fs_id, handle));
-  -- size: NULL while processing is incomplete; otherwise stx_size bits
-CREATE TABLE paths       (root_id INTEGER NOT NULL REFERENCES roots(id)
-                            ON DELETE RESTRICT,
-                          rel_path BLOB NOT NULL,
-                          inode_id INTEGER NOT NULL REFERENCES inodes(id)
-                            ON DELETE RESTRICT,
-                          PRIMARY KEY (root_id, rel_path)) WITHOUT ROWID;
-CREATE INDEX paths_by_inode ON paths (inode_id);
-CREATE TABLE blocks      (inode_id INTEGER NOT NULL REFERENCES inodes(id)
-                            ON DELETE RESTRICT,
-                          block_no INTEGER NOT NULL, weak INTEGER NOT NULL,
-                          strong BLOB NOT NULL CHECK (length(strong) = 16),
-                          PRIMARY KEY (inode_id, block_no)) WITHOUT ROWID;
-CREATE INDEX blocks_by_strong ON blocks (strong);
-```
+| Column family | Key | Value |
+|---|---|---|
+| `default` | metadata name | metadata value |
+| `roots` | root ID | identifier length (`u32`), identifier, path |
+| `inodes` | inode ID | state (`u8`), size, ctime, identity |
+| `identities` | identity | inode ID |
+| `paths` | root ID, relative path | inode ID |
+| `inode_paths` | inode ID, root ID, relative path | empty |
+| `blocks` | inode ID, block number | weak hash, strong-hash prefix |
+| `strong` | strong-hash prefix, inode ID, block number | empty |
 
-Use WAL mode with `synchronous=NORMAL`. Power loss may discard recent
-commits, which is acceptable for an index of hints. Hash lists identify
-their own content and are persisted independently (section 5.6).
+- Integers are unsigned 64-bit and big endian, so the byte order of keys
+  is their numeric order. The ctime is the bit pattern of a signed 64-bit
+  value, in nanoseconds. A strong-hash prefix is the first 16 bytes of the
+  digest.
+- An **identity** is the length of the filesystem ID as one byte, the
+  filesystem ID, and the inode handle (section 4.3).
+- Metadata names are `schema_version`, `block_size`, `weak_hash_id`,
+  `strong_hash_id`, and `index_id`.
+- A root row has an identifier only for a completely indexed immutable
+  group; length 0 means no identifier, because identifiers are never
+  empty. The path is one representative location; other copies live only
+  in memory.
+- An inode's state is 0 while processing is incomplete, and its size is
+  then 0. Otherwise the state is 1 and the size is `stx_size`.
+- IDs start at 1. A new row gets an ID larger than all IDs in use.
+  Removal takes every entry that refers to a root or inode away before its
+  row, so an ID used again finds no old entries.
 
-Configure the writer connection with `cache_size=-65536` (64 MiB; negative
-values are KiB) and `threads=8` (up to eight auxiliary sorting workers).
-Worker readers keep SQLite's default cache size. Each connection has its
-own page cache. Build the bundled SQLite without
-`SQLITE_ENABLE_MEMORY_MANAGEMENT`: that option puts the page caches of all
-connections under one mutex, which serializes the worker readers.
+A **transaction** is one atomic RocksDB write batch. It goes to RocksDB's
+write-ahead log without sync. Power loss may discard recent transactions;
+recovery then restores the state after an earlier one, which is acceptable
+for an index of hints. Hash lists identify their own content and are
+persisted independently (section 5.6). Reads see committed transactions
+only. The end of an update writes the memtables to the database files,
+so that read-only processes have no write-ahead log to replay. It writes
+one column family after the other, so that the last write also removes
+the old log. Then it waits for the compactions that RocksDB has
+scheduled: closing the database would cancel them (section 10).
 
-**Process access.** SQLite's `unix-excl` VFS provides exclusion without a
-separate lock file:
+All column families use LZ4 compression and share one 256 MiB block cache,
+a hyper clock cache. `identities` and `inodes` have bloom filters for point
+lookups. `strong` has a 16-byte prefix extractor and prefix bloom filters,
+so the lookup of an absent prefix skips most files. A column family
+flushes its memtable at 64 MiB, RocksDB's default. When the memtables of
+all column families together use 256 MiB, RocksDB also flushes the oldest
+one. One flush and one compaction run at a time. A compaction from level 0
+splits into subcompactions on up to half the cores, one thread each.
+RocksDB keeps all files of the database open, so a process raises its soft
+descriptor limit to the hard limit before it opens the index.
 
-- A modifying process (`update`, `prune`, or normal `run`) first opens
-  its writer through `unix-excl`, with no existing connections. Execute a
-  real schema read to acquire the process lock before opening worker readers
-  or changing the schema; opening a connection alone is insufficient.
-- After successful initialization, configure WAL. Every connection in this
-  modifying process, including worker readers, opens read/write through
-  `unix-excl`, using one SQLite library instance. Set `query_only=ON` on
-  worker connections before use. Opening a connection read-only, or through
-  the normal Unix VFS, can downgrade the process lock; neither is allowed
-  in this process. Normal WAL snapshots still coordinate its connections.
-  Do not use `locking_mode=EXCLUSIVE`, `immutable=1`, or `nolock=1`.
-- Keep the writer alive through the run's use of the index; close worker
-  readers first. There must be no gap in exclusion between update and use.
-- Read-only processes (`run --no-update`, `stats`) use normal read-only
-  connections. A keeper connection begins a read transaction and executes
-  a real schema read, retaining both until index use ends. Such processes
-  can coexist but exclude a writer.
-- Wait indefinitely on lock contention, replacing SQLite's default busy
-  timeout. If initialization returns busy without invoking the handler,
-  retry with fresh connections before opening readers. Use fresh
-  connections when changing access mode.
+**Process access.** A lock on the file `hashsync.lock` in the index
+directory excludes other processes:
 
-Enable foreign keys on every connection before transactions. Delete children
-before parents, as required by `ON DELETE RESTRICT`. Each connection belongs
-to one thread; the sole writer uses `BEGIN IMMEDIATE`.
+- A modifying process (`update`, `prune`, or normal `run`) creates the
+  directory and the lock file if necessary, opens the lock file
+  read/write, and takes an exclusive lock before it opens the database
+  read/write.
+- A read-only process (`run --no-update`, `stats`) opens the lock file
+  read-only and takes a shared lock, then opens the database read-only. It
+  sees the database as it was when it opened it. Read-only processes can
+  coexist but exclude a modifying process. Without the lock file, there is
+  no index.
+- The lock is an open file description lock (`F_OFD_SETLKW`) on the whole
+  file. Unlike a classic POSIX lock, which belongs to the process, it stays
+  when another descriptor of the file closes. The descriptor is
+  close-on-exec, so no child keeps the lock.
+- Wait indefinitely on lock contention, and retry interrupted calls.
+- All threads of a process share one database handle. Reads of a
+  modifying process see its latest committed transaction.
+- Keep the lock until the database handle has closed, and keep both until
+  index use ends. A normal `run` keeps the update's database open through
+  the transfer, so there is no gap in exclusion between update and use.
+- RocksDB's own `LOCK` file keeps only two read/write opens apart, and the
+  second open fails at once instead of waiting. The lock file comes first,
+  and its lock goes after RocksDB's classic lock of `LOCK`, also when a
+  process exits with the database open: the kernel releases classic locks
+  while it closes the descriptors, and an open file description lock only
+  when it releases the description, after that. So that failure cannot
+  occur.
 
 **Representation and recovery.**
 
 - Store schema version, block size, weak-hash parameters, and strong-hash
   algorithm. Incompatibility requires an in-place rebuild. Read-only runs
   report that an update is required for a missing or incompatible index.
-- Paths and identifiers are BLOBs, preserving non-UTF-8 bytes.
-  Weak hashes and unsigned file sizes use their `i64` bit patterns;
-  stored sizes are compared only for equality. NULL, not an integer
+- Paths and identifiers are byte strings, preserving non-UTF-8 bytes.
+  Stored sizes are compared only for equality. The state, not a size
   sentinel, marks an incomplete inode.
 - Before replacing blocks, mark the inode incomplete and store the ctime
   observed before hashing; this may commit before any old blocks are
@@ -358,14 +381,13 @@ to one thread; the sole writer uses `BEGIN IMMEDIATE`.
 - Successful processing of a file at least `block_size` retains the inode
   and path rows even when no block rows were inserted. Store the size
   normally so the inode is complete and reusable.
-- `blocks_by_strong` supplies candidates using 16-byte prefixes; only a
-  full digest comparison verifies a candidate. No index orders blocks by
-  weak hash; the export sorts the weak hashes in memory (section 5.4).
-- Rebuild under process-exclusive access by resetting schema and metadata
-  in one transaction, then populating in batches and creating the deferred
-  `blocks_by_strong` index. Never replace the database file by rename.
-  Every update repairs this index if an interrupted rebuild left it
-  missing; read-only runs requiring it request an update.
+- `strong` supplies candidates using 16-byte prefixes; only a full digest
+  comparison verifies a candidate. No column family orders blocks by weak
+  hash; the export sorts the weak hashes in memory (section 5.4).
+- Rebuild under process-exclusive access: one transaction removes every
+  entry of every column family, with one range deletion each, and stores
+  new metadata. Then populate in batches. Never replace the database
+  directory or its files.
 - `index_id` is a random 128-bit value created with the schema and renewed
   on rebuild. It partitions caches, not list content; there is no index
   generation counter.
@@ -405,7 +427,9 @@ Before traversing any directory, including a root, atomically insert its
 `(fs_id, handle)` into the shared directory visited set. A duplicate calls
 `die`, reporting both paths, regardless of root or immutable grouping.
 Retain entries until all scan tasks finish. A directory task then queues
-relevant children with its shared parent descriptor.
+relevant children with its shared parent descriptor, each name once: a
+listing can return a name twice when the directory changes meanwhile, and
+the index keeps one inode per path.
 
 Claim regular-file identities in a separate visited set. Repeated files add
 paths to the first task's result regardless of root, preserving all dependent
@@ -480,17 +504,21 @@ means all tasks have finished, including work spawned by running tasks.
 
 Tasks retain a shared parent fd and open their entry only when scheduled.
 Roots are opened when their tasks start. Raise the soft descriptor limit to
-the hard limit at startup. Workers own reusable buffers and SQLite reader
-connections; directory and file visited sets are shared. The default thread
-count is `4 × cores`, clamped to 16–64, with a configuration override.
+the hard limit at startup. Workers own reusable buffers; the database
+handle and the directory and file visited sets are shared. The default
+thread count is `4 × cores`, clamped to 16–64, with a configuration
+override.
 
 The hashing stage takes an open regular file and streams block rows and a
 terminal result. One writer thread owns all database mutations. Its channel
 is bounded by bytes, with bounded messages and backpressure; a large file
-must never require a whole-file message or transaction.
+must never require a whole-file message or transaction. The writer reads
+committed entries only. Only the messages of one file change its inode, so
+a read needs no commit first, except when Abandon removes the entries that
+Begin and Blocks wrote.
 
-Messages are keyed by `(fs_id, handle)`. Different files may interleave,
-but each owner's messages stay ordered:
+Messages are keyed by `(filesystem ID, handle)`. Different files may
+interleave, but each owner's messages stay ordered:
 
 | Message | Effect |
 |---|---|
@@ -574,9 +602,10 @@ output.
 
 ### 5.4 The hash list
 
-Read the weak hashes of all block rows in one table scan. Sort them in
-memory as unsigned 64-bit values, using one thread per core. Remove
-duplicates and encode canonically:
+Read the weak hashes of all block rows from one database snapshot. The first
+keys of the files of `blocks` split it into parts, which one thread per core
+reads in parallel. Sort the values in memory as unsigned 64-bit values, with
+the same threads. Remove duplicates and encode canonically:
 
 1. Width `W = 64`; no hash bits are dropped.
 2. For sorted distinct values, gaps are `g_0 = v_0` and
@@ -1073,9 +1102,9 @@ limited to the cache and worker/reconstruction buffers; pin metadata and
 queued requests still scale with outstanding work. The filesystem manages
 reclaimable page-cache pages and backing storage for pin payloads.
 
-A pool of 4–8 lookup workers, each with a reader connection, answers queries
-out of order. The receiver does not reject a match merely because many pins
-exist, and pin release requires no protocol message.
+A pool of 4–8 lookup workers, which share the database handle, answers
+queries out of order. The receiver does not reject a match merely because
+many pins exist, and pin release requires no protocol message.
 Queue all answers nonblockingly under the shared lock, checking the
 completion state before publication. Completing suppresses new work and
 answers, including no answers from obsolete lookups.
@@ -1084,8 +1113,8 @@ For `QUERY { offset: x, strong: h }`:
 
 1. Under the lock, check `c`. If `x < c`, answer no without a pin.
    Otherwise try the verified-buffer cache.
-2. If uncached, select blocks matching `h[0..16]` through
-   `blocks_by_strong`. Each path of a block's inode gives one candidate; a
+2. If uncached, select blocks matching `h[0..16]` through `strong`. Each
+   path of a block's inode gives one candidate; a
    block whose inode has no path is one candidate too. Try candidates in
    any order. Repeated location/offset pairs need only one read.
 3. Try at most `candidate_attempts` candidates (default 128, positive).
@@ -1216,9 +1245,9 @@ PIDs, so late cleanup cannot signal an unrelated process after ID reuse.
 ### 6.7 Shutdown
 
 Fatal errors end the process rather than attempting to interrupt arbitrary
-blocked threads. Persistent state is recoverable: SQLite uses WAL and cache
-publication is atomic. Kernel descriptor closure propagates EOF or errors
-to peers.
+blocked threads. Persistent state is recoverable: RocksDB recovers from its
+write-ahead log, and cache publication is atomic. Kernel descriptor closure
+propagates EOF or errors to peers.
 
 Each role has a `die(status, message)` callable from any thread. It reports
 the error, performs cleanup once, and exits without unwinding. Concurrent
@@ -1233,6 +1262,13 @@ callers wait for that cleanup rather than exiting ahead of it:
 Build with `panic = "abort"`; install a panic hook that performs the same
 cleanup before aborting. External failures use `die` without a core dump;
 bugs and database errors abort. Per-entry failures remain local.
+
+`die` and the normal end run the C library's exit handlers; an abort runs
+none. One of them, a C++ static destructor of RocksDB (`JoinThreadsOnExit`),
+joins RocksDB's background threads, so the end waits for a running flush or
+compaction. `update` and `stats` close the database first, which stops its
+background jobs. A transfer starts only after its update has waited for
+compactions, so none runs at its end.
 
 The receiver monitors both sessions and termination signals. The sender
 monitors stdin and the control socket. Unexpected EOF or session loss is
@@ -1302,7 +1338,7 @@ block_size     = "32KiB"   # at least 4 KiB; changes rebuild the index
 strong_hash    = "blake3"  # blake3 or sha256
 candidate_attempts = 128  # candidates tried per query, at least 1
 hashlist_max_age = "90d"
-index_path     = "~/.local/state/hashsync/index.sqlite"
+index_path     = "~/.local/state/hashsync/default.db"  # a directory
 threads        = 0         # 0 = 4 × cores, clamped to 16–64
 lookahead      = "256MiB"  # at least block_size
 pin_directory  = "~/.cache/hashsync/pins"  # receiver file storage; supports hole punching
@@ -1411,18 +1447,20 @@ hashsync run backup@nas -- tar -C /srv/data -cf - . | tar -C /srv/data -xf -
 
 ## 9. Libraries
 
-Use stable Rust, edition 2024. Bundle SQLite and libzstd; these and BLAKE3's
-SIMD support require a target C compiler. There is no separate pure-Rust build.
+Use stable Rust, edition 2024. Bundle RocksDB, LZ4, and libzstd. RocksDB
+requires a target C++ compiler, and libclang to generate its bindings; LZ4,
+libzstd, and BLAKE3's SIMD support require a target C compiler. There is no
+separate pure-Rust build.
 
 | Need | Choice |
 |---|---|
-| SQLite | `rusqlite` with bundled SQLite |
+| Index database | `rocksdb` with bundled RocksDB and LZ4 |
 | Strong hashes | `blake3`, `sha2`, behind one shared strong-hash interface |
 | SIMD | `fearless_simd` and its `#[simd]` attribute (`fearless_simd_macros`) on x86-64, with the level chosen at run time |
 | System calls | `rustix`; `libc` and `linux-raw-sys` for missing wrappers/constants |
 | Thread pools and channels | `rayon` for indexing, the hash-list sort, and sender probes, `crossbeam-channel`; blocking standard threads for transfer |
 | Compression | `zstd-sys` binding libzstd with worker-thread support |
-| Memory allocation | `mimalloc` for Rust code, SQLite, and libzstd, with the `mimalloc` feature (on by default); never its `override`, so other C code keeps libc `malloc` |
+| Memory allocation | `mimalloc` for Rust code, RocksDB, and libzstd, with the `mimalloc` feature (on by default): the global allocator, replacements of the C++ allocation functions from mimalloc's `mimalloc-new-delete.h`, and libzstd's allocator interface; never its `override`, so other C code keeps libc `malloc` |
 | Anonymous pin files | `tempfile`; hole punching through `rustix` |
 | Configuration and CLI | `serde`, `toml`, `clap`; `gix-glob` for byte patterns and paths |
 | Maps and caches | Standard maps with a fast hasher; `lru` for bounded caches |
@@ -1457,18 +1495,70 @@ decision history is in version control.
   byte independent of the list size. It changes the list, the index, and
   the scanner, and very repetitive blocks without an anchor cannot be
   found. Probe threads keep one table probe per window.
-- **A separate index lock file:** possible, but all read/write `unix-excl`
-  connections with `query_only` worker readers preserve process exclusion
-  without a second persistent locking object. Mixing VFSes or read-only
-  connections inside that process does not preserve this guarantee.
-- **An index by weak hash:** it gives the export its order without a
-  sort, but its keys are random. When it is larger than the writer's page
-  cache, almost every block insert changes a different page of it, and
-  SQLite writes each changed page twice: to the WAL and at the checkpoint.
-  At 20M rows, inserts without it were 2.2 times faster, and a table scan
-  with a parallel in-memory sort exported the list in 4.2 s instead of
-  8.3 s.
-  Candidate lookups need `blocks_by_strong`, which has the same cost.
+- **SQLite for the index:** its B-tree indexes by strong hash (and, at
+  first, by weak hash) have random keys. When such an index is larger than
+  the writer's page cache, almost every block insert changes a different
+  page, and SQLite writes each changed page twice: to its write-ahead log
+  and at the checkpoint. At 21M rows, an update that added 262k block rows
+  took 110 s with both indexes and 18–23 s with the strong one only.
+  RocksDB applies the same changes in 2.4–4 s. In a benchmark of the
+  database work alone, at 20M rows, a new index took SQLite 66–68 s, with
+  its index created after the rows, and RocksDB 32 s; a warm candidate
+  lookup took SQLite 14–15 µs and RocksDB 19 µs. Through the code of
+  hashsync, the one writer thread of RocksDB stores 245k rows/s, so a new
+  index of 20M rows takes about 90 s, and a warm candidate lookup takes
+  26 µs; the file reads of a transfer cost more. The export took SQLite
+  4.2–5.5 s and takes RocksDB 1.6 s with parallel reads (12.7 s with one
+  thread). The index took 2.1 GB and takes 1.3 GB.
+- **Other embedded stores:** LMDB read fastest, but inserted 16k rows/s
+  and wrote 35 KB per row. LevelDB has one compaction thread, no bulk load,
+  and lets one process open a database, even to read it; fjall has the
+  same limit.
+- **Compaction only at the end of an update:** turning automatic
+  compactions off during an update and compacting at its end does not make
+  updates faster. The single writer thread sets the pace, and compactions on
+  the other cores never stalled it: a new index of 20.5M rows took 83 s of
+  writing either way. A full compaction at the end of each update added
+  3–6 s to small updates, because it rewrote the whole index (1.3 GB).
+  Waiting at the end only for the compactions that RocksDB has scheduled
+  costs little. Without that wait, closing the database cancels them: over
+  short updates they pile up, and lookups slowed from 26 µs to 41 µs.
+- **One memtable limit for all column families:** with a limit of 256 MiB
+  for each column family, so that only the shared limit applies, the
+  writer stored a new index of 20.5M rows 10% more slowly, and the end of
+  an update that added 262k rows took 5.8 s instead of 0.4 s.
+- **More background jobs:** 12 background jobs run up to 9 compactions
+  at a time. Without subcompactions, the end of a new index of 20.5M rows
+  took 8.5 s instead of 3 s: its last compaction, from level 0, ran in one
+  thread. With 12 subcompactions as well, it took 3 s, but compactions
+  from level 0 in several column families could then use 12 threads each
+  at the same time. 4 background jobs with 3 subcompactions took
+  3.4–4.5 s. At 20.5M rows, one compaction at a time kept up with the
+  writer; compactions below level 0 do not split.
+- **Parallel flushes at the end of an update:** with 3 flush threads, the
+  end of an update that added 262k rows took 0.24 s instead of 0.4 s. But
+  after 40 of 40 updates of a new small index, the old write-ahead log
+  stayed on disk until the next modifying process opened the index. Each
+  flush records the oldest log that the other column families still need,
+  and flushes that end together see the old log of the others. Read-only
+  processes skip that log: each column family also records the log after
+  its own flush.
+- **Other locks:** RocksDB's own `LOCK` file keeps only read/write opens
+  apart, and a second open fails at once. A `flock` on the index directory
+  waits, and lets read-only processes exclude a modifying one, without
+  another file, but it fails on NFS: Linux emulates `flock` there with
+  byte-range locks, and an exclusive one needs a file open for writing,
+  which a directory cannot be. A classic POSIX lock on the lock file
+  belongs to the process: closing any other descriptor of the file releases
+  it. At exit, the kernel releases such locks in descriptor order, so the
+  lock file, opened before `LOCK`, would be free while `LOCK` is still
+  held.
+- **An index by weak hash:** a column family keyed by weak hash gives the
+  export its order without a sort, but adds one entry per block. In the
+  benchmark of the database work alone, at 20M rows in RocksDB, inserts
+  without it were 2 times faster (126k to 260k rows/s), removals 1.8
+  times faster, and a new index took 32 s instead of 52 s. The export, a
+  scan of `blocks` with a parallel in-memory sort, was not slower.
 - **Async runtimes and `io_uring`:** the blocking pool already serves the
   file-oriented workload, and `io_uring` availability would require a
   fallback. Keep one I/O model.
@@ -1519,9 +1609,10 @@ decision history is in version control.
   SSH option precedence and bootstrap quoting of executable paths containing
   whitespace, quotes, shell metacharacters, and non-UTF-8 bytes;
   a different protocol version on either side, detected before any frame;
-  crash recovery and SQLite process exclusion and snapshots after worker
-  connections open; cache publication and cleanup races, fatal cache I/O
-  failures, and removal of invalid cached lists with fallback to a full list;
+  crash recovery, process exclusion through the index's lock file, and
+  reads of later commits; cache publication and cleanup races, fatal
+  cache I/O failures, and removal of invalid cached lists with fallback to
+  a full list;
   completion without truncation or premature exit under the chosen
   synchronization scheme;
   complete stderr forwarding with backpressure and delayed stderr EOF from

@@ -15,7 +15,10 @@ linux-raw-sys = { version = "0.12.1", features = ["ioctl", "general"] }
 lru = "0.18.5"
 mimalloc = { version = "0.1.52", optional = true }
 rayon = "1.12.0"
-rusqlite = { version = "0.40.2", features = ["bundled"] }
+# The index (DESIGN.md §4.4): RocksDB, built from the C++ source that the
+# crate bundles, with LZ4 for its data blocks. bindgen needs libclang
+# (`default.nix`).
+rocksdb = { version = "0.25.0", default-features = false, features = ["bindgen-runtime", "lz4"] }
 rustix = { version = "1.1.5", features = ["event", "fs", "process", "rand", "stdio"] }
 serde = { version = "1.0.229", features = ["derive"] }
 sha2 = "0.11.0"
@@ -43,13 +46,18 @@ tempfile = "3.27.0"
 # default features would change the libzstd of test builds.
 zstd = { version = "0.14.0", default-features = false }
 
+[build-dependencies]
+# Compiles `src/cxx_allocation.cc` with the `mimalloc` feature (`build.rs`).
+cc = "1.4.6"
+
 [features]
 default = ["mimalloc"]
-# Allocate through mimalloc: Rust code through the global allocator, SQLite
-# and libzstd through their allocator interfaces (`experimental` has the
-# zstd one). Other C code keeps libc `malloc`: never enable mimalloc's
-# `override`, which replaces `malloc` in the whole process (a test in
-# `src/sys.rs` checks this).
+# Allocate through mimalloc: Rust code through the global allocator,
+# RocksDB and libstdc++ through replacements of the C++ allocation
+# functions (`src/cxx_allocation.cc`), and libzstd through its allocator
+# interface (`experimental` has it). Other C code keeps libc `malloc`:
+# never enable mimalloc's `override`, which replaces `malloc` in the whole
+# process (a test in `src/sys.rs` checks this).
 mimalloc = ["dep:libmimalloc-sys", "dep:mimalloc", "zstd-sys/experimental"]
 
 [lints.rust]
@@ -63,3 +71,10 @@ panic = "abort"
 
 [profile.release]
 panic = "abort"
+
+# RocksDB's C++ code, also in development builds: optimized, so that the
+# tests that write many rows run fast, and without debug information,
+# which would make every test binary large and slow to link.
+[profile.dev.package.librocksdb-sys]
+opt-level = 3
+debug = false

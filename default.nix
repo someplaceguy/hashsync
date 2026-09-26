@@ -38,10 +38,12 @@ rustPlatform.buildRustPackage {
   buildNoDefaultFeatures = true;
   buildFeatures = features;
 
-  # SQLite, libzstd, and BLAKE3's SIMD code are C, compiled by the crates'
-  # build scripts with the target C compiler that rustPlatform provides.
+  # RocksDB and, with the `mimalloc` feature, `src/cxx_allocation.cc` are
+  # C++; LZ4, libzstd, and BLAKE3's SIMD code are C. The build scripts
+  # compile them with the target compilers that rustPlatform provides.
+  # bindgen generates RocksDB's bindings through libclang.
 
-  nativeBuildInputs = lib.optionals shell [ clippy rustfmt ];
+  nativeBuildInputs = [ rustPlatform.bindgenHook ] ++ lib.optionals shell [ clippy rustfmt ];
 
   doCheck = stdenv.buildPlatform.canExecute stdenv.hostPlatform;
 

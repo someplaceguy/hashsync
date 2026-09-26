@@ -13,7 +13,7 @@
 //! thread through a bounded channel.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
@@ -36,7 +36,7 @@ use crate::roots::{self, Location};
 /// A root location to scan and its index row.
 pub struct ScanRoot<'a> {
     pub location: &'a Location,
-    pub root_id: i64,
+    pub root_id: u64,
 }
 
 #[derive(Default, Debug)]
@@ -57,6 +57,7 @@ pub fn run(
     config: &Config,
     roots: Vec<ScanRoot<'_>>,
     fs_cache: &FsCache,
+    reader: index::Reader,
     tx: Sender<Msg>,
     jobs: Option<u32>,
 ) -> Counters {
@@ -74,35 +75,23 @@ pub fn run(
         roots: shared,
         fs_cache,
         hasher: BlockHasher::new(config.block_size, config.strong_hash),
-        index_path: &config.index_path,
+        reader,
         visited_dirs: Mutex::default(),
         visited_files: Mutex::default(),
         tx,
         counters: Counters::default(),
     };
-    // Each worker closes its reader inside the wrapper, which the scoped
-    // pool waits for: worker readers close before the writer connection
-    // does (DESIGN.md §4.4). Neither a dropped unscoped pool (it signals
-    // termination without joining) nor the scoped join alone (it can
-    // return before thread-local destructors run) guarantees that order.
     rayon::ThreadPoolBuilder::new()
         .num_threads(thread_count(config.threads, jobs))
         .thread_name(|i| format!("scan{i}"))
-        .build_scoped(
-            |thread| {
-                thread.run();
-                READER.with_borrow_mut(|reader| drop(reader.take()));
-            },
-            |pool| {
-                pool.scope(|scope| {
-                    for (root, (dir, name)) in starts.into_iter().enumerate() {
-                        let scanner = &scanner;
-                        scope.spawn(move |scope| scanner.root_task(scope, root, dir, name));
-                    }
-                });
-            },
-        )
-        .expect("cannot start the scan pool");
+        .build()
+        .expect("cannot start the scan pool")
+        .scope(|scope| {
+            for (root, (dir, name)) in starts.into_iter().enumerate() {
+                let scanner = &scanner;
+                scope.spawn(move |scope| scanner.root_task(scope, root, dir, name));
+            }
+        });
     scanner.counters
 }
 
@@ -123,7 +112,7 @@ struct Root<'a> {
     /// The root's absolute path.
     path: Vec<u8>,
     config: &'a RootConfig,
-    root_id: i64,
+    root_id: u64,
 }
 
 /// Shared context of a traversed directory.
@@ -157,18 +146,14 @@ fn io(what: &'static str) -> impl Fn(Errno) -> Skip {
 thread_local! {
     /// Each worker's reusable block buffer.
     static BUFFER: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
-    /// Each worker's index reader connection (DESIGN.md §4.6), opened on
-    /// first use. The worker wrapper closes it explicitly before the scan
-    /// returns (DESIGN.md §4.4); a thread-local destructor can run after
-    /// the scoped pool's join.
-    static READER: RefCell<Option<index::Reader>> = const { RefCell::new(None) };
 }
 
 struct Scanner<'a> {
     roots: Vec<Root<'a>>,
     fs_cache: &'a FsCache,
     hasher: BlockHasher,
-    index_path: &'a [u8],
+    /// The workers' view of the index (DESIGN.md §4.6).
+    reader: index::Reader,
     /// Every claimed directory identity, with the path that claimed it.
     visited_dirs: Mutex<HashMap<Identity, Vec<u8>>>,
     visited_files: Mutex<HashMap<Identity, FileId>>,
@@ -277,10 +262,16 @@ impl Scanner<'_> {
         });
         let exclude = &scan_root.config.exclude;
         let dir_abs = self.abs_path(root, &ctx.rel);
+        // A listing can return a name twice when the directory changes
+        // during the listing. Each path must have one task: the index keeps
+        // one inode per path (DESIGN.md §4.5).
+        let mut names = HashSet::new();
         for entry in entries {
             let entry = entry.map_err(io("readdir"))?;
             let name = entry.file_name().to_bytes();
-            if exclude.excludes(name, || roots::join(&dir_abs, name)) {
+            if exclude.excludes(name, || roots::join(&dir_abs, name))
+                || !names.insert(name.to_vec())
+            {
                 continue;
             }
             let name = name.to_vec();
@@ -340,12 +331,10 @@ impl Scanner<'_> {
     /// size and ctime, so the file's content can be reused without
     /// hashing or reopening it (DESIGN.md §4.2). The row stays valid for
     /// the writer: only this task, its owner, can replace it.
-    fn reusable_inode(&self, identity: &Identity, meta: &Meta) -> Option<i64> {
-        READER.with_borrow_mut(|reader| {
-            let reader = reader.get_or_insert_with(|| index::open_worker_reader(self.index_path));
-            let fsid = &self.fs_cache.info(identity.fs).fsid;
-            reader.reusable_inode(fsid, &identity.handle, meta.size, meta.ctime_ns)
-        })
+    fn reusable_inode(&self, identity: &Identity, meta: &Meta) -> Option<u64> {
+        let fsid = &self.fs_cache.info(identity.fs).fsid;
+        self.reader
+            .reusable_inode(fsid, &identity.handle, meta.size, meta.ctime_ns)
     }
 
     /// Claim a file identity. Returns its ID and whether this is the first

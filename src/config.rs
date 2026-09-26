@@ -571,7 +571,7 @@ pub fn default_config_path() -> Vec<u8> {
 
 pub fn default_index_path() -> Vec<u8> {
     let mut path = xdg_dir("XDG_STATE_HOME", ".local/state");
-    path.extend_from_slice(b"/hashsync/index.sqlite");
+    path.extend_from_slice(b"/hashsync/default.db");
     path
 }
 
@@ -678,7 +678,7 @@ mod tests {
             r#"
 block_size = "64KiB"
 strong_hash = "sha256"
-index_path = '/tmp/\xFF/index.sqlite'
+index_path = '/tmp/\xFF/default.db'
 threads = 24
 lookahead = "1MiB"
 negative_cache = 0
@@ -701,7 +701,7 @@ one_filesystem = true
         .unwrap();
         assert_eq!(config.block_size, 64 * 1024);
         assert_eq!(config.strong_hash, StrongHash::Sha256);
-        assert_eq!(config.index_path, b"/tmp/\xff/index.sqlite");
+        assert_eq!(config.index_path, b"/tmp/\xff/default.db");
         assert_eq!(config.threads, 24);
         assert_eq!(config.lookahead, 1 << 20);
         assert_eq!(config.negative_cache, 0);

@@ -58,8 +58,8 @@ pub fn run(
 
     let options = config.transfer_options(host.as_bytes(), cli_ssh.map(OsStr::as_bytes));
 
-    // Hold index access through the whole run (DESIGN.md §3): the update
-    // keeps its writer, a read-only run keeps its keeper connection.
+    // Hold index access through the whole run (DESIGN.md §3): the index
+    // stays open, with its lock, until the process exits.
     let (index, locations) = if no_update {
         open_read_only(config)
     } else {
@@ -317,9 +317,8 @@ fn reconstruct<R: Read>(
 }
 
 /// Read-only index access for `--no-update` (DESIGN.md §4.4 and §8):
-/// resolve current roots, then require a compatible index with its block
-/// indexes. Returns the index with the current root locations, from which
-/// candidates are read.
+/// resolve current roots, then require a compatible index. Returns the
+/// index with the current root locations, from which candidates are read.
 fn open_read_only(config: &Config) -> (index::Index, Vec<Location>) {
     fsops::raise_descriptor_limit();
     let fs_cache = FsCache::new();
@@ -335,11 +334,6 @@ fn open_read_only(config: &Config) -> (index::Index, Vec<Location>) {
     if !meta.compatible(&Settings::from_config(config)) {
         die(format!(
             "index {path} does not match the configuration; run `hashsync update`"
-        ));
-    }
-    if !index.has_deferred_block_index() {
-        die(format!(
-            "index {path} is missing its block index; run `hashsync update`"
         ));
     }
     (index, locations)

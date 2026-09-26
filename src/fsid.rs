@@ -40,7 +40,8 @@ impl Triple {
     }
 }
 
-/// The persistent identity bytes stored in `filesystems.fsid`.
+/// The persistent identity bytes of a filesystem, which the index stores
+/// in the identity of each inode (DESIGN.md §4.4).
 #[derive(PartialEq, Eq, Hash, Debug)]
 pub struct FsInfo {
     pub fsid: Vec<u8>,
@@ -116,7 +117,7 @@ impl FsCache {
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Identity {
     pub fs: FsIndex,
-    /// The tagged handle stored in `inodes.handle`.
+    /// The tagged handle, which the index stores in the inode's identity.
     pub handle: Box<[u8]>,
 }
 

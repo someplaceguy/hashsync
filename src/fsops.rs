@@ -134,11 +134,6 @@ pub fn retry_interrupted<T>(mut op: impl FnMut() -> std::io::Result<T>) -> std::
 /// an existing directory with a check that swallows an interruption and
 /// then misreports the directory as a conflicting entry.
 pub fn create_dir_all(dir: &Path, mode: u32) -> std::io::Result<()> {
-    // The empty parent of a bare relative filename needs no directories,
-    // as for `std::fs::create_dir_all`.
-    if dir.as_os_str().is_empty() {
-        return Ok(());
-    }
     let mut prefixes: Vec<&Path> = dir.ancestors().collect();
     prefixes.reverse();
     // `mkdir` on an existing ancestor is safe, including `/` and
@@ -278,12 +273,6 @@ mod tests {
         let error = create_dir_all(&file, 0o777).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::NotADirectory);
         assert!(create_dir_all(&file.join("d"), 0o777).is_err());
-    }
-
-    #[test]
-    fn create_dir_all_accepts_an_empty_path() {
-        // The parent of a bare relative filename.
-        create_dir_all(Path::new(""), 0o777).unwrap();
     }
 
     #[test]

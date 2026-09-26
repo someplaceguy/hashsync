@@ -23,8 +23,8 @@ pub fn run(config: &Config, rebuild: bool, jobs: Option<u32>) {
 }
 
 /// Update the index and return it still open, with the current root
-/// locations that the update resolved. A normal `run` keeps this writer
-/// alive through the transfer, so there is no gap in exclusion between
+/// locations that the update resolved. A normal `run` keeps this index
+/// open through the transfer, so there is no gap in exclusion between
 /// update and use (DESIGN.md §4.4), and it reads candidate blocks through
 /// these locations.
 pub fn perform(config: &Config, rebuild: bool, jobs: Option<u32>) -> (index::Index, Vec<Location>) {
@@ -75,16 +75,17 @@ pub fn perform(config: &Config, rebuild: bool, jobs: Option<u32>) -> (index::Ind
 
     let (tx, rx) = bounded(CHANNEL_CAPACITY);
     let fs_cache = &fs_cache;
-    let (counters, (index, summary)) = std::thread::scope(|s| {
+    let (counters, summary) = std::thread::scope(|s| {
+        let index = &index;
         let writer = std::thread::Builder::new()
             .name("writer".into())
             .spawn_scoped(s, move || writer::run(index, fs_cache, rx))
             .expect("cannot start the writer thread");
-        let counters = scan::run(config, roots, fs_cache, tx, jobs);
+        let counters = scan::run(config, roots, fs_cache, index.reader(), tx, jobs);
         (counters, writer.join().expect("the writer thread panicked"))
     });
 
-    index.ensure_deferred_block_index();
+    index.finish_update();
 
     die::note(format!(
         "{} in {:.1}s: {} directories, {} files hashed ({} bytes), \

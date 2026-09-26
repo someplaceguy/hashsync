@@ -1,73 +1,59 @@
-//! The receiver's SQLite index (DESIGN.md §4.4).
+//! The receiver's index (DESIGN.md §4.4): a RocksDB database in one
+//! directory.
 //!
-//! A modifying process opens its writer through the `unix-excl` VFS and
-//! holds process-exclusive access for the life of the connection. Read-only
-//! processes use ordinary read-only connections whose keeper transaction
-//! excludes a writer. Lock contention waits forever; there is no busy
-//! timeout.
+//! A lock on the file `hashsync.lock` in the directory gives process
+//! exclusion: a modifying process holds an exclusive lock and opens the
+//! database read/write, read-only processes hold shared locks and open it
+//! read-only. Lock contention waits forever; there is no timeout. All
+//! threads of a process share one database handle, and the lock stays
+//! until the handle has closed.
 
+mod layout;
 pub mod writer;
 
 use std::ffi::OsStr;
+use std::mem;
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-use std::thread;
-use std::time::Duration;
+use std::sync::Arc;
 
 use bstr::ByteSlice;
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use rayon::slice::ParallelSliceMut;
-use rusqlite::types::Value;
-use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, params};
+use rocksdb::{
+    BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, DB, DBCompressionType,
+    DBPinnableSlice, DBRawIterator, LogLevel, Options, ReadOptions, SliceTransform,
+    WaitForCompactOptions, WriteBatch,
+};
+use rustix::fs::{Mode, OFlags};
+use rustix::io::Errno;
 
 use crate::config::Config;
 use crate::die::die;
 use crate::fsops;
-use crate::hash::weak;
+use crate::hash::{PREFIX_LEN, weak};
+use crate::sys;
+use layout::{Cf, ID_LEN, InodeRow, RootRow, id_key, u64_at};
 
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: u64 = 1;
 
-const SCHEMA: &str = "
-CREATE TABLE meta        (key TEXT PRIMARY KEY, value BLOB NOT NULL);
-CREATE TABLE filesystems (id INTEGER PRIMARY KEY, fsid BLOB NOT NULL UNIQUE);
-CREATE TABLE roots       (id INTEGER PRIMARY KEY, identifier BLOB UNIQUE,
-                          path BLOB NOT NULL UNIQUE);
-CREATE TABLE inodes      (id INTEGER PRIMARY KEY,
-                          fs_id INTEGER NOT NULL REFERENCES filesystems(id)
-                            ON DELETE RESTRICT,
-                          handle BLOB NOT NULL, size INTEGER,
-                          ctime_ns INTEGER NOT NULL, UNIQUE (fs_id, handle));
-CREATE TABLE paths       (root_id INTEGER NOT NULL REFERENCES roots(id)
-                            ON DELETE RESTRICT,
-                          rel_path BLOB NOT NULL,
-                          inode_id INTEGER NOT NULL REFERENCES inodes(id)
-                            ON DELETE RESTRICT,
-                          PRIMARY KEY (root_id, rel_path)) WITHOUT ROWID;
-CREATE INDEX paths_by_inode ON paths (inode_id);
-CREATE TABLE blocks      (inode_id INTEGER NOT NULL REFERENCES inodes(id)
-                            ON DELETE RESTRICT,
-                          block_no INTEGER NOT NULL, weak INTEGER NOT NULL,
-                          strong BLOB NOT NULL CHECK (length(strong) = 16),
-                          PRIMARY KEY (inode_id, block_no)) WITHOUT ROWID;
-";
+/// The file in the index directory whose lock excludes other processes.
+const LOCK_FILE: &str = "hashsync.lock";
 
-/// Children before parents, as `ON DELETE RESTRICT` requires.
-const DROP_SCHEMA: &str = "
-DROP TABLE IF EXISTS blocks;
-DROP TABLE IF EXISTS paths;
-DROP TABLE IF EXISTS inodes;
-DROP TABLE IF EXISTS roots;
-DROP TABLE IF EXISTS filesystems;
-DROP TABLE IF EXISTS meta;
-";
+/// The block cache that all column families of a process share.
+const BLOCK_CACHE: usize = 256 << 20;
 
-/// Created after population; repaired by every update. No index orders
-/// the blocks by weak hash: the export sorts them in memory (DESIGN.md
-/// §5.4).
-const DEFERRED_BLOCK_INDEX: &str = "CREATE INDEX IF NOT EXISTS blocks_by_strong ON blocks (strong)";
+/// The memory of the memtables of all column families together.
+const WRITE_BUFFERS: usize = 256 << 20;
+
+/// Changes per bounded transaction: entries written or removed, as the
+/// write batch counts them.
+const COMMIT_WORK: usize = 50_000;
 
 /// Unwrap a database result. Database errors are fatal bugs or failures
 /// and abort (DESIGN.md §6.5).
-pub fn db<T>(result: rusqlite::Result<T>) -> T {
+pub fn db<T>(result: Result<T, rocksdb::Error>) -> T {
     result.unwrap_or_else(|e| panic!("database error: {e}"))
 }
 
@@ -91,7 +77,7 @@ impl Settings {
 
 #[derive(Clone, Debug)]
 pub struct Meta {
-    pub schema_version: i64,
+    pub schema_version: u64,
     pub settings: Settings,
     pub index_id: [u8; 16],
 }
@@ -103,6 +89,7 @@ impl Meta {
 }
 
 pub struct Stats {
+    /// Distinct filesystems of the inode rows.
     pub filesystems: u64,
     pub roots: u64,
     pub roots_complete: u64,
@@ -112,420 +99,765 @@ pub struct Stats {
     pub blocks: u64,
     pub distinct_weak: u64,
     pub indexed_bytes: u64,
-    pub deferred_block_index: bool,
-}
-
-/// An open index connection: the writer of a modifying process, or the
-/// keeper of a read-only process.
-pub struct Index {
-    conn: Connection,
-    /// The database path, for the other connections of this process.
-    path: Vec<u8>,
-    /// This process modifies the index, which decides how its other
-    /// connections open (DESIGN.md §4.4).
-    modifying: bool,
-}
-
-/// Busy handler: wait, then retry, forever.
-fn wait_forever(_attempts: i32) -> bool {
-    thread::sleep(RETRY_INTERVAL);
-    true
-}
-
-const RETRY_INTERVAL: Duration = Duration::from_millis(20);
-
-fn is_busy(error: &rusqlite::Error) -> bool {
-    matches!(
-        error,
-        rusqlite::Error::SqliteFailure(failure, _)
-            if matches!(failure.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
-    )
 }
 
 fn os_path(path: &[u8]) -> &Path {
     Path::new(OsStr::from_bytes(path))
 }
 
-/// A real schema read; acquires the process lock of `unix-excl`, or the
-/// shared lock of a read-only keeper.
-fn schema_read(conn: &Connection) -> rusqlite::Result<()> {
-    conn.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))
+/// The database handle of a process, with the lock that gives the process
+/// its access.
+struct Shared {
+    db: DB,
+    /// The lock file, with this process's lock on it. Rust drops fields in
+    /// order, so the lock goes after the database has closed.
+    _lock: OwnedFd,
 }
 
-/// Open one connection of a modifying process: read/write through
-/// `unix-excl`, waiting forever on contention, like every connection of
-/// that process must (DESIGN.md §4.4). The writer and its worker readers
-/// share this one recipe: a change to the VFS or the flags here changes
-/// the writer, whose exclusion the locking tests verify.
-fn open_unix_excl(path: &[u8], extra: OpenFlags) -> rusqlite::Result<Connection> {
-    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX | extra;
-    let conn = Connection::open_with_flags_and_vfs(os_path(path), flags, "unix-excl")?;
-    conn.busy_handler(Some(wait_forever))?;
-    Ok(conn)
+/// The index of a process: read/write in a modifying process (`update`,
+/// `prune`, normal `run`), read-only in the others.
+pub struct Index {
+    shared: Arc<Shared>,
 }
 
-/// Open the writer of a modifying process, waiting for exclusive access.
+/// A read-only view of the index for another thread of the process: a
+/// scan worker during an update, or a lookup worker during a transfer.
+/// Reads see the latest committed transaction of this process.
+pub struct Reader {
+    shared: Arc<Shared>,
+}
+
+/// Open the lock file of the index at `path` and lock it, waiting forever
+/// on contention (DESIGN.md §4.4): exclusive and read/write for a
+/// modifying process, which creates the file, shared and read-only for the
+/// others.
+///
+/// The lock belongs to the open file description (`F_OFD_SETLKW`), not to
+/// the process as a classic POSIX lock does. Closing another descriptor of
+/// the file does not release it. And when the process exits with the
+/// database open, the kernel releases the classic locks, such as RocksDB's
+/// lock of its `LOCK` file, while it closes the descriptors, but this lock
+/// only after that, when it releases the open file description: a process
+/// that gets this lock never finds `LOCK` held. Close-on-exec keeps
+/// children from inheriting the descriptor, and so the lock.
+fn lock(path: &[u8], exclusive: bool) -> Result<OwnedFd, Errno> {
+    let flags = if exclusive {
+        OFlags::RDWR | OFlags::CREATE
+    } else {
+        OFlags::RDONLY
+    };
+    let file = rustix::io::retry_on_intr(|| {
+        rustix::fs::open(
+            os_path(path).join(LOCK_FILE),
+            flags | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o666),
+        )
+    })?;
+    sys::lock_file(file.as_fd(), exclusive)?;
+    Ok(file)
+}
+
+/// The options of the database. The column families have their own
+/// (`column_families`).
+fn db_options() -> Options {
+    let mut options = Options::default();
+    options.create_if_missing(true);
+    options.create_missing_column_families(true);
+    // One flush and one compaction at a time: RocksDB gives a quarter of
+    // the background jobs, at least one, to flushes. A compaction from
+    // level 0 splits into subcompactions on up to half the cores, each in
+    // a thread of its own.
+    options.set_max_background_jobs(2);
+    let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
+    let subcompactions = (cores / 2).max(1);
+    options.set_max_subcompactions(u32::try_from(subcompactions).unwrap_or(u32::MAX));
+    options.set_db_write_buffer_size(WRITE_BUFFERS);
+    // RocksDB's own log file stays in the index directory: warnings only,
+    // and at most two old logs. Read-only processes write no log.
+    options.set_log_level(LogLevel::Warn);
+    options.set_keep_log_file_num(2);
+    options
+}
+
+/// The column families and their options (DESIGN.md §4.4).
+fn column_families() -> Vec<ColumnFamilyDescriptor> {
+    // A hyper clock cache, RocksDB's default kind, sized automatically: its
+    // lookups take no lock, and it allocates through `new`, which the
+    // `mimalloc` feature replaces (`src/cxx_allocation.cc`). An LRU cache
+    // allocates its entries through libc `malloc`.
+    let cache = Cache::new_hyper_clock_cache(BLOCK_CACHE, 0);
+    Cf::ALL
+        .iter()
+        .map(|&cf| {
+            let mut table = BlockBasedOptions::default();
+            table.set_block_cache(&cache);
+            let mut options = Options::default();
+            options.set_compression_type(DBCompressionType::Lz4);
+            match cf {
+                // Point lookups; new files miss.
+                Cf::Identities | Cf::Inodes => table.set_bloom_filter(10.0, false),
+                // Candidate lookups by strong-hash prefix; false hits of
+                // the weak table miss.
+                Cf::Strong => {
+                    options.set_prefix_extractor(SliceTransform::create_fixed_prefix(PREFIX_LEN));
+                    table.set_bloom_filter(10.0, false);
+                    table.set_whole_key_filtering(false);
+                }
+                _ => {}
+            }
+            options.set_block_based_table_factory(&table);
+            ColumnFamilyDescriptor::new(cf.name(), options)
+        })
+        .collect()
+}
+
+/// Open the index of a modifying process, creating it when necessary.
+/// Waits for exclusive access.
 pub fn open_modifying(path: &[u8]) -> Index {
-    if let Some(parent) = os_path(path).parent()
-        && let Err(e) = fsops::create_dir_all(parent, 0o777)
-    {
+    if let Err(e) = fsops::create_dir_all(os_path(path), 0o777) {
         die(format!(
             "cannot create index directory {}: {e}",
-            parent.display()
+            path.as_bstr()
         ));
     }
-    loop {
-        let conn = match open_unix_excl(path, OpenFlags::SQLITE_OPEN_CREATE) {
-            Ok(conn) => conn,
-            Err(e) => die(format!("cannot open index {}: {e}", path.as_bstr())),
-        };
-        match schema_read(&conn) {
-            Ok(()) => {
-                db(conn.pragma_update(None, "foreign_keys", "ON"));
-                let mode: String =
-                    db(conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0)));
-                assert_eq!(mode, "wal", "cannot enable WAL mode");
-                db(conn.pragma_update(None, "synchronous", "NORMAL"));
-                // A negative cache_size specifies KiB.
-                db(conn.pragma_update(None, "cache_size", -64 * 1024));
-                db(conn.pragma_update(None, "threads", 8));
-                return Index {
-                    conn,
-                    path: path.to_vec(),
-                    modifying: true,
-                };
-            }
-            // Busy without the handler running: retry with a fresh connection.
-            Err(e) if is_busy(&e) => {
-                drop(conn);
-                thread::sleep(RETRY_INTERVAL);
-            }
-            Err(e) => db(Err(e)),
-        }
+    let lock = lock(path, true)
+        .unwrap_or_else(|e| die(format!("cannot lock index {}: {e}", path.as_bstr())));
+    let db = DB::open_cf_descriptors(&db_options(), os_path(path), column_families())
+        .unwrap_or_else(|e| die(format!("cannot open index {}: {e}", path.as_bstr())));
+    Index {
+        shared: Arc::new(Shared { db, _lock: lock }),
     }
 }
 
-/// Open a worker reader of a modifying process (DESIGN.md §4.4): like
-/// every connection of that process, read/write through `unix-excl`, with
-/// `query_only` set before use. The writer already holds the process
-/// lock. Queries run in autocommit, so a reader never pins a WAL snapshot.
-pub fn open_worker_reader(path: &[u8]) -> Reader {
-    let conn = db(open_unix_excl(path, OpenFlags::empty()));
-    db(conn.pragma_update(None, "foreign_keys", "ON"));
-    db(conn.pragma_update(None, "query_only", "ON"));
-    Reader { conn }
+/// Open the index of a read-only process, waiting while a modifying
+/// process has it. `None` when there is no database: no directory or no
+/// lock file, or a directory that the first update left before it created
+/// the database with all its column families.
+pub fn open_read_only(path: &[u8]) -> Option<Index> {
+    let lock = match lock(path, false) {
+        Ok(lock) => lock,
+        Err(Errno::NOENT) => return None,
+        Err(e) => die(format!("cannot open index {}: {e}", path.as_bstr())),
+    };
+    match rustix::io::retry_on_intr(|| rustix::fs::stat(os_path(path).join("CURRENT"))) {
+        Ok(_) => {}
+        Err(Errno::NOENT) => return None,
+        Err(e) => die(format!("cannot open index {}: {e}", path.as_bstr())),
+    }
+    // A database without every column family: the first update ended
+    // before it created them all.
+    let names = DB::list_cf(&Options::default(), os_path(path))
+        .unwrap_or_else(|e| die(format!("cannot open index {}: {e}", path.as_bstr())));
+    if Cf::ALL
+        .iter()
+        .any(|cf| !names.iter().any(|name| name == cf.name()))
+    {
+        return None;
+    }
+    let db =
+        DB::open_cf_descriptors_read_only(&db_options(), os_path(path), column_families(), false)
+            .unwrap_or_else(|e| die(format!("cannot open index {}: {e}", path.as_bstr())));
+    Some(Index {
+        shared: Arc::new(Shared { db, _lock: lock }),
+    })
 }
 
-/// Open a reader of a read-only process: an ordinary read-only
-/// connection, which the keeper's transaction protects from writers
-/// (DESIGN.md §4.4).
-fn open_plain_reader(path: &[u8]) -> Reader {
-    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    let conn = db(Connection::open_with_flags(os_path(path), flags));
-    db(conn.busy_handler(Some(wait_forever)));
-    Reader { conn }
+/// The entries of one column family whose keys start with a prefix, in
+/// key order, from one snapshot of the database.
+struct Scan<'a> {
+    raw: DBRawIterator<'a>,
 }
 
-/// A read-only view of the index for one worker thread: a scan worker
-/// during an update, or a lookup worker during a transfer. Queries run in
-/// autocommit, so a reader never pins a WAL snapshot.
-pub struct Reader {
-    conn: Connection,
+impl Scan<'_> {
+    /// The current entry; `None` after the last one.
+    fn entry(&self) -> Option<(&[u8], &[u8])> {
+        let item = self.raw.item();
+        if item.is_none() {
+            db(self.raw.status());
+        }
+        item
+    }
+
+    fn next(&mut self) {
+        self.raw.next();
+    }
 }
 
-/// The candidates of the blocks with one strong-hash prefix.
-const CANDIDATES: &str = "
-SELECT blocks.block_no, paths.root_id, paths.rel_path FROM blocks
-LEFT JOIN paths ON paths.inode_id = blocks.inode_id
-WHERE blocks.strong = ?
-ORDER BY blocks.inode_id, blocks.block_no";
+/// The first key after all keys that start with `prefix`; `None` when no
+/// key is after them.
+fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    while let Some(last) = end.pop() {
+        if last < u8::MAX {
+            end.push(last + 1);
+            return Some(end);
+        }
+    }
+    None
+}
+
+impl Shared {
+    fn cf(&self, cf: Cf) -> &ColumnFamily {
+        self.db
+            .cf_handle(cf.name())
+            .unwrap_or_else(|| panic!("database error: no column family {}", cf.name()))
+    }
+
+    fn get(&self, cf: Cf, key: &[u8]) -> Option<DBPinnableSlice<'_>> {
+        db(self.db.get_pinned_cf(self.cf(cf), key))
+    }
+
+    /// The entries of `cf` whose keys start with `prefix`. An empty prefix
+    /// scans the whole column family, without filling the block cache.
+    fn scan(&self, cf: Cf, prefix: &[u8]) -> Scan<'_> {
+        let mut options = ReadOptions::default();
+        // Seek in the order of all keys, whatever prefix extractor the
+        // column family has.
+        options.set_total_order_seek(true);
+        options.fill_cache(!prefix.is_empty());
+        // Without an upper bound, the step past the last entry would skip
+        // each removed entry that follows, up to the next live one. The
+        // reconciliation removes all paths, so the removal of many orphans
+        // with consecutive IDs would take quadratic time.
+        if let Some(end) = prefix_end(prefix) {
+            options.set_iterate_upper_bound(end);
+        }
+        let mut raw = self.db.raw_iterator_cf_opt(self.cf(cf), options);
+        raw.seek(prefix);
+        Scan { raw }
+    }
+
+    /// Call `visit` for each entry of `cf` whose key starts with `prefix`.
+    fn each(&self, cf: Cf, prefix: &[u8], mut visit: impl FnMut(&[u8], &[u8])) {
+        let mut scan = self.scan(cf, prefix);
+        while let Some((key, value)) = scan.entry() {
+            visit(key, value);
+            scan.next();
+        }
+    }
+
+    /// The largest ID of the rows of `cf`, keyed by ID; 0 when it is
+    /// empty.
+    fn last_id(&self, cf: Cf) -> u64 {
+        let mut options = ReadOptions::default();
+        options.set_total_order_seek(true);
+        let mut raw = self.db.raw_iterator_cf_opt(self.cf(cf), options);
+        raw.seek_to_last();
+        match raw.key() {
+            Some(key) => u64_at(key, 0),
+            None => {
+                db(raw.status());
+                0
+            }
+        }
+    }
+
+    /// The weak hash of every block row, from one snapshot, sorted as
+    /// unsigned 64-bit values (DESIGN.md §5.4). The reads and the sort use
+    /// one thread per core: the first keys of the files of `blocks` split
+    /// it into parts, which are read in parallel.
+    fn sorted_weak_hashes(&self) -> Vec<u64> {
+        let snapshot = self.db.snapshot();
+        let mut bounds: Vec<Vec<u8>> = db(self.db.live_files())
+            .into_iter()
+            .filter(|file| file.column_family_name == Cf::Blocks.name())
+            .filter_map(|file| file.start_key)
+            .collect();
+        bounds.sort_unstable();
+        bounds.dedup();
+        // Part `i` ends before `bounds[i]`, and starts at `bounds[i - 1]`.
+        let part = |i: usize| {
+            let mut options = ReadOptions::default();
+            options.set_snapshot(&snapshot);
+            options.set_total_order_seek(true);
+            options.fill_cache(false);
+            if let Some(end) = bounds.get(i) {
+                options.set_iterate_upper_bound(end.clone());
+            }
+            let mut raw = self.db.raw_iterator_cf_opt(self.cf(Cf::Blocks), options);
+            match i.checked_sub(1) {
+                Some(start) => raw.seek(&bounds[start]),
+                None => raw.seek_to_first(),
+            }
+            let mut values = Vec::new();
+            while let Some(value) = raw.value() {
+                values.push(u64_at(value, 0));
+                raw.next();
+            }
+            db(raw.status());
+            values
+        };
+        // The pool's threads end when it is dropped.
+        rayon::ThreadPoolBuilder::new()
+            .thread_name(|i| format!("export{i}"))
+            .build()
+            .expect("cannot start the export pool")
+            .install(|| {
+                let parts: Vec<Vec<u64>> = (0..=bounds.len()).into_par_iter().map(part).collect();
+                // Each part is freed when it has been copied, so the sort
+                // has only one copy of the values.
+                let mut values = Vec::with_capacity(parts.iter().map(Vec::len).sum());
+                for part in parts {
+                    values.extend_from_slice(&part);
+                }
+                values.par_sort_unstable();
+                values
+            })
+    }
+}
 
 /// A candidate (DESIGN.md §6.4): an indexed block with one path of its
 /// inode.
 pub struct Candidate {
     pub block_no: u64,
-    /// The `roots.id` and relative path of one path of the block's inode;
+    /// The root ID and relative path of one path of the block's inode;
     /// `None` for an inode without paths.
-    pub path: Option<(i64, Vec<u8>)>,
+    pub path: Option<(u64, Vec<u8>)>,
 }
 
 impl Reader {
     /// The ID of the complete inode row that stores this identity with
     /// the observed size and ctime, so the file's content can be reused
-    /// without hashing (DESIGN.md §4.2). The comparison uses the stored
-    /// `i64` bit pattern of the unsigned size; the equality also rejects
-    /// incomplete rows, whose size is NULL.
+    /// without hashing (DESIGN.md §4.2). An incomplete row has no size and
+    /// is never reusable.
     pub fn reusable_inode(
         &self,
         fsid: &[u8],
         handle: &[u8],
         size: u64,
         ctime_ns: i64,
-    ) -> Option<i64> {
-        let mut stmt = db(self.conn.prepare_cached(
-            "SELECT inodes.id FROM inodes
-             JOIN filesystems ON filesystems.id = inodes.fs_id
-             WHERE filesystems.fsid = ? AND inodes.handle = ?
-               AND inodes.size = ? AND inodes.ctime_ns = ?",
-        ));
-        db(stmt
-            .query_row(params![fsid, handle, size as i64, ctime_ns], |row| {
-                row.get(0)
-            })
-            .optional())
+    ) -> Option<u64> {
+        let shared = &self.shared;
+        let inode_id = u64_at(
+            &shared.get(Cf::Identities, &layout::identity(fsid, handle))?,
+            0,
+        );
+        let row = shared
+            .get(Cf::Inodes, &id_key(inode_id))
+            .map(|value| InodeRow::decode(&value))
+            .expect("database error: an identity without its inode row");
+        (row.size == Some(size) && row.ctime_ns == ctime_ns).then_some(inode_id)
     }
 
     /// At most `limit` candidates of the blocks whose strong-hash prefix is
     /// `prefix`: one for every path of each block's inode, and one for each
     /// block whose inode has no path. Any order would do; this one is
-    /// fixed, by inode row, then by block number, so that the same index
-    /// always gives the same candidates.
-    ///
-    /// The rows come from `blocks_by_strong` in that order without a sort,
-    /// so reading stops after `limit` rows. A `LIMIT ?` parameter would do
-    /// the same, but SQLite prepares a statement again whenever such a
-    /// parameter changes.
+    /// fixed, by inode ID, then by block number, so that the same index
+    /// always gives the same candidates. The keys of `strong` have this
+    /// order, and reading stops after `limit` candidates.
     pub fn candidates(&self, prefix: &[u8], limit: u32) -> Vec<Candidate> {
-        let mut stmt = db(self.conn.prepare_cached(CANDIDATES));
-        let rows = db(stmt.query_map(params![prefix], |row| {
-            let root_id: Option<i64> = row.get(1)?;
-            Ok(Candidate {
-                block_no: row.get::<_, i64>(0)? as u64,
-                path: match root_id {
-                    Some(root_id) => Some((root_id, row.get(2)?)),
-                    None => None,
-                },
-            })
-        }));
-        rows.take(limit as usize).map(db).collect()
+        assert_eq!(
+            prefix.len(),
+            PREFIX_LEN,
+            "a candidate prefix has the wrong length"
+        );
+        let limit = limit as usize;
+        let shared = &self.shared;
+        let mut options = ReadOptions::default();
+        // The prefix extractor of `strong` is `PREFIX_LEN` bytes: its bloom
+        // filters skip the files without the prefix.
+        options.set_prefix_same_as_start(true);
+        let mut blocks = shared
+            .db
+            .raw_iterator_cf_opt(shared.cf(Cf::Strong), options);
+        blocks.seek(prefix);
+        let mut found = Vec::new();
+        while found.len() < limit {
+            let Some(key) = blocks.key() else {
+                db(blocks.status());
+                break;
+            };
+            if !key.starts_with(prefix) {
+                break;
+            }
+            let inode_id = u64_at(key, PREFIX_LEN);
+            let block_no = u64_at(key, PREFIX_LEN + ID_LEN);
+            let before = found.len();
+            let mut paths = shared.scan(Cf::InodePaths, &id_key(inode_id));
+            while found.len() < limit
+                && let Some((path, _)) = paths.entry()
+            {
+                found.push(Candidate {
+                    block_no,
+                    path: Some((u64_at(path, ID_LEN), path[2 * ID_LEN..].to_vec())),
+                });
+                paths.next();
+            }
+            if found.len() == before && found.len() < limit {
+                found.push(Candidate {
+                    block_no,
+                    path: None,
+                });
+            }
+            blocks.next();
+        }
+        found
     }
 }
 
-/// Open the keeper connection of a read-only process. Its read
-/// transaction and schema read last until the `Index` is dropped. `None`
-/// when the index file does not exist.
-pub fn open_read_only(path: &[u8]) -> Option<Index> {
-    loop {
-        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-        let conn = match Connection::open_with_flags(os_path(path), flags) {
-            Ok(conn) => conn,
-            Err(e) => {
-                // Not `Path::exists`: it reports an interrupted check as
-                // a missing index.
-                match fsops::retry_interrupted(|| os_path(path).try_exists()) {
-                    Ok(false) => return None,
-                    Ok(true) => die(format!("cannot open index {}: {e}", path.as_bstr())),
-                    // SQLite's message omits the errno; the check's error
-                    // names it.
-                    Err(check) => die(format!(
-                        "cannot open index {}: {e} ({check})",
-                        path.as_bstr()
-                    )),
-                }
-            }
-        };
-        db(conn.busy_handler(Some(wait_forever)));
-        match conn
-            .execute_batch("BEGIN")
-            .and_then(|()| schema_read(&conn))
-        {
-            Ok(()) => {
-                return Some(Index {
-                    conn,
-                    path: path.to_vec(),
-                    modifying: false,
-                });
-            }
-            Err(e) if is_busy(&e) => {
-                drop(conn);
-                thread::sleep(RETRY_INTERVAL);
-            }
-            Err(e) => db(Err(e)),
+/// Changes to write together: one atomic RocksDB write batch. A modifying
+/// process commits them with `commit`, or with `checkpoint` once they reach
+/// the bound of a transaction (DESIGN.md §4.4). Reads see only committed
+/// changes.
+pub struct Transaction<'a> {
+    index: &'a Index,
+    batch: WriteBatch,
+}
+
+impl Transaction<'_> {
+    pub fn put(&mut self, cf: Cf, key: &[u8], value: &[u8]) {
+        self.batch.put_cf(self.index.shared.cf(cf), key, value);
+    }
+
+    pub fn delete(&mut self, cf: Cf, key: &[u8]) {
+        self.batch.delete_cf(self.index.shared.cf(cf), key);
+    }
+
+    /// Write the pending changes atomically.
+    pub fn commit(&mut self) {
+        if !self.batch.is_empty() {
+            #[cfg(test)]
+            tests::before_commit();
+            db(self.index.shared.db.write(mem::take(&mut self.batch)));
         }
+    }
+
+    /// Commit once the pending changes reach the bound of a transaction.
+    pub fn checkpoint(&mut self) {
+        if self.batch.len() >= COMMIT_WORK {
+            self.commit();
+        }
+    }
+
+    /// Remove every path of a root from `paths` and `inode_paths`,
+    /// committing between bounded transactions. Reads committed entries.
+    fn remove_root_paths(&mut self, root_id: u64) {
+        let index = self.index;
+        index
+            .shared
+            .each(Cf::Paths, &id_key(root_id), |key, value| {
+                let rel_path = &key[ID_LEN..];
+                self.delete(
+                    Cf::InodePaths,
+                    &layout::inode_path_key(u64_at(value, 0), root_id, rel_path),
+                );
+                self.delete(Cf::Paths, key);
+                self.checkpoint();
+            });
+    }
+
+    /// Remove every path of an inode from `inode_paths` and `paths`,
+    /// committing between bounded transactions. Reads committed entries.
+    fn remove_inode_paths(&mut self, inode_id: u64) {
+        let index = self.index;
+        index
+            .shared
+            .each(Cf::InodePaths, &id_key(inode_id), |key, _| {
+                let root_id = u64_at(key, ID_LEN);
+                self.delete(Cf::Paths, &layout::path_key(root_id, &key[2 * ID_LEN..]));
+                self.delete(Cf::InodePaths, key);
+                self.checkpoint();
+            });
+    }
+
+    /// Remove every block of an inode from `blocks` and `strong`,
+    /// committing between bounded transactions. Reads committed entries.
+    fn remove_blocks(&mut self, inode_id: u64) {
+        let index = self.index;
+        index
+            .shared
+            .each(Cf::Blocks, &id_key(inode_id), |key, value| {
+                let block_no = u64_at(key, ID_LEN);
+                let prefix = layout::block_strong_prefix(value);
+                self.delete(Cf::Strong, &layout::strong_key(prefix, inode_id, block_no));
+                self.delete(Cf::Blocks, key);
+                self.checkpoint();
+            });
     }
 }
 
 impl Index {
-    /// A reader connection for another thread of this process, opened the
-    /// way this process's access requires (DESIGN.md §4.4).
+    /// A reader for another thread of this process.
     pub fn reader(&self) -> Reader {
-        if self.modifying {
-            open_worker_reader(&self.path)
-        } else {
-            open_plain_reader(&self.path)
+        Reader {
+            shared: Arc::clone(&self.shared),
         }
+    }
+
+    /// An empty transaction.
+    pub fn transaction(&self) -> Transaction<'_> {
+        Transaction {
+            index: self,
+            batch: WriteBatch::default(),
+        }
+    }
+
+    /// Every root row, by ID.
+    fn roots(&self) -> Vec<(u64, RootRow)> {
+        let mut roots = Vec::new();
+        self.shared.each(Cf::Roots, b"", |key, value| {
+            roots.push((u64_at(key, 0), RootRow::decode(value)));
+        });
+        roots
     }
 
     /// Every root row: its ID and its representative path.
-    pub fn root_paths(&self) -> Vec<(i64, Vec<u8>)> {
-        let mut stmt = db(self.conn.prepare("SELECT id, path FROM roots"));
-        let rows = db(stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?))));
-        rows.map(db).collect()
+    pub fn root_paths(&self) -> Vec<(u64, Vec<u8>)> {
+        self.roots()
+            .into_iter()
+            .map(|(root_id, row)| (root_id, row.path))
+            .collect()
     }
 
-    /// The stored metadata, or `None` before the schema exists.
+    /// The inode ID of an identity (an `identities` key).
+    fn inode_id(&self, identity: &[u8]) -> Option<u64> {
+        let value = self.shared.get(Cf::Identities, identity)?;
+        Some(u64_at(&value, 0))
+    }
+
+    /// The row of an inode ID in use.
+    fn inode_row(&self, inode_id: u64) -> InodeRow {
+        let value = self
+            .shared
+            .get(Cf::Inodes, &id_key(inode_id))
+            .expect("database error: a missing inode row");
+        InodeRow::decode(&value)
+    }
+
+    /// The ID for the next new inode row: one more than the largest ID in
+    /// use. Removal takes every reference to an inode away before its
+    /// row, so a reused ID meets no old entries.
+    fn next_inode_id(&self) -> u64 {
+        self.shared.last_id(Cf::Inodes) + 1
+    }
+
+    /// The stored metadata, or `None` before the first reset. A malformed
+    /// value makes the metadata incompatible, which rebuilds the index.
     pub fn read_meta(&self) -> Option<Meta> {
-        let tables: i64 = db(self.conn.query_row(
-            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'meta'",
-            [],
-            |row| row.get(0),
-        ));
-        if tables == 0 {
-            return None;
-        }
-        let mut stmt = db(self.conn.prepare("SELECT key, value FROM meta"));
-        let rows = db(stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Value>(1)?))
-        }));
-        let mut meta = Meta {
-            schema_version: -1,
-            settings: Settings {
-                block_size: 0,
-                weak_hash_id: String::new(),
-                strong_hash_id: String::new(),
-            },
-            index_id: [0; 16],
+        let get = |name: &str| self.shared.get(Cf::Meta, name.as_bytes());
+        let number = |name: &str| {
+            get(name)
+                .and_then(|value| <[u8; 8]>::try_from(&value[..]).ok())
+                .map_or(0, u64::from_be_bytes)
         };
-        for row in rows {
-            let (key, value) = db(row);
-            match (key.as_str(), value) {
-                ("schema_version", Value::Integer(v)) => meta.schema_version = v,
-                ("block_size", Value::Integer(v)) => {
-                    meta.settings.block_size = u32::try_from(v).unwrap_or(0);
-                }
-                ("weak_hash_id", Value::Text(v)) => meta.settings.weak_hash_id = v,
-                ("strong_hash_id", Value::Text(v)) => meta.settings.strong_hash_id = v,
-                ("index_id", Value::Blob(v)) if v.len() == 16 => {
-                    meta.index_id.copy_from_slice(&v);
-                }
-                _ => {}
-            }
-        }
-        Some(meta)
+        let text = |name: &str| {
+            get(name)
+                .and_then(|value| String::from_utf8(value.to_vec()).ok())
+                .unwrap_or_default()
+        };
+        get("schema_version")?;
+        Some(Meta {
+            schema_version: number("schema_version"),
+            settings: Settings {
+                block_size: u32::try_from(number("block_size")).unwrap_or(0),
+                weak_hash_id: text("weak_hash_id"),
+                strong_hash_id: text("strong_hash_id"),
+            },
+            index_id: get("index_id")
+                .and_then(|value| <[u8; 16]>::try_from(&value[..]).ok())
+                .unwrap_or([0; 16]),
+        })
     }
 
-    /// Reset schema and metadata in one transaction, with a new index ID.
-    /// The deferred block index is created after population by
-    /// `ensure_deferred_block_index`.
+    /// Remove every entry and store new metadata with a new index ID, in
+    /// one transaction (DESIGN.md §4.4).
     pub fn reset(&self, settings: &Settings) {
         let mut index_id = [0u8; 16];
         rustix::io::retry_on_intr(|| {
             rustix::rand::getrandom(&mut index_id, rustix::rand::GetRandomFlags::empty())
         })
         .unwrap_or_else(|e| panic!("getrandom: {e}"));
-        db(self
-            .conn
-            .execute_batch(&format!("BEGIN IMMEDIATE;{DROP_SCHEMA}{SCHEMA}")));
-        let mut insert = db(self
-            .conn
-            .prepare("INSERT INTO meta (key, value) VALUES (?, ?)"));
-        db(insert.execute(params!["schema_version", SCHEMA_VERSION]));
-        db(insert.execute(params!["block_size", i64::from(settings.block_size)]));
-        db(insert.execute(params!["weak_hash_id", settings.weak_hash_id]));
-        db(insert.execute(params!["strong_hash_id", settings.strong_hash_id]));
-        db(insert.execute(params!["index_id", &index_id[..]]));
-        drop(insert);
-        db(self.conn.execute_batch("COMMIT"));
+        let shared = &self.shared;
+        let mut txn = self.transaction();
+        for cf in Cf::ALL {
+            let mut options = ReadOptions::default();
+            options.set_total_order_seek(true);
+            let mut raw = shared.db.raw_iterator_cf_opt(shared.cf(cf), options);
+            raw.seek_to_last();
+            let Some(last) = raw.key() else {
+                db(raw.status());
+                continue;
+            };
+            // From the first key to the key just after the last one.
+            let end = [last, &[0]].concat();
+            txn.batch.delete_range_cf(shared.cf(cf), &b""[..], &end[..]);
+        }
+        txn.put(Cf::Meta, b"schema_version", &SCHEMA_VERSION.to_be_bytes());
+        txn.put(
+            Cf::Meta,
+            b"block_size",
+            &u64::from(settings.block_size).to_be_bytes(),
+        );
+        txn.put(Cf::Meta, b"weak_hash_id", settings.weak_hash_id.as_bytes());
+        txn.put(
+            Cf::Meta,
+            b"strong_hash_id",
+            settings.strong_hash_id.as_bytes(),
+        );
+        txn.put(Cf::Meta, b"index_id", &index_id);
+        txn.commit();
     }
 
-    pub fn ensure_deferred_block_index(&self) {
-        db(self.conn.execute_batch(DEFERRED_BLOCK_INDEX));
-    }
-
-    /// True when the deferred block index exists. A read-only run needs
-    /// it for candidate lookups and requests an update otherwise
-    /// (DESIGN.md §4.4).
-    pub fn has_deferred_block_index(&self) -> bool {
-        let count: i64 = db(self.conn.query_row(
-            "SELECT count(*) FROM sqlite_master
-             WHERE type = 'index' AND name = 'blocks_by_strong'",
-            [],
-            |row| row.get(0),
-        ));
-        count == 1
+    /// End an update (DESIGN.md §4.4): write the memtables to the database
+    /// files, so that a later read-only process has no write-ahead log to
+    /// replay, then wait for the compactions that RocksDB has scheduled.
+    /// Closing the database would cancel them, and short updates would
+    /// leave ever more of them to later ones.
+    pub fn finish_update(&self) {
+        // `set_flush` flushes the column families one after the other, and
+        // the last flush removes the old write-ahead log. Parallel flushes
+        // can keep it: each flush records the oldest log that the other
+        // column families still need, and two flushes that end together
+        // both see the old log of the other one. The default options have
+        // no timeout.
+        let mut options = WaitForCompactOptions::default();
+        options.set_flush(true);
+        db(self.shared.db.wait_for_compact(&options));
     }
 
     /// The distinct weak hashes, sorted as unsigned 64-bit values, from
-    /// one database snapshot (DESIGN.md §5.4). One statement reads one
-    /// snapshot, even outside a transaction. No index orders the rows, so
-    /// the sort is in memory, with one thread per core.
+    /// one database snapshot (DESIGN.md §5.4). No column family orders
+    /// the blocks by weak hash, so the sort is in memory.
     pub fn export_weak_hashes(&self) -> Vec<u64> {
-        let mut stmt = db(self.conn.prepare("SELECT weak FROM blocks"));
-        let rows = db(stmt.query_map([], |row| row.get::<_, i64>(0)));
-        // Weak hashes are stored as `i64` bit patterns (DESIGN.md §4.4).
-        let mut values: Vec<u64> = rows.map(|row| db(row) as u64).collect();
-        // The pool's threads end when it is dropped.
-        rayon::ThreadPoolBuilder::new()
-            .thread_name(|i| format!("sort{i}"))
-            .build()
-            .expect("cannot start the sort pool")
-            .install(|| values.par_sort_unstable());
+        let mut values = self.shared.sorted_weak_hashes();
         values.dedup();
         values
     }
 
-    /// Reconcile roots before scanning (DESIGN.md §4.2): remove paths and
-    /// rows of unfinished roots and of incomplete inodes, then create rows
-    /// for the roots to scan. Returns their IDs in order.
-    pub fn reconcile_roots(&self, paths: &[&[u8]]) -> Vec<i64> {
-        db(self.conn.execute_batch(
-            "BEGIN IMMEDIATE;
-             DELETE FROM paths WHERE root_id IN (SELECT id FROM roots WHERE identifier IS NULL);
-             DELETE FROM roots WHERE identifier IS NULL;
-             DELETE FROM paths WHERE inode_id IN (SELECT id FROM inodes WHERE size IS NULL);
-             DELETE FROM blocks WHERE inode_id IN (SELECT id FROM inodes WHERE size IS NULL);
-             DELETE FROM inodes WHERE size IS NULL;",
-        ));
-        let mut insert = db(self
-            .conn
-            .prepare("INSERT INTO roots (identifier, path) VALUES (NULL, ?)"));
+    /// Reconcile roots before scanning (DESIGN.md §4.2): remove the paths
+    /// and rows of unfinished roots and of incomplete inodes, then create
+    /// rows for the roots to scan. Returns their IDs in order.
+    ///
+    /// The paths and blocks go first, in bounded transactions; the rows
+    /// then change in one transaction.
+    pub fn reconcile_roots(&self, paths: &[&[u8]]) -> Vec<u64> {
+        // Every root without an identifier is unfinished.
+        let (unfinished, retained): (Vec<_>, Vec<_>) = self
+            .roots()
+            .into_iter()
+            .partition(|(_, row)| row.identifier.is_none());
+        let mut incomplete = Vec::new();
+        self.shared.each(Cf::Inodes, b"", |key, value| {
+            let row = InodeRow::decode(value);
+            if row.size.is_none() {
+                incomplete.push((u64_at(key, 0), row));
+            }
+        });
+
+        let mut txn = self.transaction();
+        for &(root_id, _) in &unfinished {
+            txn.remove_root_paths(root_id);
+        }
+        for (inode_id, _) in &incomplete {
+            txn.remove_inode_paths(*inode_id);
+            txn.remove_blocks(*inode_id);
+        }
+        txn.commit();
+
+        for &(root_id, _) in &unfinished {
+            txn.delete(Cf::Roots, &id_key(root_id));
+        }
+        for (inode_id, row) in &incomplete {
+            txn.delete(Cf::Inodes, &id_key(*inode_id));
+            txn.delete(Cf::Identities, &row.identity);
+        }
+        // IDs of removed roots can return: their paths are gone.
+        let mut next = retained
+            .iter()
+            .map(|&(root_id, _)| root_id)
+            .max()
+            .unwrap_or(0)
+            + 1;
         let ids = paths
             .iter()
             .map(|path| {
-                db(insert.execute(params![*path]));
-                self.conn.last_insert_rowid()
+                let root_id = next;
+                next += 1;
+                let row = RootRow {
+                    identifier: None,
+                    path: path.to_vec(),
+                };
+                txn.put(Cf::Roots, &id_key(root_id), &row.encode());
+                root_id
             })
             .collect();
-        drop(insert);
-        db(self.conn.execute_batch("COMMIT"));
+        txn.commit();
         ids
     }
 
     pub fn stats(&self) -> Stats {
-        let count = |sql: &str| -> u64 {
-            let n: i64 = db(self.conn.query_row(sql, [], |row| row.get(0)));
-            n as u64
+        let shared = &self.shared;
+        let roots = self.roots();
+        let mut stats = Stats {
+            filesystems: 0,
+            roots: roots.len() as u64,
+            roots_complete: roots
+                .iter()
+                .filter(|(_, row)| row.identifier.is_some())
+                .count() as u64,
+            inodes: 0,
+            inodes_incomplete: 0,
+            paths: 0,
+            blocks: 0,
+            distinct_weak: 0,
+            indexed_bytes: 0,
         };
-        let indexed_bytes: i64 = db(self.conn.query_row(
-            "SELECT coalesce(sum(size), 0) FROM inodes WHERE size IS NOT NULL",
-            [],
-            |row| row.get(0),
-        ));
-        Stats {
-            filesystems: count("SELECT count(*) FROM filesystems"),
-            roots: count("SELECT count(*) FROM roots"),
-            roots_complete: count("SELECT count(identifier) FROM roots"),
-            inodes: count("SELECT count(*) FROM inodes"),
-            inodes_incomplete: count("SELECT count(*) FROM inodes WHERE size IS NULL"),
-            paths: count("SELECT count(*) FROM paths"),
-            blocks: count("SELECT count(*) FROM blocks"),
-            // The size of the hash list. Without an index by weak hash,
-            // `count(DISTINCT weak)` would sort in a temporary B-tree.
-            distinct_weak: self.export_weak_hashes().len() as u64,
-            indexed_bytes: indexed_bytes as u64,
-            deferred_block_index: self.has_deferred_block_index(),
-        }
+        shared.each(Cf::Inodes, b"", |_, value| {
+            stats.inodes += 1;
+            match InodeRow::decode(value).size {
+                Some(size) => stats.indexed_bytes = stats.indexed_bytes.saturating_add(size),
+                None => stats.inodes_incomplete += 1,
+            }
+        });
+        // The identities of one filesystem are adjacent.
+        let mut last_fsid = Vec::new();
+        shared.each(Cf::Identities, b"", |key, _| {
+            let fsid = layout::identity_fsid(key);
+            if stats.filesystems == 0 || fsid != last_fsid {
+                stats.filesystems += 1;
+                last_fsid = fsid.to_vec();
+            }
+        });
+        shared.each(Cf::Paths, b"", |_, _| stats.paths += 1);
+        let mut weak = shared.sorted_weak_hashes();
+        stats.blocks = weak.len() as u64;
+        weak.dedup();
+        stats.distinct_weak = weak.len() as u64;
+        stats
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::os::unix::ffi::OsStrExt;
     use std::process::Command;
 
+    use rustix::fs::FlockOperation;
+
     use super::*;
 
-    fn settings() -> Settings {
+    thread_local! {
+        /// Commits that this thread can make before the next one fails;
+        /// `None` for no limit.
+        static COMMITS_LEFT: Cell<Option<u32>> = const { Cell::new(None) };
+    }
+
+    /// Fail every commit of this thread after the next `commits`: an
+    /// interruption between transactions, as when the process dies.
+    pub fn interrupt_after_commits(commits: Option<u32>) {
+        COMMITS_LEFT.set(commits);
+    }
+
+    pub fn before_commit() {
+        match COMMITS_LEFT.get() {
+            Some(0) => panic!("injected interruption"),
+            Some(n) => COMMITS_LEFT.set(Some(n - 1)),
+            None => {}
+        }
+    }
+
+    pub fn settings() -> Settings {
         Settings {
             block_size: 4096,
             weak_hash_id: "test".into(),
@@ -533,15 +865,84 @@ mod tests {
         }
     }
 
+    /// A new modifying index in `dir`.
+    pub fn new_index(dir: &Path) -> Index {
+        let index = open_modifying(dir.join("index").as_os_str().as_bytes());
+        index.reset(&settings());
+        index
+    }
+
+    /// Write rows through one transaction: `(inode_id, identity, size)`
+    /// inodes, `(root_id, path)` roots, `(inode_id, root_id, rel_path)`
+    /// paths, and `(inode_id, block_no, weak, strong prefix)` blocks.
+    pub fn insert(
+        index: &Index,
+        inodes: &[(u64, &[u8], Option<u64>)],
+        roots: &[(u64, &[u8])],
+        paths: &[(u64, u64, &[u8])],
+        blocks: &[(u64, u64, u64, [u8; PREFIX_LEN])],
+    ) {
+        let mut txn = index.transaction();
+        for &(inode_id, identity, size) in inodes {
+            let row = InodeRow {
+                size,
+                ctime_ns: 123,
+                identity: identity.to_vec(),
+            };
+            txn.put(Cf::Inodes, &id_key(inode_id), &row.encode());
+            txn.put(Cf::Identities, identity, &id_key(inode_id));
+        }
+        for &(root_id, path) in roots {
+            let row = RootRow {
+                identifier: None,
+                path: path.to_vec(),
+            };
+            txn.put(Cf::Roots, &id_key(root_id), &row.encode());
+        }
+        for &(inode_id, root_id, rel_path) in paths {
+            txn.put(
+                Cf::Paths,
+                &layout::path_key(root_id, rel_path),
+                &id_key(inode_id),
+            );
+            txn.put(
+                Cf::InodePaths,
+                &layout::inode_path_key(inode_id, root_id, rel_path),
+                &[],
+            );
+        }
+        for &(inode_id, block_no, weak, prefix) in blocks {
+            txn.put(
+                Cf::Blocks,
+                &layout::block_key(inode_id, block_no),
+                &layout::block_value(weak, &prefix),
+            );
+            txn.put(
+                Cf::Strong,
+                &layout::strong_key(&prefix, inode_id, block_no),
+                &[],
+            );
+        }
+        txn.commit();
+    }
+
+    /// The number of entries in a column family.
+    pub fn count(index: &Index, cf: Cf) -> usize {
+        let mut n = 0;
+        index.shared.each(cf, b"", |_, _| n += 1);
+        n
+    }
+
     /// The exit code of a completed probe. The probe process exits with
     /// it because a plain successful exit proves nothing: a filter that
     /// selects no test also exits zero.
     const PROBE_RAN: i32 = 42;
 
-    /// Assert, from a separate process, that the index at `path` is
-    /// locked (`busy`) or readable (`open`). The probe makes the first
-    /// attempt of a read-only process, without the retry loop: this test
-    /// binary runs `lock_probe_child` selected by the environment.
+    /// Assert, from a separate process, that the index at `path` is locked
+    /// against a read-only process (`busy`), or that a read-only process
+    /// can have it (`open`). The probe tries a shared lock of the lock file
+    /// once, without waiting: this test binary runs `lock_probe_child`
+    /// selected by the environment.
     fn probe(path: &Path, expect: &str) {
         let output = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "index::tests::lock_probe_child", "--ignored"])
@@ -558,140 +959,144 @@ mod tests {
         );
     }
 
-    /// Not a test of its own: the separate process that
-    /// `exclusion_survives_worker_readers` starts through `probe`. On the
-    /// expected outcome it exits the process with `PROBE_RAN` instead of
-    /// returning, which tells the parent that the probe really ran.
+    /// Not a test of its own: the separate process that the lock tests
+    /// start through `probe`. It tries a classic POSIX lock, which
+    /// conflicts with the open file description locks of other owners. On
+    /// the expected outcome it exits the process with `PROBE_RAN` instead
+    /// of returning, which tells the parent that the probe really ran.
     #[test]
-    #[ignore = "helper process of exclusion_survives_worker_readers"]
+    #[ignore = "helper process of the lock tests"]
     fn lock_probe_child() {
         let Some(path) = std::env::var_os("HASHSYNC_TEST_LOCK_DB") else {
             return;
         };
         let expect = std::env::var("HASHSYNC_TEST_LOCK_EXPECT").unwrap();
-        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-        let conn = Connection::open_with_flags(Path::new(&path), flags).unwrap();
-        // The bundled SQLite installs a default busy timeout on every new
-        // connection; remove it so contention reports busy at once.
-        conn.busy_handler(None).unwrap();
-        let result = conn
-            .execute_batch("BEGIN")
-            .and_then(|()| schema_read(&conn));
+        let file = rustix::fs::open(
+            Path::new(&path).join(LOCK_FILE),
+            OFlags::RDONLY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
+        let result = rustix::fs::fcntl_lock(&file, FlockOperation::NonBlockingLockShared);
         match (expect.as_str(), result) {
-            ("busy", Err(e)) if is_busy(&e) => {}
-            ("open", Ok(())) => {}
+            ("busy", Err(Errno::AGAIN | Errno::ACCESS)) | ("open", Ok(())) => {}
             (expect, result) => panic!("expected {expect}, got {result:?}"),
         }
-        drop(conn);
+        drop(file);
         std::process::exit(PROBE_RAN);
     }
 
-    /// Process exclusion must survive the worker readers of a modifying
-    /// process (DESIGN.md §4.4): opened by the real helpers, they must
-    /// not downgrade the process lock, and closing them before the
-    /// writer must leave no gap in exclusion. Every probe is a separate
-    /// process (DESIGN.md §11).
+    /// A modifying process excludes other processes for as long as its
+    /// index is open, including the readers of its other threads, and
+    /// closing it leaves no lock (DESIGN.md §4.4). Every probe is a
+    /// separate process (DESIGN.md §11).
     #[test]
-    fn exclusion_survives_worker_readers() {
+    fn a_modifying_process_excludes_others() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("index.sqlite");
-        let path_bytes = path.as_os_str().as_bytes().to_vec();
-
-        let index = open_modifying(&path_bytes);
-        index.reset(&settings());
-        let reader = open_worker_reader(&path_bytes);
+        let path = dir.path().join("index");
+        let index = new_index(dir.path());
+        let reader = index.reader();
+        probe(&path, "busy");
+        drop(index);
+        // The reader keeps the database, and so the lock.
+        probe(&path, "busy");
         assert_eq!(reader.reusable_inode(b"\x01", b"\x02", 4096, 123), None);
-
-        // The connections of this process share the heap WAL index of
-        // `unix-excl`; a writer through the normal VFS would create the
-        // shared-memory file instead. Readers attach to the index the
-        // writer created, so this observes the shared `open_unix_excl`
-        // recipe through the writer.
-        assert!(
-            dir.path().join("index.sqlite-wal").exists(),
-            "the index is not in WAL mode"
-        );
-        assert!(
-            !dir.path().join("index.sqlite-shm").exists(),
-            "the writer bypassed the unix-excl VFS"
-        );
-        probe(&path, "busy");
-
         drop(reader);
-        probe(&path, "busy");
+        probe(&path, "open");
 
+        let read_only = open_read_only(path.as_os_str().as_bytes()).unwrap();
+        probe(&path, "open");
+        assert!(read_only.read_meta().unwrap().compatible(&settings()));
+    }
+
+    /// The lock belongs to its open file description: closing another
+    /// descriptor of the lock file in the same process, which would
+    /// release a classic POSIX lock, keeps it (DESIGN.md §4.4).
+    #[test]
+    fn closing_another_descriptor_keeps_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index");
+        let index = new_index(dir.path());
+        drop(std::fs::File::open(path.join(LOCK_FILE)).unwrap());
+        probe(&path, "busy");
         drop(index);
         probe(&path, "open");
     }
 
-    /// The export sorts the stored `i64` bit patterns as unsigned values
-    /// and deduplicates across inodes (DESIGN.md §5.4).
+    /// A read-only process finds no index where there is no directory, a
+    /// directory without the lock file, or without a database, or a
+    /// database without all its column families: the first update ended
+    /// early.
+    #[test]
+    fn a_missing_database_is_no_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index");
+        let no_index = || open_read_only(path.as_os_str().as_bytes()).is_none();
+        assert!(no_index());
+        std::fs::create_dir(&path).unwrap();
+        assert!(no_index());
+        std::fs::write(path.join(LOCK_FILE), b"").unwrap();
+        assert!(no_index());
+        let mut options = Options::default();
+        options.create_if_missing(true);
+        options.create_missing_column_families(true);
+        drop(DB::open_cf(&options, &path, ["default", "roots"]).unwrap());
+        assert!(no_index());
+    }
+
+    /// The export sorts the weak hashes as unsigned values and
+    /// deduplicates across inodes (DESIGN.md §5.4).
     #[test]
     fn weak_hashes_export_distinct_and_unsigned_sorted() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("index.sqlite");
-        let index = open_modifying(path.as_os_str().as_bytes());
-        index.reset(&settings());
+        let index = new_index(dir.path());
         assert_eq!(index.export_weak_hashes(), Vec::<u64>::new());
-        db(index.conn.execute_batch(
-            "BEGIN IMMEDIATE;
-             INSERT INTO filesystems (id, fsid) VALUES (1, x'01');
-             INSERT INTO inodes (id, fs_id, handle, size, ctime_ns)
-             VALUES (1, 1, x'02', 4096, 1), (2, 1, x'03', 4096, 1);
-             COMMIT;",
-        ));
-        let mut insert = db(index
-            .conn
-            .prepare("INSERT INTO blocks (inode_id, block_no, weak, strong) VALUES (?, ?, ?, ?)"));
-        // 2^63 and u64::MAX are negative as i64 and sort after the small
-        // values only in unsigned order; 7 repeats on another inode.
-        let values: [(i64, u64); 5] = [
-            (7i64, 7),
-            (0, 0),
-            (u64::MAX as i64, u64::MAX),
-            ((1u64 << 63) as i64, 1 << 63),
-            (i64::MAX, i64::MAX as u64),
-        ];
-        for (row, (stored, _)) in values.iter().enumerate() {
-            db(insert.execute(params![1, row as i64, stored, &[0u8; 16][..]]));
-        }
-        db(insert.execute(params![2, 0, 7i64, &[0u8; 16][..]]));
-        drop(insert);
+        // 7 repeats on another inode.
+        let values = [7, 0, u64::MAX, 1 << 63, i64::MAX as u64];
+        let mut blocks: Vec<_> = values
+            .iter()
+            .enumerate()
+            .map(|(block_no, &weak)| (1, block_no as u64, weak, [0; PREFIX_LEN]))
+            .collect();
+        blocks.push((2, 0, 7, [0; PREFIX_LEN]));
+        insert(
+            &index,
+            &[(1, b"\x01a", Some(4096)), (2, b"\x01b", Some(4096))],
+            &[],
+            &[],
+            &blocks,
+        );
         assert_eq!(
             index.export_weak_hashes(),
             vec![0, 7, i64::MAX as u64, 1 << 63, u64::MAX]
         );
+        let stats = index.stats();
+        assert_eq!((stats.blocks, stats.distinct_weak), (6, 5));
     }
 
-    /// Candidates follow the inode rows and block numbers, include blocks
-    /// of inodes without paths, stop at the limit, and come from the
-    /// `blocks_by_strong` index without a sort (DESIGN.md §4.4 and §6.4).
+    /// Candidates follow the inode IDs and block numbers, include blocks
+    /// of inodes without paths, and stop at the limit (DESIGN.md §4.4 and
+    /// §6.4).
     #[test]
     fn candidates_are_ordered_and_limited() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("index.sqlite");
-        let index = open_modifying(path.as_os_str().as_bytes());
-        index.reset(&settings());
-        index.ensure_deferred_block_index();
-        db(index.conn.execute_batch(
-            "BEGIN IMMEDIATE;
-             INSERT INTO filesystems (id, fsid) VALUES (1, x'01');
-             INSERT INTO roots (id, identifier, path) VALUES (1, NULL, x'2f72');
-             INSERT INTO inodes (id, fs_id, handle, size, ctime_ns)
-             VALUES (1, 1, x'01', 8192, 1), (2, 1, x'02', 8192, 1);
-             INSERT INTO paths (root_id, rel_path, inode_id)
-             VALUES (1, x'61', 2), (1, x'62', 2);
-             INSERT INTO blocks (inode_id, block_no, weak, strong) VALUES
-               (2, 1, 0, x'11111111111111111111111111111111'),
-               (2, 0, 0, x'11111111111111111111111111111111'),
-               (1, 5, 0, x'11111111111111111111111111111111'),
-               (1, 6, 0, x'22222222222222222222222222222222');
-             COMMIT;",
-        ));
+        let index = new_index(dir.path());
+        let (one, two) = ([0x11; PREFIX_LEN], [0x22; PREFIX_LEN]);
+        insert(
+            &index,
+            &[(1, b"\x01\x01", Some(8192)), (2, b"\x01\x02", Some(8192))],
+            &[(1, b"/r")],
+            &[(2, 1, b"a"), (2, 1, b"b")],
+            &[
+                (2, 1, 0, one),
+                (2, 0, 0, one),
+                (1, 5, 0, one),
+                (1, 6, 0, two),
+            ],
+        );
         let reader = index.reader();
-        let prefix = [0x11u8; 16];
         let found: Vec<String> = reader
-            .candidates(&prefix, 10)
+            .candidates(&one, 10)
             .into_iter()
             .map(|c| match c.path {
                 Some((root, rel)) => format!("{} {root}/{}", c.block_no, rel.as_bstr()),
@@ -699,58 +1104,87 @@ mod tests {
             })
             .collect();
         assert_eq!(found, ["5 -", "0 1/a", "0 1/b", "1 1/a", "1 1/b"]);
-        assert_eq!(reader.candidates(&prefix, 2).len(), 2);
-        assert!(reader.candidates(&[0x33; 16], 10).is_empty());
-        // Each lookup reuses the prepared statement.
-        let stmt = reader.conn.prepare_cached(CANDIDATES).unwrap();
-        assert_eq!(stmt.get_status(rusqlite::StatementStatus::RePrepare), 0);
-
-        let plan: Vec<String> = {
-            let mut stmt = index
-                .conn
-                .prepare(&format!("EXPLAIN QUERY PLAN {CANDIDATES}"))
-                .unwrap();
-            stmt.query_map(params![&prefix[..]], |row| row.get::<_, String>(3))
-                .unwrap()
-                .map(Result::unwrap)
-                .collect()
-        };
-        assert!(
-            plan.iter().any(|step| step.contains("blocks_by_strong")),
-            "{plan:?}"
-        );
-        assert!(
-            !plan.iter().any(|step| step.contains("TEMP B-TREE")),
-            "{plan:?}"
-        );
+        assert_eq!(reader.candidates(&one, 2).len(), 2);
+        assert_eq!(reader.candidates(&one, 1).len(), 1);
+        assert_eq!(reader.candidates(&two, 10).len(), 1);
+        assert!(reader.candidates(&[0x33; PREFIX_LEN], 10).is_empty());
+        // Neighbors of the prefix are not candidates.
+        assert!(reader.candidates(&[0x10; PREFIX_LEN], 10).is_empty());
+        let mut after = one;
+        after[PREFIX_LEN - 1] += 1;
+        assert!(reader.candidates(&after, 10).is_empty());
     }
 
-    /// A worker reader opens after the writer holds the process lock and
-    /// queries in autocommit: each query must observe the writer's latest
-    /// commit through the WAL that the `unix-excl` connections share
-    /// (DESIGN.md §4.4).
+    /// A scan of the entries of one inode stops at its last entry, also
+    /// when removed entries follow. The reconciliation removes all paths,
+    /// so the paths of vanished files remain as removed entries, in the
+    /// order of their inode IDs. Without the stop, a lookup of the inode
+    /// before them, and the removal of each orphan, would skip all of them.
     #[test]
-    fn worker_readers_see_later_commits() {
+    fn scans_stop_before_removed_entries() {
+        use rocksdb::perf::{PerfContext, PerfMetric, PerfStatsLevel, set_perf_stats};
+
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("index.sqlite");
-        let path_bytes = path.as_os_str().as_bytes().to_vec();
+        let index = new_index(dir.path());
+        // Inode 1 has a block and a path. The paths of inodes 2 to 1001
+        // follow, and are removed.
+        let identities: Vec<Vec<u8>> = (1..=1001u64)
+            .map(|id| layout::identity(b"\x01", &id.to_be_bytes()))
+            .collect();
+        let names: Vec<String> = (1..=1001).map(|id| format!("f{id}")).collect();
+        let inodes: Vec<(u64, &[u8], Option<u64>)> = (1..)
+            .zip(&identities)
+            .map(|(id, identity)| (id, &identity[..], Some(4096)))
+            .collect();
+        let paths: Vec<(u64, u64, &[u8])> = (1..)
+            .zip(&names)
+            .map(|(id, name)| (id, 1, name.as_bytes()))
+            .collect();
+        let prefix = [0x11; PREFIX_LEN];
+        insert(&index, &inodes, &[(1, b"/r")], &paths, &[(1, 0, 0, prefix)]);
+        let mut txn = index.transaction();
+        for &(inode_id, root_id, rel_path) in &paths[1..] {
+            txn.delete(Cf::Paths, &layout::path_key(root_id, rel_path));
+            txn.delete(
+                Cf::InodePaths,
+                &layout::inode_path_key(inode_id, root_id, rel_path),
+            );
+        }
+        txn.commit();
 
-        let index = open_modifying(&path_bytes);
-        index.reset(&settings());
-        let reader = open_worker_reader(&path_bytes);
+        // RocksDB counts the removed entries that the reads of this thread
+        // skip.
+        set_perf_stats(PerfStatsLevel::EnableCount);
+        let mut perf = PerfContext::default();
+        perf.reset();
+        assert_eq!(index.reader().candidates(&prefix, 10).len(), 1);
+        let mut txn = index.transaction();
+        txn.remove_inode_paths(2);
+        txn.commit();
+        let skipped = perf.metric(PerfMetric::InternalDeleteSkippedCount);
+        set_perf_stats(PerfStatsLevel::Disable);
+        // At most the removed path of inode 2 itself.
+        assert!(skipped <= 1, "{skipped} removed entries skipped");
+    }
+
+    /// A reader of a modifying process sees each commit of the process at
+    /// once (DESIGN.md §4.4).
+    #[test]
+    fn readers_see_later_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = new_index(dir.path());
+        let reader = index.reader();
         assert_eq!(reader.reusable_inode(b"\x01", b"\x02", 4096, 123), None);
-
-        // Committed after the reader's first query: the reader must not
-        // stay on its earlier snapshot.
-        db(index.conn.execute_batch(
-            "BEGIN IMMEDIATE;
-             INSERT INTO filesystems (id, fsid) VALUES (1, x'01');
-             INSERT INTO inodes (id, fs_id, handle, size, ctime_ns)
-             VALUES (7, 1, x'02', 4096, 123);
-             INSERT INTO inodes (id, fs_id, handle, size, ctime_ns)
-             VALUES (8, 1, x'03', NULL, 123);
-             COMMIT;",
-        ));
+        insert(
+            &index,
+            &[
+                (7, &layout::identity(b"\x01", b"\x02"), Some(4096)),
+                (8, &layout::identity(b"\x01", b"\x03"), None),
+            ],
+            &[],
+            &[],
+            &[],
+        );
         assert_eq!(
             reader.reusable_inode(b"\x01", b"\x02", 4096, 123),
             Some(7),
@@ -765,24 +1199,49 @@ mod tests {
         );
     }
 
-    /// Every connection has its own page cache (DESIGN.md §4.4).
-    /// `libsqlite3-sys` builds the bundled SQLite with
-    /// `SQLITE_ENABLE_MEMORY_MANAGEMENT`, which puts all page caches under
-    /// one mutex; `.cargo/config.toml` removes that option.
+    /// A reset removes every entry, keeps the index usable, and renews
+    /// the index ID; reconciliation reuses the IDs of removed roots only
+    /// after their paths are gone.
     #[test]
-    fn page_caches_are_separate() {
-        let conn = Connection::open_in_memory().unwrap();
-        let mut stmt = conn.prepare("PRAGMA compile_options").unwrap();
-        let options: Vec<String> = stmt
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .map(Result::unwrap)
-            .collect();
-        // A known option shows that the pragma reports the options.
-        assert!(options.iter().any(|o| o == "THREADSAFE=1"), "{options:?}");
-        assert!(
-            !options.iter().any(|o| o == "ENABLE_MEMORY_MANAGEMENT"),
-            "{options:?}"
+    fn reset_and_reconcile() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = new_index(dir.path());
+        let first_id = index.read_meta().unwrap().index_id;
+        insert(
+            &index,
+            &[(1, b"\x01\x01", Some(4096)), (2, b"\x01\x02", None)],
+            &[(1, b"/r")],
+            &[(1, 1, b"a"), (2, 1, b"b")],
+            &[(1, 0, 5, [1; PREFIX_LEN]), (2, 0, 6, [2; PREFIX_LEN])],
         );
+        // The incomplete inode goes with its paths and blocks, the
+        // unfinished root with its paths; the complete inode stays.
+        assert_eq!(index.reconcile_roots(&[b"/s", b"/t"]), [1, 2]);
+        assert_eq!(
+            index.root_paths(),
+            [(1, b"/s".to_vec()), (2, b"/t".to_vec())]
+        );
+        for (cf, n) in [
+            (Cf::Inodes, 1),
+            (Cf::Identities, 1),
+            (Cf::Paths, 0),
+            (Cf::InodePaths, 0),
+            (Cf::Blocks, 1),
+            (Cf::Strong, 1),
+        ] {
+            assert_eq!(count(&index, cf), n, "{cf:?}");
+        }
+        assert_eq!(index.next_inode_id(), 2);
+
+        index.reset(&settings());
+        for cf in Cf::ALL {
+            let expected = if cf == Cf::Meta { 5 } else { 0 };
+            assert_eq!(count(&index, cf), expected, "{cf:?}");
+        }
+        let meta = index.read_meta().unwrap();
+        assert!(meta.compatible(&settings()));
+        assert_ne!(meta.index_id, first_id);
+        assert_eq!(index.next_inode_id(), 1);
+        assert_eq!(index.reconcile_roots(&[b"/u"]), [1]);
     }
 }

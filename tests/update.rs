@@ -8,6 +8,7 @@ use std::os::unix::fs::symlink;
 use std::process::Command;
 
 use common::*;
+use rocksdb::WriteBatch;
 
 #[test]
 fn indexes_complete_useful_blocks() {
@@ -29,14 +30,21 @@ fn indexes_complete_useful_blocks() {
     assert!(stderr.contains("5 files hashed"), "{stderr}");
     assert!(stderr.contains("6 periodic"), "{stderr}");
 
-    assert_eq!(env.count("SELECT count(*) FROM inodes"), 5);
-    assert_eq!(
-        env.count("SELECT count(*) FROM inodes WHERE size IS NULL"),
-        0
-    );
-    assert_eq!(env.count("SELECT count(*) FROM blocks"), 1 + 2 + 2);
-    assert_eq!(env.count("SELECT count(*) FROM roots"), 1);
-    assert_eq!(env.count("SELECT count(*) FROM filesystems"), 1);
+    assert_eq!(env.count("inodes"), 5);
+    assert_eq!(env.index().incomplete_inodes(), 0);
+    assert_eq!(env.count("blocks"), 1 + 2 + 2);
+    assert_eq!(env.count("roots"), 1);
+    // Every inode is on one filesystem. An identity starts with the length
+    // of its filesystem ID, then that ID.
+    let mut filesystems: Vec<Vec<u8>> = env
+        .index()
+        .inodes()
+        .into_iter()
+        .map(|inode| inode.identity[..1 + usize::from(inode.identity[0])].to_vec())
+        .collect();
+    filesystems.sort();
+    filesystems.dedup();
+    assert_eq!(filesystems.len(), 1);
     assert_eq!(
         env.tree_paths(),
         vec![
@@ -55,24 +63,24 @@ fn indexes_complete_useful_blocks() {
     let expected = blake3::hash(&random(BLOCK, 2)).as_bytes()[..16].to_vec();
     assert_eq!(env.strong_prefixes("one_block"), vec![expected]);
     // one_block, two_and_half, zeros, pattern16, and mixed.
-    let sizes: i64 = env.count("SELECT sum(size) FROM inodes");
+    let sizes: u64 = env
+        .index()
+        .inodes()
+        .iter()
+        .filter_map(|inode| inode.size)
+        .sum();
     assert_eq!(
         sizes as usize,
         BLOCK + (BLOCK * 2 + BLOCK / 2) + BLOCK * 3 + BLOCK * 2 + BLOCK * 3
     );
 
-    // The deferred block index is the only index of the blocks; none
-    // orders them by weak hash (DESIGN.md §4.4).
-    let indexes: String = env
-        .db()
-        .query_row(
-            "SELECT group_concat(name) FROM sqlite_master
-             WHERE type = 'index' AND tbl_name = 'blocks'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(indexes, "blocks_by_strong");
+    // The column families are those of DESIGN.md §4.4: `strong` holds the
+    // only other key of each block row, and no column family orders the
+    // blocks by weak hash.
+    let mut expected: Vec<String> = COLUMN_FAMILIES.map(String::from).to_vec();
+    expected.sort();
+    assert_eq!(env.column_families(), expected);
+    env.index().assert_consistent();
 }
 
 #[test]
@@ -129,9 +137,9 @@ fn hard_links_within_and_across_roots() {
     assert!(stderr.contains("1 files hashed"), "{stderr}");
     assert!(stderr.contains("3 hard links"), "{stderr}");
 
-    assert_eq!(env.count("SELECT count(*) FROM inodes"), 1);
-    assert_eq!(env.count("SELECT count(*) FROM blocks"), 2);
-    assert_eq!(env.count("SELECT count(*) FROM roots"), 2);
+    assert_eq!(env.count("inodes"), 1);
+    assert_eq!(env.count("blocks"), 2);
+    assert_eq!(env.count("roots"), 2);
     let paths = env.paths();
     assert_eq!(paths.len(), 4);
     assert_eq!(env.tree_paths(), vec!["a/one", "a/two", "b/three"]);
@@ -160,8 +168,8 @@ fn hard_links_across_repeated_updates() {
     assert!(stderr.contains("1 unchanged"), "{stderr}");
     assert!(stderr.contains("1 hard links"), "{stderr}");
     assert_eq!(env.tree_paths(), vec!["one", "two"]);
-    assert_eq!(env.count("SELECT count(*) FROM inodes"), 1);
-    assert_eq!(env.count("SELECT count(*) FROM blocks"), 1);
+    assert_eq!(env.count("inodes"), 1);
+    assert_eq!(env.count("blocks"), 1);
 
     // An added link changes the inode's ctime, so the content is hashed
     // again into the same inode row; all three links get paths.
@@ -170,8 +178,9 @@ fn hard_links_across_repeated_updates() {
     assert!(stderr.contains("1 files hashed"), "{stderr}");
     assert!(stderr.contains("2 hard links"), "{stderr}");
     assert_eq!(env.tree_paths(), vec!["one", "three", "two"]);
-    assert_eq!(env.count("SELECT count(*) FROM inodes"), 1);
-    assert_eq!(env.count("SELECT count(*) FROM blocks"), 1);
+    assert_eq!(env.count("inodes"), 1);
+    assert_eq!(env.count("blocks"), 1);
+    env.index().assert_consistent();
 
     // A removed link also changes the ctime; the remaining links keep
     // the inode alive.
@@ -181,8 +190,8 @@ fn hard_links_across_repeated_updates() {
     assert!(stderr.contains("1 hard links"), "{stderr}");
     assert!(stderr.contains(" 0 stale inodes removed"), "{stderr}");
     assert_eq!(env.tree_paths(), vec!["one", "three"]);
-    assert_eq!(env.count("SELECT count(*) FROM inodes"), 1);
-    assert_eq!(env.count("SELECT count(*) FROM blocks"), 1);
+    assert_eq!(env.count("inodes"), 1);
+    assert_eq!(env.count("blocks"), 1);
 
     // Removing the last links orphans the inode.
     std::fs::remove_file(env.path("tree/one")).unwrap();
@@ -190,9 +199,10 @@ fn hard_links_across_repeated_updates() {
     let stderr = env.update();
     assert!(stderr.contains(" 0 files hashed"), "{stderr}");
     assert!(stderr.contains("1 stale inodes removed"), "{stderr}");
-    assert_eq!(env.count("SELECT count(*) FROM paths"), 0);
-    assert_eq!(env.count("SELECT count(*) FROM inodes"), 0);
-    assert_eq!(env.count("SELECT count(*) FROM blocks"), 0);
+    assert_eq!(env.count("paths"), 0);
+    assert_eq!(env.count("inodes"), 0);
+    assert_eq!(env.count("blocks"), 0);
+    env.index().assert_consistent();
 }
 
 #[test]
@@ -276,8 +286,8 @@ fn root_pattern_expansion() {
     env.configure(&env.root("tree/*", "exclude = ['.hidden']"));
     env.update();
     // a, b, file, small are roots; .hidden is excluded; link is a symlink.
-    assert_eq!(env.count("SELECT count(*) FROM roots"), 4);
-    assert_eq!(env.count("SELECT count(*) FROM paths"), 3);
+    assert_eq!(env.count("roots"), 4);
+    assert_eq!(env.count("paths"), 3);
 
     // `**` spans directories; a pattern matching nothing only warns.
     env.write("tree/x/y/leaf", &random(BLOCK, 6));
@@ -289,8 +299,8 @@ fn root_pattern_expansion() {
     ));
     let stderr = env.update();
     assert!(stderr.contains("matched nothing"), "{stderr}");
-    assert_eq!(env.count("SELECT count(*) FROM roots"), 2);
-    assert_eq!(env.count("SELECT count(*) FROM paths"), 2);
+    assert_eq!(env.count("roots"), 2);
+    assert_eq!(env.count("paths"), 2);
 }
 
 #[test]
@@ -311,7 +321,7 @@ fn missing_and_non_indexable_roots_only_warn() {
         "{stderr}"
     );
     assert_eq!(env.tree_paths(), vec!["f"]);
-    assert_eq!(env.count("SELECT count(*) FROM paths"), 1);
+    assert_eq!(env.count("paths"), 1);
 }
 
 #[test]
@@ -345,11 +355,8 @@ fn duplicate_and_nested_roots_are_rejected() {
     assert!(!stderr.contains("rebuilding"), "{stderr}");
     assert_eq!(env.index_id(), index_id, "the index ID is unchanged");
     assert_eq!(env.tree_paths(), vec!["a/f"]);
-    assert_eq!(env.count("SELECT count(*) FROM blocks"), 1);
-    assert_eq!(
-        env.count("SELECT value FROM meta WHERE key = 'block_size'"),
-        BLOCK as i64
-    );
+    assert_eq!(env.count("blocks"), 1);
+    assert_eq!(env.index().meta_u64("block_size"), BLOCK as u64);
 }
 
 #[test]
@@ -363,14 +370,14 @@ fn any_depth_patterns_enter_each_directory_once() {
     env.write("tree/x/leaf", &random(BLOCK, 4));
     env.configure(&env.root("tree/**/a/**/leaf", ""));
     env.update();
-    assert_eq!(env.count("SELECT count(*) FROM roots"), 3);
-    assert_eq!(env.count("SELECT count(*) FROM paths"), 3);
+    assert_eq!(env.count("roots"), 3);
+    assert_eq!(env.count("paths"), 3);
 
     // Consecutive `**` components overlap completely.
     env.configure(&env.root("tree/**/**/leaf", ""));
     env.update();
-    assert_eq!(env.count("SELECT count(*) FROM roots"), 4);
-    assert_eq!(env.count("SELECT count(*) FROM paths"), 4);
+    assert_eq!(env.count("roots"), 4);
+    assert_eq!(env.count("paths"), 4);
 }
 
 #[test]
@@ -407,7 +414,7 @@ fn unlistable_directories_are_abandoned_under_any_depth() {
         "{stderr}"
     );
     assert!(stderr.contains("matched nothing"), "{stderr}");
-    assert_eq!(env.count("SELECT count(*) FROM roots"), 0);
+    assert_eq!(env.count("roots"), 0);
 
     // A literal after `*` is looked up, which needs no listing.
     env.chmod("tree/x", 0o111);
@@ -436,14 +443,14 @@ fn trailing_any_depth_matches_inside_the_directory_only() {
     env.configure(&env.root("tree/**", ""));
     env.update();
     // `tree` itself is not a match; every entry inside it is one.
-    assert_eq!(env.count("SELECT count(*) FROM roots"), 2);
-    assert_eq!(env.count("SELECT count(*) FROM paths"), 2);
+    assert_eq!(env.count("roots"), 2);
+    assert_eq!(env.count("paths"), 2);
 
     // Nothing is inside a regular file.
     env.configure(&env.root("tree/f/**", ""));
     let stderr = env.update();
     assert!(stderr.contains("matched nothing"), "{stderr}");
-    assert_eq!(env.count("SELECT count(*) FROM roots"), 0);
+    assert_eq!(env.count("roots"), 0);
 }
 
 #[test]
@@ -460,7 +467,7 @@ fn the_slash_root_can_be_excluded() {
         stderr.contains("root pattern / matched nothing"),
         "{stderr}"
     );
-    assert_eq!(env.count("SELECT count(*) FROM roots"), 1);
+    assert_eq!(env.count("roots"), 1);
     assert_eq!(env.tree_paths(), vec!["f"]);
 }
 
@@ -496,7 +503,7 @@ fn exclusions_prune_root_expansion() {
     env.configure(&env.root("tree/*/a/leaf", "exclude = ['a']"));
     let stderr = env.update();
     assert!(stderr.contains("matched nothing"), "{stderr}");
-    assert_eq!(env.count("SELECT count(*) FROM roots"), 0);
+    assert_eq!(env.count("roots"), 0);
 
     // An exact pattern names its root as written; only the root itself
     // can be excluded.
@@ -510,9 +517,9 @@ fn exclusions_prune_root_expansion() {
     assert_eq!(root_paths(&env), vec![format!("{tree}/a/b/leaf")]);
 }
 
-/// Rows enough to pass the writer's 50,000-work commit limit (COMMIT_WORK)
-/// while full 1,024-row deletion batches (BATCH_ROWS) remain: replacing
-/// them commits during deletion, and again during insertion.
+/// Block rows enough that replacing them commits during the removal, and
+/// again during the insertion: each block row is two entries (`blocks` and
+/// `strong`), and a transaction holds 50,000 changes (COMMIT_WORK).
 const MANY_BLOCKS: usize = 51_200;
 
 #[test]
@@ -521,23 +528,22 @@ fn large_files_are_rehashed_in_bounded_batches() {
     env.write("tree/big", &tiled(MANY_BLOCKS, 1));
     env.configure(&env.root("tree", ""));
     env.update();
-    assert_eq!(env.count("SELECT count(*) FROM blocks"), MANY_BLOCKS as i64);
+    assert_eq!(env.count("blocks"), MANY_BLOCKS);
 
     // Changed content: all old rows go, across commits, before the new
     // rows arrive.
     env.write("tree/big", &tiled(MANY_BLOCKS, 2));
     env.update();
-    assert_eq!(env.count("SELECT count(*) FROM blocks"), MANY_BLOCKS as i64);
-    assert_eq!(
-        env.count("SELECT count(*) FROM inodes WHERE size IS NULL"),
-        0
-    );
+    assert_eq!(env.count("blocks"), MANY_BLOCKS);
+    assert_eq!(env.index().incomplete_inodes(), 0);
+    env.index().assert_consistent();
 
     // A shrunken file loses its rows, again across several transactions.
     env.write("tree/big", &random(10, 1));
     env.update();
-    assert_eq!(env.count("SELECT count(*) FROM blocks"), 0);
-    assert_eq!(env.count("SELECT count(*) FROM inodes"), 0);
+    assert_eq!(env.count("blocks"), 0);
+    assert_eq!(env.count("inodes"), 0);
+    env.index().assert_consistent();
 }
 
 #[test]
@@ -550,25 +556,36 @@ fn interrupted_replacements_are_recovered() {
     // A replacement interrupted between commits leaves a committed
     // incomplete inode with only some rows removed. The next update
     // removes the leftover rows and hashes the file again (DESIGN.md §4.2).
-    env.db_rw()
-        .execute_batch(&format!(
-            "UPDATE inodes SET size = NULL;
-             DELETE FROM blocks WHERE block_no >= {};",
-            MANY_BLOCKS / 2
-        ))
-        .unwrap();
-    assert_eq!(
-        env.count("SELECT count(*) FROM blocks"),
-        (MANY_BLOCKS / 2) as i64
-    );
+    let index = env.index_rw();
+    let mut batch = WriteBatch::default();
+    for inode in index.inodes() {
+        let incomplete = Inode {
+            size: None,
+            ..inode
+        };
+        batch.put_cf(
+            index.cf("inodes"),
+            incomplete.id.to_be_bytes(),
+            incomplete.value(),
+        );
+    }
+    for block in index.blocks() {
+        if block.block_no >= (MANY_BLOCKS / 2) as u64 {
+            batch.delete_cf(index.cf("blocks"), block.key());
+            batch.delete_cf(index.cf("strong"), block.strong_key());
+        }
+    }
+    index.write(batch);
+    drop(index);
+    assert_eq!(env.count("blocks"), MANY_BLOCKS / 2);
+    assert_eq!(env.count("strong"), MANY_BLOCKS / 2);
+    assert_eq!(env.index().incomplete_inodes(), 1);
     let stderr = env.update();
     assert!(stderr.contains("1 files hashed"), "{stderr}");
-    assert_eq!(env.count("SELECT count(*) FROM blocks"), MANY_BLOCKS as i64);
-    assert_eq!(
-        env.count("SELECT count(*) FROM inodes WHERE size IS NULL"),
-        0
-    );
-    assert_eq!(env.count("SELECT count(*) FROM paths"), 1);
+    assert_eq!(env.count("blocks"), MANY_BLOCKS);
+    assert_eq!(env.index().incomplete_inodes(), 0);
+    assert_eq!(env.count("paths"), 1);
+    env.index().assert_consistent();
 }
 
 #[test]
@@ -585,8 +602,8 @@ fn unchanged_files_are_reused_without_rehashing() {
     assert!(stderr.contains(" 0 files hashed"), "{stderr}");
     assert!(stderr.contains("2 unchanged"), "{stderr}");
     assert_eq!(env.tree_paths(), vec!["a", "b/f"]);
-    assert_eq!(env.count("SELECT count(*) FROM inodes"), 2);
-    assert_eq!(env.count("SELECT count(*) FROM blocks"), 3);
+    assert_eq!(env.count("inodes"), 2);
+    assert_eq!(env.count("blocks"), 3);
 
     // Renaming a directory does not change the ctime of the files inside
     // it: their content is reused while their paths follow the move.
@@ -595,7 +612,7 @@ fn unchanged_files_are_reused_without_rehashing() {
     assert!(stderr.contains(" 0 files hashed"), "{stderr}");
     assert!(stderr.contains("2 unchanged"), "{stderr}");
     assert_eq!(env.tree_paths(), vec!["a", "c/f"]);
-    assert_eq!(env.count("SELECT count(*) FROM inodes"), 2);
+    assert_eq!(env.count("inodes"), 2);
 
     // New content of the same size, with the mtime put back: the kernel
     // ctime still changes, so the file is hashed again (DESIGN.md §4.2).
@@ -634,38 +651,15 @@ fn files_without_useful_blocks_are_retained_and_reused() {
 
     // The files keep complete inode and path rows, without block rows.
     assert_eq!(env.tree_paths(), vec!["sparse", "tail", "zeros"]);
-    assert_eq!(env.count("SELECT count(*) FROM inodes"), 3);
-    assert_eq!(
-        env.count("SELECT count(*) FROM inodes WHERE size IS NULL"),
-        0
-    );
-    assert_eq!(env.count("SELECT count(*) FROM blocks"), 0);
+    assert_eq!(env.count("inodes"), 3);
+    assert_eq!(env.index().incomplete_inodes(), 0);
+    assert_eq!(env.count("blocks"), 0);
 
     // The next update reuses the files instead of rehashing them.
     let stderr = env.update();
     assert!(stderr.contains(" 0 files hashed"), "{stderr}");
     assert!(stderr.contains("3 unchanged"), "{stderr}");
     assert_eq!(env.tree_paths(), vec!["sparse", "tail", "zeros"]);
-}
-
-#[test]
-fn missing_deferred_block_index_is_repaired() {
-    let env = Env::new();
-    env.write("tree/f", &random(BLOCK, 1));
-    env.configure(&env.root("tree", ""));
-    env.update();
-
-    // An interrupted rebuild can leave the deferred block index missing;
-    // every update repairs it (DESIGN.md §4.4).
-    env.db_rw()
-        .execute_batch("DROP INDEX blocks_by_strong")
-        .unwrap();
-    let stderr = env.update();
-    assert!(stderr.contains("1 unchanged"), "{stderr}");
-    assert_eq!(
-        env.count("SELECT count(*) FROM sqlite_master WHERE name = 'blocks_by_strong'"),
-        1
-    );
 }
 
 #[test]
@@ -688,7 +682,7 @@ fn updates_reflect_changes_and_rebuilds() {
     env.write("tree/blanks", &random(BLOCK, 6));
     env.configure(&env.root("tree", ""));
     env.update();
-    assert_eq!(env.count("SELECT count(*) FROM inodes"), 5);
+    assert_eq!(env.count("inodes"), 5);
     let index_id = env.index_id();
 
     std::fs::remove_file(env.path("tree/goes")).unwrap();
@@ -705,9 +699,10 @@ fn updates_reflect_changes_and_rebuilds() {
     assert!(stderr.contains("1 unchanged"), "{stderr}");
     assert!(stderr.contains("1 stale inodes removed"), "{stderr}");
     assert_eq!(env.tree_paths(), vec!["blanks", "moved", "new", "stays"]);
-    assert_eq!(env.count("SELECT count(*) FROM inodes"), 4);
-    assert_eq!(env.count("SELECT count(*) FROM blocks"), 3);
+    assert_eq!(env.count("inodes"), 4);
+    assert_eq!(env.count("blocks"), 3);
     assert!(env.block_numbers("blanks").is_empty());
+    env.index().assert_consistent();
     assert_eq!(
         env.index_id(),
         index_id,
@@ -720,7 +715,8 @@ fn updates_reflect_changes_and_rebuilds() {
     assert!(stderr.contains("4 files hashed"), "{stderr}");
     assert!(stderr.contains(" 0 unchanged"), "{stderr}");
     assert_ne!(env.index_id(), index_id, "a rebuild renews the index ID");
-    assert_eq!(env.count("SELECT count(*) FROM inodes"), 4);
+    assert_eq!(env.count("inodes"), 4);
+    env.index().assert_consistent();
 
     // Changed settings rebuild the index in place.
     let rebuilt_id = env.index_id();
@@ -733,14 +729,11 @@ fn updates_reflect_changes_and_rebuilds() {
     assert!(stderr.contains("rebuilding"), "{stderr}");
     assert_ne!(env.index_id(), rebuilt_id);
     assert_eq!(
-        env.count("SELECT count(*) FROM inodes"),
+        env.count("inodes"),
         0,
         "every file is smaller than the 8 KiB block size"
     );
-    assert_eq!(
-        env.count("SELECT value FROM meta WHERE key = 'block_size'"),
-        (BLOCK * 2) as i64
-    );
+    assert_eq!(env.index().meta_u64("block_size"), (BLOCK * 2) as u64);
 }
 
 #[test]
@@ -771,6 +764,9 @@ fn stats_reports_the_index() {
         stats.contains(&format!("indexed bytes:    {}", BLOCK * 2)),
         "{stats}"
     );
+    // The end of the update wrote the memtables to the database files
+    // (DESIGN.md §4.4).
+    assert!(stats.contains("(+0 write-ahead log)"), "{stats}");
 
     // Stats of an incompatible index still print, with a warning.
     env.configure_with(&format!(
@@ -781,6 +777,29 @@ fn stats_reports_the_index() {
     let output = env.run(&["stats"]);
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("differ from the configuration"));
+}
+
+/// RocksDB keeps all files of the index open: here one for each column
+/// family, more than a soft descriptor limit of 8 leaves after the
+/// standard streams and the lock file. Every process raises the limit
+/// before it opens the index (DESIGN.md §4.4).
+#[test]
+fn a_low_descriptor_limit_is_raised() {
+    let env = Env::new();
+    env.write("tree/f", &random(BLOCK, 1));
+    env.configure(&env.root("tree", ""));
+    for command in ["update", "stats"] {
+        let output = Command::new("sh")
+            .args(["-c", "ulimit -S -n 8 && exec \"$@\"", "sh"])
+            .arg(env!("CARGO_BIN_EXE_hashsync"))
+            .arg("--config")
+            .arg(env.config_path())
+            .arg(command)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{command} failed:\n{stderr}");
+    }
 }
 
 #[test]
@@ -807,10 +826,7 @@ fn unreadable_entries_are_skipped_with_a_warning() {
         "{stderr}"
     );
     assert_eq!(env.tree_paths(), vec!["ok"]);
-    assert_eq!(
-        env.count("SELECT count(*) FROM inodes WHERE size IS NULL"),
-        0
-    );
+    assert_eq!(env.index().incomplete_inodes(), 0);
 }
 
 /// A pipe without a reader: every write to it fails with `EPIPE`.
@@ -864,15 +880,15 @@ fn missing_configuration_fails() {
 }
 
 #[test]
-fn bare_relative_index_filename() {
+fn bare_relative_index_directory() {
     let env = Env::new();
     env.write("tree/a", &random(BLOCK, 1));
-    // A single-component relative filename has an empty parent path, which
-    // needs no directory creation.
+    // A single-component relative name: the index directory is created in
+    // the current directory, whose path is empty.
     std::fs::write(
         env.config_path(),
         format!(
-            "index_path = 'index.sqlite'\nblock_size = {BLOCK}\n{}",
+            "index_path = 'default.db'\nblock_size = {BLOCK}\n{}",
             env.root("tree", "")
         ),
     )
@@ -885,6 +901,6 @@ fn bare_relative_index_filename() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(output.status.success(), "{run} update failed:\n{stderr}");
     }
-    assert!(env.index_path().is_file());
-    assert_eq!(env.count("SELECT count(*) FROM blocks"), 1);
+    assert!(env.index_path().is_dir());
+    assert_eq!(env.count("blocks"), 1);
 }

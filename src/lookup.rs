@@ -39,7 +39,7 @@ pub fn start(
         .into_iter()
         .map(|location| (location.path.clone(), location))
         .collect();
-    let by_root: HashMap<i64, Location> = index
+    let by_root: HashMap<u64, Location> = index
         .root_paths()
         .into_iter()
         .filter_map(|(root_id, path)| Some((root_id, by_path.remove(&path)?)))
@@ -73,9 +73,9 @@ pub fn start(
 
 struct Worker {
     reader: Reader,
-    /// The current location of every indexed root that has one, by
-    /// `roots.id`.
-    sources: Arc<HashMap<i64, Location>>,
+    /// The current location of every indexed root that has one, by root
+    /// ID.
+    sources: Arc<HashMap<u64, Location>>,
     strong: StrongHash,
     block_size: u64,
     attempts: u32,
