@@ -1,9 +1,11 @@
 //! Weak hash: a mixed polynomial rolling hash modulo 2^64 (DESIGN.md §5.1).
 //!
-//! For a window `w[0..B)`, `P = sum(w[i] * a^(B-1-i))`, computed with
-//! Horner's rule. The weak hash is `mix64(P)`. All arithmetic wraps modulo
-//! 2^64. The sender rolls the unmixed `P` from one window to the next with
-//! `P' = a*P - Tout[out] + in`, where `Tout[b] = b * a^B`.
+//! For a window `w[0..B)`, `P = sum(w[i] * a^(B-1-i))`, computed directly
+//! as dot products (`simd`). The weak hash is `mix64(P)`. All arithmetic
+//! wraps modulo 2^64. The sender rolls the unmixed `P` from one window to
+//! the next with `P' = a*P - Tout[out] + in`, where `Tout[b] = b * a^B`.
+
+mod simd;
 
 /// The fixed odd multiplier `a`, with `a ≡ 5 (mod 8)`.
 pub const MULTIPLIER: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -11,17 +13,6 @@ pub const MULTIPLIER: u64 = 0x9E37_79B9_7F4A_7C15;
 /// Identifies the algorithm, multiplier, and mixer in index metadata and
 /// in HELLO. Changing the weak hash changes this string.
 pub const ID: &str = "poly64-9e3779b97f4a7c15-splitmix64";
-
-/// `a^0` to `a^8`.
-const POWERS: [u64; 9] = {
-    let mut powers = [1u64; 9];
-    let mut i = 1;
-    while i < powers.len() {
-        powers[i] = powers[i - 1].wrapping_mul(MULTIPLIER);
-        i += 1;
-    }
-    powers
-};
 
 /// The splitmix64 finaliser (DESIGN.md §5.2). A bijection on `u64`.
 #[inline]
@@ -57,25 +48,10 @@ impl WeakHasher {
         self.block_size
     }
 
-    /// The unmixed polynomial `P` of a full window, by Horner's rule over
-    /// eight bytes per step: `P = P*a^8 + sum(w[i+k] * a^(7-k))`. The
-    /// products of a step are independent, so a step waits for one
-    /// multiplication instead of eight.
+    /// The unmixed polynomial `P` of a full window, computed directly.
     pub fn polynomial(&self, window: &[u8]) -> u64 {
         debug_assert_eq!(window.len(), self.block_size);
-        let mut steps = window.chunks_exact(8);
-        let p = (&mut steps).fold(0u64, |p, step| {
-            let sum = step
-                .iter()
-                .zip(POWERS[..8].iter().rev())
-                .fold(0u64, |sum, (&b, &power)| {
-                    sum.wrapping_add(u64::from(b).wrapping_mul(power))
-                });
-            p.wrapping_mul(POWERS[8]).wrapping_add(sum)
-        });
-        steps.remainder().iter().fold(p, |p, &b| {
-            p.wrapping_mul(MULTIPLIER).wrapping_add(u64::from(b))
-        })
+        simd::polynomial(window)
     }
 
     /// The polynomial of the window one byte further: `poly` is that of
@@ -121,7 +97,7 @@ mod tests {
 
     proptest! {
         #[test]
-        fn horner_matches_the_definition(
+        fn polynomial_matches_the_definition(
             window in proptest::collection::vec(any::<u8>(), 1..64),
         ) {
             let hasher = WeakHasher::new(window.len());

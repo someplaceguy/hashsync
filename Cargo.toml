@@ -26,6 +26,14 @@ toml = "1.1.6"
 # allocator.
 zstd-sys = { version = "2.1.0", default-features = false, features = ["vendored", "zstdmt"] }
 
+# Vector instructions for the direct weak-hash polynomial, chosen at run
+# time (`src/hash/weak/simd.rs`), and the `#[simd]` attribute that
+# compiles a function with them. Other targets use the instructions of
+# the build target.
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+fearless_simd = "1.0.0"
+fearless_simd_macros = "0.1.0"
+
 [dev-dependencies]
 proptest = "1.11.0"
 # `thread`: CPU affinity in `tests/serve.rs`.

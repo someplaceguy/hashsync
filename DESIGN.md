@@ -527,7 +527,8 @@ modulo 2^64.
 - `a` is a fixed odd multiplier with `a ≡ 5 (mod 8)`, for example
   `0x9E3779B97F4A7C15`.
 - For a window `w[0..B)`, `P = sum(w[i] * a^(B-1-i))`.
-  Compute directly with Horner's rule: `P = P*a + byte`.
+  Compute directly, as dot products of the bytes with the powers of `a`,
+  in steps that Horner's rule combines.
 - The weak hash is `mix64(P)`.
 - Roll one byte with `P' = a*P - Tout[out] + in`, where
   `Tout[b] = b * a^B` is precomputed for the block size.
@@ -1417,6 +1418,7 @@ SIMD support require a target C compiler. There is no separate pure-Rust build.
 |---|---|
 | SQLite | `rusqlite` with bundled SQLite |
 | Strong hashes | `blake3`, `sha2`, behind one shared strong-hash interface |
+| SIMD | `fearless_simd` and its `#[simd]` attribute (`fearless_simd_macros`) on x86-64, with the level chosen at run time |
 | System calls | `rustix`; `libc` and `linux-raw-sys` for missing wrappers/constants |
 | Thread pools and channels | `rayon` for indexing, the hash-list sort, and sender probes, `crossbeam-channel`; blocking standard threads for transfer |
 | Compression | `zstd-sys` binding libzstd with worker-thread support |
