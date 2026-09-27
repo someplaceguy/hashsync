@@ -162,6 +162,13 @@ pub fn wait_exit_status(pid: rustix::process::Pid) -> i32 {
     }
 }
 
+/// End the process at once with `status`: `_exit` runs none of the C
+/// library's exit handlers, and the other threads stop where they are.
+pub fn exit_now(status: i32) -> ! {
+    // SAFETY: `_exit` accepts any status and does not return.
+    unsafe { libc::_exit(status) }
+}
+
 /// Set `SIGCHLD` to `SIG_DFL` with `SA_NOCLDWAIT` clear, so children stay
 /// unreaped until process exit and `waitid` with `WNOWAIT` can observe
 /// them (DESIGN.md §6.6). Call before spawning the first child.

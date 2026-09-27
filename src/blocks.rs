@@ -1,7 +1,6 @@
 //! Block selection and file hashing (DESIGN.md §4.1 and §4.5).
 
 use std::fmt;
-use std::mem;
 use std::ops::Range;
 use std::os::fd::BorrowedFd;
 
@@ -14,7 +13,8 @@ use crate::hash::{PREFIX_LEN, StrongHash};
 /// Blocks with any period from 1 to `MAX_PERIOD` are not indexed.
 pub const MAX_PERIOD: usize = 16;
 
-/// Rows per `Blocks` message. Bounds the size of one message.
+/// Rows per batch that `hash_file` passes on. Bounds the changes that one
+/// batch adds to a transaction.
 pub const BATCH_ROWS: usize = 1024;
 
 /// One batched read of contiguous data requests up to this many bytes,
@@ -95,7 +95,7 @@ impl BlockHasher {
         &self,
         fd: BorrowedFd<'_>,
         buf: &mut Vec<u8>,
-        emit: &mut dyn FnMut(Vec<BlockRow>),
+        emit: &mut dyn FnMut(&[BlockRow]),
     ) -> Result<Outcome, HashError> {
         let block_size = self.block_size() as usize;
         let bs = block_size as u64;
@@ -134,7 +134,8 @@ impl BlockHasher {
                     });
                     outcome.blocks_indexed += 1;
                     if rows.len() == BATCH_ROWS {
-                        emit(mem::replace(&mut rows, Vec::with_capacity(BATCH_ROWS)));
+                        emit(&rows);
+                        rows.clear();
                     }
                 }
                 block_no += 1;
@@ -146,7 +147,7 @@ impl BlockHasher {
             }
         }
         if !rows.is_empty() {
-            emit(rows);
+            emit(&rows);
         }
         Ok(outcome)
     }
@@ -610,7 +611,7 @@ mod tests {
         let mut rows = Vec::new();
         let outcome = hasher
             .hash_file(file.as_fd(), &mut Vec::new(), &mut |batch| {
-                rows.extend(batch);
+                rows.extend_from_slice(batch);
             })
             .unwrap();
         (rows.iter().map(|row| row.block_no).collect(), outcome)

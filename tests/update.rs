@@ -205,6 +205,83 @@ fn hard_links_across_repeated_updates() {
     env.index().assert_consistent();
 }
 
+/// Many files with links in two roots, on many threads: a link found
+/// before its owner's row commits waits for it, a later link adds its path
+/// itself, and every link gets its path (DESIGN.md §4.6). The same holds
+/// while owners hash changed files again and remove shrunken ones.
+#[test]
+fn many_hard_links_on_many_threads() {
+    const FILES: usize = 300;
+    const LINKS: usize = 4;
+    let env = Env::new();
+    let original = |file: usize| format!("tree/d{}/f{file}", file % 7);
+    // Every tenth file is too small to index.
+    let len = |file: usize| {
+        if file.is_multiple_of(10) {
+            100
+        } else {
+            BLOCK * (1 + file % 3)
+        }
+    };
+    for file in 0..FILES {
+        env.write(original(file), &random(len(file), file as u64 + 1));
+        for link in 1..LINKS {
+            let dir = format!(
+                "{}/d{}",
+                if link % 2 == 0 { "tree" } else { "other" },
+                (file + link) % 5
+            );
+            env.mkdir(&dir);
+            std::fs::hard_link(
+                env.path(original(file)),
+                env.path(format!("{dir}/f{file}-{link}")),
+            )
+            .unwrap();
+        }
+    }
+    env.configure(&format!(
+        "threads = 16\n{}{}",
+        env.root("tree", ""),
+        env.root("other", "")
+    ));
+    let check = |stderr: &str, hashed: usize, unchanged: usize, indexed: usize, small: usize| {
+        for expected in [
+            format!(" {hashed} files hashed"),
+            format!(" {unchanged} unchanged"),
+            format!(" {} hard links", indexed * (LINKS - 1)),
+            format!(" {} small files", small * LINKS),
+            format!(" {} paths", indexed * LINKS),
+        ] {
+            assert!(stderr.contains(&expected), "{expected}: {stderr}");
+        }
+        assert_eq!(env.count("inodes"), indexed);
+        assert_eq!(env.paths().len(), indexed * LINKS);
+        env.index().assert_consistent();
+    };
+    let stderr = env.update();
+    check(&stderr, 270, 0, 270, 30);
+    // Nothing changed: owners reuse their rows while links are found.
+    let stderr = env.update();
+    check(&stderr, 0, 270, 270, 30);
+
+    // Rewrite some files in place, which hashes their inodes again, and
+    // shrink others below a block, which removes their rows.
+    let (mut rewritten, mut shrunk) = (0, 0);
+    for file in (0..FILES).filter(|file| !file.is_multiple_of(10)) {
+        if file.is_multiple_of(5) {
+            env.write(original(file), &random(100, 1));
+            shrunk += 1;
+        } else if file.is_multiple_of(3) {
+            env.write(original(file), &random(len(file), file as u64 + 1000));
+            rewritten += 1;
+        }
+    }
+    assert_eq!((rewritten, shrunk), (80, 30));
+    let stderr = env.update();
+    assert!(stderr.contains(" 0 stale inodes removed"), "{stderr}");
+    check(&stderr, 80, 160, 240, 60);
+}
+
 #[test]
 fn symlinks_and_special_files_are_skipped() {
     let env = Env::new();

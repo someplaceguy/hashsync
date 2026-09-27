@@ -207,14 +207,29 @@ change in one transaction:
 1. In one transaction, invalidate every completed immutable root that is
    no longer configured or that references an incomplete inode: remove its
    identifier.
-2. In bounded transactions, remove the paths of every root without an
-   identifier, and the paths and blocks of incomplete inodes.
+2. In bounded transactions, on one thread per core, remove the paths and
+   blocks of incomplete inodes. If a root keeps its identifier, also
+   remove the paths of every root without an identifier.
 3. In one transaction, remove the rows of those roots and of incomplete
-   inodes. Preserve complete inodes, including orphans, for reuse. Retain
-   completed immutable groups still configured. Keep their representative
-   path if still present, otherwise choose any current location. Create
-   rows without identifiers for roots that need scanning. Two root rows
-   never share a path, also when roots exchange paths.
+   inodes. If no root keeps its identifier, the same transaction removes
+   every path, with one range deletion in `paths` and one in
+   `inode_paths`. Preserve complete inodes, including orphans, for reuse.
+   Retain completed immutable groups still configured. Keep their
+   representative path if still present, otherwise choose any current
+   location. Create rows without identifiers for roots that need
+   scanning. Two root rows never share a path, also when roots exchange
+   paths.
+
+A range deletion removes all entries of a key range with one change, and
+later scans skip the range quickly. The key of a `paths` row starts with
+the root ID, so the rows of the roots without an identifier between two
+roots with an identifier form one key range. The key of an `inode_paths`
+entry starts with the inode ID instead: the entries of one root are
+spread among the entries of all other roots, and a range deletion cannot
+remove them. So in step 2, a scan of the `paths` rows finds their
+entries. Each bounded transaction removes the entries that it found one
+by one, and their rows with range deletions; one range deletion can cover
+the rows of many roots.
 
 Schedule scan tasks for every mutable root and one chosen location per
 unfinished immutable group. Completed groups and unchosen copies have no
@@ -317,10 +332,15 @@ write-ahead log without sync. Power loss may discard recent transactions;
 recovery then restores the state after an earlier one, which is acceptable
 for an index of hints. Hash lists identify their own content and are
 persisted independently (section 5.6). Reads see committed transactions
-only. The end of an update writes the memtables to the database files,
-so that read-only processes have no write-ahead log to replay. It writes
-one column family after the other, so that the last write also removes
-the old log. Then it waits for the compactions that RocksDB has
+only, with one exception. The threads of an update commit at the same
+time, and RocksDB inserts each transaction into its memtables on its own
+(unordered writes); only the write-ahead log keeps their order. A read can
+then see part of a transaction that another thread is still inserting, so
+no thread of an update reads rows that another thread writes
+(section 4.6). The end of an update writes the memtables to the database
+files, so that read-only processes have no write-ahead log to replay. It
+writes one column family after the other, so that the last write also
+removes the old log. Then it waits for the compactions that RocksDB has
 scheduled: closing the database would cancel them (section 10).
 
 All column families use LZ4 compression and share one 256 MiB block cache,
@@ -490,7 +510,7 @@ them, abandon the entry, and continue. An entry that vanishes before it is
 opened is skipped silently. Entries that are not indexed are normal and do
 not change the exit status. A directory failure also skips unread
 descendants. Mark the root unsuccessful so an immutable traversal is retried.
-If inode work has begun, remove its partial result through the writer.
+If inode work has begun, its owner removes the partial result (section 4.6).
 Supported identity and hole-seeking fallbacks are not failures. Database
 failures and invariant violations are fatal. The traversal conflicts above
 also end the process instead of abandoning a single entry.
@@ -509,41 +529,56 @@ handle and the directory and file visited sets are shared. The default
 thread count is `4 × cores`, clamped to 16–64, with a configuration
 override.
 
-The hashing stage takes an open regular file and streams block rows and a
-terminal result. One writer thread owns all database mutations. Its channel
-is bounded by bytes, with bounded messages and backpressure; a large file
-must never require a whole-file message or transaction. The writer reads
-committed entries only. Only the messages of one file change its inode, so
-a read needs no commit first, except when Abandon removes the entries that
-Begin and Blocks wrote.
+The hashing stage takes an open regular file and produces block rows and
+a result. The scan tasks write their index changes themselves. Each thread
+of the pool collects the changes of its tasks in a transaction of its own,
+which commits when it reaches the bound of a transaction, before the
+thread publishes an inode row that other links depend on, and after all
+tasks have finished. A large file never requires a whole-file transaction.
+Only the owner of a file changes its inode, so the owner reads committed
+rows of its inode without a commit first, except when Abandon removes the
+rows that its own transaction wrote. No thread reads rows that another
+thread writes during the scan, as unordered writes require (section 4.4).
 
-Messages are keyed by `(filesystem ID, handle)`. Different files may
-interleave, but each owner's messages stay ordered:
+The file visited set holds the state of each claimed file, keyed by
+`(filesystem ID, handle)`:
 
-| Message | Effect |
+| State | Meaning |
 |---|---|
-| Begin | Mark the inode incomplete with the observed ctime, then remove old blocks in bounded transactions. |
-| Blocks | Append a bounded batch of block number, weak hash, and strong prefix rows. |
-| End | Store the successful size and the owner's path, marking the inode complete even if no block rows were inserted. |
-| Unchanged | Reuse complete rows and record the owner's path. |
-| Omit | Remove an inode too small to index and its dependent rows. |
-| Path | Record an additional hard-link path after the owner's result is known. |
-| Abandon | Invalidate referring immutable roots before removing paths and partial inode data; discard pending paths. |
-| RootDone | Record the traversal outcome; completion publication waits until all scan tasks finish and dependent inode and path results commit. |
+| Pending | The owner has no result yet. The paths of other links wait in the entry. |
+| Indexed | The owner's inode row has committed. Other links add their paths to it. |
+| Dropped | The file has no rows: it is too small to index, or its processing failed. Other links add nothing. |
 
-Every claimed file produces exactly one terminal result: End, Unchanged,
-Omit, or Abandon. Only hashed files send Begin and Blocks. A Path can precede
-its owner's Begin and must wait even if an old complete row exists. Later
-paths use the remembered result; a failure makes every dependent root
+The first claim of a file makes its task the owner, with a Dropped entry
+for a file too small to index and a Pending entry otherwise. The owner
+looks up its identity once and uses the row for one of these results:
+
+| Result | Changes |
+|---|---|
+| Unchanged | Reuse the complete row, add the owner's path, and publish Indexed. |
+| Hashed | Mark the inode incomplete with the observed ctime, remove old blocks in bounded transactions, and add bounded batches of block number, weak hash, and strong prefix rows. A new identity gets a new row, with an ID from a counter that all threads share. Store the successful size and the owner's path, marking the inode complete even if no block rows were added, then commit and publish Indexed. |
+| Small | Remove the inode's existing rows with its paths and blocks. |
+| Abandon | Commit, invalidate referring immutable roots, remove the paths and partial inode data, and publish Dropped. |
+
+An index without inode rows, such as a new or rebuilt one, has no
+identities, so its owners look up none. When the owner publishes Indexed,
+it adds the paths that waited; a later link adds its own path. A path
+therefore commits only after its inode row. A link that finds Pending
+waits even if an old complete row exists. Every claimed file ends Indexed
+or Dropped. A failure makes the roots of all waiting and later paths
 unsuccessful. Do not retry an abandoned inode through another hard link
 during the same update.
 
-Remember failed roots even after RootDone. Once all scan tasks finish and
-the writer has processed their messages, publish immutable identifiers for
-successful groups whose dependent inode and path results have committed.
-This prevents a group from becoming reusable before a later task detects a
-directory overlap. Then remove all orphaned inodes and blocks in bounded
-transactions, including orphans left by earlier interrupted cleanup.
+Tasks mark failed roots, which stay remembered until the scan ends. Once
+all scan tasks finish and every thread's transaction has committed,
+publish immutable identifiers for successful groups whose dependent inode
+and path results have committed. This prevents a group from becoming
+reusable before a later task detects a directory overlap. Then remove all
+orphaned inodes and blocks in bounded transactions, including orphans left
+by earlier interrupted cleanup. The threads of the pool share this work by
+ranges of inode IDs. A thread reads only entries whose keys start with an
+inode ID in its ranges, so no thread reads rows that another thread
+writes.
 
 ## 5. Hashes, hash list, and hash table
 
@@ -1263,12 +1298,16 @@ Build with `panic = "abort"`; install a panic hook that performs the same
 cleanup before aborting. External failures use `die` without a core dump;
 bugs and database errors abort. Per-entry failures remain local.
 
-`die` and the normal end run the C library's exit handlers; an abort runs
-none. One of them, a C++ static destructor of RocksDB (`JoinThreadsOnExit`),
-joins RocksDB's background threads, so the end waits for a running flush or
-compaction. `update` and `stats` close the database first, which stops its
-background jobs. A transfer starts only after its update has waited for
-compactions, so none runs at its end.
+Only the normal end runs the C library's exit handlers. One of them, a C++
+static destructor of RocksDB (`JoinThreadsOnExit`), joins RocksDB's
+background threads, so the end waits for a running flush or compaction.
+`update` and `stats` close the database first, which stops its background
+jobs. A transfer starts only after its update has waited for compactions,
+so none runs at its end. A fatal end, through `die` or a termination
+signal, calls `_exit` instead, and an abort runs no handlers either: many
+threads can be inside RocksDB then, and the process must neither wait for
+a background job nor destroy RocksDB's static objects under them. The
+index recovers from its write-ahead log, as after a crash.
 
 The receiver monitors both sessions and termination signals. The sender
 monitors stdin and the control socket. Unexpected EOF or session loss is
@@ -1505,36 +1544,53 @@ decision history is in version control.
   database work alone, at 20M rows, a new index took SQLite 66–68 s, with
   its index created after the rows, and RocksDB 32 s; a warm candidate
   lookup took SQLite 14–15 µs and RocksDB 19 µs. Through the code of
-  hashsync, the one writer thread of RocksDB stores 245k rows/s, so a new
-  index of 20M rows takes about 90 s, and a warm candidate lookup takes
-  26 µs; the file reads of a transfer cost more. The export took SQLite
-  4.2–5.5 s and takes RocksDB 1.6 s with parallel reads (12.7 s with one
-  thread). The index took 2.1 GB and takes 1.3 GB.
+  hashsync, the one writer thread of that time stored 245k rows/s in
+  RocksDB, so a new index of 20M rows took about 90 s, and a warm
+  candidate lookup takes 26 µs; the file reads of a transfer cost more.
+  The export took SQLite 4.2–5.5 s and takes RocksDB 1.6 s with parallel
+  reads (12.7 s with one thread). The index took 2.1 GB and takes 1.3 GB.
+- **One writer thread:** SQLite allows one writer, so one thread made
+  every index change, and the scan tasks sent it messages. With RocksDB
+  that thread limited updates. In an update of a new index of 77.6 GB at
+  4 KiB blocks (18.7M block rows), it was busy 98% of the time, 52 of 64
+  scan threads waited for it, and the disk was 20–45% busy. The update
+  took 121–125 s with it and 65–68 s with the scan tasks writing; an
+  update without changes took 26–29 s and 8–13 s. Eight writer threads
+  were as fast, but kept the messages, a second lookup of each identity,
+  and the state of each file in two places. RocksDB inserts the
+  transactions of several threads in parallel only with unordered writes:
+  its ordered write path runs one write group at a time, and 64 scan
+  threads with ordered writes took 98–113 s.
 - **Other embedded stores:** LMDB read fastest, but inserted 16k rows/s
   and wrote 35 KB per row. LevelDB has one compaction thread, no bulk load,
   and lets one process open a database, even to read it; fjall has the
   same limit.
 - **Compaction only at the end of an update:** turning automatic
   compactions off during an update and compacting at its end does not make
-  updates faster. The single writer thread sets the pace, and compactions on
-  the other cores never stalled it: a new index of 20.5M rows took 83 s of
-  writing either way. A full compaction at the end of each update added
-  3–6 s to small updates, because it rewrote the whole index (1.3 GB).
+  updates faster. The one writer thread of that time set the pace, and
+  compactions on the other cores never stalled it: a new index of 20.5M
+  rows took 83 s of writing either way. A full compaction at the end of
+  each update added 3–6 s to small updates, because it rewrote the whole
+  index (1.3 GB).
   Waiting at the end only for the compactions that RocksDB has scheduled
   costs little. Without that wait, closing the database cancels them: over
   short updates they pile up, and lookups slowed from 26 µs to 41 µs.
 - **One memtable limit for all column families:** with a limit of 256 MiB
-  for each column family, so that only the shared limit applies, the
-  writer stored a new index of 20.5M rows 10% more slowly, and the end of
-  an update that added 262k rows took 5.8 s instead of 0.4 s.
+  for each column family, so that only the shared limit applies, the one
+  writer thread of that time stored a new index of 20.5M rows 10% more
+  slowly, and the end of an update that added 262k rows took 5.8 s instead
+  of 0.4 s.
 - **More background jobs:** 12 background jobs run up to 9 compactions
   at a time. Without subcompactions, the end of a new index of 20.5M rows
   took 8.5 s instead of 3 s: its last compaction, from level 0, ran in one
   thread. With 12 subcompactions as well, it took 3 s, but compactions
   from level 0 in several column families could then use 12 threads each
   at the same time. 4 background jobs with 3 subcompactions took
-  3.4–4.5 s. At 20.5M rows, one compaction at a time kept up with the
-  writer; compactions below level 0 do not split.
+  3.4–4.5 s. At 20.5M rows, one compaction at a time kept up with the one
+  writer thread of that time; compactions below level 0 do not split.
+  With the scan tasks writing, 8 background jobs saved about 1 s at the end
+  of a new index of 18.7M block rows, and nothing overall (65–68 s either
+  way).
 - **Parallel flushes at the end of an update:** with 3 flush threads, the
   end of an update that added 262k rows took 0.24 s instead of 0.4 s. But
   after 40 of 40 updates of a new small index, the old write-ahead log
@@ -1543,6 +1599,19 @@ decision history is in version control.
   and flushes that end together see the old log of the others. Read-only
   processes skip that log: each column family also records the log after
   its own flush.
+- **Point deletions of all paths in reconciliation:** in an index of
+  `/nix/store` at 4 KiB blocks (360k inodes, 625k paths), the removal of
+  each `paths` row and `inode_paths` entry made the reconciliation of an
+  update without changes take 0.62–0.83 s. The orphan pass after the scan
+  then stepped over the removed `inode_paths` entries and took 0.67–2.2 s.
+  With one range deletion in each column family, they took 0.24–0.40 s
+  and 0.27–0.40 s. The whole update, with the orphan pass below, took
+  6.2–12.1 s instead of 7.9–12.6 s (medians 6.5 s and 11.0 s).
+- **One thread for the orphan pass:** the merge of `inodes` and
+  `inode_paths` took 0.27–0.40 s after that update without changes, and
+  0.54–0.67 s after a new index. On the threads of the scan pool it takes
+  0.022–0.030 s and 0.065–0.085 s. Completed immutable roots skip the
+  scan, but this pass reads the whole index.
 - **Other locks:** RocksDB's own `LOCK` file keeps only read/write opens
   apart, and a second open fails at once. A `flock` on the index directory
   waits, and lets read-only processes exclude a modifying one, without
@@ -1603,7 +1672,8 @@ decision history is in version control.
   traversal order; root replacement between expansion and scanning;
   immutable reuse after root-directory identity changes; no tasks or opens
   solely for overlap checks on cached groups or unused copies; completion
-  withheld after a late directory conflict; hard links within and across
+  withheld after a late directory conflict; links that the scan finds
+  before and after their owner's row commits; hard links within and across
   roots (including links to a single-file root); conflicting copy policies;
   pruning a vanished immutable root and indexing it again when it returns;
   SSH option precedence and bootstrap quoting of executable paths containing

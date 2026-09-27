@@ -5,12 +5,11 @@
 //! starts; root tasks hold the directory that root expansion left open. A
 //! directory task claims the directory's identity in a shared visited set,
 //! where a repeat is fatal, then lists its entries and queues one task per
-//! relevant child. A file task claims the file's identity: the first claimer
-//! reuses the file's unchanged stored content or hashes it, and later
-//! claimers add hard-link paths. A root that is not a
-//! directory or a regular file is skipped like any other such entry, but
-//! with a warning, since it is configuration. Results go to the writer
-//! thread through a bounded channel.
+//! relevant child. A file task claims the file's identity in the index
+//! changes (`index::changes`): the first claim owns the file and reuses its
+//! unchanged stored content or hashes it, and later claims add hard-link
+//! paths. A root that is not a directory or a regular file is skipped like
+//! any other such entry, but with a warning, since it is configuration.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -19,7 +18,6 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 
 use bstr::ByteSlice;
-use crossbeam_channel::Sender;
 use rayon::Scope;
 use rustix::fs::FileType;
 use rustix::io::Errno;
@@ -29,8 +27,8 @@ use crate::config::{Config, RootConfig};
 use crate::die::{die, warn};
 use crate::fsid::{FsCache, Identity, identify};
 use crate::fsops::{self, Meta};
-use crate::index;
-use crate::index::writer::{FileId, Msg, RelPath};
+use crate::index::Index;
+use crate::index::changes::{Changes, Claim, Owner, RelPath, Summary};
 use crate::roots::{self, Location};
 
 /// A root location to scan and its index row.
@@ -51,16 +49,15 @@ pub struct Counters {
     pub blocks_in_holes: AtomicU64,
 }
 
-/// Scan every root on a dedicated pool, then close `tx`. `jobs` is the
-/// `-j` override.
+/// Scan every root on a dedicated pool, writing the changes to `index`,
+/// then remove the orphaned inodes. `jobs` is the `-j` override.
 pub fn run(
     config: &Config,
     roots: Vec<ScanRoot<'_>>,
     fs_cache: &FsCache,
-    reader: index::Reader,
-    tx: Sender<Msg>,
+    index: &Index,
     jobs: Option<u32>,
-) -> Counters {
+) -> (Counters, Summary) {
     let mut shared = Vec::with_capacity(roots.len());
     let mut starts = Vec::with_capacity(roots.len());
     for ScanRoot { location, root_id } in roots {
@@ -71,28 +68,29 @@ pub fn run(
         });
         starts.push((Arc::clone(&location.dir), location.name.clone()));
     }
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(thread_count(config.threads, jobs))
+        .thread_name(|i| format!("scan{i}"))
+        .build()
+        .expect("cannot start the scan pool");
     let scanner = Scanner {
         roots: shared,
         fs_cache,
         hasher: BlockHasher::new(config.block_size, config.strong_hash),
-        reader,
+        changes: Changes::new(index, fs_cache, &pool),
         visited_dirs: Mutex::default(),
-        visited_files: Mutex::default(),
-        tx,
         counters: Counters::default(),
     };
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(thread_count(config.threads, jobs))
-        .thread_name(|i| format!("scan{i}"))
-        .build()
-        .expect("cannot start the scan pool")
-        .scope(|scope| {
-            for (root, (dir, name)) in starts.into_iter().enumerate() {
-                let scanner = &scanner;
-                scope.spawn(move |scope| scanner.root_task(scope, root, dir, name));
-            }
-        });
-    scanner.counters
+    pool.scope(|scope| {
+        for (root, (dir, name)) in starts.into_iter().enumerate() {
+            let scanner = &scanner;
+            scope.spawn(move |scope| scanner.root_task(scope, root, dir, name));
+        }
+    });
+    let Scanner {
+        changes, counters, ..
+    } = scanner;
+    (counters, changes.finish())
 }
 
 /// The scan pool size: `-j`, else the `threads` option, else the default
@@ -152,22 +150,17 @@ struct Scanner<'a> {
     roots: Vec<Root<'a>>,
     fs_cache: &'a FsCache,
     hasher: BlockHasher,
-    /// The workers' view of the index (DESIGN.md §4.6).
-    reader: index::Reader,
+    /// The claimed files, and the index changes that the tasks write
+    /// (DESIGN.md §4.6).
+    changes: Changes<'a>,
     /// Every claimed directory identity, with the path that claimed it.
     visited_dirs: Mutex<HashMap<Identity, Vec<u8>>>,
-    visited_files: Mutex<HashMap<Identity, FileId>>,
-    tx: Sender<Msg>,
     counters: Counters,
 }
 
 impl Scanner<'_> {
     fn count(&self, counter: impl Fn(&Counters) -> &AtomicU64, n: u64) {
         counter(&self.counters).fetch_add(n, Relaxed);
-    }
-
-    fn send(&self, msg: Msg) {
-        self.tx.send(msg).expect("the writer thread ended early");
     }
 
     fn abs_path(&self, root: usize, rel: &[u8]) -> Vec<u8> {
@@ -297,96 +290,47 @@ impl Scanner<'_> {
 
     fn visit_file(&self, fd: OwnedFd, meta: &Meta, root: usize, rel: Vec<u8>) -> LocalResult<()> {
         let identity = identify(self.fs_cache, fd.as_fd(), meta).map_err(io("identity"))?;
-        let (file, first) = self.claim_file(&identity);
-        let root_id = self.roots[root].root_id;
         if meta.size < u64::from(self.hasher.block_size()) {
-            if first {
-                self.send(Msg::Omit { file, identity });
-            }
+            self.changes.claim_small(identity);
             self.count(|c| &c.files_small, 1);
             return Ok(());
         }
         let path = RelPath {
-            root_id,
+            root_id: self.roots[root].root_id,
             rel_path: rel,
         };
-        if !first {
-            self.send(Msg::Path { file, path });
-            self.count(|c| &c.files_linked, 1);
-            return Ok(());
+        match self.changes.claim(identity, path, meta.size, meta.ctime_ns) {
+            Claim::Linked => {
+                self.count(|c| &c.files_linked, 1);
+                Ok(())
+            }
+            Claim::Unchanged => {
+                self.count(|c| &c.files_unchanged, 1);
+                Ok(())
+            }
+            Claim::Owner(owner) => self.hash_owner(fd, owner),
         }
-        if let Some(inode_id) = self.reusable_inode(&identity, meta) {
-            self.send(Msg::Unchanged {
-                file,
-                inode_id,
-                path,
-            });
-            self.count(|c| &c.files_unchanged, 1);
-            return Ok(());
-        }
-        self.hash_owner(fd, meta, file, identity, path)
     }
 
-    /// The complete inode row that holds `identity` with the observed
-    /// size and ctime, so the file's content can be reused without
-    /// hashing or reopening it (DESIGN.md §4.2). The row stays valid for
-    /// the writer: only this task, its owner, can replace it.
-    fn reusable_inode(&self, identity: &Identity, meta: &Meta) -> Option<u64> {
-        let fsid = &self.fs_cache.info(identity.fs).fsid;
-        self.reader
-            .reusable_inode(fsid, &identity.handle, meta.size, meta.ctime_ns)
-    }
-
-    /// Claim a file identity. Returns its ID and whether this is the first
-    /// claim.
-    fn claim_file(&self, identity: &Identity) -> (FileId, bool) {
-        let mut files = self.visited_files.lock().unwrap();
-        if let Some(&file) = files.get(identity) {
-            return (file, false);
-        }
-        let file = FileId::try_from(files.len()).expect("too many files");
-        files.insert(identity.clone(), file);
-        (file, true)
-    }
-
-    /// Hash a claimed file. Sends exactly one terminal message.
-    fn hash_owner(
-        &self,
-        fd: OwnedFd,
-        meta: &Meta,
-        file: FileId,
-        identity: Identity,
-        path: RelPath,
-    ) -> LocalResult<()> {
+    /// Hash an owned file into its inode row, and publish the file's
+    /// result.
+    fn hash_owner(&self, fd: OwnedFd, owner: Owner<'_, '_>) -> LocalResult<()> {
         let readable = match fsops::reopen_file(fd.as_fd()) {
             Ok(readable) => readable,
             Err(e) => {
-                self.send(Msg::Abandon { file });
+                owner.fail();
                 return Err(io("reopen")(e));
             }
         };
         drop(fd);
-        self.send(Msg::Begin {
-            file,
-            identity,
-            ctime_ns: meta.ctime_ns,
-        });
+        let mut hashing = owner.begin();
         let outcome = BUFFER.with_borrow_mut(|buffer| {
             self.hasher
-                .hash_file(readable.as_fd(), buffer, &mut |rows| {
-                    self.send(Msg::Blocks { file, rows });
-                })
+                .hash_file(readable.as_fd(), buffer, &mut |rows| hashing.blocks(rows))
         });
         match outcome {
             Ok(outcome) => {
-                // The size observed before hashing, like the ctime sent
-                // with Begin: a file that changed meanwhile has a later
-                // ctime, so the next update rehashes it.
-                self.send(Msg::End {
-                    file,
-                    size: meta.size,
-                    path,
-                });
+                hashing.end();
                 self.count(|c| &c.files_hashed, 1);
                 self.count(
                     |c| &c.bytes_hashed,
@@ -400,7 +344,7 @@ impl Scanner<'_> {
                 Ok(())
             }
             Err(e) => {
-                self.send(Msg::Abandon { file });
+                hashing.abandon();
                 Err(Skip::Failed(e.to_string()))
             }
         }

@@ -4,19 +4,14 @@ use std::sync::atomic::Ordering::Relaxed;
 use std::time::Instant;
 
 use bstr::ByteSlice;
-use crossbeam_channel::bounded;
 
 use crate::config::Config;
 use crate::die;
 use crate::fsid::FsCache;
 use crate::fsops;
-use crate::index::{self, Settings, writer};
+use crate::index::{self, Settings};
 use crate::roots::{self, Location};
 use crate::scan::{self, ScanRoot};
-
-/// Messages in flight between workers and the writer. Each message is
-/// bounded (`blocks::BATCH_ROWS` rows or one path), so this bounds memory.
-const CHANNEL_CAPACITY: usize = 1024;
 
 pub fn run(config: &Config, rebuild: bool, jobs: Option<u32>) {
     drop(perform(config, rebuild, jobs));
@@ -73,17 +68,7 @@ pub fn perform(config: &Config, rebuild: bool, jobs: Option<u32>) -> (index::Ind
         .map(|(location, root_id)| ScanRoot { location, root_id })
         .collect();
 
-    let (tx, rx) = bounded(CHANNEL_CAPACITY);
-    let fs_cache = &fs_cache;
-    let (counters, summary) = std::thread::scope(|s| {
-        let index = &index;
-        let writer = std::thread::Builder::new()
-            .name("writer".into())
-            .spawn_scoped(s, move || writer::run(index, fs_cache, rx))
-            .expect("cannot start the writer thread");
-        let counters = scan::run(config, roots, fs_cache, index.reader(), tx, jobs);
-        (counters, writer.join().expect("the writer thread panicked"))
-    });
+    let (counters, summary) = scan::run(config, roots, &fs_cache, &index, jobs);
 
     index.finish_update();
 

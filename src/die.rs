@@ -11,7 +11,8 @@
 //! panic instead: the crate builds with `panic = "abort"`, so the panic
 //! hook of this module runs the fatal cleanup, and the process aborts with
 //! a core dump. A panic does not wait for another end in progress: it
-//! reports a bug.
+//! reports a bug. Only the normal end runs the C library's exit handlers
+//! (DESIGN.md §6.7).
 //!
 //! Diagnostics are best effort: a failed write to stderr is ignored. There
 //! is no other channel to report it on, and a panic would turn the failure
@@ -94,7 +95,10 @@ fn end(end: End<'_>) -> ! {
     let status = match end {
         End::Normal(status) => {
             begin_cleanup().remove_files();
-            status
+            // The exit handlers run. One of them, a C++ static destructor
+            // of RocksDB, joins its background threads, which have no work
+            // left at a normal end.
+            std::process::exit(status)
         }
         End::Failure(message) => {
             report(format_args!("{message}"));
@@ -107,7 +111,11 @@ fn end(end: End<'_>) -> ! {
             128 + signal
         }
     };
-    std::process::exit(status)
+    // A fatal end runs no exit handlers: it does not wait for a flush or
+    // compaction of RocksDB, nor destroy RocksDB's static objects while
+    // other threads use them. The index recovers from its write-ahead log,
+    // as after a crash.
+    sys::exit_now(status)
 }
 
 fn signal_name(signal: i32) -> String {

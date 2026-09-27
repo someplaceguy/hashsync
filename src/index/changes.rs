@@ -1,0 +1,984 @@
+//! The index changes of an update's scan (DESIGN.md §4.6): the claims of
+//! the regular files that the scan finds, and the rows that the scan tasks
+//! write for them.
+//!
+//! The first claim of a file makes its task the owner. The owner reuses the
+//! file's unchanged row, or hashes the file into its row, and then
+//! publishes the result. The tasks of the other links wait for that result,
+//! or use it. Each thread of the scan pool collects the changes of its
+//! tasks in a transaction of its own. The transaction commits when it
+//! reaches the bound of a transaction, before its task publishes an inode
+//! row that the tasks of other links depend on, and after the scan. Only
+//! the owner of a file changes that file's inode, so the owner reads the
+//! committed rows of its inode without waiting for other threads. After the
+//! scan, the inodes that no path references any more are removed.
+
+use std::collections::HashMap;
+use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::{Mutex, MutexGuard};
+
+use rayon::ThreadPool;
+use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
+
+use super::layout::{self, Cf, InodeRow, id_key, u64_at};
+use super::{Index, Transaction};
+use crate::blocks::BlockRow;
+use crate::fsid::{FsCache, Identity};
+
+/// A path of a file under a root.
+pub struct RelPath {
+    pub root_id: u64,
+    pub rel_path: Vec<u8>,
+}
+
+#[derive(Default, Debug)]
+pub struct Summary {
+    pub paths: u64,
+    pub blocks: u64,
+    /// Inodes that ended the update without a path and were removed.
+    pub orphans: u64,
+}
+
+/// The index changes of one update's scan.
+pub struct Changes<'a> {
+    index: &'a Index,
+    fs_cache: &'a FsCache,
+    /// The pool whose tasks write the changes.
+    pool: &'a ThreadPool,
+    /// One transaction for each thread of the pool, by the index of the
+    /// thread in the pool.
+    transactions: Vec<Mutex<Transaction<'a>>>,
+    files: Files,
+    /// The index had no inode rows when the scan began, so it had no
+    /// identities either: an identity is added and removed in the
+    /// transaction of its inode row. The owners look up none.
+    empty: bool,
+    /// The ID for the next new inode row.
+    next_inode_id: AtomicU64,
+    paths: AtomicU64,
+    blocks: AtomicU64,
+}
+
+impl<'a> Changes<'a> {
+    /// The changes of a scan whose tasks run on `pool`.
+    pub fn new(index: &'a Index, fs_cache: &'a FsCache, pool: &'a ThreadPool) -> Self {
+        let next_inode_id = index.next_inode_id();
+        Changes {
+            index,
+            fs_cache,
+            pool,
+            transactions: (0..pool.current_num_threads())
+                .map(|_| Mutex::new(index.transaction()))
+                .collect(),
+            files: Files::default(),
+            empty: next_inode_id == 1,
+            next_inode_id: AtomicU64::new(next_inode_id),
+            paths: AtomicU64::new(0),
+            blocks: AtomicU64::new(0),
+        }
+    }
+
+    /// Claim a file too small to index (DESIGN.md §4.1). The first claim
+    /// removes the rows that the file had. No link adds a path.
+    pub fn claim_small(&self, identity: Identity) {
+        if self.files.claim_small(&identity)
+            && let Some(existing) = self.existing(&self.identity_key(&identity))
+        {
+            let mut writer = self.writer();
+            delete_inode(&mut writer.txn, existing.inode_id, existing.row);
+            writer.txn.checkpoint();
+        }
+    }
+
+    /// Claim a file that can be indexed, found at `path`. `size` and
+    /// `ctime_ns` are the metadata observed before hashing: the first claim
+    /// reuses a complete row that stores them (DESIGN.md §4.2), and
+    /// otherwise its owner stores them with the new content. A file that
+    /// changes while it is hashed then has a later ctime than its row, so
+    /// the next update hashes it again (DESIGN.md §4.5).
+    pub fn claim(
+        &self,
+        identity: Identity,
+        path: RelPath,
+        size: u64,
+        ctime_ns: i64,
+    ) -> Claim<'_, 'a> {
+        let path = match self.files.claim(&identity, path) {
+            Found::Owner(path) => path,
+            Found::Link(inode_id, path) => {
+                self.writer().insert_path(inode_id, &path);
+                return Claim::Linked;
+            }
+            Found::Deferred => return Claim::Linked,
+        };
+        // The owner looks up its identity once, for the reuse and for the
+        // replacement of the row.
+        let key = self.identity_key(&identity);
+        let existing = self.existing(&key);
+        if let Some(existing) = &existing
+            && existing.reusable(size, ctime_ns)
+        {
+            // The row committed before the scan: the owner's path and the
+            // waiting paths can go into the same transaction.
+            let mut writer = self.writer();
+            writer.insert_path(existing.inode_id, &path);
+            for path in self.files.publish(&identity, existing.inode_id) {
+                writer.insert_path(existing.inode_id, &path);
+            }
+            return Claim::Unchanged;
+        }
+        Claim::Owner(Owner {
+            changes: self,
+            identity,
+            key,
+            existing: existing.map(|existing| existing.inode_id),
+            path,
+            size,
+            ctime_ns,
+        })
+    }
+
+    /// End the scan (DESIGN.md §4.6): check that every claimed file has a
+    /// result, and commit the transaction of every thread, in parallel on
+    /// the threads of the pool. Then remove the inodes without paths, and
+    /// their blocks, in bounded transactions, also on the threads of the
+    /// pool.
+    pub fn finish(self) -> Summary {
+        // `#[must_use]` does not catch an owner that an early return drops.
+        let pending = self.files.pending();
+        assert!(pending == 0, "{pending} claimed files have no result");
+        self.pool.install(|| {
+            self.transactions
+                .par_iter()
+                .for_each(|txn| txn.lock().unwrap().commit());
+        });
+        Summary {
+            paths: self.paths.into_inner(),
+            blocks: self.blocks.into_inner(),
+            orphans: remove_orphans(self.index, self.pool),
+        }
+    }
+
+    /// The transaction of the calling thread, which must be a thread of the
+    /// pool. Only the tasks of that thread lock it, one at a time: a task
+    /// that finds it locked runs inside another task of the thread, which
+    /// is a bug (`Hashing`).
+    fn writer(&self) -> Writer<'_, 'a> {
+        let thread = self
+            .pool
+            .current_thread_index()
+            .expect("index changes come from the scan pool");
+        Writer {
+            changes: self,
+            txn: self.transactions[thread]
+                .try_lock()
+                .expect("one task of a thread holds its transaction at a time"),
+        }
+    }
+
+    /// The `identities` key of a scan identity (DESIGN.md §4.4).
+    fn identity_key(&self, identity: &Identity) -> Vec<u8> {
+        layout::identity(&self.fs_cache.info(identity.fs).fsid, &identity.handle)
+    }
+
+    /// The row of an identity (an `identities` key), for the owner of the
+    /// file; `None` for a new identity. Only the owner changes the row, so
+    /// it stays valid for the owner's changes.
+    fn existing(&self, identity: &[u8]) -> Option<Existing> {
+        if self.empty {
+            return None;
+        }
+        let inode_id = self.index.inode_id(identity)?;
+        Some(Existing {
+            inode_id,
+            row: self.index.inode_row(inode_id),
+        })
+    }
+}
+
+/// What the claim of a file that can be indexed gives its task.
+#[must_use]
+pub enum Claim<'c, 'a> {
+    /// Another link of a claimed file. Its path goes to the owner's row
+    /// once that row has committed, and goes nowhere if the file has no
+    /// rows.
+    Linked,
+    /// The first claim, of a file whose row is current. Its path, and the
+    /// paths that waited, go to that row.
+    Unchanged,
+    /// The first claim, of a file that its task must hash.
+    Owner(Owner<'c, 'a>),
+}
+
+/// The owner of a file that its task must hash. The owner ends with
+/// `fail`, or with `begin` and then `end` or `abandon`, which publish the
+/// file's result to the other links. `Changes::finish` checks that every
+/// claimed file has a result.
+#[must_use]
+pub struct Owner<'c, 'a> {
+    changes: &'c Changes<'a>,
+    identity: Identity,
+    /// The `identities` key of `identity`.
+    key: Vec<u8>,
+    /// The ID of the identity's existing inode row.
+    existing: Option<u64>,
+    /// The owner's own path.
+    path: RelPath,
+    size: u64,
+    ctime_ns: i64,
+}
+
+impl<'c, 'a> Owner<'c, 'a> {
+    /// Start to replace the blocks of the file: mark its inode incomplete,
+    /// with the observed ctime, then remove the old blocks of an existing
+    /// row in bounded transactions (DESIGN.md §4.4). A new identity gets a
+    /// new row.
+    pub fn begin(self) -> Hashing<'c, 'a> {
+        let mut writer = self.changes.writer();
+        let row = InodeRow {
+            size: None,
+            ctime_ns: self.ctime_ns,
+            identity: self.key,
+        };
+        let inode_id = match self.existing {
+            Some(inode_id) => {
+                // The mark may commit before any block is removed; recovery
+                // then removes the blocks of the incomplete inode.
+                writer.txn.put(Cf::Inodes, &id_key(inode_id), &row.encode());
+                writer.txn.remove_blocks(inode_id);
+                inode_id
+            }
+            None => {
+                let inode_id = self.changes.next_inode_id.fetch_add(1, Relaxed);
+                writer
+                    .txn
+                    .put(Cf::Identities, &row.identity, &id_key(inode_id));
+                writer.txn.put(Cf::Inodes, &id_key(inode_id), &row.encode());
+                inode_id
+            }
+        };
+        Hashing {
+            writer,
+            identity: self.identity,
+            inode_id,
+            row,
+            path: self.path,
+            size: self.size,
+        }
+    }
+
+    /// The file cannot be opened for reading: no link adds a path. The
+    /// existing row of the file, if any, gets no path either, so it goes
+    /// with the orphans after the scan.
+    pub fn fail(self) {
+        self.changes.files.discard(&self.identity);
+    }
+}
+
+/// A file that its owner hashes into an incomplete inode row. It holds the
+/// lock of the transaction of its thread until `end` or `abandon`. So while
+/// the file is hashed, its task must not call a rayon function that can
+/// run other tasks on the thread, such as `join`, `scope`, or a parallel
+/// iterator: a task that writes changes there finds that lock taken, and
+/// panics.
+#[must_use]
+pub struct Hashing<'c, 'a> {
+    writer: Writer<'c, 'a>,
+    identity: Identity,
+    inode_id: u64,
+    row: InodeRow,
+    /// The owner's own path.
+    path: RelPath,
+    size: u64,
+}
+
+impl Hashing<'_, '_> {
+    /// Add a bounded batch of the file's block rows.
+    pub fn blocks(&mut self, rows: &[BlockRow]) {
+        let txn = &mut self.writer.txn;
+        for row in rows {
+            txn.put(
+                Cf::Blocks,
+                &layout::block_key(self.inode_id, row.block_no),
+                &layout::block_value(row.weak, &row.strong_prefix),
+            );
+            txn.put(
+                Cf::Strong,
+                &layout::strong_key(&row.strong_prefix, self.inode_id, row.block_no),
+                &[],
+            );
+        }
+        txn.checkpoint();
+        self.writer
+            .changes
+            .blocks
+            .fetch_add(rows.len() as u64, Relaxed);
+    }
+
+    /// Hashing succeeded: store the size and the owner's path, which make
+    /// the inode complete even when no block rows were added
+    /// (DESIGN.md §4.4). Commit, so that the row has committed before the
+    /// other links add their paths to it. Then publish the row, and add the
+    /// paths that waited for it.
+    pub fn end(mut self) {
+        // The ctime is already there from `begin`.
+        self.row.size = Some(self.size);
+        self.writer
+            .txn
+            .put(Cf::Inodes, &id_key(self.inode_id), &self.row.encode());
+        self.writer.insert_path(self.inode_id, &self.path);
+        self.writer.txn.commit();
+        let changes = self.writer.changes;
+        for path in changes.files.publish(&self.identity, self.inode_id) {
+            self.writer.insert_path(self.inode_id, &path);
+        }
+    }
+
+    /// Hashing failed: remove the rows that `begin` and `blocks` wrote, and
+    /// publish that the file has no rows, which drops the paths of the
+    /// other links. The removal reads committed entries, so the transaction
+    /// commits first.
+    pub fn abandon(mut self) {
+        self.writer.txn.commit();
+        delete_inode(&mut self.writer.txn, self.inode_id, self.row);
+        self.writer.txn.checkpoint();
+        self.writer.changes.files.discard(&self.identity);
+    }
+}
+
+/// The transaction of the calling thread, locked for the changes of one
+/// task.
+struct Writer<'c, 'a> {
+    changes: &'c Changes<'a>,
+    txn: MutexGuard<'c, Transaction<'a>>,
+}
+
+impl Writer<'_, '_> {
+    /// Add a path of an inode whose row has committed, or commits with
+    /// this transaction.
+    fn insert_path(&mut self, inode_id: u64, path: &RelPath) {
+        self.txn.put(
+            Cf::Paths,
+            &layout::path_key(path.root_id, &path.rel_path),
+            &id_key(inode_id),
+        );
+        self.txn.put(
+            Cf::InodePaths,
+            &layout::inode_path_key(inode_id, path.root_id, &path.rel_path),
+            &[],
+        );
+        self.changes.paths.fetch_add(1, Relaxed);
+        self.txn.checkpoint();
+    }
+}
+
+/// The inode row that an identity had when its owner looked it up.
+struct Existing {
+    inode_id: u64,
+    row: InodeRow,
+}
+
+impl Existing {
+    /// The row is complete and stores the observed size and ctime, so the
+    /// file's content can be reused without hashing (DESIGN.md §4.2). An
+    /// incomplete row has no size and is never reusable.
+    fn reusable(&self, size: u64, ctime_ns: i64) -> bool {
+        self.row.size == Some(size) && self.row.ctime_ns == ctime_ns
+    }
+}
+
+/// The file visited set (DESIGN.md §4.5 and §4.6): the state of each
+/// claimed regular file, by identity.
+#[derive(Default)]
+struct Files(Mutex<HashMap<Identity, FileState>>);
+
+enum FileState {
+    /// The owner has no result yet: the paths of other links wait here.
+    Pending(Vec<RelPath>),
+    /// The owner's inode row has committed: other links add their paths
+    /// to it.
+    Indexed(u64),
+    /// The file has no rows, because it is too small to index or its
+    /// processing failed: other links add nothing.
+    Dropped,
+}
+
+/// What the claim of a file that can be indexed finds.
+enum Found {
+    /// The first claim: the task owns the file, and adds this path.
+    Owner(RelPath),
+    /// Another link of a file whose inode row has committed: the task adds
+    /// this path to the row.
+    Link(u64, RelPath),
+    /// Another link of a file without a committed row: the path waits for
+    /// the owner's result, or goes nowhere if the file has no rows.
+    Deferred,
+}
+
+impl Files {
+    /// Claim a file too small to index; true for the first claim. Nothing
+    /// waits for such a file, so its entry is dropped at once.
+    fn claim_small(&self, identity: &Identity) -> bool {
+        let mut files = self.0.lock().unwrap();
+        if files.contains_key(identity) {
+            return false;
+        }
+        files.insert(identity.clone(), FileState::Dropped);
+        true
+    }
+
+    /// Claim a file that can be indexed, with the path of this link.
+    fn claim(&self, identity: &Identity, path: RelPath) -> Found {
+        let mut files = self.0.lock().unwrap();
+        match files.get_mut(identity) {
+            None => {
+                files.insert(identity.clone(), FileState::Pending(Vec::new()));
+                Found::Owner(path)
+            }
+            Some(FileState::Pending(paths)) => {
+                paths.push(path);
+                Found::Deferred
+            }
+            Some(FileState::Indexed(inode_id)) => Found::Link(*inode_id, path),
+            Some(FileState::Dropped) => Found::Deferred,
+        }
+    }
+
+    /// The owner's inode row has committed: later links add their paths to
+    /// it. Returns the paths that waited, for the owner to add.
+    fn publish(&self, identity: &Identity, inode_id: u64) -> Vec<RelPath> {
+        match self.settle(identity, FileState::Indexed(inode_id)) {
+            FileState::Pending(paths) => paths,
+            _ => panic!("the result of a file was published twice"),
+        }
+    }
+
+    /// The owner's processing failed: drop the paths that waited, and
+    /// those of later links.
+    fn discard(&self, identity: &Identity) {
+        let FileState::Pending(_) = self.settle(identity, FileState::Dropped) else {
+            panic!("the result of a file was published twice");
+        };
+    }
+
+    /// Replace the state of a claimed file; returns the old state.
+    fn settle(&self, identity: &Identity, state: FileState) -> FileState {
+        let mut files = self.0.lock().unwrap();
+        let entry = files
+            .get_mut(identity)
+            .expect("the owner of a file has claimed it");
+        std::mem::replace(entry, state)
+    }
+
+    /// The number of claimed files whose owners have no result yet.
+    fn pending(&self) -> usize {
+        let files = self.0.lock().unwrap();
+        files
+            .values()
+            .filter(|state| matches!(state, FileState::Pending(_)))
+            .count()
+    }
+}
+
+/// Remove inodes without paths, and their blocks, once every result has
+/// committed (DESIGN.md §4.6). This also removes orphans left by earlier
+/// interrupted cleanup. Returns their number.
+///
+/// The threads of `pool` share the inode IDs by ranges, about four for
+/// each thread. A thread reads only entries whose keys start with an
+/// inode ID in its ranges, and changes only the entries of those inodes,
+/// so no thread reads the entries that another thread changes.
+fn remove_orphans(index: &Index, pool: &ThreadPool) -> u64 {
+    // The inode IDs start at 1 and are less than `end`.
+    let end = index.next_inode_id();
+    let parts = 4 * pool.current_num_threads() as u64;
+    let size = (end - 1).div_ceil(parts).max(1);
+    let mut ranges = Vec::new();
+    let mut start = 1;
+    while start < end {
+        let next = start.saturating_add(size).min(end);
+        ranges.push(start..next);
+        start = next;
+    }
+    pool.install(|| {
+        ranges
+            .into_par_iter()
+            .map(|ids| remove_orphans_in(index, ids))
+            .sum()
+    })
+}
+
+/// Remove the inodes with IDs in `ids` that have no paths, and their
+/// blocks, in bounded transactions. Returns their number.
+fn remove_orphans_in(index: &Index, ids: Range<u64>) -> u64 {
+    let mut txn = index.transaction();
+    let mut orphans = 0;
+    let (start, end) = (id_key(ids.start), id_key(ids.end));
+    // Both scans read the snapshot of their start, which the removals do
+    // not change.
+    let mut inodes = index
+        .shared
+        .scan_range(Cf::Inodes, &start, Some(end.to_vec()), false);
+    let mut paths = index
+        .shared
+        .scan_range(Cf::InodePaths, &start, Some(end.to_vec()), false);
+    while let Some((key, value)) = inodes.entry() {
+        let inode_id = u64_at(key, 0);
+        while let Some((path, _)) = paths.entry()
+            && u64_at(path, 0) < inode_id
+        {
+            paths.next();
+        }
+        if paths
+            .entry()
+            .is_none_or(|(path, _)| u64_at(path, 0) != inode_id)
+        {
+            delete_inode(&mut txn, inode_id, InodeRow::decode(value));
+            orphans += 1;
+            txn.checkpoint();
+        }
+        inodes.next();
+    }
+    txn.commit();
+    orphans
+}
+
+/// Remove an inode with its paths and blocks. The inode is marked
+/// incomplete first, in the same transaction as the removal of its paths
+/// and first blocks: block removal can commit between batches, and an
+/// interrupted removal must not leave a complete inode with missing
+/// blocks — a later scan would reuse it as unchanged. Recovery removes
+/// incomplete inodes instead (DESIGN.md §4.2). The removal reads committed
+/// entries.
+fn delete_inode(txn: &mut Transaction<'_>, inode_id: u64, mut row: InodeRow) {
+    row.size = None;
+    txn.put(Cf::Inodes, &id_key(inode_id), &row.encode());
+    txn.remove_inode_paths(inode_id);
+    txn.remove_blocks(inode_id);
+    txn.delete(Cf::Inodes, &id_key(inode_id));
+    txn.delete(Cf::Identities, &row.identity);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::ffi::OsStrExt;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    use rustix::fs::{Mode, OFlags};
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::fsid::{FsIndex, Triple};
+    use crate::hash::PREFIX_LEN;
+    use crate::index::{self, tests as index_tests};
+
+    /// Block rows enough that removing them commits mid-way: each row is
+    /// two entries, and a transaction holds `COMMIT_WORK` changes.
+    const MANY_BLOCKS: u64 = 51_200;
+
+    /// An index, with the scan pool and the filesystem of the files that a
+    /// test claims.
+    struct Fixture {
+        index: Index,
+        fs_cache: FsCache,
+        /// The filesystem of the test's directory.
+        fs: FsIndex,
+        /// One thread, so that one transaction collects all changes.
+        pool: ThreadPool,
+        /// Declared last: it is removed after the index has closed.
+        _dir: TempDir,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let index = index_tests::new_index(dir.path());
+            let fs_cache = FsCache::new();
+            let triple = Triple {
+                mnt_id: 0,
+                dev_major: 0,
+                dev_minor: 0,
+            };
+            let fs = fs_cache
+                .resolve(triple, || {
+                    rustix::fs::open(
+                        dir.path(),
+                        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                        Mode::empty(),
+                    )
+                })
+                .unwrap();
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .unwrap();
+            Fixture {
+                index,
+                fs_cache,
+                fs,
+                pool,
+                _dir: dir,
+            }
+        }
+
+        fn changes(&self) -> Changes<'_> {
+            Changes::new(&self.index, &self.fs_cache, &self.pool)
+        }
+
+        /// A file on the test's filesystem.
+        fn identity(&self, handle: u8) -> Identity {
+            Identity {
+                fs: self.fs,
+                handle: Box::new([handle]),
+            }
+        }
+
+        /// The `identities` key of `identity(handle)`.
+        fn key(&self, handle: u8) -> Vec<u8> {
+            layout::identity(&self.fs_cache.info(self.fs).fsid, &[handle])
+        }
+
+        /// The relative paths that have committed, in key order.
+        fn committed_paths(&self) -> Vec<Vec<u8>> {
+            let mut paths = Vec::new();
+            self.index.shared.each(Cf::Paths, b"", |key, _| {
+                paths.push(key[layout::ID_LEN..].to_vec());
+            });
+            paths
+        }
+    }
+
+    fn path(name: &str) -> RelPath {
+        RelPath {
+            root_id: 1,
+            rel_path: name.as_bytes().to_vec(),
+        }
+    }
+
+    fn block(block_no: u64) -> BlockRow {
+        BlockRow {
+            block_no,
+            weak: block_no,
+            strong_prefix: [block_no as u8; PREFIX_LEN],
+        }
+    }
+
+    /// An interrupted orphan cleanup must not leave a complete inode with
+    /// missing blocks: a later scan of the returned file would reuse the
+    /// remaining rows as unchanged. The injected failure interrupts the
+    /// cleanup after its first commit; the committed state must hold an
+    /// incomplete inode, which reconciliation removes. The injection is
+    /// for the calling thread, so the test removes the orphans of all
+    /// inode IDs as one range on its own thread.
+    #[test]
+    fn interrupted_orphan_cleanup_leaves_the_inode_incomplete() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index");
+        let index = index_tests::new_index(dir.path());
+        // One complete inode without paths: an orphan.
+        let blocks: Vec<_> = (0..MANY_BLOCKS)
+            .map(|block_no| (1, block_no, block_no, [0; PREFIX_LEN]))
+            .collect();
+        index_tests::insert(&index, &[(1, b"\x01\x02", Some(4096))], &[], &[], &blocks);
+
+        index_tests::interrupt_after_commits(Some(1));
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            remove_orphans_in(&index, 1..index.next_inode_id())
+        }));
+        index_tests::interrupt_after_commits(None);
+        assert!(result.is_err(), "the injected failure must abort cleanup");
+        drop(index);
+
+        let index = index::open_modifying(path.as_os_str().as_bytes());
+        let row = index.inode_row(1);
+        assert_eq!(row.size, None, "the committed inode must be incomplete");
+        let blocks = index_tests::count(&index, Cf::Blocks) as u64;
+        assert!(
+            blocks > 0 && blocks < MANY_BLOCKS,
+            "cleanup must stop between its commits: {blocks} rows left"
+        );
+        assert_eq!(index_tests::count(&index, Cf::Strong) as u64, blocks);
+
+        // The next update's reconciliation removes the incomplete remains.
+        index.reconcile_roots(&[]);
+        for cf in [Cf::Inodes, Cf::Identities, Cf::Blocks, Cf::Strong] {
+            assert_eq!(index_tests::count(&index, cf), 0, "{cf:?}");
+        }
+    }
+
+    /// The orphan removal splits the inode IDs into ranges for the threads
+    /// of the pool: an orphan at either end of a range goes with its
+    /// blocks, and an inode with paths stays, also next to the end of its
+    /// range. The one thread of the fixture's pool takes four ranges:
+    /// inodes 1-3, 4-6, 7-9, and 10-12.
+    #[test]
+    fn orphans_go_at_the_ends_of_ranges() {
+        let fixture = Fixture::new();
+        let identities: Vec<Vec<u8>> = (1..=12u8)
+            .map(|id| layout::identity(b"\x01", &[id]))
+            .collect();
+        let inodes: Vec<(u64, &[u8], Option<u64>)> = (1..)
+            .zip(&identities)
+            .map(|(id, identity)| (id, &identity[..], Some(4096)))
+            .collect();
+        let linked = [1, 2, 5, 6, 7, 8, 11];
+        let names: Vec<String> = linked.iter().map(|id| format!("f{id}")).collect();
+        let mut paths: Vec<(u64, u64, &[u8])> = linked
+            .iter()
+            .zip(&names)
+            .map(|(&id, name)| (id, 1, name.as_bytes()))
+            .collect();
+        paths.push((6, 2, b"g"));
+        let blocks: Vec<_> = (1..=12)
+            .map(|id| (id, 0, id, [id as u8; PREFIX_LEN]))
+            .collect();
+        index_tests::insert(
+            &fixture.index,
+            &inodes,
+            &[(1, b"/r"), (2, b"/s")],
+            &paths,
+            &blocks,
+        );
+        assert_eq!(remove_orphans(&fixture.index, &fixture.pool), 5);
+        let mut left = Vec::new();
+        fixture.index.shared.each(Cf::Inodes, b"", |key, _| {
+            left.push(u64_at(key, 0));
+        });
+        assert_eq!(left, linked);
+        let mut blocks_left = Vec::new();
+        fixture.index.shared.each(Cf::Blocks, b"", |key, _| {
+            blocks_left.push(u64_at(key, 0));
+        });
+        assert_eq!(blocks_left, linked);
+        for (cf, n) in [(Cf::Identities, 7), (Cf::Strong, 7), (Cf::InodePaths, 8)] {
+            assert_eq!(index_tests::count(&fixture.index, cf), n, "{cf:?}");
+        }
+    }
+
+    /// Links found before the owner's row commits wait for it, and links
+    /// found after it add their paths themselves; a file without rows
+    /// takes no paths (DESIGN.md §4.6).
+    #[test]
+    fn links_wait_for_the_owner() {
+        let identity = |n: u8| Identity {
+            fs: 0,
+            handle: Box::new([n]),
+        };
+        let files = Files::default();
+        let one = identity(1);
+        assert!(matches!(files.claim(&one, path("a")), Found::Owner(p) if p.rel_path == b"a"));
+        assert!(matches!(files.claim(&one, path("b")), Found::Deferred));
+        assert_eq!(files.pending(), 1, "the owner has no result yet");
+        let waiting: Vec<_> = files
+            .publish(&one, 7)
+            .into_iter()
+            .map(|p| p.rel_path)
+            .collect();
+        assert_eq!(waiting, [b"b".to_vec()]);
+        assert!(matches!(files.claim(&one, path("c")), Found::Link(7, p) if p.rel_path == b"c"));
+
+        // A failed owner drops the waiting paths and the later ones.
+        let two = identity(2);
+        assert!(matches!(files.claim(&two, path("a")), Found::Owner(_)));
+        assert!(matches!(files.claim(&two, path("b")), Found::Deferred));
+        files.discard(&two);
+        assert!(matches!(files.claim(&two, path("c")), Found::Deferred));
+
+        // Only the first claim of a small file owns it, and no link of it
+        // adds a path, even one that finds the file large.
+        let three = identity(3);
+        assert!(files.claim_small(&three));
+        assert!(!files.claim_small(&three));
+        assert!(matches!(files.claim(&three, path("d")), Found::Deferred));
+        assert!(!files.claim_small(&one));
+        assert_eq!(files.pending(), 0, "every claimed file has a result");
+    }
+
+    /// The first claim reuses the row of its identity only when the row is
+    /// complete and stores the observed size and ctime; otherwise its task
+    /// owns the file, and replaces the row. An index without inode rows
+    /// has no identities, so nothing is looked up in it.
+    #[test]
+    fn existing_rows_are_reused_only_when_unchanged() {
+        let fixture = Fixture::new();
+        assert!(fixture.changes().empty, "a new index has no inode rows");
+        // `insert` stores the ctime 123.
+        index_tests::insert(
+            &fixture.index,
+            &[
+                (7, &fixture.key(1), Some(4096)),
+                (8, &fixture.key(2), Some(4096)),
+                (9, &fixture.key(3), Some(4096)),
+                (10, &fixture.key(4), None),
+            ],
+            &[],
+            &[],
+            &[],
+        );
+        let changes = fixture.changes();
+        assert!(!changes.empty);
+        /// The existing row that the owner of a claim replaces.
+        fn replaces(claim: Claim<'_, '_>) -> Option<u64> {
+            let Claim::Owner(owner) = claim else {
+                panic!("the file is not owned");
+            };
+            let existing = owner.existing;
+            owner.fail();
+            existing
+        }
+        fixture.pool.install(|| {
+            let claim = |handle, size, ctime_ns| {
+                changes.claim(fixture.identity(handle), path("f"), size, ctime_ns)
+            };
+            assert!(matches!(claim(1, 4096, 123), Claim::Unchanged));
+            assert_eq!(replaces(claim(2, 4096, 124)), Some(8), "a new ctime");
+            assert_eq!(replaces(claim(3, 4095, 123)), Some(9), "a new size");
+            assert_eq!(
+                replaces(claim(4, 4096, 123)),
+                Some(10),
+                "an incomplete row is not reusable"
+            );
+            assert_eq!(replaces(claim(5, 4096, 123)), None, "a new identity");
+        });
+        let summary = changes.finish();
+        assert_eq!(summary.paths, 1);
+        assert_eq!(fixture.committed_paths(), [b"f".to_vec()]);
+    }
+
+    /// `end` commits the complete row and the owner's path before it
+    /// publishes the row: a link that finds the row published adds its
+    /// path at once, and a path must commit only after its inode row
+    /// (DESIGN.md §4.6). Links found before and after `end` get their
+    /// paths.
+    #[test]
+    fn end_commits_the_row_before_it_publishes() {
+        let fixture = Fixture::new();
+        let changes = fixture.changes();
+        let claim = |name| changes.claim(fixture.identity(1), path(name), 4096, 123);
+        fixture.pool.install(|| {
+            let Claim::Owner(owner) = claim("a") else {
+                panic!("the first claim owns the file");
+            };
+            assert!(matches!(claim("b"), Claim::Linked));
+            let mut hashing = owner.begin();
+            hashing.blocks(&[block(0)]);
+            hashing.end();
+        });
+        // Before `finish` commits the transactions.
+        let inode_id = fixture
+            .index
+            .inode_id(&fixture.key(1))
+            .expect("the identity must have committed");
+        assert_eq!(fixture.index.inode_row(inode_id).size, Some(4096));
+        assert_eq!(index_tests::count(&fixture.index, Cf::Blocks), 1);
+        assert!(fixture.committed_paths().contains(&b"a".to_vec()));
+        fixture
+            .pool
+            .install(|| assert!(matches!(claim("c"), Claim::Linked)));
+        let summary = changes.finish();
+        assert_eq!((summary.paths, summary.blocks), (3, 1));
+        assert_eq!(
+            fixture.committed_paths(),
+            [b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]
+        );
+
+        // When the commit of `end` fails, no link can see the row yet.
+        let changes = fixture.changes();
+        fixture.pool.install(|| {
+            let Claim::Owner(owner) = changes.claim(fixture.identity(2), path("d"), 4096, 123)
+            else {
+                panic!("the first claim owns the file");
+            };
+            let hashing = owner.begin();
+            index_tests::interrupt_after_commits(Some(0));
+            let result = catch_unwind(AssertUnwindSafe(|| hashing.end()));
+            index_tests::interrupt_after_commits(None);
+            assert!(result.is_err(), "the injected failure must stop `end`");
+        });
+        assert_eq!(
+            changes.files.pending(),
+            1,
+            "`end` must publish the row only after its commit"
+        );
+    }
+
+    /// An owner whose hashing fails removes the rows that it wrote, and the
+    /// rows of the inode that it replaced; no link of the file adds a path
+    /// (DESIGN.md §4.6).
+    #[test]
+    fn abandoned_files_leave_no_rows() {
+        let fixture = Fixture::new();
+        // The row that the owner of file 1 replaces; file 2 is new.
+        index_tests::insert(
+            &fixture.index,
+            &[(1, &fixture.key(1), Some(4096))],
+            &[],
+            &[],
+            &[(1, 0, 5, [5; PREFIX_LEN])],
+        );
+        let changes = fixture.changes();
+        fixture.pool.install(|| {
+            for handle in [1, 2] {
+                let claim =
+                    |name: &str| changes.claim(fixture.identity(handle), path(name), 8192, 124);
+                let Claim::Owner(owner) = claim(&format!("{handle}a")) else {
+                    panic!("the first claim owns the file");
+                };
+                assert!(matches!(claim(&format!("{handle}b")), Claim::Linked));
+                let mut hashing = owner.begin();
+                hashing.blocks(&[block(0), block(1)]);
+                hashing.abandon();
+                assert!(matches!(claim(&format!("{handle}c")), Claim::Linked));
+            }
+        });
+        let summary = changes.finish();
+        assert_eq!(summary.paths, 0);
+        for cf in [
+            Cf::Inodes,
+            Cf::Identities,
+            Cf::Paths,
+            Cf::InodePaths,
+            Cf::Blocks,
+            Cf::Strong,
+        ] {
+            assert_eq!(index_tests::count(&fixture.index, cf), 0, "{cf:?}");
+        }
+    }
+
+    /// An owner that ends without a result is a bug, which `finish`
+    /// reports. `#[must_use]` does not catch an owner that an early return
+    /// drops.
+    #[test]
+    #[should_panic(expected = "1 claimed files have no result")]
+    fn finish_requires_a_result_for_every_claimed_file() {
+        let fixture = Fixture::new();
+        let changes = fixture.changes();
+        fixture.pool.install(|| {
+            drop(changes.claim(fixture.identity(1), path("a"), 4096, 123));
+        });
+        changes.finish();
+    }
+
+    /// A rayon call while a file is hashed can run another task on the
+    /// thread of the hashing task. A task that writes changes there finds
+    /// the transaction of the thread locked, which is a bug: `writer`
+    /// reports it instead of waiting forever. With one thread, `join` runs
+    /// its second closure on the thread of the hashing task.
+    #[test]
+    #[should_panic(expected = "one task of a thread holds its transaction at a time")]
+    fn writing_inside_a_hashing_task_is_a_bug() {
+        let fixture = Fixture::new();
+        let changes = fixture.changes();
+        let owner =
+            |handle, name| match changes.claim(fixture.identity(handle), path(name), 4096, 123) {
+                Claim::Owner(owner) => owner,
+                _ => panic!("the first claim owns the file"),
+            };
+        fixture.pool.install(|| {
+            let hashing = owner(1, "a").begin();
+            rayon::join(|| {}, || owner(2, "b").begin().end());
+            hashing.end();
+        });
+    }
+}

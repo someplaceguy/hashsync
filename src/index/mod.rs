@@ -8,18 +8,19 @@
 //! threads of a process share one database handle, and the lock stays
 //! until the handle has closed.
 
+pub mod changes;
 mod layout;
-pub mod writer;
 
 use std::ffi::OsStr;
 use std::mem;
+use std::ops::RangeInclusive;
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::Arc;
 
 use bstr::ByteSlice;
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use rayon::slice::ParallelSliceMut;
 use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, DB, DBCompressionType,
@@ -120,8 +121,7 @@ pub struct Index {
     shared: Arc<Shared>,
 }
 
-/// A read-only view of the index for another thread of the process: a
-/// scan worker during an update, or a lookup worker during a transfer.
+/// A read-only view of the index for a lookup worker during a transfer.
 /// Reads see the latest committed transaction of this process.
 pub struct Reader {
     shared: Arc<Shared>,
@@ -172,6 +172,10 @@ fn db_options() -> Options {
     let subcompactions = (cores / 2).max(1);
     options.set_max_subcompactions(u32::try_from(subcompactions).unwrap_or(u32::MAX));
     options.set_db_write_buffer_size(WRITE_BUFFERS);
+    // The scan threads of an update commit at the same time (DESIGN.md
+    // §4.6). With unordered writes, each thread inserts its batch into the
+    // memtables on its own; only the write-ahead log keeps their order.
+    options.set_unordered_write(true);
     // RocksDB's own log file stays in the index directory: warnings only,
     // and at most two old logs. Read-only processes write no log.
     options.set_log_level(LogLevel::Warn);
@@ -262,8 +266,8 @@ pub fn open_read_only(path: &[u8]) -> Option<Index> {
     })
 }
 
-/// The entries of one column family whose keys start with a prefix, in
-/// key order, from one snapshot of the database.
+/// The entries of one column family in a range of keys, in key order,
+/// from one snapshot of the database.
 struct Scan<'a> {
     raw: DBRawIterator<'a>,
 }
@@ -307,24 +311,34 @@ impl Shared {
         db(self.db.get_pinned_cf(self.cf(cf), key))
     }
 
-    /// The entries of `cf` whose keys start with `prefix`. An empty prefix
-    /// scans the whole column family, without filling the block cache.
-    fn scan(&self, cf: Cf, prefix: &[u8]) -> Scan<'_> {
+    /// The entries of `cf` from the key `start` up to the key `end`,
+    /// excluded, or up to the last entry for `None`. `fill_cache` keeps
+    /// the blocks that the scan reads in the block cache; bulk scans do
+    /// not change the cache.
+    fn scan_range(&self, cf: Cf, start: &[u8], end: Option<Vec<u8>>, fill_cache: bool) -> Scan<'_> {
         let mut options = ReadOptions::default();
         // Seek in the order of all keys, whatever prefix extractor the
         // column family has.
         options.set_total_order_seek(true);
-        options.fill_cache(!prefix.is_empty());
+        options.fill_cache(fill_cache);
         // Without an upper bound, the step past the last entry would skip
-        // each removed entry that follows, up to the next live one. The
-        // reconciliation removes all paths, so the removal of many orphans
-        // with consecutive IDs would take quadratic time.
-        if let Some(end) = prefix_end(prefix) {
+        // each removed entry that follows, up to the next live one.
+        // Removals can leave long runs of removed entries, for example
+        // when the reconciliation removes the `inode_paths` entries of
+        // roots one by one: the removal of many orphans with consecutive
+        // IDs would then take quadratic time.
+        if let Some(end) = end {
             options.set_iterate_upper_bound(end);
         }
         let mut raw = self.db.raw_iterator_cf_opt(self.cf(cf), options);
-        raw.seek(prefix);
+        raw.seek(start);
         Scan { raw }
+    }
+
+    /// The entries of `cf` whose keys start with `prefix`. An empty prefix
+    /// scans the whole column family, without filling the block cache.
+    fn scan(&self, cf: Cf, prefix: &[u8]) -> Scan<'_> {
+        self.scan_range(cf, prefix, prefix_end(prefix), !prefix.is_empty())
     }
 
     /// Call `visit` for each entry of `cf` whose key starts with `prefix`.
@@ -336,20 +350,23 @@ impl Shared {
         }
     }
 
-    /// The largest ID of the rows of `cf`, keyed by ID; 0 when it is
-    /// empty.
-    fn last_id(&self, cf: Cf) -> u64 {
+    /// The last key of `cf`; `None` when it is empty.
+    fn last_key(&self, cf: Cf) -> Option<Vec<u8>> {
         let mut options = ReadOptions::default();
         options.set_total_order_seek(true);
         let mut raw = self.db.raw_iterator_cf_opt(self.cf(cf), options);
         raw.seek_to_last();
-        match raw.key() {
-            Some(key) => u64_at(key, 0),
-            None => {
-                db(raw.status());
-                0
-            }
+        let key = raw.key().map(<[u8]>::to_vec);
+        if key.is_none() {
+            db(raw.status());
         }
+        key
+    }
+
+    /// The largest ID of the rows of `cf`, keyed by ID; 0 when it is
+    /// empty.
+    fn last_id(&self, cf: Cf) -> u64 {
+        self.last_key(cf).map_or(0, |key| u64_at(&key, 0))
     }
 
     /// The weak hash of every block row, from one snapshot, sorted as
@@ -416,29 +433,6 @@ pub struct Candidate {
 }
 
 impl Reader {
-    /// The ID of the complete inode row that stores this identity with
-    /// the observed size and ctime, so the file's content can be reused
-    /// without hashing (DESIGN.md §4.2). An incomplete row has no size and
-    /// is never reusable.
-    pub fn reusable_inode(
-        &self,
-        fsid: &[u8],
-        handle: &[u8],
-        size: u64,
-        ctime_ns: i64,
-    ) -> Option<u64> {
-        let shared = &self.shared;
-        let inode_id = u64_at(
-            &shared.get(Cf::Identities, &layout::identity(fsid, handle))?,
-            0,
-        );
-        let row = shared
-            .get(Cf::Inodes, &id_key(inode_id))
-            .map(|value| InodeRow::decode(&value))
-            .expect("database error: an identity without its inode row");
-        (row.size == Some(size) && row.ctime_ns == ctime_ns).then_some(inode_id)
-    }
-
     /// At most `limit` candidates of the blocks whose strong-hash prefix is
     /// `prefix`: one for every path of each block's inode, and one for each
     /// block whose inode has no path. Any order would do; this one is
@@ -497,8 +491,11 @@ impl Reader {
 
 /// Changes to write together: one atomic RocksDB write batch. A modifying
 /// process commits them with `commit`, or with `checkpoint` once they reach
-/// the bound of a transaction (DESIGN.md §4.4). Reads see only committed
-/// changes.
+/// the bound of a transaction (DESIGN.md §4.4). Reads do not see the
+/// changes before the commit. The database has unordered writes
+/// (`db_options`): while a thread commits, a read on another thread can see
+/// part of the transaction. So no thread may read rows that another thread
+/// can commit at the same time.
 pub struct Transaction<'a> {
     index: &'a Index,
     batch: WriteBatch,
@@ -511,6 +508,24 @@ impl Transaction<'_> {
 
     pub fn delete(&mut self, cf: Cf, key: &[u8]) {
         self.batch.delete_cf(self.index.shared.cf(cf), key);
+    }
+
+    /// Remove the entries of `cf` from the key `first` to the key `last`,
+    /// both included, with one range deletion.
+    fn delete_range(&mut self, cf: Cf, first: &[u8], last: &[u8]) {
+        // A range deletion stops before its end key. The key just after
+        // `last` is `last` with a zero byte.
+        let end = [last, &[0]].concat();
+        self.batch
+            .delete_range_cf(self.index.shared.cf(cf), first, &end[..]);
+    }
+
+    /// Remove every entry of `cf` with one range deletion. Reads committed
+    /// entries.
+    fn clear(&mut self, cf: Cf) {
+        if let Some(last) = self.index.shared.last_key(cf) {
+            self.delete_range(cf, b"", &last);
+        }
     }
 
     /// Write the pending changes atomically.
@@ -529,21 +544,44 @@ impl Transaction<'_> {
         }
     }
 
-    /// Remove every path of a root from `paths` and `inode_paths`,
-    /// committing between bounded transactions. Reads committed entries.
-    fn remove_root_paths(&mut self, root_id: u64) {
+    /// Remove every path of the roots with IDs in `roots` from `paths` and
+    /// `inode_paths`, committing between bounded transactions. No root in
+    /// the range may keep its paths: the `paths` rows of the range then
+    /// form one key range, which each transaction removes up to its last
+    /// row with one range deletion. The same transaction removes the
+    /// `inode_paths` entries of those rows one by one: their keys start
+    /// with the inode ID, so they are spread among the entries of other
+    /// roots. Reads committed entries.
+    fn remove_root_paths(&mut self, roots: RangeInclusive<u64>) {
         let index = self.index;
-        index
-            .shared
-            .each(Cf::Paths, &id_key(root_id), |key, value| {
-                let rel_path = &key[ID_LEN..];
-                self.delete(
-                    Cf::InodePaths,
-                    &layout::inode_path_key(u64_at(value, 0), root_id, rel_path),
-                );
-                self.delete(Cf::Paths, key);
-                self.checkpoint();
-            });
+        let mut scan = index.shared.scan_range(
+            Cf::Paths,
+            &id_key(*roots.start()),
+            prefix_end(&id_key(*roots.end())),
+            false,
+        );
+        // The rows that the next range deletion removes: from the key
+        // `first` to the key `last`.
+        let mut first = None;
+        let mut last = Vec::new();
+        while let Some((key, value)) = scan.entry() {
+            self.delete(
+                Cf::InodePaths,
+                &layout::inode_path_key(u64_at(value, 0), u64_at(key, 0), &key[ID_LEN..]),
+            );
+            let range_first = first.get_or_insert_with(|| key.to_vec());
+            last.clear();
+            last.extend_from_slice(key);
+            if self.batch.len() >= COMMIT_WORK {
+                self.delete_range(Cf::Paths, range_first, &last);
+                self.commit();
+                first = None;
+            }
+            scan.next();
+        }
+        if let Some(first) = first {
+            self.delete_range(Cf::Paths, &first, &last);
+        }
     }
 
     /// Remove every path of an inode from `inode_paths` and `paths`,
@@ -590,6 +628,21 @@ impl Index {
             index: self,
             batch: WriteBatch::default(),
         }
+    }
+
+    /// Apply `remove` to every item on the threads of the current pool,
+    /// each thread in bounded transactions of its own.
+    fn remove_all<T: Sync>(&self, items: &[T], remove: impl Fn(&mut Transaction<'_>, &T) + Sync) {
+        items
+            .par_iter()
+            .fold(
+                || self.transaction(),
+                |mut txn, item| {
+                    remove(&mut txn, item);
+                    txn
+                },
+            )
+            .for_each(|mut txn| txn.commit());
     }
 
     /// Every root row, by ID.
@@ -667,20 +720,9 @@ impl Index {
             rustix::rand::getrandom(&mut index_id, rustix::rand::GetRandomFlags::empty())
         })
         .unwrap_or_else(|e| panic!("getrandom: {e}"));
-        let shared = &self.shared;
         let mut txn = self.transaction();
         for cf in Cf::ALL {
-            let mut options = ReadOptions::default();
-            options.set_total_order_seek(true);
-            let mut raw = shared.db.raw_iterator_cf_opt(shared.cf(cf), options);
-            raw.seek_to_last();
-            let Some(last) = raw.key() else {
-                db(raw.status());
-                continue;
-            };
-            // From the first key to the key just after the last one.
-            let end = [last, &[0]].concat();
-            txn.batch.delete_range_cf(shared.cf(cf), &b""[..], &end[..]);
+            txn.clear(cf);
         }
         txn.put(Cf::Meta, b"schema_version", &SCHEMA_VERSION.to_be_bytes());
         txn.put(
@@ -728,14 +770,19 @@ impl Index {
     /// and rows of unfinished roots and of incomplete inodes, then create
     /// rows for the roots to scan. Returns their IDs in order.
     ///
-    /// The paths and blocks go first, in bounded transactions; the rows
-    /// then change in one transaction.
+    /// The blocks go first, in bounded transactions, and so do the paths
+    /// when some roots keep theirs. The rows then change in one
+    /// transaction, which also removes all paths when no root keeps its
+    /// paths.
     pub fn reconcile_roots(&self, paths: &[&[u8]]) -> Vec<u64> {
-        // Every root without an identifier is unfinished.
-        let (unfinished, retained): (Vec<_>, Vec<_>) = self
-            .roots()
-            .into_iter()
-            .partition(|(_, row)| row.identifier.is_none());
+        // Every root without an identifier is unfinished; the others keep
+        // their paths.
+        let roots = self.roots();
+        let last_retained = roots
+            .iter()
+            .filter(|(_, row)| row.identifier.is_some())
+            .map(|&(root_id, _)| root_id)
+            .max();
         let mut incomplete = Vec::new();
         self.shared.each(Cf::Inodes, b"", |key, value| {
             let row = InodeRow::decode(value);
@@ -744,30 +791,43 @@ impl Index {
             }
         });
 
-        let mut txn = self.transaction();
-        for &(root_id, _) in &unfinished {
-            txn.remove_root_paths(root_id);
-        }
-        for (inode_id, _) in &incomplete {
-            txn.remove_inode_paths(*inode_id);
-            txn.remove_blocks(*inode_id);
-        }
-        txn.commit();
+        // A root can have many paths, and there can be many roots: the
+        // removals run on one thread per core. A path of an incomplete
+        // inode under an unfinished root is removed twice, which changes
+        // nothing. The pool's threads end when it is dropped.
+        rayon::ThreadPoolBuilder::new()
+            .thread_name(|i| format!("reconcile{i}"))
+            .build()
+            .expect("cannot start the reconcile pool")
+            .install(|| {
+                if last_retained.is_some() {
+                    let parts = root_parts(&roots, rayon::current_num_threads());
+                    self.remove_all(&parts, |txn, part| txn.remove_root_paths(part.clone()));
+                }
+                self.remove_all(&incomplete, |txn, &(inode_id, _)| {
+                    txn.remove_inode_paths(inode_id);
+                    txn.remove_blocks(inode_id);
+                });
+            });
 
-        for &(root_id, _) in &unfinished {
-            txn.delete(Cf::Roots, &id_key(root_id));
+        let mut txn = self.transaction();
+        if last_retained.is_none() {
+            // No root keeps its paths: they all go, with one range
+            // deletion in each column family.
+            txn.clear(Cf::Paths);
+            txn.clear(Cf::InodePaths);
+        }
+        for (root_id, row) in &roots {
+            if row.identifier.is_none() {
+                txn.delete(Cf::Roots, &id_key(*root_id));
+            }
         }
         for (inode_id, row) in &incomplete {
             txn.delete(Cf::Inodes, &id_key(*inode_id));
             txn.delete(Cf::Identities, &row.identity);
         }
         // IDs of removed roots can return: their paths are gone.
-        let mut next = retained
-            .iter()
-            .map(|&(root_id, _)| root_id)
-            .max()
-            .unwrap_or(0)
-            + 1;
+        let mut next = last_retained.unwrap_or(0) + 1;
         let ids = paths
             .iter()
             .map(|path| {
@@ -825,6 +885,24 @@ impl Index {
         stats.distinct_weak = weak.len() as u64;
         stats
     }
+}
+
+/// The unfinished roots of `roots`, which are in ID order, as parts for a
+/// pool of `threads` threads: ranges of root IDs without a retained root
+/// inside, so that the paths of a part form one key range. About four
+/// parts for each thread let the threads share the work. A part removes
+/// its paths with one range deletion for each transaction, so the range
+/// deletions do not increase with the number of roots.
+fn root_parts(roots: &[(u64, RootRow)], threads: usize) -> Vec<RangeInclusive<u64>> {
+    let unfinished = |row: &RootRow| row.identifier.is_none();
+    let count = roots.iter().filter(|(_, row)| unfinished(row)).count();
+    let roots_per_part = count.div_ceil(4 * threads).max(1);
+    roots
+        .chunk_by(|(_, a), (_, b)| unfinished(a) == unfinished(b))
+        .filter(|run| unfinished(&run[0].1))
+        .flat_map(|run| run.chunks(roots_per_part))
+        .map(|part| part[0].0..=part[part.len() - 1].0)
+        .collect()
 }
 
 #[cfg(test)]
@@ -933,6 +1011,43 @@ mod tests {
         n
     }
 
+    /// Give root rows identifiers: they become completed immutable groups,
+    /// which keep their paths.
+    fn complete_roots(index: &Index, root_ids: &[u64]) {
+        let mut txn = index.transaction();
+        for &root_id in root_ids {
+            let row = RootRow {
+                identifier: Some(format!("group{root_id}").into_bytes()),
+                path: format!("/group{root_id}").into_bytes(),
+            };
+            txn.put(Cf::Roots, &id_key(root_id), &row.encode());
+        }
+        txn.commit();
+    }
+
+    /// A path as `(root_id, rel_path, inode_id)`.
+    type PathRow = (u64, Vec<u8>, u64);
+
+    /// The paths of the `paths` rows and of the `inode_paths` entries,
+    /// each sorted.
+    fn path_rows(index: &Index) -> (Vec<PathRow>, Vec<PathRow>) {
+        let mut rows = Vec::new();
+        index.shared.each(Cf::Paths, b"", |key, value| {
+            rows.push((u64_at(key, 0), key[ID_LEN..].to_vec(), u64_at(value, 0)));
+        });
+        let mut entries = Vec::new();
+        index.shared.each(Cf::InodePaths, b"", |key, _| {
+            entries.push((
+                u64_at(key, ID_LEN),
+                key[2 * ID_LEN..].to_vec(),
+                u64_at(key, 0),
+            ));
+        });
+        rows.sort();
+        entries.sort();
+        (rows, entries)
+    }
+
     /// The exit code of a completed probe. The probe process exits with
     /// it because a plain successful exit proves nothing: a filter that
     /// selects no test also exits zero.
@@ -1000,7 +1115,7 @@ mod tests {
         drop(index);
         // The reader keeps the database, and so the lock.
         probe(&path, "busy");
-        assert_eq!(reader.reusable_inode(b"\x01", b"\x02", 4096, 123), None);
+        assert!(reader.candidates(&[0; PREFIX_LEN], 1).is_empty());
         drop(reader);
         probe(&path, "open");
 
@@ -1116,10 +1231,12 @@ mod tests {
     }
 
     /// A scan of the entries of one inode stops at its last entry, also
-    /// when removed entries follow. The reconciliation removes all paths,
-    /// so the paths of vanished files remain as removed entries, in the
-    /// order of their inode IDs. Without the stop, a lookup of the inode
-    /// before them, and the removal of each orphan, would skip all of them.
+    /// when removed entries follow. When some roots keep their paths, the
+    /// reconciliation removes the `inode_paths` entries of the other roots
+    /// one by one, so the paths of vanished files remain as removed
+    /// entries, in the order of their inode IDs. Without the stop, a
+    /// lookup of the inode before them, and the removal of each orphan,
+    /// would skip all of them.
     #[test]
     fn scans_stop_before_removed_entries() {
         use rocksdb::perf::{PerfContext, PerfMetric, PerfStatsLevel, set_perf_stats};
@@ -1174,34 +1291,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let index = new_index(dir.path());
         let reader = index.reader();
-        assert_eq!(reader.reusable_inode(b"\x01", b"\x02", 4096, 123), None);
+        let prefix = [0x11; PREFIX_LEN];
+        assert!(reader.candidates(&prefix, 10).is_empty());
         insert(
             &index,
-            &[
-                (7, &layout::identity(b"\x01", b"\x02"), Some(4096)),
-                (8, &layout::identity(b"\x01", b"\x03"), None),
-            ],
-            &[],
-            &[],
-            &[],
+            &[(7, &layout::identity(b"\x01", b"\x02"), Some(4096))],
+            &[(1, b"/r")],
+            &[(7, 1, b"a")],
+            &[(7, 0, 0, prefix)],
         );
-        assert_eq!(
-            reader.reusable_inode(b"\x01", b"\x02", 4096, 123),
-            Some(7),
-            "the reader must see the commit"
-        );
-        assert_eq!(reader.reusable_inode(b"\x01", b"\x02", 4096, 124), None);
-        assert_eq!(reader.reusable_inode(b"\x01", b"\x02", 4095, 123), None);
-        assert_eq!(
-            reader.reusable_inode(b"\x01", b"\x03", 4096, 123),
-            None,
-            "an incomplete row is not reusable"
-        );
+        let found = reader.candidates(&prefix, 10);
+        assert_eq!(found.len(), 1, "the reader must see the commit");
+        assert_eq!(found[0].path, Some((1, b"a".to_vec())));
     }
 
     /// A reset removes every entry, keeps the index usable, and renews
     /// the index ID; reconciliation reuses the IDs of removed roots only
-    /// after their paths are gone.
+    /// after their paths are gone. When no root keeps its paths, their
+    /// removal takes one range deletion in each column family, which
+    /// leaves the paths that the scan adds later (DESIGN.md §4.2).
     #[test]
     fn reset_and_reconcile() {
         let dir = tempfile::tempdir().unwrap();
@@ -1210,12 +1318,12 @@ mod tests {
         insert(
             &index,
             &[(1, b"\x01\x01", Some(4096)), (2, b"\x01\x02", None)],
-            &[(1, b"/r")],
-            &[(1, 1, b"a"), (2, 1, b"b")],
+            &[(1, b"/r"), (2, b"/q")],
+            &[(1, 1, b"a"), (2, 1, b"b"), (1, 2, b"")],
             &[(1, 0, 5, [1; PREFIX_LEN]), (2, 0, 6, [2; PREFIX_LEN])],
         );
         // The incomplete inode goes with its paths and blocks, the
-        // unfinished root with its paths; the complete inode stays.
+        // unfinished roots with their paths; the complete inode stays.
         assert_eq!(index.reconcile_roots(&[b"/s", b"/t"]), [1, 2]);
         assert_eq!(
             index.root_paths(),
@@ -1232,6 +1340,10 @@ mod tests {
             assert_eq!(count(&index, cf), n, "{cf:?}");
         }
         assert_eq!(index.next_inode_id(), 2);
+        insert(&index, &[], &[], &[(1, 2, b"a")], &[]);
+        let (rows, entries) = path_rows(&index);
+        assert_eq!(rows, [(2, b"a".to_vec(), 1)], "a later path must stay");
+        assert_eq!(entries, rows);
 
         index.reset(&settings());
         for cf in Cf::ALL {
@@ -1243,5 +1355,145 @@ mod tests {
         assert_ne!(meta.index_id, first_id);
         assert_eq!(index.next_inode_id(), 1);
         assert_eq!(index.reconcile_roots(&[b"/u"]), [1]);
+    }
+
+    /// Roots that keep their paths lose only the paths of incomplete
+    /// inodes. The other roots lose both entries of every path, and their
+    /// rows; new roots get IDs after the kept ones (DESIGN.md §4.2). The
+    /// paths at the ends of each root's key range test the ends of the
+    /// range deletions.
+    #[test]
+    fn reconcile_keeps_the_paths_of_retained_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = new_index(dir.path());
+        // Roots 2 and 5 keep their paths; there is no root 8.
+        let root_ids = [1, 2, 3, 4, 5, 6, 7, 9];
+        let root_names: Vec<String> = root_ids.iter().map(|id| format!("/r{id}")).collect();
+        let roots: Vec<(u64, &[u8])> = root_ids
+            .iter()
+            .zip(&root_names)
+            .map(|(&id, name)| (id, name.as_bytes()))
+            .collect();
+        let mut paths: Vec<(u64, u64, &[u8])> = Vec::new();
+        for &root_id in &root_ids {
+            paths.extend([(1, root_id, &b""[..]), (2, root_id, b"\xff\xff")]);
+        }
+        // Inode 3 is incomplete, with paths under a kept root and an
+        // unfinished one.
+        paths.extend([(3, 2, &b"i"[..]), (3, 3, b"i")]);
+        insert(
+            &index,
+            &[
+                (1, b"\x01\x01", Some(4096)),
+                (2, b"\x01\x02", Some(4096)),
+                (3, b"\x01\x03", None),
+            ],
+            &roots,
+            &paths,
+            &[
+                (1, 0, 5, [1; PREFIX_LEN]),
+                (3, 0, 6, [3; PREFIX_LEN]),
+                (3, 1, 7, [4; PREFIX_LEN]),
+            ],
+        );
+        complete_roots(&index, &[2, 5]);
+
+        assert_eq!(index.reconcile_roots(&[b"/new"]), [6]);
+        let ids: Vec<u64> = index.root_paths().iter().map(|&(id, _)| id).collect();
+        assert_eq!(ids, [2, 5, 6]);
+        let (rows, entries) = path_rows(&index);
+        let kept = |root_id| {
+            [
+                (root_id, b"".to_vec(), 1),
+                (root_id, b"\xff\xff".to_vec(), 2),
+            ]
+        };
+        assert_eq!(rows, [kept(2), kept(5)].concat());
+        assert_eq!(entries, rows);
+        for (cf, n) in [
+            (Cf::Inodes, 2),
+            (Cf::Identities, 2),
+            (Cf::Blocks, 1),
+            (Cf::Strong, 1),
+        ] {
+            assert_eq!(count(&index, cf), n, "{cf:?}");
+        }
+    }
+
+    /// Each transaction that removes root paths removes both entries of
+    /// the paths that it covers: an interruption between transactions
+    /// leaves both entries of every other path (DESIGN.md §4.4). The next
+    /// reconciliation removes the rest, and a root that keeps its paths
+    /// loses none, also between the removed roots.
+    #[test]
+    fn interrupted_root_path_removal_leaves_whole_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = new_index(dir.path());
+        // Roots 1 and 2 together have enough paths that their removal
+        // commits in the middle, after `COMMIT_WORK` paths.
+        const MANY_PATHS: usize = COMMIT_WORK + 10_000;
+        let names: Vec<String> = (0..MANY_PATHS).map(|i| format!("f{i:05}")).collect();
+        let mut paths: Vec<(u64, u64, &[u8])> = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (1, 1 + (2 * i / MANY_PATHS) as u64, name.as_bytes()))
+            .collect();
+        paths.extend([(1, 3, &b""[..]), (1, 3, b"\xff\xff"), (1, 4, b"a")]);
+        insert(
+            &index,
+            &[(1, b"\x01\x01", Some(4096))],
+            &[(1, b"/a"), (2, b"/b"), (3, b"/c"), (4, b"/d")],
+            &paths,
+            &[],
+        );
+        complete_roots(&index, &[3]);
+
+        interrupt_after_commits(Some(1));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut txn = index.transaction();
+            txn.remove_root_paths(1..=2);
+            txn.commit();
+        }));
+        interrupt_after_commits(None);
+        assert!(
+            result.is_err(),
+            "the injected failure must stop the removal"
+        );
+        let (rows, entries) = path_rows(&index);
+        assert_eq!(entries, rows, "every path must keep both entries");
+        let left: Vec<&PathRow> = rows.iter().filter(|(root_id, ..)| *root_id <= 2).collect();
+        assert_eq!(left.len(), MANY_PATHS - COMMIT_WORK);
+        assert!(left.iter().all(|(root_id, ..)| *root_id == 2));
+        assert_eq!(rows.len(), left.len() + 3);
+
+        index.reconcile_roots(&[]);
+        let (rows, entries) = path_rows(&index);
+        assert_eq!(rows, [(3, b"".to_vec(), 1), (3, b"\xff\xff".to_vec(), 1)]);
+        assert_eq!(entries, rows);
+    }
+
+    /// The parts of the unfinished roots cover each of them once, never
+    /// contain a retained root, and contain more roots when there are
+    /// fewer threads.
+    #[test]
+    fn root_parts_leave_out_retained_roots() {
+        // Roots 2 and 5 are retained; there is no root 8.
+        let roots: Vec<(u64, RootRow)> = [1, 2, 3, 4, 5, 6, 7, 9]
+            .into_iter()
+            .map(|id| {
+                let row = RootRow {
+                    identifier: [2, 5].contains(&id).then(|| b"group".to_vec()),
+                    path: format!("/r{id}").into_bytes(),
+                };
+                (id, row)
+            })
+            .collect();
+        // Six unfinished roots, four parts per thread: two roots per part.
+        assert_eq!(root_parts(&roots, 1), [1..=1, 3..=4, 6..=7, 9..=9]);
+        assert_eq!(
+            root_parts(&roots, 64),
+            [1..=1, 3..=3, 4..=4, 6..=6, 7..=7, 9..=9]
+        );
+        assert!(root_parts(&roots[1..2], 1).is_empty());
     }
 }
