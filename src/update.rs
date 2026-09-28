@@ -57,6 +57,14 @@ pub fn perform(config: &Config, rebuild: bool, jobs: Option<u32>) -> (index::Ind
             }
         };
     if rebuild {
+        // Warn only when the index gets its block size, not on each update.
+        if settings.block_size < 4096 {
+            die::warn(format!(
+                "block_size ({} bytes) is less than 4 KiB, so performance is much \
+                 reduced; a block size of at least 4 KiB is strongly recommended",
+                settings.block_size
+            ));
+        }
         index.reset(&settings);
     }
 

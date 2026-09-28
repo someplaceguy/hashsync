@@ -814,6 +814,38 @@ fn updates_reflect_changes_and_rebuilds() {
 }
 
 #[test]
+fn small_block_sizes_warn_when_the_index_is_built() {
+    const WARNING: &str = "block_size (512 bytes) is less than 4 KiB";
+    let env = Env::new();
+    env.write("tree/f", &random(BLOCK * 3, 1));
+    let update = |block_size: usize| {
+        env.configure_with(&format!(
+            "block_size = {block_size}\n{}",
+            env.root("tree", "")
+        ));
+        env.update()
+    };
+
+    let stderr = update(512);
+    assert!(stderr.contains("creating index"), "{stderr}");
+    assert!(stderr.contains(WARNING), "{stderr}");
+    assert_eq!(env.count("blocks"), BLOCK * 3 / 512);
+    let stderr = update(512);
+    assert!(!stderr.contains(WARNING), "the index stays: {stderr}");
+    let output = env.run(&["update", "--rebuild"]);
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains(WARNING));
+
+    // Changed settings rebuild the index, and the new block size decides.
+    let stderr = update(BLOCK);
+    assert!(stderr.contains("rebuilding"), "{stderr}");
+    assert!(!stderr.contains("less than 4 KiB"), "{stderr}");
+    let stderr = update(512);
+    assert!(stderr.contains("rebuilding"), "{stderr}");
+    assert!(stderr.contains(WARNING), "{stderr}");
+}
+
+#[test]
 fn stats_reports_the_index() {
     let env = Env::new();
     env.configure(&env.root("tree", ""));

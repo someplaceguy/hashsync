@@ -20,7 +20,7 @@ asynchronous runtime or event loop.
 - **Receiver**: the host running `hashsync run`; it holds the index and
   reconstructs the command's output.
 - **Sender**: the remote host; it runs the command and scans its output.
-- **Block**: `block_size` bytes (default 32 KiB) at an aligned offset in an
+- **Block**: `block_size` bytes (default 16 KiB) at an aligned offset in an
   indexed file. Only complete blocks are indexed.
 - **Window**: `block_size` bytes at any offset in the command's output.
   All protocol offsets count output bytes from zero.
@@ -1373,7 +1373,7 @@ a broken pipe on its next write to either closed output pipe.
 Use `$XDG_CONFIG_HOME/hashsync/config.toml`, or `--config PATH`:
 
 ```toml
-block_size     = "32KiB"   # at least 4 KiB; changes rebuild the index
+block_size     = "16KiB"   # at least 512 bytes; changes rebuild the index
 strong_hash    = "blake3"  # blake3 or sha256
 candidate_attempts = 128  # candidates tried per query, at least 1
 hashlist_max_age = "90d"

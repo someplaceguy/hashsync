@@ -17,8 +17,8 @@ use crate::hash::StrongHash;
 use crate::protocol::COMPRESSION_LEVELS;
 use crate::ssh;
 
-pub const MIN_BLOCK_SIZE: u64 = 4096;
-pub const DEFAULT_BLOCK_SIZE: u32 = 32 * 1024;
+pub const MIN_BLOCK_SIZE: u64 = 512;
+pub const DEFAULT_BLOCK_SIZE: u32 = 16 * 1024;
 
 /// 90 days (DESIGN.md §5.6), in seconds.
 pub const DEFAULT_HASHLIST_MAX_AGE: u64 = 90 * 24 * 3600;
@@ -752,14 +752,15 @@ one_filesystem = true
         assert_eq!(config.roots[0].pattern, b"/srv/\xff/*");
         assert!(parse("").unwrap().roots.is_empty());
         assert_eq!(parse("block_size = 8192").unwrap().block_size, 8192);
+        assert_eq!(parse("block_size = 512").unwrap().block_size, 512);
     }
 
     #[test]
     fn rejected_configurations() {
         assert!(
-            parse("block_size = \"2KiB\"")
+            parse("block_size = 511")
                 .unwrap_err()
-                .contains("at least")
+                .contains("at least 512 bytes")
         );
         assert!(
             parse("block_size = \"8GiB\"")
