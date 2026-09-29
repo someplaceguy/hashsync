@@ -844,6 +844,13 @@ fn small_block_sizes_warn_when_the_index_is_built() {
     let stderr = update(512);
     assert!(stderr.contains("rebuilding"), "{stderr}");
     assert!(stderr.contains(WARNING), "{stderr}");
+
+    // `--quiet` removes the notes, but not the warning.
+    let output = env.run(&["update", "--rebuild", "--quiet"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert!(stderr.contains(WARNING), "{stderr}");
 }
 
 #[test]

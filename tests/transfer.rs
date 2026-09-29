@@ -578,6 +578,18 @@ fn summaries_show_scale_units() {
 }
 
 #[test]
+fn quiet_runs_print_only_the_command_stderr() {
+    // `--quiet` removes the summary and the notes of the update, which
+    // creates the index here. The command's stderr still arrives
+    // (DESIGN.md §8).
+    let transfer = Transfer::new("");
+    let command = args(&["sh", "-c", "echo to-stdout; echo to-stderr >&2"]);
+    let output = succeeded(transfer.run(&["--quiet"], &refs(&command)));
+    assert_eq!(output.stdout, b"to-stdout\n");
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "to-stderr\n");
+}
+
+#[test]
 fn command_killed_by_a_signal_reports_128_plus_signal() {
     let transfer = Transfer::new("");
     let command = args(&["sh", "-c", "kill -KILL $$"]);
@@ -597,6 +609,14 @@ fn startup_failure_reports_127_and_the_error() {
         stderr.contains("failed to start") && stderr.contains("nonexistent-hashsync-test"),
         "startup error:\n{stderr}"
     );
+
+    // The error is not a note: `--quiet` keeps it, and removes the
+    // summary.
+    let output = transfer.run(&["--quiet"], &refs(&command));
+    assert_eq!(output.status.code(), Some(127));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("failed to start"), "{stderr}");
+    assert!(!stderr.contains(" output ("), "{stderr}");
 }
 
 #[test]

@@ -38,12 +38,15 @@ pub fn perform(config: &Config, rebuild: bool, jobs: Option<u32>) -> (index::Ind
     let rebuild = rebuild
         || match index.read_meta() {
             None => {
-                die::note(format!("creating index {}", config.index_path.as_bstr()));
+                die::note(format_args!(
+                    "creating index {}",
+                    config.index_path.as_bstr()
+                ));
                 true
             }
             Some(meta) if meta.compatible(&settings) => false,
             Some(meta) => {
-                die::note(format!(
+                die::note(format_args!(
                     "index settings changed (schema {} -> {}, block size {} -> {}, \
                      weak hash {} -> {}, strong hash {} -> {}); rebuilding",
                     meta.schema_version,
@@ -82,7 +85,7 @@ pub fn perform(config: &Config, rebuild: bool, jobs: Option<u32>) -> (index::Ind
 
     index.finish_update();
 
-    die::note(format!(
+    die::note(format_args!(
         "{} in {:.1}s: {} directories, {} files hashed ({}), \
          {} unchanged, {} hard links, {} small files, {} newly indexed blocks \
          (skipped: {} periodic, {} in holes), {} paths, {} stale inodes removed",

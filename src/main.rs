@@ -53,6 +53,10 @@ struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     config: Option<OsString>,
 
+    /// Print no progress notes and summaries, only warnings and errors
+    #[arg(short, long, global = true)]
+    quiet: bool,
+
     /// Show amounts of bytes as whole bytes, without scale units such as KiB
     #[arg(long, global = true)]
     no_human_readable: bool,
@@ -110,6 +114,9 @@ enum Command {
 fn main() {
     die::install_panic_hook();
     let cli = Cli::parse();
+    if cli.quiet {
+        die::disable_notes();
+    }
     if cli.no_human_readable {
         units::disable_human_readable();
     }

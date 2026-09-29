@@ -266,9 +266,9 @@ pub fn run(
     index.close();
 
     if end.status == 127 && !end.error.is_empty() {
-        die::note(format!("remote command failed to start: {}", end.error));
+        die::error(format!("remote command failed to start: {}", end.error));
     }
-    die::note(format!(
+    die::note(format_args!(
         "{} output ({} literal, {} reference, {} run), {} wire, {} hash list, {} delta",
         Bytes(counts.output),
         Bytes(counts.literal),

@@ -1551,9 +1551,11 @@ exclude = ['*.tmp', 'literal\x2Aname', 'back\\slash']
   unconfigured roots together with their paths, then orphaned inodes and
   blocks. Inaccessible locations are not proof of absence (section 4.2).
 
-Every command also accepts this option, besides `--config PATH`
+Every command also accepts these options, besides `--config PATH`
 (section 7):
 
+- `-q` (`--quiet`): do not print progress messages and summaries to
+  stderr. Warnings and errors stay.
 - `--no-human-readable`: show all amounts of bytes as whole bytes.
 
 Summaries and statistics show amounts of bytes in binary units. An amount

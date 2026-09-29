@@ -16,12 +16,15 @@
 //!
 //! Diagnostics are best effort: a failed write to stderr is ignored. There
 //! is no other channel to report it on, and a panic would turn the failure
-//! into an abort with a core dump.
+//! into an abort with a core dump. `--quiet` removes the notes, which
+//! report progress and summaries, and keeps warnings and errors
+//! (DESIGN.md §8).
 
 use std::fmt::Display;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Child, Command};
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use rustix::event::{PollFd, PollFlags};
@@ -59,9 +62,26 @@ pub fn warn(message: impl Display) {
     report(format_args!("warning: {message}"));
 }
 
-/// Report progress or a summary.
-pub fn note(message: impl Display) {
+/// Report a failure that does not end the process: the remote command's
+/// failure to start, after which the run ends normally with the
+/// command's status.
+pub fn error(message: impl Display) {
     report(format_args!("{message}"));
+}
+
+/// Cleared by `--quiet`, before other threads start.
+static NOTES: AtomicBool = AtomicBool::new(true);
+
+/// Report no more progress or summaries.
+pub fn disable_notes() {
+    NOTES.store(false, Relaxed);
+}
+
+/// Report progress or a summary, unless `--quiet` disabled the notes.
+pub fn note(message: impl Display) {
+    if NOTES.load(Relaxed) {
+        report(format_args!("{message}"));
+    }
 }
 
 /// Write `hashsync: `, the message, and a newline to stderr as one write.
