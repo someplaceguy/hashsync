@@ -20,7 +20,7 @@ use std::process::{Child, Command, Output, Stdio};
 use std::time::Duration;
 
 use common::{
-    BLOCK, CACHE_RESULT, END, Env, HELLO, KillOnDrop, LIT, frame, proc_state, random, tiled,
+    BLOCK, CACHE_RESULT, END, Env, HELLO, KillOnDrop, LIT, QUERY, frame, proc_state, random, tiled,
     toml_literal, version,
 };
 use rustix::event::{PollFd, PollFlags, poll};
@@ -192,8 +192,9 @@ fn whole_bytes(number: &str, line: &str) -> usize {
         .unwrap_or_else(|_| panic!("{number} is not whole bytes: {line}"))
 }
 
-/// The byte counts of the summary line of a run with `EXACT` amounts:
-/// output, literal, reference, run, wire, hash-list, and delta bytes.
+/// The byte counts of the first summary line of a run with `EXACT`
+/// amounts: output, literal, reference, run, wire, hash-list, and delta
+/// bytes.
 fn summary_counts(output: &Output) -> Vec<usize> {
     let line = summary_line(output, " output (");
     numbers(&line)
@@ -212,6 +213,62 @@ fn summary(output: &Output) -> [usize; 4] {
 /// The bytes that the data session received, from the summary line.
 fn wire_bytes(output: &Output) -> usize {
     summary_counts(output)[4]
+}
+
+/// The second summary line, which reports the traffic as rsync does.
+struct Traffic {
+    sent: usize,
+    received: usize,
+    seconds: f64,
+    /// Bytes per second.
+    rate: usize,
+    speedup: f64,
+}
+
+/// The second summary line of a run with `EXACT` amounts, `sent S and
+/// received R in Ts (X/s), speedup Y`, whose numbers are S, R, T, X, and
+/// Y.
+fn traffic(output: &Output) -> Traffic {
+    let line = summary_line(output, "hashsync: sent ");
+    let [sent, received, seconds, rate, speedup] = numbers(&line)[..] else {
+        panic!("unexpected traffic line: {line}");
+    };
+    Traffic {
+        sent: whole_bytes(sent, &line),
+        received: whole_bytes(received, &line),
+        seconds: seconds.parse().unwrap(),
+        rate: whole_bytes(rate, &line),
+        speedup: speedup.parse().unwrap(),
+    }
+}
+
+/// The units of amounts of bytes, from the smallest (DESIGN.md §8).
+const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+
+/// The amounts of bytes on a summary line, as pairs of a word and the
+/// unit after it. A rate such as `(1.65 KiB/s)` gives `1.65` and `KiB`.
+fn amounts(line: &str) -> Vec<(&str, &str)> {
+    let words: Vec<&str> = line.split([' ', '(', '/']).collect();
+    words
+        .windows(2)
+        .filter(|pair| UNITS.contains(&pair[1]))
+        .map(|pair| (pair[0], pair[1]))
+        .collect()
+}
+
+/// Whether `number` and `unit` show an amount in scale units: whole
+/// bytes below 1 KiB, else two decimal digits.
+fn is_scaled_amount(number: &str, unit: &str) -> bool {
+    let digits = |text: &str| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
+    match unit {
+        "B" => digits(number) && number.parse::<u64>().unwrap() < 1024,
+        _ => {
+            UNITS.contains(&unit)
+                && number.split_once('.').is_some_and(|(whole, fraction)| {
+                    digits(whole) && fraction.len() == 2 && digits(fraction)
+                })
+        }
+    }
 }
 
 /// Require a successful run; return its output.
@@ -557,11 +614,56 @@ fn empty_output_and_command_failure_status() {
 }
 
 #[test]
+fn the_summary_counts_both_sessions() {
+    // Each reference needs a QUERY on the control session and a yes
+    // ANSWER, which the data session does not carry. The second summary
+    // line counts both sessions in both directions (DESIGN.md §8).
+    let transfer = Transfer::new("");
+    let blocks = tiled(64, 7);
+    transfer.env.write("tree/blocks", &blocks);
+    let command = args(&["cat", transfer.env.path("tree/blocks").to_str().unwrap()]);
+    let output = transfer.run_ok(&refs(&command));
+    assert_eq!(output.stdout, blocks);
+    let counts = summary_counts(&output);
+    let (output_bytes, wire, hash_list) = (counts[0], counts[4], counts[5]);
+    assert_eq!(counts[2], blocks.len(), "every block is a reference");
+
+    // The receiver reads the sender's control version and one QUERY per
+    // block: a 5-byte frame header, the offset, and the full digest. It
+    // writes its two versions, the hash list, and one ANSWER per block:
+    // a header, the offset, and the flag.
+    let traffic = traffic(&output);
+    assert_eq!(traffic.received, wire + 4 + 64 * (5 + 8 + 32));
+    assert!(traffic.sent > hash_list + 2 * 4 + 64 * (5 + 8 + 1));
+
+    // The speedup is the output over the traffic. The rate is the
+    // traffic over the elapsed time. The line rounds the time to a tenth
+    // of a second and the rate to whole bytes per second. So the traffic
+    // is between the products of the smallest and of the largest time and
+    // rate that round to the shown values, however long the run takes.
+    let total = traffic.sent + traffic.received;
+    let speedup = output_bytes as f64 / total as f64;
+    assert!(
+        (traffic.speedup - speedup).abs() <= 0.005 + 1e-9,
+        "speedup {speedup}"
+    );
+    let (seconds, rate) = (traffic.seconds, traffic.rate as f64);
+    let smallest = (seconds - 0.05).max(0.0) * (rate - 0.5).max(0.0);
+    let largest = (seconds + 0.05) * (rate + 0.5);
+    assert!(
+        smallest - 1e-9 <= total as f64 && total as f64 <= largest + 1e-9,
+        "{total} B in {seconds}s at {rate} B/s"
+    );
+}
+
+#[test]
 fn summaries_show_scale_units() {
     // Without `--no-human-readable`, amounts show in binary units with
     // two decimal digits (DESIGN.md §8). No block of the payload is
-    // indexed, so all of it is literal.
+    // indexed, so all of it is literal. The indexed file makes the hash
+    // list, and so the sent bytes, larger than 1 KiB.
     let transfer = Transfer::new("");
+    transfer.env.write("tree/blocks", &tiled(256, 7));
     let payload = random(10 << 20, 42);
     let source = transfer.env.path("payload");
     std::fs::write(&source, &payload).unwrap();
@@ -575,6 +677,18 @@ fn summaries_show_scale_units() {
         ),
         "{line}"
     );
+
+    // The sent and received bytes, and the rate, whose unit depends on
+    // the elapsed time.
+    let line = summary_line(&output, "hashsync: sent ");
+    let amounts = amounts(&line);
+    assert!(
+        amounts
+            .iter()
+            .all(|&(number, unit)| is_scaled_amount(number, unit)),
+        "{line}"
+    );
+    assert!(matches!(amounts[..], [(_, "KiB"), (_, "MiB"), _]), "{line}");
 }
 
 #[test]
@@ -1041,6 +1155,52 @@ exit $status"#,
             assert_eq!(summary(&output), [blocks.len(), 0, blocks.len(), 0]);
         }
     }
+}
+
+#[test]
+fn the_summary_counts_every_byte_that_the_sessions_deliver() {
+    // `tee` copies the stdout of each session to a file. After the control
+    // session's SSH exits, a process that inherited its stdout sends one
+    // more QUERY, which the receiver skips in Completing. The receiver reads
+    // both sessions to EOF before the summary (DESIGN.md §6.7 and §8), so
+    // the summary counts exactly the bytes of both files, that QUERY
+    // included. One changed block makes the scanner rescan.
+    let transfer = Transfer::new("");
+    let mut blocks = tiled(32, 27);
+    transfer.env.write("tree/blocks", &blocks);
+    transfer.env.update();
+    blocks[5 * BLOCK + 9] ^= 1;
+    transfer.env.write("tree/blocks", &blocks);
+    let captured = transfer.env.path("captured");
+    // QUERY: offset 0 and a zero digest.
+    let late = frame(QUERY, &[0; 8 + 32]);
+    let late_path = transfer.env.path("late-query");
+    std::fs::write(&late_path, &late).unwrap();
+    wrap_ssh(
+        &transfer,
+        &format!(
+            r#"{{ "$ssh" "$@"; echo $? >'{0}'.$session.status; }} | tee '{0}'.$session
+status=$(cat '{0}'.$session.status)
+if [ $session = control ]; then
+    ( sleep 0.2; tee -a '{0}'.control <'{1}' ) </dev/null 2>/dev/null &
+fi
+exit $status"#,
+            captured.display(),
+            late_path.display(),
+        ),
+    );
+    let command = args(&["cat", transfer.env.path("tree/blocks").to_str().unwrap()]);
+    let output = succeeded(transfer.run(&["--no-update"], &refs(&command)));
+    assert_eq!(output.stdout, blocks);
+    assert_eq!(summary(&output), [blocks.len(), BLOCK, 31 * BLOCK, 0]);
+    let read = |session: &str| std::fs::read(format!("{}.{session}", captured.display())).unwrap();
+    let (data, control) = (read("data"), read("control"));
+    assert!(
+        control.ends_with(&late),
+        "the run ended before the last QUERY"
+    );
+    assert_eq!(wire_bytes(&output), data.len());
+    assert_eq!(traffic(&output).received, data.len() + control.len());
 }
 
 /// True once both SSH children of the receiver `pid` have exited: the

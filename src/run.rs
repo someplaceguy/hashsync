@@ -1,5 +1,5 @@
 //! `hashsync run [--no-update] [--ssh CMD] [USER@]HOST -- COMMAND ...`
-//! (DESIGN.md §3, §5.6, §6): the receiver.
+//! (DESIGN.md §3, §5.6, §6, §8): the receiver.
 //!
 //! The run updates the index (or opens it read-only), exports and
 //! publishes the hash list, prepares the pin file and the lookup workers,
@@ -7,13 +7,14 @@
 //! reconstructs stdout from literals, runs, and references, which arrive
 //! through the compression stream, while the lookup workers answer the
 //! sender's queries (DESIGN.md §6.4). It returns the command's status once
-//! both sessions exited successfully.
+//! both sessions exited successfully, after a summary.
 //!
 //! The end is orderly (DESIGN.md §6.7). After END_ACK, DONE tells the
 //! receiver that the sender needs neither session any more. The main
 //! thread then closes both stdin pipes, without waiting for the EOF of
 //! either stdout, and joins each thread of the transfer once its work
-//! ends. Then the pins and the index close.
+//! ends. Then the pins and the index close, and the summary gives exact
+//! counts.
 
 use std::ffi::OsStr;
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -21,6 +22,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::process::{ChildStdin, ChildStdout};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::time::Instant;
 
 use bstr::ByteSlice;
 use crossbeam_channel::{Receiver, Sender, unbounded};
@@ -52,6 +54,12 @@ const READ_BUFFER: usize = 256 << 10;
 /// The largest write of a run's bytes to stdout.
 const RUN_CHUNK: u64 = 256 << 10;
 
+/// The bytes that the receiver wrote to both sessions, and that it read
+/// from each session, for the summary.
+static SENT: AtomicU64 = AtomicU64::new(0);
+static DATA_RECEIVED: AtomicU64 = AtomicU64::new(0);
+static CONTROL_RECEIVED: AtomicU64 = AtomicU64::new(0);
+
 pub fn run(
     config: &Config,
     no_update: bool,
@@ -59,6 +67,7 @@ pub fn run(
     host: &OsStr,
     command: &[std::ffi::OsString],
 ) -> ! {
+    let start = Instant::now();
     // Before any other thread starts: SIGINT and SIGTERM end the run with
     // `128 + signal`, and the end kills the SSH children (DESIGN.md §6.6).
     die::handle_termination_signals();
@@ -109,7 +118,10 @@ pub fn run(
     // the peer's (DESIGN.md §6.2). The relay delivers it once `attach`
     // connects. The control writer gives the session's stdin back when it
     // ends: the pipe must stay open until DONE (DESIGN.md §6.7).
-    let mut control_out = FrameWriter::new(BufWriter::new(control.stdin));
+    let mut control_out = FrameWriter::new(BufWriter::new(Counting {
+        inner: control.stdin,
+        count: &SENT,
+    }));
     if let Err(e) = control_out
         .send_version()
         .and_then(|()| control_out.flush())
@@ -132,14 +144,17 @@ pub fn run(
             .expect("cannot start the control reader")
     };
 
-    // The data session, with received bytes counted for the summary.
-    let wire_bytes = Arc::new(AtomicU64::new(0));
-    let mut data_out = FrameWriter::new(data.stdin);
+    // The data session, with the bytes of both directions counted for the
+    // summary.
+    let mut data_out = FrameWriter::new(Counting {
+        inner: data.stdin,
+        count: &SENT,
+    });
     let mut data_in = FrameReader::new(BufReader::with_capacity(
         READ_BUFFER,
-        CountingReader {
+        Counting {
             inner: data.stdout,
-            count: Arc::clone(&wire_bytes),
+            count: &DATA_RECEIVED,
         },
     ));
 
@@ -268,17 +283,40 @@ pub fn run(
     if end.status == 127 && !end.error.is_empty() {
         die::error(format!("remote command failed to start: {}", end.error));
     }
+    print_summary(start, &counts, hash_list_bytes);
+    die::finish(end.status)
+}
+
+/// The summary on stderr (DESIGN.md §8). The first line gives the bytes
+/// of output, the wire bytes that the data session received, and the
+/// bytes of the hash list and the delta. The second line gives, as rsync
+/// does, the bytes sent and received on both sessions, the elapsed time
+/// of the run with the rate of that traffic, and the speedup: the output
+/// bytes over the traffic. The threads that count the traffic have ended,
+/// so the counts are exact.
+fn print_summary(start: Instant, counts: &Counts, hash_list_bytes: u64) {
+    let elapsed = start.elapsed().as_secs_f64();
+    let sent = SENT.load(Relaxed);
+    let wire = DATA_RECEIVED.load(Relaxed);
+    let received = wire + CONTROL_RECEIVED.load(Relaxed);
+    let traffic = sent + received;
     die::note(format_args!(
         "{} output ({} literal, {} reference, {} run), {} wire, {} hash list, {} delta",
         Bytes(counts.output),
         Bytes(counts.literal),
         Bytes(counts.reference),
         Bytes(counts.run),
-        Bytes(wire_bytes.load(Relaxed)),
+        Bytes(wire),
         Bytes(hash_list_bytes),
         Bytes(0),
     ));
-    die::finish(end.status)
+    die::note(format_args!(
+        "sent {} and received {} in {elapsed:.1}s ({}/s), speedup {:.2}",
+        Bytes(sent),
+        Bytes(received),
+        Bytes((traffic as f64 / elapsed).round() as u64),
+        counts.output as f64 / traffic as f64,
+    ));
 }
 
 /// The bytes of reconstructed output, for the summary.
@@ -373,18 +411,30 @@ fn open_read_only(config: &Config) -> (index::Index, Vec<Location>) {
     (index, locations)
 }
 
-/// Counts the bytes received on the data session, for the summary's
-/// wire count.
-struct CountingReader<R> {
-    inner: R,
-    count: Arc<AtomicU64>,
+/// Counts the bytes that pass through one direction of a session, for
+/// the summary.
+struct Counting<T> {
+    inner: T,
+    count: &'static AtomicU64,
 }
 
-impl<R: Read> Read for CountingReader<R> {
+impl<R: Read> Read for Counting<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let n = self.inner.read(buf)?;
         self.count.fetch_add(n as u64, Relaxed);
         Ok(n)
+    }
+}
+
+impl<W: Write> Write for Counting<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.count.fetch_add(n as u64, Relaxed);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
     }
 }
 
@@ -455,7 +505,10 @@ fn advance(offset: u64, length: u64) -> u64 {
 /// write to a closed pipe would make SSH fail. The end of this thread
 /// closes the query queue.
 fn read_queries(stdout: ChildStdout, pins: &Pins, lookups: Sender<Query>) {
-    let mut control_in = FrameReader::new(BufReader::new(stdout));
+    let mut control_in = FrameReader::new(BufReader::new(Counting {
+        inner: stdout,
+        count: &CONTROL_RECEIVED,
+    }));
     let closed = || {
         if !pins.is_completing() {
             die("the control session closed unexpectedly");
@@ -488,7 +541,7 @@ fn read_queries(stdout: ChildStdout, pins: &Pins, lookups: Sender<Query>) {
 /// (DESIGN.md §6.7). It gives back the session's stdin without closing it,
 /// and discards the answers that a failed write left in the buffer.
 fn write_answers(
-    mut control_out: FrameWriter<BufWriter<ChildStdin>>,
+    mut control_out: FrameWriter<BufWriter<Counting<ChildStdin>>>,
     answers: &Receiver<Answer>,
     pins: &Pins,
 ) -> ChildStdin {
@@ -506,5 +559,5 @@ fn write_answers(
         }
     }
     let (stdin, _) = control_out.into_inner().into_parts();
-    stdin
+    stdin.inner
 }

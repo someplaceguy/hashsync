@@ -1541,8 +1541,18 @@ exclude = ['*.tmp', 'literal\x2Aname', 'back\\slash']
   Normal runs hold exclusive index access through update and transfer.
   `--no-update` shares read-only access and still resolves current roots.
   Pass HOST unchanged, preserving SSH aliases. Run argv without a shell.
-  Print one summary line to stderr: output, literal, reference, run, wire,
-  and hash-list/delta byte counts.
+  After a successful transfer, also when the command fails, print a
+  summary of two lines to stderr:
+  1. The output bytes, as literal, reference, and run bytes; the wire
+     bytes, which the receiver read from the data session; and the
+     hash-list and delta bytes.
+  2. As rsync does, the bytes that the receiver sent and received on both
+     sessions, the elapsed time of the run, including its index update,
+     the rate of the sent and received bytes in that time, and the
+     speedup: the output bytes divided by the sent and received bytes.
+     These counts do not include the bytes that SSH adds or the command's
+     stderr. They are exact: the receiver prints the summary after the
+     threads that count the bytes have ended (section 6.7).
 - `hashsync serve --token T` and `hashsync attach --token T`: internal
   sender entry points.
 - `hashsync stats`: report index statistics.
