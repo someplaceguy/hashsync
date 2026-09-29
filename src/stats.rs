@@ -11,6 +11,7 @@ use crate::config::Config;
 use crate::die::{die, warn};
 use crate::fsops;
 use crate::index::{self, Settings};
+use crate::units::Bytes;
 
 pub fn run(config: &Config) {
     // RocksDB keeps every file of the index open (DESIGN.md §4.4).
@@ -43,8 +44,8 @@ pub fn run(config: &Config) {
          paths:            {paths}\n\
          blocks:           {blocks}\n\
          distinct weak:    {distinct_weak}\n\
-         indexed bytes:    {indexed_bytes}\n\
-         database bytes:   {database} (+{wal} write-ahead log)\n",
+         indexed size:     {indexed_size}\n\
+         database size:    {database} (+{wal} write-ahead log)\n",
         schema_version = meta.schema_version,
         block_size = meta.settings.block_size,
         strong_hash = meta.settings.strong_hash_id,
@@ -57,7 +58,9 @@ pub fn run(config: &Config) {
         paths = stats.paths,
         blocks = stats.blocks,
         distinct_weak = stats.distinct_weak,
-        indexed_bytes = stats.indexed_bytes,
+        indexed_size = Bytes(stats.indexed_bytes),
+        database = Bytes(database),
+        wal = Bytes(wal),
     );
     if let Err(e) = fsops::stdout().write_all(report.as_bytes()) {
         die(format!("cannot write to stdout: {e}"));

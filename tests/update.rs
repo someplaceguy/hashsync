@@ -26,8 +26,9 @@ fn indexes_complete_useful_blocks() {
 
     let stderr = env.update();
     // Periodic-only files are hashed too; they add no block rows but
-    // keep complete inode and path rows (DESIGN.md §4.1).
-    assert!(stderr.contains("5 files hashed"), "{stderr}");
+    // keep complete inode and path rows (DESIGN.md §4.1). Their 11
+    // complete blocks were read.
+    assert!(stderr.contains("5 files hashed (44.00 KiB)"), "{stderr}");
     assert!(stderr.contains("6 periodic"), "{stderr}");
 
     assert_eq!(env.count("inodes"), 5);
@@ -869,13 +870,24 @@ fn stats_reports_the_index() {
     assert!(stats.contains("paths:            1"), "{stats}");
     assert!(stats.contains("blocks:           2"), "{stats}");
     assert!(stats.contains("distinct weak:    2"), "{stats}");
-    assert!(
-        stats.contains(&format!("indexed bytes:    {}", BLOCK * 2)),
-        "{stats}"
-    );
+    assert!(stats.contains("indexed size:     8.00 KiB"), "{stats}");
     // The end of the update wrote the memtables to the database files
     // (DESIGN.md §4.4).
-    assert!(stats.contains("(+0 write-ahead log)"), "{stats}");
+    assert!(stats.contains("(+0 B write-ahead log)"), "{stats}");
+
+    // `--no-human-readable` shows whole bytes. The block size is a
+    // setting, which shows exactly either way.
+    let output = env.run(&["stats", "--no-human-readable"]);
+    assert!(output.status.success());
+    let stats = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stats.contains(&format!("block size:       {BLOCK}\n")),
+        "{stats}"
+    );
+    assert!(
+        stats.contains(&format!("indexed size:     {} B\n", BLOCK * 2)),
+        "{stats}"
+    );
 
     // Stats of an incompatible index still print, with a warning.
     env.configure_with(&format!(

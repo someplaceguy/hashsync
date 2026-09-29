@@ -43,6 +43,7 @@ use crate::rendezvous;
 use crate::roots::{self, Location};
 use crate::ssh;
 use crate::sys;
+use crate::units::Bytes;
 use crate::update;
 
 /// The size of the data session's read buffer.
@@ -268,13 +269,14 @@ pub fn run(
         die::note(format!("remote command failed to start: {}", end.error));
     }
     die::note(format!(
-        "{} bytes output ({} literal, {} reference, {} run), {} bytes wire, \
-         {hash_list_bytes} bytes hash list, 0 bytes delta",
-        counts.output,
-        counts.literal,
-        counts.reference,
-        counts.run,
-        wire_bytes.load(Relaxed),
+        "{} output ({} literal, {} reference, {} run), {} wire, {} hash list, {} delta",
+        Bytes(counts.output),
+        Bytes(counts.literal),
+        Bytes(counts.reference),
+        Bytes(counts.run),
+        Bytes(wire_bytes.load(Relaxed)),
+        Bytes(hash_list_bytes),
+        Bytes(0),
     ));
     die::finish(end.status)
 }

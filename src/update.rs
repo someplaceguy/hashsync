@@ -12,6 +12,7 @@ use crate::fsops;
 use crate::index::{self, Settings};
 use crate::roots::{self, Location};
 use crate::scan::{self, ScanRoot};
+use crate::units::Bytes;
 
 pub fn run(config: &Config, rebuild: bool, jobs: Option<u32>) {
     let (index, _) = perform(config, rebuild, jobs);
@@ -82,7 +83,7 @@ pub fn perform(config: &Config, rebuild: bool, jobs: Option<u32>) -> (index::Ind
     index.finish_update();
 
     die::note(format!(
-        "{} in {:.1}s: {} directories, {} files hashed ({} bytes), \
+        "{} in {:.1}s: {} directories, {} files hashed ({}), \
          {} unchanged, {} hard links, {} small files, {} newly indexed blocks \
          (skipped: {} periodic, {} in holes), {} paths, {} stale inodes removed",
         if rebuild {
@@ -93,7 +94,7 @@ pub fn perform(config: &Config, rebuild: bool, jobs: Option<u32>) -> (index::Ind
         start.elapsed().as_secs_f64(),
         counters.directories.load(Relaxed),
         counters.files_hashed.load(Relaxed),
-        counters.bytes_hashed.load(Relaxed),
+        Bytes(counters.bytes_hashed.load(Relaxed)),
         counters.files_unchanged.load(Relaxed),
         counters.files_linked.load(Relaxed),
         counters.files_small.load(Relaxed),

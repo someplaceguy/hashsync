@@ -32,6 +32,10 @@ use rustix::process::{
 
 const HOST: &str = "testhost";
 
+/// Amounts in whole bytes, so that the tests can compare the summary's
+/// counts exactly.
+const EXACT: &str = "--no-human-readable";
+
 struct Transfer {
     env: Env,
 }
@@ -116,18 +120,18 @@ exec /bin/sh -c "$1"
         invocation
     }
 
+    /// Run with the summary in whole bytes (`EXACT`).
     fn run(&self, flags: &[&str], command: &[&OsStr]) -> Output {
-        self.invocation(flags, command).output().unwrap()
+        self.invocation(&[&[EXACT], flags].concat(), command)
+            .output()
+            .unwrap()
     }
 
     fn run_ok(&self, command: &[&OsStr]) -> Output {
         let output = self.run(&[], command);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(output.status.success(), "run failed:\n{stderr}");
-        assert!(
-            stderr.contains("bytes output"),
-            "missing summary:\n{stderr}"
-        );
+        assert!(stderr.contains(" output ("), "missing summary:\n{stderr}");
         output
     }
 
@@ -162,17 +166,39 @@ fn args(words: &[&str]) -> Vec<OsString> {
     words.iter().map(OsString::from).collect()
 }
 
-/// The byte counts of the summary line: output, literal, reference, run,
-/// wire, hash-list, and delta bytes.
-fn summary_counts(output: &Output) -> Vec<usize> {
+/// The line of the summary that contains `marker`.
+fn summary_line(output: &Output, marker: &str) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let line = stderr
         .lines()
-        .find(|line| line.contains("bytes output"))
-        .unwrap_or_else(|| panic!("no summary:\n{stderr}"));
-    line.split(|c: char| !c.is_ascii_digit())
+        .find(|line| line.contains(marker))
+        .unwrap_or_else(|| panic!("no summary line with {marker:?}:\n{stderr}"));
+    line.to_owned()
+}
+
+/// The numbers of `line`: the words between the characters that are not
+/// digits or `.`.
+fn numbers(line: &str) -> Vec<&str> {
+    line.split(|c: char| !c.is_ascii_digit() && c != '.')
         .filter(|word| !word.is_empty())
-        .map(|word| word.parse().unwrap())
+        .collect()
+}
+
+/// `number`, a count of whole bytes on `line`. An amount in scale units,
+/// such as `1.65`, fails the test.
+fn whole_bytes(number: &str, line: &str) -> usize {
+    number
+        .parse()
+        .unwrap_or_else(|_| panic!("{number} is not whole bytes: {line}"))
+}
+
+/// The byte counts of the summary line of a run with `EXACT` amounts:
+/// output, literal, reference, run, wire, hash-list, and delta bytes.
+fn summary_counts(output: &Output) -> Vec<usize> {
+    let line = summary_line(output, " output (");
+    numbers(&line)
+        .into_iter()
+        .map(|number| whole_bytes(number, &line))
         .collect()
 }
 
@@ -221,7 +247,7 @@ fn output_reproduces_byte_for_byte_and_lists_are_cached() {
     let payload_len = payload.len();
     assert!(
         stderr.contains(&format!(
-            "{payload_len} bytes output ({payload_len} literal, 0 reference, 0 run)"
+            "{payload_len} B output ({payload_len} B literal, 0 B reference, 0 B run)"
         )),
         "summary counts:\n{stderr}"
     );
@@ -440,7 +466,7 @@ fn a_slow_consumer_and_a_one_window_lookahead_keep_the_output_exact() {
         transfer.env.path("tree/big").display()
     );
     let mut receiver = transfer
-        .invocation(&[], &refs(&args(&["sh", "-c", &script])))
+        .invocation(&[EXACT], &refs(&args(&["sh", "-c", &script])))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -527,7 +553,28 @@ fn empty_output_and_command_failure_status() {
     assert_eq!(output.stdout, b"partial\n");
     assert_eq!(output.status.code(), Some(3));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("bytes output"), "summary:\n{stderr}");
+    assert!(stderr.contains(" output ("), "summary:\n{stderr}");
+}
+
+#[test]
+fn summaries_show_scale_units() {
+    // Without `--no-human-readable`, amounts show in binary units with
+    // two decimal digits (DESIGN.md §8). No block of the payload is
+    // indexed, so all of it is literal.
+    let transfer = Transfer::new("");
+    let payload = random(10 << 20, 42);
+    let source = transfer.env.path("payload");
+    std::fs::write(&source, &payload).unwrap();
+    let command = args(&["cat", source.to_str().unwrap()]);
+    let output = succeeded(transfer.invocation(&[], &refs(&command)).output().unwrap());
+    assert_eq!(output.stdout, payload);
+    let line = summary_line(&output, " output (");
+    assert!(
+        line.starts_with(
+            "hashsync: 10.00 MiB output (10.00 MiB literal, 0 B reference, 0 B run), "
+        ),
+        "{line}"
+    );
 }
 
 #[test]

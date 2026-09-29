@@ -31,6 +31,7 @@ mod serve;
 mod ssh;
 mod stats;
 mod sys;
+mod units;
 mod update;
 
 use std::ffi::OsString;
@@ -51,6 +52,10 @@ struct Cli {
     /// Configuration file [default: $XDG_CONFIG_HOME/hashsync/config.toml]
     #[arg(long, global = true, value_name = "PATH")]
     config: Option<OsString>,
+
+    /// Show amounts of bytes as whole bytes, without scale units such as KiB
+    #[arg(long, global = true)]
+    no_human_readable: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -105,6 +110,9 @@ enum Command {
 fn main() {
     die::install_panic_hook();
     let cli = Cli::parse();
+    if cli.no_human_readable {
+        units::disable_human_readable();
+    }
     // The sender entry points run on the remote host, which needs no
     // configuration file.
     let load_config = || config::load(cli.config.as_deref());

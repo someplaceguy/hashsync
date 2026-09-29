@@ -1551,6 +1551,19 @@ exclude = ['*.tmp', 'literal\x2Aname', 'back\\slash']
   unconfigured roots together with their paths, then orphaned inodes and
   blocks. Inaccessible locations are not proof of absence (section 4.2).
 
+Every command also accepts this option, besides `--config PATH`
+(section 7):
+
+- `--no-human-readable`: show all amounts of bytes as whole bytes.
+
+Summaries and statistics show amounts of bytes in binary units. An amount
+below 1 KiB shows as whole bytes, for example `512 B`. A larger amount
+shows with two decimal digits, in the first of KiB, MiB, GiB, TiB, and PiB
+in which its rounded value is less than 1024, else in PiB. For example,
+1536 bytes show as `1.50 KiB`, and 1048575 bytes as `1.00 MiB`. Settings,
+limits, and messages that help to debug show exact byte counts, because
+rounding could make them unclear.
+
 ```sh
 hashsync run backup@nas -- tar -C /srv/data -cf - . | tar -C /srv/data -xf -
 ```
