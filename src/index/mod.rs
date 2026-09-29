@@ -34,6 +34,7 @@ use crate::config::Config;
 use crate::die::die;
 use crate::fsops;
 use crate::hash::{PREFIX_LEN, weak};
+use crate::pool::Pool;
 use crate::sys;
 use layout::{Cf, ID_LEN, InodeRow, RootRow, id_key, u64_at};
 
@@ -404,22 +405,18 @@ impl Shared {
             db(raw.status());
             values
         };
-        // The pool's threads end when it is dropped.
-        rayon::ThreadPoolBuilder::new()
-            .thread_name(|i| format!("export{i}"))
-            .build()
-            .expect("cannot start the export pool")
-            .install(|| {
-                let parts: Vec<Vec<u64>> = (0..=bounds.len()).into_par_iter().map(part).collect();
-                // Each part is freed when it has been copied, so the sort
-                // has only one copy of the values.
-                let mut values = Vec::with_capacity(parts.iter().map(Vec::len).sum());
-                for part in parts {
-                    values.extend_from_slice(&part);
-                }
-                values.par_sort_unstable();
-                values
-            })
+        let pool = Pool::start("export", 0);
+        pool.install(|| {
+            let parts: Vec<Vec<u64>> = (0..=bounds.len()).into_par_iter().map(part).collect();
+            // Each part is freed when it has been copied, so the sort
+            // has only one copy of the values.
+            let mut values = Vec::with_capacity(parts.iter().map(Vec::len).sum());
+            for part in parts {
+                values.extend_from_slice(&part);
+            }
+            values.par_sort_unstable();
+            values
+        })
     }
 }
 
@@ -794,21 +791,19 @@ impl Index {
         // A root can have many paths, and there can be many roots: the
         // removals run on one thread per core. A path of an incomplete
         // inode under an unfinished root is removed twice, which changes
-        // nothing. The pool's threads end when it is dropped.
-        rayon::ThreadPoolBuilder::new()
-            .thread_name(|i| format!("reconcile{i}"))
-            .build()
-            .expect("cannot start the reconcile pool")
-            .install(|| {
-                if last_retained.is_some() {
-                    let parts = root_parts(&roots, rayon::current_num_threads());
-                    self.remove_all(&parts, |txn, part| txn.remove_root_paths(part.clone()));
-                }
-                self.remove_all(&incomplete, |txn, &(inode_id, _)| {
-                    txn.remove_inode_paths(inode_id);
-                    txn.remove_blocks(inode_id);
-                });
+        // nothing.
+        let pool = Pool::start("reconcile", 0);
+        pool.install(|| {
+            if last_retained.is_some() {
+                let parts = root_parts(&roots, rayon::current_num_threads());
+                self.remove_all(&parts, |txn, part| txn.remove_root_paths(part.clone()));
+            }
+            self.remove_all(&incomplete, |txn, &(inode_id, _)| {
+                txn.remove_inode_paths(inode_id);
+                txn.remove_blocks(inode_id);
             });
+        });
+        drop(pool);
 
         let mut txn = self.transaction();
         if last_retained.is_none() {

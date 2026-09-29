@@ -29,6 +29,7 @@ use crate::fsid::{FsCache, Identity, identify};
 use crate::fsops::{self, Meta};
 use crate::index::Index;
 use crate::index::changes::{Changes, Claim, Owner, RelPath, Summary};
+use crate::pool::Pool;
 use crate::roots::{self, Location};
 
 /// A root location to scan and its index row.
@@ -50,7 +51,8 @@ pub struct Counters {
 }
 
 /// Scan every root on a dedicated pool, writing the changes to `index`,
-/// then remove the orphaned inodes. `jobs` is the `-j` override.
+/// then remove the orphaned inodes. The pool ends when this returns
+/// (DESIGN.md §4.6). `jobs` is the `-j` override.
 pub fn run(
     config: &Config,
     roots: Vec<ScanRoot<'_>>,
@@ -68,11 +70,7 @@ pub fn run(
         });
         starts.push((Arc::clone(&location.dir), location.name.clone()));
     }
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(thread_count(config.threads, jobs))
-        .thread_name(|i| format!("scan{i}"))
-        .build()
-        .expect("cannot start the scan pool");
+    let pool = Pool::start("scan", thread_count(config.threads, jobs));
     let scanner = Scanner {
         roots: shared,
         fs_cache,

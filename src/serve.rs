@@ -39,6 +39,7 @@ use crate::fsops::{self, FdWriter, retry_interrupted};
 use crate::hash;
 use crate::hashlist::{self, ListId};
 use crate::hashtable::HashTable;
+use crate::pool::Pool;
 use crate::protocol::{
     self, Answer, COMPRESSION_LEVELS, Compressor, End, FrameReader, FrameWriter, HashList, Query,
     ReceiverHello, Rle, SenderHello, frame,
@@ -204,7 +205,7 @@ pub fn run(token: &str) -> ! {
 
     // The scanner's probe threads (DESIGN.md §6.3) start before the
     // command.
-    let probe_pool = probe_pool(hello.probe_threads);
+    let probe_pool = start_probe_pool(hello.probe_threads);
 
     // The command. Keep it unreaped and in its own process group
     // (DESIGN.md §6.6); a fatal exit SIGKILLs the group, and the spawn
@@ -249,7 +250,7 @@ pub fn run(token: &str) -> ! {
                     hello.strong_hash,
                     hello.lookahead,
                     hello.negative_cache,
-                    probe_pool.as_ref(),
+                    probe_pool.as_deref(),
                 );
                 transfer(&mut scanner, &chunk_rx, &answer_rx, &output_tx, &query_tx);
                 let status = sys::wait_exit_status(Pid::from_child(&child));
@@ -297,18 +298,12 @@ fn thread_count(requested: u32) -> u32 {
     }
 }
 
-/// The threads that probe the scanner's long stretches of windows
-/// (DESIGN.md §6.3). One thread needs no pool: the scanner probes on its
-/// own thread.
-fn probe_pool(requested: u32) -> Option<rayon::ThreadPool> {
-    let threads = thread_count(requested) as usize;
-    (threads > 1).then(|| {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .thread_name(|i| format!("probe{i}"))
-            .build()
-            .expect("cannot start the probe pool")
-    })
+/// Start the threads that probe the scanner's long stretches of windows
+/// (DESIGN.md §6.3): `requested` threads, or half the cores for 0. One
+/// thread needs no pool: the scanner probes on its own thread.
+fn start_probe_pool(requested: u32) -> Option<Pool> {
+    let count = thread_count(requested) as usize;
+    (count > 1).then(|| Pool::start("probe", count))
 }
 
 /// Run the scanner until the command's output is emitted (DESIGN.md

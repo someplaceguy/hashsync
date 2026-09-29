@@ -20,6 +20,7 @@ mod hashtable;
 mod index;
 mod lookup;
 mod pins;
+mod pool;
 mod protocol;
 mod rendezvous;
 mod roots;

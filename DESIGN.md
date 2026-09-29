@@ -209,7 +209,8 @@ change in one transaction:
    identifier.
 2. In bounded transactions, on one thread per core, remove the paths and
    blocks of incomplete inodes. If a root keeps its identifier, also
-   remove the paths of every root without an identifier.
+   remove the paths of every root without an identifier. Then end those
+   threads and join them.
 3. In one transaction, remove the rows of those roots and of incomplete
    inodes. If no root keeps its identifier, the same transaction removes
    every path, with one range deletion in `paths` and one in
@@ -578,7 +579,7 @@ orphaned inodes and blocks in bounded transactions, including orphans left
 by earlier interrupted cleanup. The threads of the pool share this work by
 ranges of inode IDs. A thread reads only entries whose keys start with an
 inode ID in its ranges, so no thread reads rows that another thread
-writes.
+writes. Then end the threads of the pool and join them.
 
 ## 5. Hashes, hash list, and hash table
 
@@ -640,7 +641,8 @@ output.
 Read the weak hashes of all block rows from one database snapshot. The first
 keys of the files of `blocks` split it into parts, which one thread per core
 reads in parallel. Sort the values in memory as unsigned 64-bit values, with
-the same threads. Remove duplicates and encode canonically:
+the same threads. Then end those threads and join them. Remove duplicates
+and encode canonically:
 
 1. Width `W = 64`; no hash bits are dropped.
 2. For sorted distinct values, gaps are `g_0 = v_0` and
