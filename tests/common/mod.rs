@@ -1,12 +1,13 @@
 //! Shared helpers for integration tests: a temporary environment with a
-//! configuration file, an index directory, and a tree to index.
+//! configuration file, an index directory, and a tree to index; and the
+//! processes that the tests start.
 #![allow(dead_code)]
 
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output};
 
 use rocksdb::{ColumnFamily, DB, IteratorMode, Options, WriteBatch};
 use tempfile::TempDir;
@@ -528,4 +529,16 @@ pub fn namespaces_available() -> bool {
         .args(["-Urm", "true"])
         .status()
         .is_ok_and(|status| status.success())
+}
+
+/// Kills and reaps a child that a test leaves behind, even when the test
+/// fails. `kill` does nothing to a child that `wait` reaped, whose PID
+/// another process can have then.
+pub struct KillOnDrop(pub Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }

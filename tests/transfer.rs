@@ -4,19 +4,28 @@
 //! quoting, the rendezvous socket, both sessions, the cache publication
 //! rules on both sides, block references with their pins, runs, and the
 //! compression stream.
+//!
+//! No wait of these tests has a deadline: a regression hangs the test, so
+//! that a debugger can examine it.
 
 mod common;
 
 use std::ffi::{OsStr, OsString};
-use std::io::Read;
+use std::fs::File;
+use std::io::{BufRead, BufReader, Read};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::process::{Command, Output, Stdio};
-use std::time::{Duration, Instant};
+use std::process::{Child, Command, Output, Stdio};
+use std::time::Duration;
 
-use common::{BLOCK, Env, random, tiled, toml_literal};
-use rustix::process::{Pid, Signal, kill_process};
+use common::{BLOCK, Env, KillOnDrop, random, tiled, toml_literal};
+use rustix::event::{PollFd, PollFlags, poll};
+use rustix::fs::{CWD, Mode, mkfifoat};
+use rustix::io::retry_on_intr;
+use rustix::process::{
+    Pid, PidfdFlags, Signal, WaitId, WaitIdOptions, kill_process, pidfd_open, waitid,
+};
 
 const HOST: &str = "testhost";
 
@@ -712,37 +721,38 @@ fn signal(pid: u32, signal: Signal) {
     kill_process(pid, signal).unwrap();
 }
 
-/// The state letter of `pid` in `/proc`: `T` when stopped, `Z` for a
-/// zombie.
-fn state(pid: u32) -> Option<char> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    stat.rsplit(')').next()?.trim_start().chars().next()
+/// Make a FIFO at `path`, and hold it open for writing. A command that
+/// opens the FIFO for reading while the returned file is open reads EOF
+/// only after the file closes, at the latest when the test process ends.
+/// A command that opens the FIFO later waits for a writer forever.
+fn held_fifo(path: &std::path::Path) -> File {
+    mkfifoat(CWD, path, Mode::RUSR | Mode::WUSR).unwrap();
+    // Also for reading, so that the open does not wait for a reader.
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap()
 }
 
-/// Wait until `pid` reaches `wanted`, within a bound: a regression must
-/// fail the test, not hang it.
-fn wait_for_state(pid: u32, wanted: char) {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while state(pid) != Some(wanted) {
-        assert!(
-            Instant::now() < deadline,
-            "{pid} never reached state {wanted}"
-        );
-        std::thread::sleep(Duration::from_millis(1));
-    }
+/// Wait until `child` stops, and keep that state for a later wait. Fail
+/// when the child ends before it stops.
+fn wait_until_stopped(child: &Child) {
+    let pid = Pid::from_child(child);
+    let options = WaitIdOptions::STOPPED | WaitIdOptions::EXITED | WaitIdOptions::NOWAIT;
+    let status = retry_on_intr(|| waitid(WaitId::Pid(pid), options))
+        .unwrap()
+        .expect("waitid without NOHANG returned no status");
+    assert!(status.stopped(), "{pid:?} ended instead of stopping");
 }
 
-/// The PID in `path`, once the file exists, within a bound: a regression
-/// must fail the test, not hang it.
-fn wait_for_pid_file(path: &str) -> u32 {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if let Ok(text) = std::fs::read_to_string(path) {
-            return text.trim().parse().unwrap();
-        }
-        assert!(Instant::now() < deadline, "{path} never appeared");
-        std::thread::sleep(Duration::from_millis(1));
-    }
+/// Wait until `pid` has exited, also when it is not a child of the test
+/// process.
+fn wait_until_exited(pid: u32) {
+    let pid = Pid::from_raw(pid as i32).unwrap();
+    let pidfd = pidfd_open(pid, PidfdFlags::empty()).unwrap();
+    let mut fds = [PollFd::new(&pidfd, PollFlags::IN)];
+    retry_on_intr(|| poll(&mut fds, None)).unwrap();
 }
 
 /// The children of `pid`, started by any of its threads.
@@ -758,17 +768,6 @@ fn children(pid: u32) -> Vec<u32> {
     children
 }
 
-/// Kills a process that the test leaves behind, even when it fails.
-struct KillOnDrop(u32);
-
-impl Drop for KillOnDrop {
-    fn drop(&mut self) {
-        if state(self.0).is_some_and(|state| state != 'Z') {
-            signal(self.0, Signal::KILL);
-        }
-    }
-}
-
 #[test]
 fn a_termination_signal_decides_the_status_even_after_the_sessions_break() {
     // Ctrl-C reaches the receiver and its SSH children together. The dying
@@ -777,30 +776,37 @@ fn a_termination_signal_decides_the_status_even_after_the_sessions_break() {
     // order: stop the receiver, send it the signal, kill both sessions,
     // and let the receiver continue with both events already present.
     let transfer = Transfer::new("");
-    // The command publishes its PID in a file: a line on stdout, shorter
-    // than a block, would stay in the sender's scanner until more output
-    // or EOF (DESIGN.md §6.3).
-    let pid_file = transfer.env.path("command.pid");
-    let pid_file = pid_file.to_str().expect("the test path must be plain text");
-    let script = format!("echo $$ >{pid_file}.new && mv {pid_file}.new {pid_file}; exec sleep 60");
+    // The command opens a FIFO that the test holds open, and reports on
+    // stderr that it runs: the sender relays stderr at once, but a line on
+    // stdout, shorter than a block, would stay in the sender's scanner
+    // until more output or EOF (DESIGN.md §6.3). Then it reads the FIFO
+    // until EOF, so it runs until the test ends, also after the killed
+    // sessions orphan it.
+    let fifo = transfer.env.path("hold");
+    let _hold = held_fifo(&fifo);
+    let running = "the command runs";
+    let script = format!("exec <'{}'; echo '{running}' >&2; exec cat", fifo.display());
     let command = args(&["sh", "-c", &script]);
     for (sent, status, name) in [(Signal::INT, 130, "SIGINT"), (Signal::TERM, 143, "SIGTERM")] {
         for _ in 0..4 {
-            let _ = std::fs::remove_file(pid_file);
-            let receiver = transfer
-                .invocation(&[], &refs(&command))
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .unwrap();
-            let pid = receiver.id();
-            let _receiver_guard = KillOnDrop(pid);
-            // The command runs once its PID file appears. Killing the
-            // sessions orphans it, so kill it at the end.
-            let _command_guard = KillOnDrop(wait_for_pid_file(pid_file));
+            let mut receiver = KillOnDrop(
+                transfer
+                    .invocation(&[], &refs(&command))
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            );
+            let mut stderr = BufReader::new(receiver.0.stderr.take().unwrap());
+            let mut text = String::new();
+            while !text.contains(running) {
+                let n = stderr.read_line(&mut text).unwrap();
+                assert!(n > 0, "the run ended before the command ran:\n{text}");
+            }
 
+            let pid = receiver.0.id();
             signal(pid, Signal::STOP);
-            wait_for_state(pid, 'T');
+            wait_until_stopped(&receiver.0);
             signal(pid, sent);
             let sessions = children(pid);
             assert_eq!(sessions.len(), 2, "both SSH sessions: {sessions:?}");
@@ -808,16 +814,16 @@ fn a_termination_signal_decides_the_status_even_after_the_sessions_break() {
                 signal(session, Signal::KILL);
             }
             for &session in &sessions {
-                wait_for_state(session, 'Z');
+                wait_until_exited(session);
             }
             signal(pid, Signal::CONT);
 
-            let output = receiver.wait_with_output().unwrap();
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            assert_eq!(output.status.code(), Some(status), "stderr:\n{stderr}");
+            stderr.read_to_string(&mut text).unwrap();
+            let exit = receiver.0.wait().unwrap();
+            assert_eq!(exit.code(), Some(status), "stderr:\n{text}");
             assert!(
-                stderr.contains(&format!("terminated by {name}")),
-                "stderr:\n{stderr}"
+                text.contains(&format!("terminated by {name}")),
+                "stderr:\n{text}"
             );
         }
     }

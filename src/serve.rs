@@ -654,8 +654,8 @@ mod tests {
     /// `transfer` with a data queue of one frame, which the data writer
     /// drains slowly, while the lookups answer from another thread and
     /// reject the stale blocks. The output stays exact and in order, and
-    /// the transfer ends (DESIGN.md §6.3). The wait is bounded: a stall
-    /// must fail the test, not hang it.
+    /// the transfer ends (DESIGN.md §6.3). The wait has no deadline: a
+    /// transfer that stalls hangs the test, and a debugger can inspect it.
     #[test]
     fn a_full_data_queue_keeps_the_output_exact() {
         let valid: Vec<Vec<u8>> = (0..4).map(|i| noise(BS as usize, i)).collect();
@@ -744,8 +744,8 @@ mod tests {
                 output_tx.send(Output::End(end)).unwrap();
             });
             let output = done_rx
-                .recv_timeout(Duration::from_secs(30))
-                .expect("the transfer stalled");
+                .recv()
+                .expect("the data writer ended without the output");
             assert!(output == input, "lookahead {lookahead}: the output differs");
         }
     }

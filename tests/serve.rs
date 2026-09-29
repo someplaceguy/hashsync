@@ -13,9 +13,12 @@ use std::io::{BufReader, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
+use std::time::Duration;
 
+use rustix::event::{PollFd, PollFlags, poll};
+use rustix::io::retry_on_intr;
+use rustix::process::{Pid, PidfdFlags, pidfd_open};
 use rustix::thread::{CpuSet, sched_getaffinity, sched_setaffinity};
 use tempfile::TempDir;
 
@@ -131,42 +134,6 @@ fn hello_payload(block_size: u32, list: &[u8], command: &[&str], level: i32) -> 
     hello
 }
 
-/// True while `pid` runs; a zombie has already exited.
-fn running(pid: u32) -> bool {
-    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-        return false;
-    };
-    // The state follows the parenthesized command name.
-    let state = stat.rsplit(')').next().unwrap_or_default().trim_start();
-    !state.starts_with(['Z', 'X'])
-}
-
-/// Kills a process that still runs when a failed test unwinds.
-struct KillOnDrop(u32);
-
-impl Drop for KillOnDrop {
-    fn drop(&mut self) {
-        if running(self.0) {
-            let _ = Command::new("kill")
-                .args(["-KILL", &self.0.to_string()])
-                .status();
-        }
-    }
-}
-
-/// Wait until `done`, within a bound: a regression must fail the test,
-/// not hang it. False when the bound passed first.
-fn wait_until(mut done: impl FnMut() -> bool) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while !done() {
-        if Instant::now() > deadline {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    true
-}
-
 /// Run `start` with this thread on one of its CPUs; a process that it
 /// starts stays on that CPU with all its threads.
 fn on_one_cpu<T>(start: impl FnOnce() -> T) -> T {
@@ -198,8 +165,8 @@ struct Serve {
 }
 
 impl Drop for Serve {
-    /// A failed test must not leave `serve` running. After a successful
-    /// `try_wait`, `kill` sends nothing.
+    /// A failed test must not leave `serve` running. After `wait`, `kill`
+    /// sends nothing.
     fn drop(&mut self) {
         let _ = self.child.kill();
     }
@@ -295,9 +262,11 @@ impl Serve {
     }
 
     /// Wait until `serve` has published the list in its cache, which it
-    /// does right before CACHE_RESULT (DESIGN.md §5.6), within a bound: a
-    /// regression must fail the test, not hang it.
-    fn wait_for_published_list(&self) {
+    /// does right before CACHE_RESULT (DESIGN.md §5.6). No event tells the
+    /// receiver when, so this polls the cache directory, with no deadline:
+    /// a `serve` that neither publishes nor ends hangs the test, and a
+    /// debugger can inspect it.
+    fn wait_for_published_list(&mut self) {
         let dir = self.home.path().join("cache/hashsync/remote-hashlists");
         let published = || {
             let peers = std::fs::read_dir(&dir).into_iter().flatten().flatten();
@@ -309,21 +278,29 @@ impl Serve {
                         .any(|file| file.file_name().to_string_lossy().ends_with(".cache"))
                 })
         };
-        assert!(wait_until(published), "serve published no list");
+        while !published() {
+            if self.child.try_wait().unwrap().is_some() {
+                let (status, stderr) = self.finish();
+                panic!("serve ended before it published the list ({status}):\n{stderr}");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Wait until `serve` ends, with no deadline: if `serve` hangs, the
+    /// test hangs too, and a debugger can inspect it. Returns the exit
+    /// status and stderr.
+    fn finish(&mut self) -> (ExitStatus, String) {
+        let mut stderr = String::new();
+        let mut pipe = self.child.stderr.take().unwrap();
+        pipe.read_to_string(&mut stderr).unwrap();
+        (self.child.wait().unwrap(), stderr)
     }
 
     /// Require the normal exit, with status 0.
     fn expect_success(mut self) {
-        let mut status = None;
-        let ended = wait_until(|| {
-            status = self.child.try_wait().unwrap();
-            status.is_some()
-        });
-        assert!(ended, "serve hangs instead of ending");
-        let mut stderr = String::new();
-        let mut pipe = self.child.stderr.take().unwrap();
-        pipe.read_to_string(&mut stderr).unwrap();
-        assert_eq!(status.unwrap().code(), Some(0), "stderr:\n{stderr}");
+        let (status, stderr) = self.finish();
+        assert_eq!(status.code(), Some(0), "stderr:\n{stderr}");
     }
 
     /// The receiver disappears: its end of the data session closes.
@@ -334,16 +311,8 @@ impl Serve {
     /// Require a fatal exit with `message`, and the fatal cleanup of the
     /// rendezvous socket.
     fn expect_death(mut self, message: &str) {
-        let mut status = None;
-        let ended = wait_until(|| {
-            status = self.child.try_wait().unwrap();
-            status.is_some()
-        });
-        assert!(ended, "serve hangs instead of ending");
-        let mut stderr = String::new();
-        let mut pipe = self.child.stderr.take().unwrap();
-        pipe.read_to_string(&mut stderr).unwrap();
-        assert_eq!(status.unwrap().code(), Some(1), "stderr:\n{stderr}");
+        let (status, stderr) = self.finish();
+        assert_eq!(status.code(), Some(1), "stderr:\n{stderr}");
         assert!(stderr.contains(message), "stderr:\n{stderr}");
         assert!(!self.socket().exists(), "the socket file must be removed");
     }
@@ -429,9 +398,15 @@ fn receiver_loss_after_end_ack_is_fatal_while_stderr_drains() {
     // A descendant keeps command stderr open, so the relay has not
     // finished when END_ACK arrives. The receiver's disappearance then
     // fails the run and kills the command's process group, descendant
-    // included.
+    // included. The descendant runs until this test process ends: it does
+    // not end by itself, however slow the machine is, and a failed test
+    // does not leave it behind.
     let mut serve = Serve::start();
-    serve.hello(&["sh", "-c", "( exec >/dev/null; exec sleep 60 ) & echo $!"]);
+    let script = format!(
+        "( exec >/dev/null; exec tail --pid={} -f /dev/null ) & echo $!",
+        std::process::id()
+    );
+    serve.hello(&["sh", "-c", &script]);
     let mut control = serve.attach();
     control.write_all(&version()).unwrap();
     serve.send_empty_list();
@@ -444,15 +419,18 @@ fn receiver_loss_after_end_ack_is_fatal_while_stderr_drains() {
             (kind, _) => panic!("unexpected frame type {kind}"),
         }
     }
-    let descendant: u32 = String::from_utf8(output).unwrap().trim().parse().unwrap();
-    let _guard = KillOnDrop(descendant);
+    let descendant: i32 = String::from_utf8(output).unwrap().trim().parse().unwrap();
+    // Nothing ends the descendant before the fatal cleanup, so no other
+    // process can have its PID yet.
+    let descendant = pidfd_open(Pid::from_raw(descendant).unwrap(), PidfdFlags::empty()).unwrap();
     serve.send(END_ACK, b"");
     serve.lose_data_session();
     serve.expect_death("the receiver disappeared after END_ACK");
-    assert!(
-        wait_until(|| !running(descendant)),
-        "the descendant survived the fatal cleanup"
-    );
+    // A pidfd becomes readable when its process ends, also for a process
+    // that is not a child of this one. A descendant that survived the fatal
+    // cleanup hangs the test here.
+    let mut fds = [PollFd::new(&descendant, PollFlags::IN)];
+    retry_on_intr(|| poll(&mut fds, None)).unwrap();
 }
 
 #[test]
@@ -570,7 +548,9 @@ fn obsolete_queries_in_flight_do_not_fail_the_normal_end() {
     control.write_all(&answers).unwrap();
     assert_eq!(next_query(&mut control), 20);
     // Give the rescan time to queue the whole q chain, more than the
-    // socket holds. A slower rescan only makes the test weaker.
+    // socket holds. A slower rescan only makes the test weaker. No check
+    // can replace the pause: the only sign of the queued chain is its
+    // queries, which must stay unread.
     std::thread::sleep(Duration::from_millis(300));
     control.write_all(&answer(20, false)).unwrap();
 

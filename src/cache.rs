@@ -591,22 +591,27 @@ mod tests {
             std::fs::write(store.dir.join(".abandoned-temp"), b"x").unwrap();
 
             // A fresh file survives any positive age bound, and `ctime`
-            // cannot be faked: test the boundary with a future clock
-            // instead.
-            let now = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
+            // cannot be faked: test the boundary with clocks set from the
+            // ctimes of the files instead. The current time would count a
+            // stall of the test as age.
+            let ctimes: Vec<i64> = std::fs::read_dir(&store.dir)
                 .unwrap()
-                .as_secs() as i64;
-            expire_tree(&cache_root().join("remote-hashlists"), now, 3600);
+                .map(|entry| entry.unwrap().metadata().unwrap().ctime())
+                .collect();
+            let first = *ctimes.iter().min().unwrap();
+            let last = *ctimes.iter().max().unwrap();
+            // When the first file was made, no file was older than an
+            // hour.
+            expire_tree(&cache_root().join("remote-hashlists"), first, 3600);
             assert_eq!(std::fs::read_dir(&store.dir).unwrap().count(), 2);
 
-            // One hour later, both the list and the hidden temporary are
-            // older than a half-hour bound.
-            expire_tree(&cache_root().join("remote-hashlists"), now + 3600, 1800);
+            // One hour after the last file was made, both the list and the
+            // hidden temporary are older than a half-hour bound.
+            expire_tree(&cache_root().join("remote-hashlists"), last + 3600, 1800);
             assert_eq!(std::fs::read_dir(&store.dir).unwrap().count(), 0);
 
             // A missing tree is normal absence.
-            expire_tree(&cache_root().join("no-such-tree"), now, 0);
+            expire_tree(&cache_root().join("no-such-tree"), first, 0);
         });
     }
 }
