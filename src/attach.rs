@@ -3,14 +3,19 @@
 //!
 //! Stdin is relayed to the socket and the socket to stdout. Stdin EOF
 //! half-closes the socket. Socket EOF or a peer-closed socket error ends
-//! the relay successfully after flushing stdout, without waiting for
-//! stdin EOF or joining the other relay thread; the receiver decides
-//! whether that closure was expected. Either direction may observe
-//! closure first. Nothing is buffered: both directions write straight to
-//! their descriptors, so the successful end has nothing to flush.
+//! the relay from the socket; the main thread then waits until stdin EOF
+//! ends the relay from stdin, joins that thread, and exits successfully.
+//! After a write finds the socket closed by `serve`, the relay from stdin
+//! reads stdin to EOF and discards it: the receiver closes the session's
+//! stdin only after its control writer has ended, and that writer must
+//! not block on a full pipe. The receiver decides whether a closure was
+//! expected. Either direction may observe closure first. Nothing is
+//! buffered: both directions write straight to their descriptors, so the
+//! successful end has nothing to flush.
 
 use std::io::{Read, Write};
 use std::net::Shutdown;
+use std::os::unix::net::UnixStream;
 
 use crate::die::{self, die};
 use crate::fsops::{self, retry_interrupted};
@@ -31,45 +36,53 @@ pub fn run(token: &str) -> ! {
         Err(e) => die(format!("cannot clone the socket: {e}")),
     };
 
-    // Stdin to socket: on stdin EOF, half-close the socket so `serve`
-    // sees the end of control input while its output still flows.
-    std::thread::Builder::new()
+    let stdin_relay = std::thread::Builder::new()
         .name("stdin-relay".into())
-        .spawn(move || {
-            let mut socket = socket;
-            let mut stdin = fsops::stdin();
-            let mut buf = vec![0u8; 64 * 1024];
-            loop {
-                let n = match retry_interrupted(|| stdin.read(&mut buf)) {
-                    Ok(0) => {
-                        let _ = socket.shutdown(Shutdown::Write);
-                        return;
-                    }
-                    Ok(n) => n,
-                    Err(e) => die(format!("control relay: stdin: {e}")),
-                };
-                match socket.write_all(&buf[..n]) {
-                    Ok(()) => {}
-                    Err(e) if peer_closed(&e) => die::finish(0),
-                    Err(e) => die(format!("control relay: socket: {e}")),
-                }
-            }
-        })
+        .spawn(move || relay_stdin(socket))
         .expect("cannot start the relay thread");
 
-    // Socket to stdout.
+    // Socket to stdout, until the socket closes.
     let mut socket_in = socket_in;
     let mut stdout = fsops::stdout();
     let mut buf = vec![0u8; 64 * 1024];
     loop {
         let n = match retry_interrupted(|| socket_in.read(&mut buf)) {
-            Ok(0) => die::finish(0),
+            Ok(0) => break,
             Ok(n) => n,
-            Err(e) if peer_closed(&e) => die::finish(0),
+            Err(e) if peer_closed(&e) => break,
             Err(e) => die(format!("control relay: socket: {e}")),
         };
         if let Err(e) = stdout.write_all(&buf[..n]) {
             die(format!("control relay: stdout: {e}"));
+        }
+    }
+    stdin_relay.join().expect("the stdin relay panicked");
+    die::finish(0)
+}
+
+/// Stdin to socket, until stdin EOF. On stdin EOF, half-close the socket
+/// so `serve` sees the end of control input while its output still
+/// flows. After `serve` has closed the socket, discard the rest of stdin.
+fn relay_stdin(mut socket: UnixStream) {
+    let mut stdin = fsops::stdin();
+    let mut buf = vec![0u8; 64 * 1024];
+    // False once a write found the socket closed by `serve`.
+    let mut relaying = true;
+    loop {
+        let n = match retry_interrupted(|| stdin.read(&mut buf)) {
+            Ok(0) => {
+                let _ = socket.shutdown(Shutdown::Write);
+                return;
+            }
+            Ok(n) => n,
+            Err(e) => die(format!("control relay: stdin: {e}")),
+        };
+        if relaying {
+            match socket.write_all(&buf[..n]) {
+                Ok(()) => {}
+                Err(e) if peer_closed(&e) => relaying = false,
+                Err(e) => die(format!("control relay: socket: {e}")),
+            }
         }
     }
 }

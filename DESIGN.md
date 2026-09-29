@@ -65,8 +65,9 @@ asynchronous runtime or event loop.
 6. The receiver reconstructs stdout. After all command stdout is processed,
    and the command's exit status is available, the sender sends END. The
    receiver validates stream completion and flushes stdout before sending
-   END_ACK. Both SSH sessions must exit successfully before it returns the
-   command's status.
+   END_ACK. When the sender needs neither session any more, it sends DONE,
+   and the receiver closes both session stdin pipes. Both SSH sessions must
+   exit successfully before the receiver returns the command's status.
 
 **Verification is authoritative.** The index, hash lists, caches, and weak
 hash table are hints. Verify candidates before writing pins and verify the
@@ -845,11 +846,16 @@ flushes the frames that the receiver must read to reply.
 `attach` retries a not-yet-listening socket while its stdin remains open,
 with no deadline. It relays stdin to the socket and the socket to stdout,
 half-closing the socket on stdin EOF. Socket EOF or a peer-closed socket
-error (`EPIPE` or `ECONNRESET`) ends the relay successfully after flushing
-stdout, without waiting for stdin EOF or joining the other relay thread.
-Either direction may observe closure first. The receiver decides whether
-that closure was expected from its completion state; other relay failures
-end the relay unsuccessfully.
+error (`EPIPE` or `ECONNRESET`) on a read ends the relay from the socket.
+`attach` then waits until stdin EOF ends the relay from stdin, joins that
+thread, and exits zero. After a peer-closed error on a write, the relay
+from stdin writes nothing more to the socket, but reads stdin to EOF and
+discards the bytes. This prevents a deadlock: the receiver closes the
+control session's stdin only after its control writer has ended
+(section 6.7), and that writer could otherwise block on a full pipe.
+Either direction may observe closure first. The receiver decides from its
+completion state whether a closure was expected; other relay failures end
+the relay unsuccessfully.
 Rendezvous waits must also observe receiver disappearance (section 6.7).
 
 The command's argv travels in HELLO, not on the SSH command line. Start it
@@ -893,7 +899,7 @@ repeating them.
 | Session | Direction | Types |
 |---|---|---|
 | data | receiver to sender | HELLO, HASHLIST, HASHDELTA, HASHKEEP, END_ACK |
-| data | sender to receiver | HELLO, HASHFULL, CACHE_RESULT, LIT, REF, RLE, END |
+| data | sender to receiver | HELLO, HASHFULL, CACHE_RESULT, LIT, REF, RLE, END, DONE |
 | control | sender to receiver | QUERY |
 | control | receiver to sender | ANSWER |
 
@@ -928,11 +934,16 @@ Payloads:
 - REF: empty; use the pin at the current output offset.
 - RLE: `byte u8, length u64`.
 - END: `status i32, error string`. Status is the command's exit status,
-  `128 + signal`, or 127 plus error text if startup failed. No further
-  sender-to-receiver data frames follow.
+  `128 + signal`, or 127 plus error text if startup failed. Of the
+  sender-to-receiver data frames, only DONE follows.
 - END_ACK: empty. The receiver has validated END and compression completion
   and flushed reconstructed stdout. Send exactly once on the data session;
   it is the receiver's last data-session frame. Section 6.7 defines shutdown.
+- DONE: empty. The completion conditions of section 6.7 hold, and the
+  sender needs neither session any more, so the receiver can close both
+  session stdin pipes. The sender sends it once, after it has received
+  END_ACK. It directly follows the compression stream, outside it. Nothing
+  follows DONE: a byte after it is a protocol error.
 - QUERY: `offset u64, strong [u8; S]`. At most one per offset; offsets may
   go backwards after rescanning.
 - ANSWER: `offset u64, found u8` (0 or 1). Answers may arrive out of order.
@@ -948,10 +959,11 @@ durable receiver publication, then HASHLIST/HASHDELTA/HASHKEEP and its data.
 The sender replies with CACHE_RESULT, possibly after one HASHFULL fallback.
 The receiver handles the result and cache cleanup before entering its output
 loop. Its only remaining data-session frame is END_ACK; it keeps both session
-stdin pipes open until the sender and relay exit.
+stdin pipes open until DONE (section 6.7).
 
-After HELLO, all sender-to-receiver data-session frames share one zstd stream,
-unless compression is disabled. This includes HASHFULL and CACHE_RESULT.
+After HELLO, all sender-to-receiver data-session frames through END share one
+zstd stream, unless compression is disabled. This includes HASHFULL and
+CACHE_RESULT. DONE follows the stream, outside it.
 Control traffic and all receiver-to-sender traffic are uncompressed.
 Output latency does not matter, only bandwidth. So the sender flushes the
 stream only before it waits for a reply, after HASHFULL, and finishes the
@@ -1181,8 +1193,8 @@ For `QUERY { offset: x, strong: h }`:
    unpublished, release it to the reclaimer, and answer no. Otherwise publish
    `{ file_offset, strong: h }` at `x` and queue yes nonblockingly under the
    lock. Release the worker's buffer. The Completing state prevents new
-   appends or pin publication; late workers discard their results and the
-   unlinked file is reclaimed at process exit (section 6.7).
+   appends or pin publication; late workers discard their results, and
+   closing the pin file at the end frees their extents (section 6.7).
 
 A yes is binding because the receiver owns an independent copy of the
 verified bytes in its pin file. A later source-file change cannot affect
@@ -1248,25 +1260,34 @@ that receiver/index.
 
 ### 6.6 Threads at run time
 
-Both roles use blocking threads and channels. Fatal shutdown ends the process
-rather than cancelling or joining blocked threads. Normal completion uses the
-coordination chosen by the implementation, subject to section 6.7.
+Both roles use blocking threads and channels, with the threads of the table
+below. At the normal end, a thread ends when its work ends: its input
+reaches EOF or END, its queue closes because no thread can send to it any
+more, or a write fails at an expected closure (section 6.7). Then the main
+thread joins it, in the order of section 6.7. One thread is the exception:
+the receiver's signal thread stays until the process exits, and no thread
+joins it, so that SIGINT and SIGTERM during the end still give
+`128 + signal`.
+
+Fatal shutdown ends the process rather than cancelling or joining blocked
+threads.
 
 | Role | Responsibilities |
 |---|---|
-| Sender main | Handshake and command startup, then wait for the completion conditions of section 6.7. |
-| Sender data reader | Read the data session for the whole run: the protocol version, HELLO, the list, and END_ACK. EOF before the normal exit means that the receiver disappeared. |
+| Sender main | Handshake and command startup, then wait for the completion conditions of section 6.7 and send DONE. |
+| Sender data reader | Read the data session for the whole run: the protocol version, HELLO, the list, END_ACK, and EOF. EOF before DONE means that the receiver disappeared. |
 | Sender command reader | Fill lookahead until stdout EOF; obtain the command's exit status without reaping. |
 | Sender stderr relay | Copy command stderr to sender stderr through EOF and flush. |
 | Sender scanner | Own records and query states; queue queries and output. |
 | Sender probe threads | Probe the parts of long stretches of windows for the scanner (section 6.3). |
 | Sender data writer | Drain output in order, compress, and finish and flush the stream after END. |
 | Sender control reader/writer | Receive answers and send queries promptly, independently of data output. |
-| Receiver main | Start SSH sessions, reconstruct stdout, validate completion, and send END_ACK. |
+| Receiver main | Start SSH sessions, reconstruct stdout, validate completion, send END_ACK, and close both session stdin pipes after DONE. |
 | Receiver control reader/writer | Dispatch queries to lookup workers and send answers promptly. |
+| Receiver lookup workers | Answer queries out of order (section 6.4). |
 | Receiver reclaimer | Punch the extents of released pins. |
 | Receiver signal thread | Handle SIGINT/SIGTERM with status `128 + signal`. |
-| Attach relay | Copy both directions; half-close on stdin EOF, exit after flushing on socket EOF. |
+| Attach relay | Copy both directions; half-close on stdin EOF. Once the socket is closed, discard stdin; at socket EOF, wait for stdin EOF, then exit zero. |
 
 Blocking output provides backpressure; it must not prevent independent
 control traffic. Completion requirements are in section 6.7.
@@ -1303,13 +1324,13 @@ bugs and database errors abort. Per-entry failures remain local.
 Only the normal end runs the C library's exit handlers. One of them, a C++
 static destructor of RocksDB (`JoinThreadsOnExit`), joins RocksDB's
 background threads, so the end waits for a running flush or compaction.
-`update` and `stats` close the database first, which stops its background
-jobs. A transfer starts only after its update has waited for compactions,
-so none runs at its end. A fatal end, through `die` or a termination
-signal, calls `_exit` instead, and an abort runs no handlers either: many
-threads can be inside RocksDB then, and the process must neither wait for
-a background job nor destroy RocksDB's static objects under them. The
-index recovers from its write-ahead log, as after a crash.
+`update`, `stats`, and `run` close the database first, which stops its
+background jobs. A transfer starts only after its update has waited for
+compactions, so none runs at its end. A fatal end, through `die` or a
+termination signal, calls `_exit` instead, and an abort runs no handlers
+either: many threads can be inside RocksDB then, and the process must
+neither wait for a background job nor destroy RocksDB's static objects
+under them. The index recovers from its write-ahead log, as after a crash.
 
 The receiver monitors both sessions and termination signals. The sender
 monitors stdin and the control socket. Unexpected EOF or session loss is
@@ -1317,7 +1338,8 @@ fatal. Monitoring also applies during rendezvous and setup, when no command
 output is flowing. A broken stdout is detected when a write to it fails;
 neither role watches an idle stdout. As under plain SSH, a consumer that
 exits after it reads all output does not fail the run. Normal shutdown uses
-END_ACK, not stdin EOF, to establish receiver completion.
+END_ACK, not stdin EOF, to establish receiver completion, and DONE, not
+stdout EOF, to establish sender completion.
 
 Successful sender completion requires:
 
@@ -1334,10 +1356,25 @@ conditions to make the code simple and reliable. It may serialize waits or
 coordinate concurrent completion; no particular event ordering or state
 machine is required. Startup failure has no command streams to drain.
 
-Keep sender stdout open until process exit. Once the completion conditions
-hold, perform normal cleanup once: remove the rendezvous socket and exit zero.
-Closing the control socket lets `attach` flush and exit zero even though its
-stdin is still open.
+Keep sender stdout open until process exit. Join the threads whose work
+ends with the command's streams or with END: the command reader after
+command stdout EOF, the stderr relay for its completion condition, and the
+data writer after END. Once the completion conditions hold, perform normal
+cleanup once:
+
+1. Shut down the control socket. `attach` then relays the rest of the
+   socket to its stdout, and discards its stdin until EOF (section 6.1).
+   Join the control reader, which then reads EOF, and the control writer,
+   which ends when its queue is closed and empty or a write fails. Socket
+   EOF and a failed write are expected closure then.
+2. End the probe threads and join them.
+3. Send DONE and flush the data session: the sender needs neither session
+   any more.
+4. Join the data reader. It reads stdin to EOF, which the receiver causes
+   after DONE. Before DONE, EOF or a read error remains the receiver's
+   disappearance and is fatal. A read error is fatal also after DONE. A
+   byte after END_ACK is a protocol error.
+5. Remove the rendezvous socket and exit zero.
 
 Receiver completion:
 
@@ -1347,28 +1384,60 @@ Receiver completion:
    sufficient framing. Flush reconstructed stdout.
 2. The receiver enters Completing before sending and flushing END_ACK on
    the data session. It stops admitting lookups and publishing control
-   replies; queued replies and late control traffic can be discarded. It
-   keeps both session stdin pipes open while awaiting peer exit. Workers
+   replies, and closes the queue of replies. Late control traffic can be
+   discarded. It keeps both session stdin pipes open until DONE. Workers
    returning later discard their results, including results of unfinished
-   pin-file writes; process exit reclaims the unlinked file. Control EOF,
-   broken pipes, and a partial final control frame in Completing are expected
-   closure, not failures. Do not wait for blocked lookup or control threads.
-3. The receiver drains data-session stdout to transport EOF, rejecting any
-   trailing bytes, and observes both SSH exits without reaping. Both must
-   exit zero; otherwise the transfer failed even if END was received. After
-   success it closes the session pipes and exits with END's command status.
+   pin-file writes; closing the pin file in step 6 frees their extents.
+   Control EOF, broken pipes, and a partial final control frame in
+   Completing are expected closure, not failures.
+3. The receiver reads DONE, which directly follows the zstd frame. EOF or
+   another frame before DONE fails the run.
+4. The receiver closes both session stdin pipes, in this order:
+   1. Close the data session's stdin.
+   2. Join the control writer. It ends when its queue is closed and empty,
+      after it has sent the queued replies, or when a write fails.
+   3. Close the control session's stdin.
+
+   Neither close waits for the EOF of a stdout pipe: through an SSH
+   multiplexing client, or through a wrapper that waits for SSH, that EOF
+   comes only when SSH exits, and SSH exits only after the sender has read
+   stdin EOF (section 10).
+5. The receiver drains data-session stdout to transport EOF, rejecting any
+   bytes after DONE. Then it ends its other threads, in this order:
+   1. Join the control reader. It reads control-session stdout to EOF, also
+      in Completing, so it does not close the pipe while SSH can still
+      write to it: SSH would fail with a broken pipe. Its end closes the
+      query queue.
+   2. Join the lookup workers. In Completing, a worker skips the queries
+      that are still in the queue and reads no candidates for them; a
+      lookup in progress finishes first.
+6. The receiver observes both SSH exits without reaping. Both must exit
+   zero; otherwise the transfer failed even if END was received. Then it
+   closes what the threads used, in this order:
+   1. Close the pins: close the reclaimer's queue, join the reclaimer, and
+      close the pin file, which frees all its remaining storage.
+   2. Close the index: first the database, then its lock (section 4.4).
+7. The receiver prints the summary (section 8) and exits with END's command
+   status.
 
 The receiver's Completing transition uses the same lock as pin allocation
 and response publication. This prevents late lookup completion from trying
-to prolong the exchange. Sender stdin or control EOF before its normal exit
-remains a failure: the receiver never closes those pipes to acknowledge
-success. Failures during stream validation, stdout flushing, or sending
-END_ACK take the fatal cleanup path.
+to prolong the exchange. Sender stdin EOF before DONE remains a failure,
+and so does control EOF before the sender shuts down the control socket:
+the receiver closes those pipes only after DONE. Failures during stream
+validation, stdout flushing, sending END_ACK, or reading DONE take the
+fatal cleanup path.
 
 No step has a deadline. A descendant retaining command stdout or stderr
-keeps the run open, as under plain SSH; this is expected behavior. After fatal
-cleanup, a descendant that left the process group can survive and will get
-a broken pipe on its next write to either closed output pipe.
+keeps the run open, as under plain SSH; this is expected behavior. In the
+same way, a process that inherited a session's stdout pipe from SSH delays
+the receiver's end until it closes the pipe. It does not delay the sender:
+the receiver closes both stdin pipes after DONE, before it waits for the
+EOF of either stdout. A lookup or pin-file I/O that stalls, for example on
+an unresponsive NFS mount, delays the receiver's end until the I/O
+completes. After fatal cleanup, a descendant that left the process group can
+survive and will get a broken pipe on its next write to either closed output
+pipe.
 
 ## 7. Configuration
 
@@ -1642,6 +1711,18 @@ decision history is in version control.
   responsive when the command pauses, but each flush ends a zstd block or
   job early. With a command paced at 2 MB/s, level 9 sent 5.7% more bytes
   and used 53% more compression CPU. Output latency does not matter here.
+- **Stdout EOF as the end of the sender:** `serve` could close its stdout
+  when it has finished, and the receiver could close each session's stdin
+  at the EOF of that session's stdout. With SSH multiplexing, this is a
+  deadlock: the OpenSSH mux client (ControlMaster) gives its descriptors 0
+  to 2 to the master, and keeps its own stdout open until the session ends
+  (`mux.c`, `mux_client_request_session`). So the receiver sees no stdout
+  EOF before `serve` exits, and `serve` waits for stdin EOF before it
+  exits. A wrapper script that waits for SSH holds the pipe in the same
+  way. Without multiplexing, `ssh` replaces its stdout with `/dev/null`
+  after it opens the session, so the EOF arrives, but the design cannot
+  depend on that. DONE needs no stdout EOF, and stdin EOF always arrives:
+  the receiver is the only writer of each stdin pipe.
 
 ## 11. Repository conventions
 

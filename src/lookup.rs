@@ -8,12 +8,16 @@
 //! against `candidate_attempts`, including one without a usable location,
 //! so stale rows cannot make a lookup unbounded. Filesystem failures only
 //! reject a candidate.
+//!
+//! A worker ends when the query queue is closed and empty. In Completing,
+//! the queries left in the queue cost no reads: the pins skip them.
 
 use std::collections::HashMap;
 use std::fs::File;
 use std::os::fd::AsFd;
 use std::os::unix::fs::FileExt;
 use std::sync::Arc;
+use std::thread::JoinHandle;
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use rustix::fs::FileType;
@@ -28,13 +32,14 @@ use crate::roots::Location;
 
 /// Start the lookup workers. `locations` are the current root locations
 /// from this run's root resolution; an indexed root without one has no
-/// usable location. Returns the queue of the queries to answer.
+/// usable location. Returns the queue of the queries to answer, and the
+/// workers, which end once that queue is closed and empty.
 pub fn start(
     index: &Index,
     locations: Vec<Location>,
     pins: &Arc<Pins>,
     config: &Config,
-) -> Sender<Query> {
+) -> (Sender<Query>, Vec<JoinHandle<()>>) {
     let mut by_path: HashMap<Vec<u8>, Location> = locations
         .into_iter()
         .map(|location| (location.path.clone(), location))
@@ -48,6 +53,7 @@ pub fn start(
     let (queries, queue) = unbounded();
     // A pool of 4 to 8 workers (DESIGN.md §6.4).
     let workers = std::thread::available_parallelism().map_or(4, |n| n.get().clamp(4, 8));
+    let mut threads = Vec::with_capacity(workers);
     for i in 0..workers {
         let mut worker = Worker {
             reader: index.reader(),
@@ -59,7 +65,7 @@ pub fn start(
         };
         let pins = Arc::clone(pins);
         let queue: Receiver<Query> = queue.clone();
-        std::thread::Builder::new()
+        let thread = std::thread::Builder::new()
             .name(format!("lookup{i}"))
             .spawn(move || {
                 while let Ok(query) = queue.recv() {
@@ -67,8 +73,9 @@ pub fn start(
                 }
             })
             .expect("cannot start a lookup worker");
+        threads.push(thread);
     }
-    queries
+    (queries, threads)
 }
 
 struct Worker {

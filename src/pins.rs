@@ -3,14 +3,19 @@
 //! passes their query offsets.
 //!
 //! One lock protects the output offset `c`, the published pins, the next
-//! extent, the cache of verified blocks, and the completion state. So a
-//! lookup either publishes its pin before the output passes the pin's
-//! offset, and the pin is released later, or it sees the obsolete offset
-//! and releases its extent at once. An extent is released only after its
-//! last use, the REF read or the lookup's write. A reclaimer thread punches
-//! released extents in the background, in merged calls. Source reads,
-//! pin-file I/O, and stdout writes happen outside the lock; answers are
-//! queued under it, after the completion check.
+//! extent, the cache of verified blocks, and the queue of answers, whose
+//! closure marks Completing. So a lookup either publishes its pin before
+//! the output passes the pin's offset, and the pin is released later, or
+//! it sees the obsolete offset and releases its extent at once. An extent
+//! is released only after its last use, the REF read or the lookup's
+//! write. A reclaimer thread punches released extents in the background,
+//! in merged calls. Source reads, pin-file I/O, and stdout writes happen
+//! outside the lock; answers are queued under it, until Completing closes
+//! the queue.
+//!
+//! At the normal end, after the lookups have ended, `close` ends the
+//! reclaimer and then closes the pin file, which frees all its remaining
+//! storage (DESIGN.md §6.7).
 //!
 //! Pin-file failures end the run with `die` (DESIGN.md §6.5): a yes
 //! answer cannot be taken back.
@@ -24,6 +29,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread::JoinHandle;
 
 use bstr::ByteSlice;
 use crossbeam_channel::{Receiver, Sender, unbounded};
@@ -183,16 +189,24 @@ struct State {
     next_extent: u64,
     /// Verified blocks by full strong hash. Pins never hold them.
     cache: LruCache<Strong, Block>,
-    /// Completing (DESIGN.md §6.7): lookups neither append, publish, nor
-    /// answer.
-    completing: bool,
-    answers: Sender<Answer>,
+    /// The queue of answers for the control writer; `None` in Completing.
+    answers: Option<Sender<Answer>>,
 }
 
 impl State {
+    /// Completing (DESIGN.md §6.7): the answer queue is closed, and lookups
+    /// neither append, publish, nor answer.
+    fn completing(&self) -> bool {
+        self.answers.is_none()
+    }
+
+    /// Queue an answer; in Completing, nothing is answered.
     fn answer(&self, offset: u64, found: bool) {
-        // The control writer ends only in Completing.
-        let _ = self.answers.send(Answer { offset, found });
+        if let Some(answers) = &self.answers {
+            // Before the queue closes, the control writer ends only with
+            // the process.
+            let _ = answers.send(Answer { offset, found });
+        }
     }
 }
 
@@ -200,7 +214,9 @@ impl State {
 /// wait until they total `holdback` bytes; then each run of neighbors goes
 /// in one call. Merged calls cost much less on some filesystems: XFS, for
 /// one, writes a range back before it punches it, and holds the inode lock
-/// that pin writes and reads also need.
+/// that pin writes and reads also need. Once the queue is closed and
+/// empty, return without punching the extents that wait: closing the pin
+/// file frees them.
 fn reclaim(file: &PinFile, released: &Receiver<u64>, holdback: u64) {
     let mut pending = Vec::new();
     while let Ok(extent) = released.recv() {
@@ -234,6 +250,7 @@ pub struct Pins {
     state: Mutex<State>,
     /// Extents that nothing uses any more, for the reclaimer.
     released: Sender<u64>,
+    reclaimer: JoinHandle<()>,
 }
 
 impl Pins {
@@ -259,25 +276,25 @@ impl Pins {
     ) -> Self {
         let file = Arc::new(file);
         let (released, queue) = unbounded();
-        {
+        let reclaimer = {
             let file = Arc::clone(&file);
             std::thread::Builder::new()
                 .name("reclaimer".into())
                 .spawn(move || reclaim(&file, &queue, holdback))
-                .expect("cannot start the reclaimer");
-        }
+                .expect("cannot start the reclaimer")
+        };
         let blocks = usize::try_from(CACHE_BYTES / u64::from(block_size)).unwrap_or(usize::MAX);
         Pins {
             file,
             strong,
             released,
+            reclaimer,
             state: Mutex::new(State {
                 output: 0,
                 pins: BTreeMap::new(),
                 next_extent: 0,
                 cache: LruCache::sparse(NonZeroUsize::new(blocks).unwrap_or(NonZeroUsize::MIN)),
-                completing: false,
-                answers,
+                answers: Some(answers),
             }),
         }
     }
@@ -295,7 +312,7 @@ impl Pins {
     pub fn answer(&self, offset: u64, strong: &Strong, find: impl FnOnce() -> Option<Block>) {
         let cached = {
             let mut state = self.lock();
-            if state.completing {
+            if state.completing() {
                 return;
             }
             if offset < state.output {
@@ -305,11 +322,7 @@ impl Pins {
         };
         let searched = cached.is_none();
         let Some(block) = cached.or_else(find) else {
-            let state = self.lock();
-            if !state.completing {
-                state.answer(offset, false);
-            }
-            return;
+            return self.lock().answer(offset, false);
         };
         let extent = {
             let mut state = self.lock();
@@ -317,7 +330,7 @@ impl Pins {
             if searched {
                 state.cache.put(*strong, Arc::clone(&block));
             }
-            if state.completing {
+            if state.completing() {
                 return;
             }
             if offset < state.output {
@@ -337,8 +350,8 @@ impl Pins {
         }
         drop(block);
         let mut state = self.lock();
-        if state.completing {
-            // Process exit reclaims the unpublished extent.
+        if state.completing() {
+            // Closing the pin file frees the unpublished extent.
             return;
         }
         if offset < state.output {
@@ -403,24 +416,44 @@ impl Pins {
 
     /// Hand an extent that nothing uses any more to the reclaimer.
     fn release(&self, extent: u64) {
-        // The reclaimer ends only after the pins.
+        // The reclaimer ends only after `close` closes its queue.
         let _ = self.released.send(extent);
     }
 
-    /// Enter Completing (DESIGN.md §6.7).
+    /// Enter Completing (DESIGN.md §6.7), and close the answer queue: the
+    /// control writer ends after it has sent the answers that the queue
+    /// holds.
     pub fn complete(&self) {
-        self.lock().completing = true;
+        self.lock().answers = None;
     }
 
     pub fn is_completing(&self) -> bool {
-        self.lock().completing
+        self.lock().completing()
+    }
+
+    /// The normal end of the pins, after the lookups have ended
+    /// (DESIGN.md §6.7): close the reclaimer's queue, wait for the
+    /// reclaimer, and then close the pin file, which frees all its
+    /// remaining storage.
+    pub fn close(self) {
+        let Pins {
+            file,
+            released,
+            reclaimer,
+            ..
+        } = self;
+        drop(released);
+        reclaimer.join().expect("the reclaimer panicked");
+        let file = Arc::into_inner(file).expect("the pin file is still in use");
+        drop(file);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
-    use std::time::{Duration, Instant};
+
+    use crossbeam_channel::TryRecvError;
 
     use super::*;
 
@@ -477,30 +510,24 @@ mod tests {
         buf
     }
 
-    /// The bytes of the extent at `extent`, straight from the file.
-    fn extent_bytes(setup: &Setup, extent: u64, length: u64) -> Vec<u8> {
+    /// The `length` bytes at `offset` of `file`.
+    fn bytes_at(file: &File, offset: u64, length: u64) -> Vec<u8> {
         let mut buf = vec![0; length as usize];
-        setup
-            .pins
-            .file
-            .file
-            .read_exact_at(&mut buf, extent)
-            .unwrap();
+        file.read_exact_at(&mut buf, offset).unwrap();
         buf
     }
 
-    /// True once the reclaimer has punched the `length` bytes at `extent`,
-    /// which then read as zeros. The wait is bounded: a regression must fail
-    /// the test, not hang it.
-    fn punched(setup: &Setup, extent: u64, length: u64) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while extent_bytes(setup, extent, length).iter().any(|&b| b != 0) {
-            if Instant::now() > deadline {
-                return false;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        true
+    /// Close the pins, which waits for the reclaimer, and return another
+    /// descriptor of the pin file. It keeps the file open: the extents that
+    /// the reclaimer punched read as zeros, the others keep their bytes.
+    fn close(setup: Setup) -> File {
+        let file = setup.pins.file.file.try_clone().unwrap();
+        setup.pins.close();
+        file
+    }
+
+    fn zeros(bytes: &[u8]) -> bool {
+        bytes.iter().all(|&b| b == 0)
     }
 
     #[test]
@@ -511,9 +538,11 @@ mod tests {
         assert_eq!(answers(&setup), vec![(0, true)]);
         assert_eq!(read_back(&setup, BS), *data);
         let extent = setup.pins.lock().pins[&0].extent;
+        let stride = setup.pins.file.stride;
         setup.pins.reached(u64::from(BS));
         assert!(setup.pins.lock().pins.is_empty());
-        assert!(punched(&setup, extent, setup.pins.file.stride));
+        let file = close(setup);
+        assert!(zeros(&bytes_at(&file, extent, stride)));
     }
 
     #[test]
@@ -566,6 +595,43 @@ mod tests {
     }
 
     #[test]
+    fn completing_closes_the_answer_queue() {
+        // The control writer takes the answers that the queue holds, and
+        // then finds the queue closed: it ends (DESIGN.md §6.7).
+        let setup = setup(BS);
+        let (strong, data) = block(6, BS);
+        setup.pins.answer(0, &strong, || Some(Arc::clone(&data)));
+        assert!(!setup.pins.is_completing());
+        setup.pins.complete();
+        assert!(setup.pins.is_completing());
+        assert_eq!(answers(&setup), vec![(0, true)]);
+        assert!(
+            matches!(setup.answers.try_recv(), Err(TryRecvError::Disconnected)),
+            "the queue is still open"
+        );
+    }
+
+    /// The descriptors of this process that refer to a file in `dir`.
+    fn descriptors_in(dir: &Path) -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+            .filter(|target| target.starts_with(dir) && target != dir)
+            .count()
+    }
+
+    #[test]
+    fn closing_the_pins_closes_the_pin_file() {
+        // The other threads of the test process open and close their own
+        // descriptors, but none in this directory.
+        let setup = setup(BS);
+        let pin_dir = std::fs::canonicalize(setup._dir.path().join("pins")).unwrap();
+        assert_eq!(descriptors_in(&pin_dir), 1, "the pin file is open");
+        setup.pins.close();
+        assert_eq!(descriptors_in(&pin_dir), 0, "the pin file is still open");
+    }
+
+    #[test]
     fn releasing_a_pin_keeps_its_neighbors() {
         // 5000-byte blocks leave padding in 8192-byte strides on common
         // filesystems; every pin still owns its whole stride.
@@ -580,33 +646,49 @@ mod tests {
             }
             // Release the first two pins; the next two stay intact.
             setup.pins.reached(2 * u64::from(block_size));
-            assert!(punched(&setup, 0, 2 * stride));
             assert_eq!(read_back(&setup, block_size), *blocks[2].1);
-            let extent = setup.pins.lock().pins[&(3 * u64::from(block_size))].extent;
-            assert_eq!(
-                extent_bytes(&setup, extent, block_size.into()),
-                *blocks[3].1
-            );
+            let kept: Vec<u64> = (2..4)
+                .map(|i| setup.pins.lock().pins[&(i * u64::from(block_size))].extent)
+                .collect();
+            let file = close(setup);
+            assert!(zeros(&bytes_at(&file, 0, 2 * stride)));
+            for (extent, (_, data)) in kept.into_iter().zip(&blocks[2..]) {
+                assert_eq!(bytes_at(&file, extent, block_size.into()), **data);
+            }
         }
     }
 
     #[test]
     fn released_extents_wait_for_the_holdback() {
-        // The reclaimer holds two extents back, then punches them in one
-        // call.
+        // The reclaimer holds one released extent back. Two reach the
+        // holdback, and it punches them in one call. At the end, it does
+        // not punch the extents that it holds back: closing the file frees
+        // them.
         let stride = setup(BS).pins.file.stride;
-        let setup = setup_with_holdback(BS, 2 * stride);
-        let blocks: Vec<(Strong, Block)> = (0..3).map(|i| block(i, BS)).collect();
-        for (i, (strong, data)) in blocks.iter().enumerate() {
-            setup
-                .pins
-                .answer(i as u64 * u64::from(BS), strong, || Some(Arc::clone(data)));
+        for released in [1, 2] {
+            let setup = setup_with_holdback(BS, 2 * stride);
+            let blocks: Vec<(Strong, Block)> = (0..3).map(|i| block(i, BS)).collect();
+            for (i, (strong, data)) in blocks.iter().enumerate() {
+                setup
+                    .pins
+                    .answer(i as u64 * u64::from(BS), strong, || Some(Arc::clone(data)));
+            }
+            setup.pins.reached(released * u64::from(BS));
+            let file = close(setup);
+            for (i, (_, data)) in blocks.iter().enumerate() {
+                let punched = released == 2 && i < 2;
+                let expected = if punched {
+                    vec![0; BS as usize]
+                } else {
+                    data.to_vec()
+                };
+                assert_eq!(
+                    bytes_at(&file, i as u64 * stride, BS.into()),
+                    expected,
+                    "{released} released, extent {i}"
+                );
+            }
         }
-        setup.pins.reached(u64::from(BS));
-        assert_eq!(extent_bytes(&setup, 0, BS.into()), *blocks[0].1);
-        setup.pins.reached(2 * u64::from(BS));
-        assert!(punched(&setup, 0, 2 * stride));
-        assert_eq!(read_back(&setup, BS), *blocks[2].1);
     }
 
     #[test]

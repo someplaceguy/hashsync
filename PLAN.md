@@ -138,7 +138,9 @@ Design coverage: §§3, 5.4–5.6, 6.1–6.2, 6.5–6.7, 7–8.
 - Preserve ordered output with slow consumers, concurrent lookups, and
   out-of-order, late, or obsolete answers. Honor `lookahead` and
   `negative_cache`, along with the design's limits on retained payloads;
-  obsolete lookups must not delay completion.
+  obsolete lookups must not delay END_ACK. At the normal end, the receiver
+  skips the queued lookups and waits only for the lookups in progress
+  (DESIGN.md §6.7).
 - Include reference byte counts in the summary.
 
 Result: transfers save network traffic by using verified local content,

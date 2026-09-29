@@ -109,8 +109,9 @@ pub fn session_argv(ssh: &[Vec<u8>], host: &[u8], remote: &[u8]) -> Vec<OsString
 }
 
 /// One running SSH session. The child stays unreaped so its PID stays
-/// reserved (DESIGN.md §6.6); dropping `stdin` would close the pipe, so
-/// the receiver holds it until process exit.
+/// reserved (DESIGN.md §6.6); dropping `stdin` closes the pipe, and the
+/// sender takes that EOF as the receiver's disappearance until it has sent
+/// DONE, so the receiver holds `stdin` until DONE (DESIGN.md §6.7).
 pub struct Session {
     pub child: Child,
     pub stdin: ChildStdin,

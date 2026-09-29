@@ -1,6 +1,6 @@
 //! Shared helpers for integration tests: a temporary environment with a
-//! configuration file, an index directory, and a tree to index; and the
-//! processes that the tests start.
+//! configuration file, an index directory, and a tree to index; the
+//! frames of the protocol; and the processes that the tests start.
 #![allow(dead_code)]
 
 use std::ffi::OsStr;
@@ -529,6 +529,44 @@ pub fn namespaces_available() -> bool {
         .args(["-Urm", "true"])
         .status()
         .is_ok_and(|status| status.success())
+}
+
+// The protocol version and the frame types of DESIGN.md §6.2, spelled out
+// because the tests reach only the binary.
+pub const PROTOCOL_VERSION: u32 = 1;
+pub const HELLO: u8 = 1;
+pub const HASHLIST: u8 = 2;
+pub const CACHE_RESULT: u8 = 6;
+pub const LIT: u8 = 7;
+pub const REF: u8 = 8;
+pub const END: u8 = 10;
+pub const END_ACK: u8 = 11;
+pub const QUERY: u8 = 12;
+pub const ANSWER: u8 = 13;
+pub const DONE: u8 = 14;
+
+/// The first bytes of each session, in both directions.
+pub fn version() -> [u8; 4] {
+    PROTOCOL_VERSION.to_le_bytes()
+}
+
+/// A frame: the type, the length of the payload as a little-endian `u32`,
+/// and the payload.
+pub fn frame(kind: u8, payload: &[u8]) -> Vec<u8> {
+    let mut frame = vec![kind];
+    frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    frame.extend_from_slice(payload);
+    frame
+}
+
+/// The state letter of the process or thread whose directory in `/proc`
+/// is `dir`, such as `/proc/PID` or `/proc/PID/task/TID`: `S` when it
+/// sleeps, `T` when it is stopped, `Z` for a zombie. `None` once it is
+/// gone.
+pub fn proc_state(dir: impl AsRef<Path>) -> Option<char> {
+    let stat = std::fs::read_to_string(dir.as_ref().join("stat")).ok()?;
+    // The state follows the name, which ends at the last `)`.
+    stat.rsplit(')').next()?.trim_start().chars().next()
 }
 
 /// Kills and reaps a child that a test leaves behind, even when the test

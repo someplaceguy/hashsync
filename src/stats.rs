@@ -25,7 +25,7 @@ pub fn run(config: &Config) {
     let stats = index.stats();
     // The lock keeps modifying processes away while the files are listed.
     let (database, wal) = file_sizes(&config.index_path);
-    drop(index);
+    index.close();
 
     let index_id: String = meta.index_id.iter().map(|b| format!("{b:02x}")).collect();
     // The report is the output of the command, so a failure to write it

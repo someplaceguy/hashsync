@@ -14,7 +14,8 @@ use crate::roots::{self, Location};
 use crate::scan::{self, ScanRoot};
 
 pub fn run(config: &Config, rebuild: bool, jobs: Option<u32>) {
-    drop(perform(config, rebuild, jobs));
+    let (index, _) = perform(config, rebuild, jobs);
+    index.close();
 }
 
 /// Update the index and return it still open, with the current root

@@ -19,6 +19,12 @@
 //! control reader, lends long stretches of windows to the probe threads,
 //! and queues queries for the control writer and frames for the data
 //! writer. Command success and startup failure share one completion path.
+//!
+//! The normal end joins every thread (DESIGN.md §6.7). After the cleanup,
+//! DONE tells the receiver that this side needs neither session any more,
+//! and the receiver then closes both stdin pipes. The data reader monitors
+//! the receiver until that EOF, and the main thread joins it last. Until
+//! DONE, stdin EOF means that the receiver disappeared.
 
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::net::Shutdown;
@@ -27,7 +33,7 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::process::{ChildStdout, Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+use std::sync::atomic::{AtomicU8, Ordering::SeqCst};
 
 use bstr::ByteSlice;
 use crossbeam_channel::{Receiver, Select, Sender, TryRecvError, bounded, unbounded};
@@ -67,26 +73,63 @@ enum Output {
     End(End),
 }
 
+/// How far the end of the run has come (DESIGN.md §6.7). The main thread
+/// moves it forward, one phase after the other. The reader and writer
+/// threads read it to tell the frames and closures that the end expects
+/// from failures.
+#[derive(Clone, Copy)]
+enum Phase {
+    /// Before END: every closure is a failure.
+    Running,
+    /// END is on its way: one END_ACK can arrive.
+    EndSent,
+    /// The normal cleanup has begun: the closure of the control session is
+    /// expected.
+    Completing,
+    /// DONE is on its way: stdin EOF is the normal end.
+    DoneSent,
+}
+
+/// The phase that the threads share.
+struct Progress(AtomicU8);
+
+impl Progress {
+    fn new() -> Self {
+        Progress(AtomicU8::new(Phase::Running as u8))
+    }
+
+    /// Move on to `phase`, which must come after the current one.
+    fn advance(&self, phase: Phase) {
+        let previous = self.0.swap(phase as u8, SeqCst);
+        assert!(previous < phase as u8, "the phase did not advance");
+    }
+
+    /// True when the run is in `phase` or in a later one.
+    fn reached(&self, phase: Phase) -> bool {
+        self.0.load(SeqCst) >= phase as u8
+    }
+}
+
 pub fn run(token: &str) -> ! {
     // Listen before anything else, so `attach`'s retries can end.
     let listener = rendezvous::listen(token);
 
-    let completing = Arc::new(AtomicBool::new(false));
-    let end_sent = Arc::new(AtomicBool::new(false));
+    let progress = Arc::new(Progress::new());
     let (hello_tx, hello_rx) = bounded(1);
     let (list_tx, list_rx) = bounded(1);
     let (ack_tx, ack_rx) = bounded(1);
-    {
-        let end_sent = Arc::clone(&end_sent);
-        let completing = Arc::clone(&completing);
+    // The first thread, and the last that the normal end joins: it reads
+    // stdin until the EOF that the receiver causes after DONE.
+    let data_reader = {
+        let progress = Arc::clone(&progress);
         std::thread::Builder::new()
             .name("data-reader".into())
             .spawn(move || {
                 let data_in = FrameReader::new(BufReader::new(fsops::stdin()));
-                data_reader(data_in, hello_tx, list_tx, ack_tx, &end_sent, &completing)
+                data_reader(data_in, hello_tx, list_tx, ack_tx, &progress)
             })
-            .expect("cannot start the data reader");
-    }
+            .expect("cannot start the data reader")
+    };
     let mut data_out = FrameWriter::new(BufWriter::with_capacity(WRITE_BUFFER, fsops::stdout()));
 
     // This side's protocol version goes first, without waiting for the
@@ -135,14 +178,14 @@ pub fn run(token: &str) -> ! {
     }
     let (control_ready_tx, control_ready_rx) = bounded(1);
     let (answer_tx, answer_rx) = unbounded();
-    {
-        let completing = Arc::clone(&completing);
+    let control_reader = {
+        let progress = Arc::clone(&progress);
         let control_in = clone_control(&control);
         std::thread::Builder::new()
             .name("control-reader".into())
-            .spawn(move || read_answers(control_in, control_ready_tx, answer_tx, &completing))
-            .expect("cannot start the control reader");
-    }
+            .spawn(move || read_answers(control_in, control_ready_tx, answer_tx, &progress))
+            .expect("cannot start the control reader")
+    };
 
     // The list, assembled and digest-verified by the data reader; then the
     // canonical decoding and the table (DESIGN.md §5.6).
@@ -189,19 +232,19 @@ pub fn run(token: &str) -> ! {
     // direction and the control writer the control session's.
     let queued = (QUEUED_BYTES / hello.block_size as usize).max(1);
     let (output_tx, output_rx) = bounded(queued);
-    std::thread::Builder::new()
+    let data_writer = std::thread::Builder::new()
         .name("data-writer".into())
         .spawn(move || write_output(data_out, &output_rx))
         .expect("cannot start the data writer");
     let (query_tx, query_rx) = unbounded();
-    {
-        let completing = Arc::clone(&completing);
+    let control_writer = {
+        let progress = Arc::clone(&progress);
         let control_out = clone_control(&control);
         std::thread::Builder::new()
             .name("control-writer".into())
-            .spawn(move || write_queries(control_out, &query_rx, &completing))
-            .expect("cannot start the control writer");
-    }
+            .spawn(move || write_queries(control_out, &query_rx, &progress))
+            .expect("cannot start the control writer")
+    };
 
     // The scanner's probe threads (DESIGN.md §6.3) start before the
     // command.
@@ -240,7 +283,7 @@ pub fn run(token: &str) -> ! {
                 // §6.3).
                 let command_stdout = child.stdout.take().unwrap();
                 let (chunk_tx, chunk_rx) = bounded(1);
-                std::thread::Builder::new()
+                let output_reader = std::thread::Builder::new()
                     .name("output-reader".into())
                     .spawn(move || read_output(command_stdout, &chunk_tx))
                     .expect("cannot start the output reader");
@@ -253,6 +296,8 @@ pub fn run(token: &str) -> ! {
                     probe_pool.as_deref(),
                 );
                 transfer(&mut scanner, &chunk_rx, &answer_rx, &output_tx, &query_tx);
+                // The scan ended after the output reader closed its queue.
+                output_reader.join().expect("the output reader panicked");
                 let status = sys::wait_exit_status(Pid::from_child(&child));
                 (status, String::new(), Some(relay))
             }
@@ -265,26 +310,44 @@ pub fn run(token: &str) -> ! {
 
     // The completion conditions of DESIGN.md §6.7, one path for command
     // success and startup failure: END, one valid END_ACK, and a
-    // finished stderr relay when command streams exist. Set `end_sent`
+    // finished stderr relay when command streams exist. Enter `EndSent`
     // first so an immediate acknowledgement is valid.
-    end_sent.store(true, SeqCst);
+    progress.advance(Phase::EndSent);
     output_tx
         .send(Output::End(End { status, error }))
         .expect("the data writer ended before END");
     ack_rx
         .recv()
         .expect("the data reader ended without acknowledgement");
+    // END_ACK follows the end of the stream: the data writer has no more
+    // work. It gives back the data session for DONE.
+    let mut data_out = data_writer.join().expect("the data writer panicked");
     if let Some(relay) = stderr_relay {
         relay.join().expect("the stderr relay panicked");
     }
 
-    // Normal cleanup once (DESIGN.md §6.7): close the control socket so
-    // `attach` flushes and exits zero, then end normally, which removes
-    // the rendezvous socket. Sender stdout stays open until process exit.
-    // From here on, both control threads expect the closure: the writer
-    // can still have obsolete queries to send.
-    completing.store(true, SeqCst);
+    // Normal cleanup once (DESIGN.md §6.7): shut down the control socket,
+    // join the control threads and the probe threads, send DONE, join the
+    // data reader, then end normally, which removes the rendezvous socket.
+    // Sender stdout stays open until process exit. From here on, both
+    // control threads expect the closure: the writer can still have
+    // obsolete queries to send. The reader reads EOF after the shutdown.
+    // The writer ends when its queue is closed and empty or a write
+    // fails.
+    progress.advance(Phase::Completing);
     let _ = control.shutdown(Shutdown::Both);
+    control_reader.join().expect("the control reader panicked");
+    control_writer.join().expect("the control writer panicked");
+    drop(control);
+    drop(probe_pool);
+    // DONE follows the zstd frame, outside it: this side needs neither
+    // session any more, so the receiver closes both stdin pipes, and the
+    // data reader reads EOF. Enter `DoneSent` first, so that an immediate
+    // EOF is the normal end.
+    progress.advance(Phase::DoneSent);
+    send_data(&mut data_out, frame::DONE, b"");
+    flush_data(&mut data_out);
+    data_reader.join().expect("the data reader panicked");
     die::finish(0)
 }
 
@@ -401,7 +464,11 @@ fn read_output(mut stdout: ChildStdout, chunks: &Sender<Vec<u8>>) {
 /// The data session's outgoing direction after setup: frames in order,
 /// then END, which finishes the stream (DESIGN.md §6.2). Nothing flushes
 /// the stream before END: the receiver replies to no frame before it.
-fn write_output(mut data_out: DataWriter, output: &Receiver<Output>) {
+/// Returns the session after the stream, for DONE.
+fn write_output(
+    mut data_out: DataWriter,
+    output: &Receiver<Output>,
+) -> FrameWriter<BufWriter<FdWriter>> {
     loop {
         match output.recv().expect("the scanner ended before END") {
             Output::Scanned(Frame::Literal(bytes)) => send_data(&mut data_out, frame::LIT, &bytes),
@@ -412,21 +479,23 @@ fn write_output(mut data_out: DataWriter, output: &Receiver<Output>) {
             Output::End(end) => {
                 send_data(&mut data_out, frame::END, &end.encode());
                 // Sender stdout stays open until process exit.
-                if let Err(e) = data_out.into_inner().finish() {
-                    die(format!("data session: {e}"));
-                }
-                return;
+                let transport = data_out
+                    .into_inner()
+                    .finish()
+                    .unwrap_or_else(|e| die(format!("data session: {e}")));
+                return FrameWriter::new(transport);
             }
         }
     }
 }
 
 /// The control session's outgoing direction during the transfer: queries
-/// in order, flushed whenever the queue runs empty. Obsolete queries do
-/// not delay completion (DESIGN.md §6.3), so normal cleanup can close the
-/// socket while this thread still has some to send. A failed write is
-/// then expected closure, not a failure.
-fn write_queries(stream: UnixStream, queries: &Receiver<Query>, completing: &AtomicBool) {
+/// in order, flushed whenever the queue runs empty, until the queue is
+/// closed and empty. Obsolete queries do not delay completion (DESIGN.md
+/// §6.3), so normal cleanup can close the socket while this thread still
+/// has some to send. A failed write is then expected closure, not a
+/// failure.
+fn write_queries(stream: UnixStream, queries: &Receiver<Query>, progress: &Progress) {
     let mut control_out = FrameWriter::new(BufWriter::new(stream));
     loop {
         let result = match control_out.next_from(queries) {
@@ -435,7 +504,7 @@ fn write_queries(stream: UnixStream, queries: &Receiver<Query>, completing: &Ato
             Err(e) => Err(e),
         };
         if let Err(e) = result {
-            if !completing.load(SeqCst) {
+            if !progress.reached(Phase::Completing) {
                 die(format!("control session: {e}"));
             }
             return;
@@ -445,15 +514,15 @@ fn write_queries(stream: UnixStream, queries: &Receiver<Query>, completing: &Ato
 
 /// The single owner of the data session's incoming direction, for the
 /// whole run: the protocol version, HELLO, the list, END_ACK, then
-/// closure. EOF before the normal exit is the receiver's disappearance
-/// and is fatal (DESIGN.md §6.7).
+/// closure. EOF before DONE is the receiver's disappearance and is fatal
+/// (DESIGN.md §6.7). The receiver closes the session after DONE, so EOF
+/// then is the normal end of this thread, and the main thread joins it.
 fn data_reader<R: Read>(
     mut data_in: FrameReader<R>,
     hello_tx: Sender<ReceiverHello>,
     list_tx: Sender<Vec<u8>>,
     ack_tx: Sender<()>,
-    end_sent: &AtomicBool,
-    completing: &AtomicBool,
+    progress: &Progress,
 ) {
     match data_in.version() {
         Ok(Some(version)) => protocol::check_version(version, "receiver"),
@@ -489,37 +558,42 @@ fn data_reader<R: Read>(
                 received.payload.is_empty(),
                 "protocol error: END_ACK with a payload"
             );
-            assert!(end_sent.load(SeqCst), "protocol error: unsolicited END_ACK");
+            assert!(
+                progress.reached(Phase::EndSent),
+                "protocol error: unsolicited END_ACK"
+            );
         }
         Ok(None) => die("the receiver disappeared"),
         Err(e) => die_data(&e),
     }
     let _ = ack_tx.send(());
 
-    // Nothing else may arrive, and the receiver keeps the session open
-    // until this process exits: closure before the normal exit remains
-    // fatal, so a receiver lost while command stderr still drains kills
-    // the command instead of leaving the run half-alive.
-    match data_in.next() {
-        Ok(Some(extra)) => {
-            panic!("protocol error: frame type {} after END_ACK", extra.kind)
-        }
-        Ok(None) | Err(_) => {
-            if !completing.load(SeqCst) {
+    // Nothing else may arrive: the first byte after END_ACK is a protocol
+    // error, also when no whole frame follows it. Only EOF after DONE is
+    // the normal end. The receiver keeps the session open until DONE:
+    // closure before DONE remains fatal, so a receiver lost while command
+    // stderr still drains kills the command instead of leaving the run
+    // half-alive.
+    match protocol::drain_to_eof(data_in.into_inner()) {
+        Ok(true) => {
+            if !progress.reached(Phase::DoneSent) {
                 die("the receiver disappeared after END_ACK");
             }
         }
+        Ok(false) => panic!("protocol error: data after END_ACK"),
+        Err(e) => die_data(&e),
     }
 }
 
 /// The owner of the control session's incoming direction: the protocol
 /// version, whose check gates command startup, then answers for the
-/// scanner until closure, which is fatal before the normal exit.
+/// scanner until closure, which is fatal before the normal cleanup
+/// (DESIGN.md §6.7).
 fn read_answers(
     stream: UnixStream,
     ready_tx: Sender<()>,
     answers: Sender<Answer>,
-    completing: &AtomicBool,
+    progress: &Progress,
 ) {
     let mut control_in = FrameReader::new(BufReader::new(stream));
     match control_in.version() {
@@ -541,7 +615,7 @@ fn read_answers(
                 let _ = answers.send(Answer::decode(received.payload));
             }
             Ok(None) | Err(_) => {
-                if !completing.load(SeqCst) {
+                if !progress.reached(Phase::Completing) {
                     die("the control session closed unexpectedly");
                 }
                 return;
@@ -743,5 +817,57 @@ mod tests {
                 .expect("the data writer ended without the output");
             assert!(output == input, "lookahead {lookahead}: the output differs");
         }
+    }
+
+    /// The receiver's side of the data session through END_ACK, for the
+    /// empty list, then `trailing`.
+    fn receiver_session(trailing: &[u8]) -> Vec<u8> {
+        let list = hashlist::encode(&[]);
+        let hello = ReceiverHello {
+            block_size: BS,
+            weak_hash_id: hash::weak::ID.to_string(),
+            strong_hash: StrongHash::Blake3,
+            target: StrongHash::Blake3.digest(&list),
+            account_id: [1; 16],
+            index_id: [2; 16],
+            sender_cache: false,
+            hashlist_max_age: 0,
+            compression_level: 0,
+            compression_long: false,
+            compression_threads: 0,
+            probe_threads: 0,
+            lookahead: u64::from(BS),
+            negative_cache: 0,
+            command: vec![b"true".to_vec()],
+        };
+        let header = HashList {
+            length: list.len() as u64,
+        };
+        let mut session = FrameWriter::new(Vec::new());
+        session.send_version().unwrap();
+        session.send(frame::HELLO, &hello.encode()).unwrap();
+        session.send(frame::HASHLIST, &header.encode()).unwrap();
+        session.send_bytes(&list).unwrap();
+        session.send(frame::END_ACK, b"").unwrap();
+        let mut bytes = session.into_inner();
+        bytes.extend_from_slice(trailing);
+        bytes
+    }
+
+    /// A byte after END_ACK is a protocol error, also after DONE, and also
+    /// when no whole frame follows it: here the first byte of a second
+    /// END_ACK, then EOF. Only EOF after DONE is the normal end
+    /// (DESIGN.md §6.7).
+    #[test]
+    #[should_panic(expected = "protocol error: data after END_ACK")]
+    fn a_byte_after_end_ack_is_a_protocol_error() {
+        let session = receiver_session(&[frame::END_ACK]);
+        let data_in = FrameReader::new(&session[..]);
+        let (hello_tx, _hello_rx) = bounded(1);
+        let (list_tx, _list_rx) = bounded(1);
+        let (ack_tx, _ack_rx) = bounded(1);
+        let progress = Progress::new();
+        progress.advance(Phase::DoneSent);
+        data_reader(data_in, hello_tx, list_tx, ack_tx, &progress);
     }
 }

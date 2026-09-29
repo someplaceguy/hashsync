@@ -619,6 +619,13 @@ impl Index {
         }
     }
 
+    /// Close the database, then release the lock. The readers must be gone
+    /// first: the database closes with its last handle.
+    pub fn close(self) {
+        let shared = Arc::into_inner(self.shared).expect("a reader outlives the index");
+        drop(shared);
+    }
+
     /// An empty transaction.
     pub fn transaction(&self) -> Transaction<'_> {
         Transaction {

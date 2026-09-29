@@ -1,11 +1,12 @@
 //! `hashsync serve` driven directly through its standard streams and its
 //! rendezvous socket, the way the receiver and `attach` drive it. The
-//! receiver's disappearance is fatal at every stage before the normal
-//! exit (DESIGN.md §6.7): during rendezvous, while `serve` waits for the
+//! receiver's disappearance is fatal at every stage before DONE
+//! (DESIGN.md §6.7): during rendezvous, while `serve` waits for the
 //! control session, and while command stderr still drains after END_ACK.
-//! Queries and answers travel on the control session (DESIGN.md §6.2);
-//! obsolete queries still unsent at the normal end do not fail it. After
-//! HELLO, the data frames of `serve` form one zstd frame.
+//! After DONE, stdin EOF is the normal end. Queries and answers travel on
+//! the control session (DESIGN.md §6.2); obsolete queries still unsent at
+//! the normal end do not fail it. After HELLO, the data frames of `serve`
+//! through END form one zstd frame, and DONE follows it.
 
 mod common;
 
@@ -16,25 +17,19 @@ use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::time::Duration;
 
+use common::{
+    ANSWER, CACHE_RESULT, DONE, END, END_ACK, HASHLIST, HELLO, LIT, PROTOCOL_VERSION, QUERY, REF,
+    frame, proc_state, version,
+};
 use rustix::event::{PollFd, PollFlags, poll};
 use rustix::io::retry_on_intr;
 use rustix::process::{Pid, PidfdFlags, pidfd_open};
 use rustix::thread::{CpuSet, sched_getaffinity, sched_setaffinity};
 use tempfile::TempDir;
 
-// The protocol constants and frame types of DESIGN.md §6.2, spelled out
-// because the tests reach only the binary.
-const PROTOCOL_VERSION: u32 = 1;
+// The weak hash of DESIGN.md §5.1, spelled out because the tests reach
+// only the binary.
 const WEAK_HASH_ID: &[u8] = b"poly64-9e3779b97f4a7c15-splitmix64";
-const HELLO: u8 = 1;
-const HASHLIST: u8 = 2;
-const CACHE_RESULT: u8 = 6;
-const LIT: u8 = 7;
-const REF: u8 = 8;
-const END: u8 = 10;
-const END_ACK: u8 = 11;
-const QUERY: u8 = 12;
-const ANSWER: u8 = 13;
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 
@@ -92,17 +87,6 @@ fn string(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(bytes);
 }
 
-fn frame(kind: u8, payload: &[u8]) -> Vec<u8> {
-    let mut out = vec![kind];
-    string(&mut out, payload);
-    out
-}
-
-/// The first bytes of each session, in both directions.
-fn version() -> [u8; 4] {
-    PROTOCOL_VERSION.to_le_bytes()
-}
-
 /// The start of the receiver's HELLO payload, through the name of its
 /// strong hash: the block size, then the weak and strong hashes.
 fn hello_prefix(block_size: u32, strong: &[u8]) -> Vec<u8> {
@@ -145,6 +129,24 @@ fn on_one_cpu<T>(start: impl FnOnce() -> T) -> T {
     let started = start();
     sched_setaffinity(None, &all).unwrap();
     started
+}
+
+/// Wait until every thread of the process `pid` sleeps, polling with no
+/// deadline. Fail when the process has ended: it stays a zombie until the
+/// test reaps it.
+fn wait_until_asleep(pid: u32) {
+    loop {
+        // A thread that ends meanwhile has no state.
+        let states: Vec<Option<char>> = std::fs::read_dir(format!("/proc/{pid}/task"))
+            .unwrap()
+            .map(|task| proc_state(task.unwrap().path()))
+            .collect();
+        assert!(!states.contains(&Some('Z')), "the process ended");
+        if states.iter().all(|&state| state == Some('S')) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
 /// One frame from `reader`.
@@ -297,8 +299,22 @@ impl Serve {
         (self.child.wait().unwrap(), stderr)
     }
 
-    /// Require the normal exit, with status 0.
+    /// The normal end after END (DESIGN.md §6.7): END_ACK, DONE from
+    /// `serve`, and the end after DONE.
+    fn end_normally(mut self) {
+        self.send(END_ACK, b"");
+        assert_eq!(self.recv(), (DONE, Vec::new()));
+        self.expect_success();
+    }
+
+    /// The normal exit after DONE: close stdin, as the receiver does.
+    /// Nothing may follow DONE on stdout, and `serve` must exit with
+    /// status 0.
     fn expect_success(mut self) {
+        self.data_in = None;
+        let mut rest = Vec::new();
+        self.data_out.read_to_end(&mut rest).unwrap();
+        assert!(rest.is_empty(), "bytes after DONE");
         let (status, stderr) = self.finish();
         assert_eq!(status.code(), Some(0), "stderr:\n{stderr}");
     }
@@ -396,11 +412,12 @@ fn receiver_loss_while_serve_waits_for_the_control_version_is_fatal() {
 #[test]
 fn receiver_loss_after_end_ack_is_fatal_while_stderr_drains() {
     // A descendant keeps command stderr open, so the relay has not
-    // finished when END_ACK arrives. The receiver's disappearance then
-    // fails the run and kills the command's process group, descendant
-    // included. The descendant runs until this test process ends: it does
-    // not end by itself, however slow the machine is, and a failed test
-    // does not leave it behind.
+    // finished when END_ACK arrives, and `serve` does not send DONE. The
+    // receiver's disappearance, stdin EOF before DONE, then fails the run
+    // and kills the command's process group, descendant included. The
+    // descendant runs until this test process ends: it does not end by
+    // itself, however slow the machine is, and a failed test does not
+    // leave it behind.
     let mut serve = Serve::start();
     let script = format!(
         "( exec >/dev/null; exec tail --pid={} -f /dev/null ) & echo $!",
@@ -483,8 +500,7 @@ fn an_answer_decides_between_a_reference_and_literals() {
             assert_eq!(references, 0);
             assert_eq!(literal, block);
         }
-        serve.send(END_ACK, b"");
-        serve.expect_success();
+        serve.end_normally();
     }
 }
 
@@ -565,14 +581,14 @@ fn obsolete_queries_in_flight_do_not_fail_the_normal_end() {
         }
     }
     assert!(output == data, "the output differs");
-    serve.send(END_ACK, b"");
-    serve.expect_success();
+    serve.end_normally();
 }
 
 #[test]
 fn compressed_frames_form_one_zstd_frame_that_ends_with_end() {
     // After HELLO, the data frames share one zstd frame with a checksum,
-    // which ends right after END, and nothing follows it (DESIGN.md §6.2).
+    // which ends right after END. DONE follows the frame, outside it, and
+    // nothing follows DONE (DESIGN.md §6.2).
     let mut serve = Serve::start();
     serve.hello_with(4096, &empty_list(), &["printf", "%s", "compressed"], 3);
     let mut control = serve.attach();
@@ -594,8 +610,34 @@ fn compressed_frames_form_one_zstd_frame_that_ends_with_end() {
         .unwrap()
         .write_all(&frame(END_ACK, b""))
         .unwrap();
+    assert_eq!(recv_frame(&mut transport), (DONE, Vec::new()));
+    *data_in = None;
     let mut rest = Vec::new();
     transport.read_to_end(&mut rest).unwrap();
-    assert!(rest.is_empty(), "bytes after the zstd frame");
+    assert!(rest.is_empty(), "bytes after DONE");
+    serve.expect_success();
+}
+
+#[test]
+fn stdin_eof_after_done_is_the_normal_end() {
+    // `serve` sends DONE once it needs neither session: after END_ACK, and
+    // after it shut down the control socket. Then it waits, with every
+    // thread asleep, until its data reader reads the stdin EOF that the
+    // receiver causes after DONE. It joins that thread and exits with
+    // status 0 (DESIGN.md §6.7).
+    let mut serve = Serve::start();
+    serve.hello(&["printf", "%s", "output"]);
+    let mut control = serve.attach();
+    control.write_all(&version()).unwrap();
+    serve.send_empty_list();
+    serve.recv_result();
+    assert_eq!(serve.recv(), (LIT, b"output".to_vec()));
+    assert_eq!(serve.recv().0, END);
+    serve.send(END_ACK, b"");
+    assert_eq!(serve.recv(), (DONE, Vec::new()));
+    let mut received = Vec::new();
+    control.read_to_end(&mut received).unwrap();
+    assert_eq!(received, version(), "the control session after the version");
+    wait_until_asleep(serve.child.id());
     serve.expect_success();
 }

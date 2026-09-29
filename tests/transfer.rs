@@ -19,7 +19,10 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 use std::time::Duration;
 
-use common::{BLOCK, Env, KillOnDrop, random, tiled, toml_literal};
+use common::{
+    BLOCK, CACHE_RESULT, END, Env, HELLO, KillOnDrop, LIT, frame, proc_state, random, tiled,
+    toml_literal, version,
+};
 use rustix::event::{PollFd, PollFlags, poll};
 use rustix::fs::{CWD, Mode, mkfifoat};
 use rustix::io::retry_on_intr;
@@ -716,6 +719,61 @@ fn a_sender_with_another_protocol_version_is_rejected() {
     );
 }
 
+#[test]
+fn a_data_session_that_ends_before_done_fails_the_run() {
+    // A fake sender sends its version, HELLO, CACHE_RESULT, output, and
+    // END, reads what the receiver sends, END_ACK included, and ends the
+    // data session without DONE, as a sender that fails after END_ACK
+    // does. The receiver wrote the output, so it read END; without
+    // compression, only DONE can then fail. The run fails although the
+    // output is complete (DESIGN.md §6.7). The fake control session sends
+    // its version and stays open until its stdin ends.
+    let transfer = Transfer::new("");
+    // HELLO: an account ID and no base. END: status 0 and no error text.
+    let mut hello = vec![0x11; 16];
+    hello.push(0);
+    let frames = [
+        version().to_vec(),
+        frame(HELLO, &hello),
+        frame(CACHE_RESULT, b""),
+        frame(LIT, b"output"),
+        frame(END, &[0; 8]),
+    ]
+    .concat();
+    let data = transfer.env.path("sender-frames");
+    std::fs::write(&data, frames).unwrap();
+    let control = transfer.env.path("sender-version");
+    std::fs::write(&control, version()).unwrap();
+    let sender = transfer.env.path("ends-before-done");
+    std::fs::write(
+        &sender,
+        format!(
+            r#"#!/bin/sh
+if [ "$1" = serve ]; then
+    cat '{}'
+    exec cat >/dev/null
+fi
+cat '{}'
+exec cat 3>&1 >/dev/null
+"#,
+            data.display(),
+            control.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&sender, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // Without compression, END needs no zstd frame.
+    transfer.reconfigure(sender.as_os_str().as_bytes(), "compression_level = 0\n");
+    let output = transfer.run(&[], &refs(&args(&["true"])));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "stderr:\n{stderr}");
+    assert_eq!(output.stdout, b"output");
+    assert!(
+        stderr.contains("the data session ended unexpectedly"),
+        "stderr:\n{stderr}"
+    );
+}
+
 fn signal(pid: u32, signal: Signal) {
     let pid = Pid::from_raw(pid as i32).unwrap();
     kill_process(pid, signal).unwrap();
@@ -755,11 +813,13 @@ fn wait_until_exited(pid: u32) {
     retry_on_intr(|| poll(&mut fds, None)).unwrap();
 }
 
-/// The children of `pid`, started by any of its threads.
+/// The children of `pid`, started by any of its threads. A thread that
+/// ends meanwhile has no children file.
 fn children(pid: u32) -> Vec<u32> {
     let mut children = Vec::new();
     for task in std::fs::read_dir(format!("/proc/{pid}/task")).unwrap() {
-        let list = std::fs::read_to_string(task.unwrap().path().join("children")).unwrap();
+        let list =
+            std::fs::read_to_string(task.unwrap().path().join("children")).unwrap_or_default();
         children.extend(
             list.split_whitespace()
                 .map(|pid| pid.parse::<u32>().unwrap()),
@@ -827,4 +887,144 @@ fn a_termination_signal_decides_the_status_even_after_the_sessions_break() {
             );
         }
     }
+}
+
+/// Put a wrapper in place of the fake `ssh`. The wrapper sets `$ssh` to the
+/// fake `ssh`, and `$session` to `control` for the session that runs
+/// `attach`, else to `data`. Then it runs `body`, which runs `"$ssh" "$@"`
+/// and exits with its status.
+fn wrap_ssh(transfer: &Transfer, body: &str) {
+    let ssh = transfer.env.path("ssh");
+    let inner = transfer.env.path("ssh-inner");
+    std::fs::rename(&ssh, &inner).unwrap();
+    let script = format!(
+        r#"#!/bin/sh
+ssh='{}'
+case "$*" in
+*"'attach'"*) session=control ;;
+*) session=data ;;
+esac
+{body}
+"#,
+        inner.display()
+    );
+    std::fs::write(&ssh, script).unwrap();
+    std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[test]
+fn the_receiver_closes_stdin_before_either_stdout_ends() {
+    // Like an OpenSSH multiplexing client, the wrapper keeps the stdout of
+    // each session open until its SSH child exits, and the sender exits
+    // only after stdin EOF. The receiver closes both stdin pipes after
+    // DONE, without waiting for the EOF of either stdout, so the run still
+    // ends (DESIGN.md §6.7 and §10).
+    let transfer = Transfer::new("");
+    let blocks = tiled(16, 28);
+    transfer.env.write("tree/blocks", &blocks);
+    wrap_ssh(&transfer, "\"$ssh\" \"$@\"\nexit $?");
+    let command = args(&["cat", transfer.env.path("tree/blocks").to_str().unwrap()]);
+    let output = transfer.run_ok(&refs(&command));
+    assert_eq!(output.stdout, blocks);
+    assert_eq!(summary(&output), [blocks.len(), 0, blocks.len(), 0]);
+}
+
+#[test]
+fn the_end_waits_for_a_process_that_keeps_the_control_session_open() {
+    // After the control session's SSH exits, a process that inherited its
+    // stdout keeps the pipe open for a moment, creates the marker, and
+    // exits. The receiver reads each session to EOF and ends its threads
+    // before it exits (DESIGN.md §6.7), so it cannot exit before the
+    // marker exists, however the processes are scheduled. The normal run,
+    // the read-only run, and a command that fails to start end the same
+    // way.
+    let transfer = Transfer::new("");
+    let blocks = tiled(16, 26);
+    transfer.env.write("tree/blocks", &blocks);
+    let marker = transfer.env.path("marker");
+    wrap_ssh(
+        &transfer,
+        &format!(
+            r#""$ssh" "$@"
+status=$?
+if [ $session = control ]; then
+    ( sleep 0.2; : >'{}' ) </dev/null 2>/dev/null &
+fi
+exit $status"#,
+            marker.display()
+        ),
+    );
+    let cat = args(&["cat", transfer.env.path("tree/blocks").to_str().unwrap()]);
+    let missing = args(&["/nonexistent-hashsync-test-command"]);
+    for (flags, command, status) in [
+        (&[][..], &cat, 0),
+        (&["--no-update"][..], &cat, 0),
+        (&[][..], &missing, 127),
+    ] {
+        let _ = std::fs::remove_file(&marker);
+        let output = transfer.run(flags, &refs(command));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(status), "{flags:?}:\n{stderr}");
+        assert!(
+            marker.exists(),
+            "{flags:?}: ended before the EOF:\n{stderr}"
+        );
+        if status == 0 {
+            assert_eq!(output.stdout, blocks);
+            assert_eq!(summary(&output), [blocks.len(), 0, blocks.len(), 0]);
+        }
+    }
+}
+
+/// True once both SSH children of the receiver `pid` have exited: the
+/// receiver does not reap them, so both are zombies until it exits.
+fn sessions_exited(pid: u32) -> bool {
+    let exited = children(pid)
+        .into_iter()
+        .filter(|child| proc_state(format!("/proc/{child}")) == Some('Z'))
+        .count();
+    exited == 2
+}
+
+#[test]
+fn a_termination_signal_during_the_end_decides_the_status() {
+    // After the control session's SSH exits, a process that inherited its
+    // stdout keeps the pipe open while the hold file exists, until the test
+    // ends and removes its directory. So the receiver waits in its end
+    // (DESIGN.md §6.7). The signal thread still runs then: SIGTERM ends the
+    // run with `128 + signal` (DESIGN.md §6.6).
+    let transfer = Transfer::new("");
+    let hold = transfer.env.path("hold");
+    std::fs::write(&hold, b"").unwrap();
+    wrap_ssh(
+        &transfer,
+        &format!(
+            r#""$ssh" "$@"
+status=$?
+if [ $session = control ]; then
+    ( while [ -e '{}' ]; do sleep 0.01; done ) </dev/null 2>/dev/null &
+fi
+exit $status"#,
+            hold.display()
+        ),
+    );
+    let mut receiver = transfer
+        .invocation(&[], &refs(&args(&["true"])))
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = receiver.id();
+    while !sessions_exited(pid) {
+        assert!(receiver.try_wait().unwrap().is_none(), "the run ended");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    kill_process(Pid::from_raw(pid as i32).unwrap(), Signal::TERM).unwrap();
+    let output = receiver.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(143), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("terminated by SIGTERM"),
+        "stderr:\n{stderr}"
+    );
 }

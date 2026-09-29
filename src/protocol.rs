@@ -9,9 +9,9 @@
 //! needs a bound beyond its field: a corrupt value costs only the bytes
 //! that really follow it.
 //!
-//! After its HELLO, the sender's data-session frames share one zstd stream
-//! unless compression is disabled: `Compressor` writes it and
-//! `Decompressor` reads it.
+//! After its HELLO, the sender's data-session frames through END share one
+//! zstd stream unless compression is disabled: `Compressor` writes it and
+//! `Decompressor` reads it. DONE follows the stream, outside it.
 //!
 //! Malformed payloads, invalid compressed data, and violated frame rules
 //! are bugs in a compatible peer: parsers panic (DESIGN.md §6.5). Transport
@@ -51,6 +51,7 @@ pub mod frame {
     pub const END_ACK: u8 = 11;
     pub const QUERY: u8 = 12;
     pub const ANSWER: u8 = 13;
+    pub const DONE: u8 = 14;
 }
 
 /// Require the peer's protocol version, read before any frame, to equal
