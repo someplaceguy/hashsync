@@ -5,16 +5,19 @@
 //! exchange and CACHE_RESULT before starting the command. The scanner then
 //! turns the command's stdout into literals, runs, and references. After
 //! its HELLO, this side's data frames share one zstd stream unless
-//! compression is disabled (DESIGN.md §6.2).
+//! compression is disabled, and so do the queries and the answers on the
+//! control session after the protocol version (DESIGN.md §6.2).
 //!
 //! Each incoming direction has one owner for the whole run, so session
 //! loss is fatal at any moment — during rendezvous, setup, startup
 //! failure, and transfer alike (DESIGN.md §6.7). The data reader owns
 //! stdin and walks the receiver's fixed sequence: the protocol version,
-//! HELLO, HASHLIST and the list bytes, END_ACK, closure. The control reader
-//! owns the control socket from acceptance: the protocol version, then
-//! answers. The main thread writes the setup frames, then gives the data
-//! session to the data writer and runs the scanner (DESIGN.md §6.6): it
+//! HELLO, HASHLIST and the list bytes, END_ACK, closure. From acceptance,
+//! the control reader owns the incoming direction of the control socket:
+//! the protocol version, then answers. The control writer owns the
+//! outgoing one: the protocol version, then queries. The main thread
+//! writes the setup frames, then gives the data session to the data
+//! writer and runs the scanner (DESIGN.md §6.6): it
 //! takes command output from the output reader and answers from the
 //! control reader, lends long stretches of windows to the probe threads,
 //! and queues queries for the control writer and frames for the data
@@ -47,8 +50,8 @@ use crate::hashlist::{self, ListId};
 use crate::hashtable::HashTable;
 use crate::pool::Pool;
 use crate::protocol::{
-    self, Answer, COMPRESSION_LEVELS, Compressor, End, FrameReader, FrameWriter, HashList, Query,
-    ReceiverHello, Rle, SenderHello, frame,
+    self, Answer, COMPRESSION_LEVELS, Compressor, Decompressor, End, FrameReader, FrameWriter,
+    HashList, Query, ReceiverHello, Rle, SenderHello, frame,
 };
 use crate::rendezvous;
 use crate::scanner::{Frame, Scanner};
@@ -162,28 +165,40 @@ pub fn run(token: &str) -> ! {
         thread_count(hello.compression_threads),
     ));
 
-    // The control session: accept `attach`, then both sides send their
-    // protocol version immediately. The control reader owns the incoming
-    // direction; it reports readiness once the receiver's version matched,
-    // then forwards answers.
+    // The control session: accept `attach`. Each direction has one thread,
+    // from the protocol version on, and both sides send their version at
+    // once (DESIGN.md §6.2). The control writer sends the scanner's
+    // queries; the control reader reports readiness once the receiver's
+    // version matched, then forwards answers. After the version, each
+    // direction is one zstd stream at the data session's level.
     let control = listener.accept();
-    {
-        let mut control_out = FrameWriter::new(&control);
-        if let Err(e) = control_out
-            .send_version()
-            .and_then(|()| control_out.flush())
-        {
-            die(format!("control session: {e}"));
-        }
-    }
+    let (query_tx, query_rx) = unbounded();
+    let control_writer = {
+        let progress = Arc::clone(&progress);
+        let control_out = clone_control(&control);
+        let level = hello.compression_level;
+        std::thread::Builder::new()
+            .name("control-writer".into())
+            .spawn(move || write_queries(control_out, level, &query_rx, &progress))
+            .expect("cannot start the control writer")
+    };
     let (control_ready_tx, control_ready_rx) = bounded(1);
     let (answer_tx, answer_rx) = unbounded();
     let control_reader = {
         let progress = Arc::clone(&progress);
         let control_in = clone_control(&control);
+        let compressed = hello.compression_level != 0;
         std::thread::Builder::new()
             .name("control-reader".into())
-            .spawn(move || read_answers(control_in, control_ready_tx, answer_tx, &progress))
+            .spawn(move || {
+                read_answers(
+                    control_in,
+                    compressed,
+                    control_ready_tx,
+                    answer_tx,
+                    &progress,
+                )
+            })
             .expect("cannot start the control reader")
     };
 
@@ -229,22 +244,13 @@ pub fn run(token: &str) -> ! {
         .expect("the control reader ended before the protocol version");
 
     // From here on, the data writer owns the data session's outgoing
-    // direction and the control writer the control session's.
+    // direction.
     let queued = (QUEUED_BYTES / hello.block_size as usize).max(1);
     let (output_tx, output_rx) = bounded(queued);
     let data_writer = std::thread::Builder::new()
         .name("data-writer".into())
         .spawn(move || write_output(data_out, &output_rx))
         .expect("cannot start the data writer");
-    let (query_tx, query_rx) = unbounded();
-    let control_writer = {
-        let progress = Arc::clone(&progress);
-        let control_out = clone_control(&control);
-        std::thread::Builder::new()
-            .name("control-writer".into())
-            .spawn(move || write_queries(control_out, &query_rx, &progress))
-            .expect("cannot start the control writer")
-    };
 
     // The scanner's probe threads (DESIGN.md §6.3) start before the
     // command.
@@ -489,26 +495,31 @@ fn write_output(
     }
 }
 
-/// The control session's outgoing direction during the transfer: queries
-/// in order, flushed whenever the queue runs empty, until the queue is
-/// closed and empty. Obsolete queries do not delay completion (DESIGN.md
+/// The owner of the control session's outgoing direction: this side's
+/// protocol version, sent at once, without waiting for the receiver's,
+/// then queries in order, one zstd stream at `level`, 0 for none, flushed
+/// whenever the queue runs empty, until the queue is closed and empty
+/// (DESIGN.md §6.2). Obsolete queries do not delay completion (DESIGN.md
 /// §6.3), so normal cleanup can close the socket while this thread still
-/// has some to send. A failed write is then expected closure, not a
-/// failure.
-fn write_queries(stream: UnixStream, queries: &Receiver<Query>, progress: &Progress) {
+/// has some to send. In Completing, a failed write is expected closure,
+/// not a failure (DESIGN.md §6.7).
+fn write_queries(stream: UnixStream, level: i32, queries: &Receiver<Query>, progress: &Progress) {
     let mut control_out = FrameWriter::new(BufWriter::new(stream));
-    loop {
-        let result = match control_out.next_from(queries) {
-            Ok(Some(query)) => control_out.send(frame::QUERY, &query.encode()),
-            Ok(None) => return,
-            Err(e) => Err(e),
-        };
-        if let Err(e) = result {
-            if !progress.reached(Phase::Completing) {
-                die(format!("control session: {e}"));
-            }
-            return;
+    let mut result = control_out
+        .send_version()
+        .and_then(|()| control_out.flush());
+    let mut control_out = FrameWriter::new(Compressor::control(control_out.into_inner(), level));
+    while result.is_ok() {
+        match control_out.next_from(queries) {
+            Ok(Some(query)) => result = control_out.send(frame::QUERY, &query.encode()),
+            Ok(None) => break,
+            Err(e) => result = Err(e),
         }
+    }
+    if let Err(e) = result
+        && !progress.reached(Phase::Completing)
+    {
+        die(format!("control session: {e}"));
     }
 }
 
@@ -588,9 +599,11 @@ fn data_reader<R: Read>(
 /// The owner of the control session's incoming direction: the protocol
 /// version, whose check gates command startup, then answers for the
 /// scanner until closure, which is fatal before the normal cleanup
-/// (DESIGN.md §6.7).
+/// (DESIGN.md §6.7). The answers are one zstd stream when `compressed`
+/// (DESIGN.md §6.2).
 fn read_answers(
     stream: UnixStream,
+    compressed: bool,
     ready_tx: Sender<()>,
     answers: Sender<Answer>,
     progress: &Progress,
@@ -602,6 +615,7 @@ fn read_answers(
         Err(e) => die(format!("control session: {e}")),
     }
     let _ = ready_tx.send(());
+    let mut control_in = FrameReader::new(Decompressor::new(control_in.into_inner(), compressed));
     loop {
         match control_in.next() {
             Ok(Some(received)) => {

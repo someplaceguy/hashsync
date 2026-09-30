@@ -11,7 +11,11 @@
 //!
 //! After its HELLO, the sender's data-session frames through END share one
 //! zstd stream unless compression is disabled: `Compressor` writes it and
-//! `Decompressor` reads it. DONE follows the stream, outside it.
+//! `Decompressor` reads it. DONE follows the stream, outside it. After the
+//! protocol version, each direction of the control session is one zstd
+//! stream too, which the closure of the session ends. The receiver-to-sender
+//! direction of the data session is not compressed: nearly all its bytes
+//! are the hash list, which is already as small as zstd can make it.
 //!
 //! Malformed payloads, invalid compressed data, and violated frame rules
 //! are bugs in a compatible peer: parsers panic (DESIGN.md §6.5). Transport
@@ -607,8 +611,9 @@ impl<W: Write> FrameWriter<W> {
     /// The next item from `queue`, for a control writer, which writes what
     /// the queue delivers. When nothing is queued, flush first: the
     /// scanner waits for answers, so queries and answers must not stay in
-    /// a buffer while this thread waits (DESIGN.md §6.6). `None`, after a
-    /// flush, once the queue is closed and empty.
+    /// a buffer or in the compressor while this thread waits (DESIGN.md
+    /// §6.2 and §6.6). `None`, after a flush, once the queue is closed and
+    /// empty.
     pub fn next_from<T>(&mut self, queue: &Receiver<T>) -> std::io::Result<Option<T>> {
         match queue.try_recv() {
             Ok(item) => Ok(Some(item)),
@@ -629,12 +634,14 @@ pub const COMPRESSION_LEVELS: RangeInclusive<i32> = 0..=19;
 /// default, so the receiver needs no setting for it.
 const LONG_WINDOW_LOG: u32 = 27;
 
-/// The sender's data session after its HELLO (DESIGN.md §6.2): one zstd
-/// stream for all frames, or the frames as they are when compression is
-/// disabled. `flush` makes every byte written so far decodable by the
-/// receiver, for a frame that it must answer, and `finish` ends the stream
-/// after END. The zstd frame has a checksum: the trailer that the receiver
-/// checks (DESIGN.md §6.7).
+/// One compressed direction of a session (DESIGN.md §6.2): one zstd stream
+/// for all frames, or the frames as they are when compression is disabled.
+/// `flush` makes every byte written so far decodable by the peer, for a
+/// frame that it must answer. The sender's data session begins the stream
+/// after its HELLO, and `finish` ends it after END. The zstd frame has a
+/// checksum: the trailer that the receiver checks (DESIGN.md §6.7). Each
+/// direction of the control session begins its stream after the protocol
+/// version, and no frame ends it: the closure of the session ends it.
 ///
 /// Transport failures are `io::Error`s for the caller's `die`. A failure of
 /// zstd itself panics.
@@ -666,6 +673,15 @@ impl<W: Write> Compressor<W> {
         Compressor { transport, zstd }
     }
 
+    /// One direction of the control session: compress at zstd `level` in
+    /// the writer's own thread, without long-distance matching; level 0
+    /// disables compression. Its frames are small, and the writer flushes
+    /// whenever its queue runs empty, so worker threads and a long window
+    /// would only add cost (DESIGN.md §6.2).
+    pub fn control(transport: W, level: i32) -> Self {
+        Self::new(transport, level, false, 0)
+    }
+
     /// End the stream, flush the transport, and return it.
     pub fn finish(mut self) -> std::io::Result<W> {
         if let Some(zstd) = &mut self.zstd {
@@ -673,6 +689,12 @@ impl<W: Write> Compressor<W> {
         }
         self.transport.flush()?;
         Ok(self.transport)
+    }
+
+    /// The transport, without ending the stream, as a control writer ends:
+    /// the bytes that zstd still holds are lost.
+    pub fn into_transport(self) -> W {
+        self.transport
     }
 }
 
@@ -730,17 +752,18 @@ impl<W: Write> Write for Compressor<W> {
     }
 }
 
-/// The receiver's end of the sender's data session after HELLO
-/// (DESIGN.md §6.2): the decoded bytes of one zstd frame, or the bytes of
-/// the transport when compression is disabled. After END, `finish` checks
-/// that the frame ends there.
+/// The reading end of a `Compressor`'s stream (DESIGN.md §6.2): the decoded
+/// bytes of one zstd frame, or the bytes of the transport when compression
+/// is disabled. On the data session, after END, `finish` checks that the
+/// frame ends there. On the control session, the frame never ends.
 ///
 /// EOF of the transport inside the frame is `UnexpectedEof`: a truncated
-/// stream. Other transport failures are `io::Error`s too, for the caller's
-/// `die`. Invalid compressed data, including a wrong checksum, and a frame
-/// that ends before END are protocol errors and panic (DESIGN.md §6.5): a
-/// truncated stream cannot end a frame, because its end needs the last
-/// block and the checksum.
+/// stream, or the closure of a control session. Other transport failures
+/// are `io::Error`s too, for the caller. Invalid compressed data, including
+/// a wrong checksum, and a frame that ends before END or on the control
+/// session are protocol errors and panic (DESIGN.md §6.5): a truncated
+/// stream cannot end a frame, because its end needs the last block and the
+/// checksum.
 pub struct Decompressor<R: BufRead> {
     transport: R,
     /// `None` when compression is disabled.
@@ -835,11 +858,11 @@ impl<R: BufRead> Read for Decompressor<R> {
         if buf.is_empty() {
             return Ok(0);
         }
-        // The sender ends the frame only after END, and only `finish`
+        // Only the data session's frame ends, after END, and only `finish`
         // reads after END.
         assert!(
             zstd.available(&mut self.transport)?,
-            "protocol error: the compressed stream ended before END"
+            "protocol error: the compressed stream ended early"
         );
         let n = buf.len().min(zstd.end - zstd.start);
         buf[..n].copy_from_slice(&zstd.buffer[zstd.start..zstd.start + n]);
@@ -1208,7 +1231,7 @@ mod tests {
         // The bytes sent until a flush decode to every frame written
         // before it, although the stream goes on: the sender flushes
         // before it waits for a reply (DESIGN.md §6.2).
-        for (long, threads) in [(false, 1), (false, 3), (true, 1), (true, 3)] {
+        for (long, threads) in [(false, 0), (false, 1), (false, 3), (true, 1), (true, 3)] {
             let sent = Shared::default();
             let mut writer = FrameWriter::new(Compressor::new(sent.clone(), 9, long, threads));
             writer.send(frame::CACHE_RESULT, b"").unwrap();
@@ -1221,6 +1244,46 @@ mod tests {
             let error = reader.next().unwrap_err();
             assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
         }
+    }
+
+    #[test]
+    fn a_control_stream_decodes_at_each_flush_and_ends_at_closure() {
+        // A control writer flushes whenever its queue runs empty, and it
+        // never ends its zstd frame: the closure of the session ends the
+        // stream, as EOF inside the frame (DESIGN.md §6.2). Answers that
+        // share a flush take a small part of their plain size.
+        let answers: Vec<Vec<u8>> = (0..1000u64)
+            .map(|i| {
+                let found = i % 7 != 0;
+                Answer {
+                    offset: i * 4096,
+                    found,
+                }
+                .encode()
+            })
+            .collect();
+        let sent = Shared::default();
+        let mut writer = FrameWriter::new(Compressor::control(sent.clone(), 9));
+        writer.send(frame::ANSWER, &answers[0]).unwrap();
+        writer.flush().unwrap();
+        let alone = sent.0.borrow().len();
+        for answer in &answers[1..] {
+            writer.send(frame::ANSWER, answer).unwrap();
+        }
+        writer.flush().unwrap();
+        let batch = sent.0.borrow().len() - alone;
+        let plain = 999 * (5 + answers[0].len());
+        assert!(batch < plain / 4, "{batch} bytes for {plain} plain bytes");
+        writer.into_inner().into_transport();
+        let stream = sent.0.borrow().clone();
+        assert_eq!(stream.len(), alone + batch, "nothing ends the frame");
+
+        let mut reader = FrameReader::new(Decompressor::new(&stream[..], true));
+        for answer in &answers {
+            assert_eq!(reader.expect(frame::ANSWER, "ANSWER").unwrap(), answer);
+        }
+        let error = reader.next().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 
     #[test]
@@ -1340,7 +1403,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "protocol error: the compressed stream ended before END")]
+    #[should_panic(expected = "protocol error: the compressed stream ended early")]
     fn a_frame_that_ends_before_end_is_a_protocol_error() {
         // Only the sender ends the zstd frame, after END; a truncated
         // stream cannot end it (DESIGN.md §6.5).
@@ -1348,7 +1411,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "protocol error: the compressed stream ended before END")]
+    #[should_panic(expected = "protocol error: the compressed stream ended early")]
     fn a_frame_that_ends_inside_a_frame_is_a_protocol_error() {
         // Two bytes of a frame header, which a check after the frame
         // reader would see as UnexpectedEof, like a truncation.

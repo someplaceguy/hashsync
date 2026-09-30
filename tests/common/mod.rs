@@ -4,6 +4,7 @@
 #![allow(dead_code)]
 
 use std::ffi::OsStr;
+use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -557,6 +558,22 @@ pub fn frame(kind: u8, payload: &[u8]) -> Vec<u8> {
     frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     frame.extend_from_slice(payload);
     frame
+}
+
+/// One frame from `reader`: its type and its payload.
+pub fn recv_frame(reader: &mut impl Read) -> (u8, Vec<u8>) {
+    try_recv_frame(reader).unwrap()
+}
+
+/// One frame from `reader`, or the error that ends the stream first:
+/// `UnexpectedEof` when it ends before or inside the frame.
+pub fn try_recv_frame(reader: &mut impl Read) -> std::io::Result<(u8, Vec<u8>)> {
+    let mut header = [0u8; 5];
+    reader.read_exact(&mut header)?;
+    let length = u32::from_le_bytes(header[1..].try_into().unwrap());
+    let mut payload = vec![0; length as usize];
+    reader.read_exact(&mut payload)?;
+    Ok((header[0], payload))
 }
 
 /// The state letter of the process or thread whose directory in `/proc`

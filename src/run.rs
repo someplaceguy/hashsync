@@ -6,8 +6,9 @@
 //! starts both SSH sessions, and completes the exchange. It then
 //! reconstructs stdout from literals, runs, and references, which arrive
 //! through the compression stream, while the lookup workers answer the
-//! sender's queries (DESIGN.md §6.4). It returns the command's status once
-//! both sessions exited successfully, after a summary.
+//! sender's queries (DESIGN.md §6.4). Queries and answers have compression
+//! streams of their own (DESIGN.md §6.2). It returns the command's status
+//! once both sessions exited successfully, after a summary.
 //!
 //! The end is orderly (DESIGN.md §6.7). After END_ACK, DONE tells the
 //! receiver that the sender needs neither session any more. The main
@@ -38,8 +39,8 @@ use crate::index::{self, Settings};
 use crate::lookup;
 use crate::pins::{PinFile, Pins};
 use crate::protocol::{
-    self, Answer, Decompressor, End, FrameReader, FrameWriter, HashList, Query, ReceiverHello, Rle,
-    SenderHello, frame,
+    self, Answer, Compressor, Decompressor, End, FrameReader, FrameWriter, HashList, Query,
+    ReceiverHello, Rle, SenderHello, frame,
 };
 use crate::rendezvous;
 use crate::roots::{self, Location};
@@ -114,33 +115,26 @@ pub fn run(
     );
     let sessions = [(data.pid(), "data"), (control.pid(), "control")];
 
-    // Both sides send their protocol version first, without waiting for
-    // the peer's (DESIGN.md §6.2). The relay delivers it once `attach`
-    // connects. The control writer gives the session's stdin back when it
-    // ends: the pipe must stay open until DONE (DESIGN.md §6.7).
-    let mut control_out = FrameWriter::new(BufWriter::new(Counting {
-        inner: control.stdin,
-        count: &SENT,
-    }));
-    if let Err(e) = control_out
-        .send_version()
-        .and_then(|()| control_out.flush())
-    {
-        die(format!("control session: {e}"));
-    }
+    // Each direction of the control session has one thread, from the
+    // protocol version on (DESIGN.md §6.2 and §6.6). The control writer
+    // gives the session's stdin back when it ends: the pipe must stay open
+    // until DONE (DESIGN.md §6.7).
     let control_writer = {
         let pins = Arc::clone(&pins);
+        let control_stdin = control.stdin;
+        let level = config.compression_level;
         std::thread::Builder::new()
             .name("control-writer".into())
-            .spawn(move || write_answers(control_out, &answer_rx, &pins))
+            .spawn(move || write_answers(control_stdin, level, &answer_rx, &pins))
             .expect("cannot start the control writer")
     };
     let control_reader = {
         let pins = Arc::clone(&pins);
         let control_stdout = control.stdout;
+        let compressed = config.compression_level != 0;
         std::thread::Builder::new()
             .name("control-reader".into())
-            .spawn(move || read_queries(control_stdout, &pins, queries))
+            .spawn(move || read_queries(control_stdout, compressed, &pins, queries))
             .expect("cannot start the control reader")
     };
 
@@ -497,14 +491,15 @@ fn advance(offset: u64, length: u64) -> u64 {
 }
 
 /// The owner of the control session's incoming direction: the sender's
-/// protocol version, then queries for the lookup workers. Loss before
-/// Completing is fatal (DESIGN.md §6.7); in Completing, EOF, errors, and a
-/// partial frame are expected closure. Also in Completing, reading goes on
-/// until closure. So the sender's relay never blocks on a full pipe, and
-/// the pipe closes only at EOF, when SSH cannot write to it any more: a
-/// write to a closed pipe would make SSH fail. The end of this thread
-/// closes the query queue.
-fn read_queries(stdout: ChildStdout, pins: &Pins, lookups: Sender<Query>) {
+/// protocol version, then queries for the lookup workers, one zstd stream
+/// when `compressed` (DESIGN.md §6.2). Loss before Completing is fatal
+/// (DESIGN.md §6.7); in Completing, EOF, errors, and a partial frame are
+/// expected closure. Also in Completing, reading goes on until closure. So
+/// the sender's relay never blocks on a full pipe, and the pipe closes
+/// only at EOF, when SSH cannot write to it any more: a write to a closed
+/// pipe would make SSH fail. The end of this thread closes the query
+/// queue.
+fn read_queries(stdout: ChildStdout, compressed: bool, pins: &Pins, lookups: Sender<Query>) {
     let mut control_in = FrameReader::new(BufReader::new(Counting {
         inner: stdout,
         count: &CONTROL_RECEIVED,
@@ -518,6 +513,7 @@ fn read_queries(stdout: ChildStdout, pins: &Pins, lookups: Sender<Query>) {
         Ok(Some(version)) => protocol::check_version(version, "sender's control session"),
         Ok(None) | Err(_) => return closed(),
     }
+    let mut control_in = FrameReader::new(Decompressor::new(control_in.into_inner(), compressed));
     loop {
         match control_in.next() {
             Ok(Some(received)) => {
@@ -534,30 +530,41 @@ fn read_queries(stdout: ChildStdout, pins: &Pins, lookups: Sender<Query>) {
     }
 }
 
-/// The owner of the control session's outgoing direction after the
-/// version: answers in the order the workers queue them, flushed whenever
-/// the queue runs empty. It ends in Completing: once the queue is closed
-/// and empty, or when a write fails, which is then expected closure
-/// (DESIGN.md §6.7). It gives back the session's stdin without closing it,
-/// and discards the answers that a failed write left in the buffer.
+/// The owner of the control session's outgoing direction: this side's
+/// protocol version, sent at once, without waiting for the sender's, then
+/// answers in the order the workers queue them, one zstd stream at
+/// `level`, 0 for none, flushed whenever the queue runs empty (DESIGN.md
+/// §6.2). It ends in Completing: once the queue is closed and empty, or
+/// when a write fails, which is then expected closure; before Completing,
+/// a failed write is fatal (DESIGN.md §6.7). It gives back the session's
+/// stdin without closing it or ending the stream, and discards the answers
+/// that a failed write left in the buffer.
 fn write_answers(
-    mut control_out: FrameWriter<BufWriter<Counting<ChildStdin>>>,
+    stdin: ChildStdin,
+    level: i32,
     answers: &Receiver<Answer>,
     pins: &Pins,
 ) -> ChildStdin {
-    loop {
-        let result = match control_out.next_from(answers) {
-            Ok(Some(answer)) => control_out.send(frame::ANSWER, &answer.encode()),
+    let mut control_out = FrameWriter::new(BufWriter::new(Counting {
+        inner: stdin,
+        count: &SENT,
+    }));
+    let mut result = control_out
+        .send_version()
+        .and_then(|()| control_out.flush());
+    let mut control_out = FrameWriter::new(Compressor::control(control_out.into_inner(), level));
+    while result.is_ok() {
+        match control_out.next_from(answers) {
+            Ok(Some(answer)) => result = control_out.send(frame::ANSWER, &answer.encode()),
             Ok(None) => break,
-            Err(e) => Err(e),
-        };
-        if let Err(e) = result {
-            if !pins.is_completing() {
-                die(format!("control session: {e}"));
-            }
-            break;
+            Err(e) => result = Err(e),
         }
     }
-    let (stdin, _) = control_out.into_inner().into_parts();
+    if let Err(e) = result
+        && !pins.is_completing()
+    {
+        die(format!("control session: {e}"));
+    }
+    let (stdin, _) = control_out.into_inner().into_transport().into_parts();
     stdin.inner
 }

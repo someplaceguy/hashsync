@@ -20,8 +20,8 @@ use std::process::{Child, Command, Output, Stdio};
 use std::time::Duration;
 
 use common::{
-    BLOCK, CACHE_RESULT, END, Env, HELLO, KillOnDrop, LIT, QUERY, frame, proc_state, random, tiled,
-    toml_literal, version,
+    ANSWER, BLOCK, CACHE_RESULT, END, Env, HELLO, KillOnDrop, LIT, QUERY, frame, proc_state,
+    random, recv_frame, tiled, toml_literal, version,
 };
 use rustix::event::{PollFd, PollFlags, poll};
 use rustix::fs::{CWD, Mode, mkfifoat};
@@ -617,8 +617,9 @@ fn empty_output_and_command_failure_status() {
 fn the_summary_counts_both_sessions() {
     // Each reference needs a QUERY on the control session and a yes
     // ANSWER, which the data session does not carry. The second summary
-    // line counts both sessions in both directions (DESIGN.md §8).
-    let transfer = Transfer::new("");
+    // line counts both sessions in both directions (DESIGN.md §8). Without
+    // compression, the control session carries its frames as they are.
+    let transfer = Transfer::new("compression_level = 0\n");
     let blocks = tiled(64, 7);
     transfer.env.write("tree/blocks", &blocks);
     let command = args(&["cat", transfer.env.path("tree/blocks").to_str().unwrap()]);
@@ -1164,8 +1165,10 @@ fn the_summary_counts_every_byte_that_the_sessions_deliver() {
     // more QUERY, which the receiver skips in Completing. The receiver reads
     // both sessions to EOF before the summary (DESIGN.md §6.7 and §8), so
     // the summary counts exactly the bytes of both files, that QUERY
-    // included. One changed block makes the scanner rescan.
-    let transfer = Transfer::new("");
+    // included. One changed block makes the scanner rescan. The late QUERY
+    // is a plain frame, so this run has no compression: inside a zstd
+    // stream, the receiver could not decode it.
+    let transfer = Transfer::new("compression_level = 0\n");
     let mut blocks = tiled(32, 27);
     transfer.env.write("tree/blocks", &blocks);
     transfer.env.update();
@@ -1201,6 +1204,68 @@ exit $status"#,
     );
     assert_eq!(wire_bytes(&output), data.len());
     assert_eq!(traffic(&output).received, data.len() + control.len());
+}
+
+#[test]
+fn both_directions_of_the_control_session_are_compressed() {
+    // After the protocol version, the queries form one zstd stream, and the
+    // answers another. No frame ends either stream: the closure of the
+    // session does (DESIGN.md §6.2). `tee` copies both directions of the
+    // control session. Every block of the output is queried once, in
+    // order, and answered yes.
+    let transfer = Transfer::new("");
+    let blocks = tiled(16, 29);
+    transfer.env.write("tree/blocks", &blocks);
+    let captured = transfer.env.path("captured");
+    wrap_ssh(
+        &transfer,
+        &format!(
+            r#"if [ $session = control ]; then
+    tee '{0}'.answers | {{ "$ssh" "$@"; echo $? >'{0}'.status; }} | tee '{0}'.queries
+    exit "$(cat '{0}'.status)"
+fi
+exec "$ssh" "$@""#,
+            captured.display(),
+        ),
+    );
+    let command = args(&["cat", transfer.env.path("tree/blocks").to_str().unwrap()]);
+    let output = transfer.run_ok(&refs(&command));
+    assert_eq!(output.stdout, blocks);
+    assert_eq!(summary(&output), [blocks.len(), 0, blocks.len(), 0]);
+
+    let offsets: Vec<u64> = (0..16).map(|i| (i * BLOCK) as u64).collect();
+    let decode = |direction: &str| {
+        let stream = std::fs::read(format!("{}.{direction}", captured.display())).unwrap();
+        assert_eq!(stream[..4], version(), "{direction}");
+        let mut stream = zstd::stream::read::Decoder::new(&stream[4..]).unwrap();
+        let frames: Vec<(u8, Vec<u8>)> = std::iter::repeat_with(|| recv_frame(&mut stream))
+            .take(offsets.len())
+            .collect();
+        let error = stream.read(&mut [0]).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::UnexpectedEof,
+            "{direction}"
+        );
+        frames
+    };
+    for ((kind, query), (offset, block)) in decode("queries")
+        .into_iter()
+        .zip(offsets.iter().zip(blocks.chunks(BLOCK)))
+    {
+        assert_eq!(kind, QUERY);
+        assert_eq!(query[..8], offset.to_le_bytes());
+        assert_eq!(query[8..], *blake3::hash(block).as_bytes());
+    }
+    let mut answered: Vec<u64> = decode("answers")
+        .into_iter()
+        .map(|(kind, answer)| {
+            assert_eq!((kind, answer.len(), answer[8]), (ANSWER, 9, 1), "a yes");
+            u64::from_le_bytes(answer[..8].try_into().unwrap())
+        })
+        .collect();
+    answered.sort_unstable();
+    assert_eq!(answered, offsets);
 }
 
 /// True once both SSH children of the receiver `pid` have exited: the

@@ -27,8 +27,8 @@ files by identity, size, and ctime, and recover interrupted work; `run`
 command's output over two SSH sessions, with the full hash-list exchange,
 account identities, and durable list caches, replace indexed blocks with
 references verified through the pin file, send constant-byte runs
-compactly, and compress the data stream with zstd. Step 6 is the next
-milestone.
+compactly, and compress the data stream and both directions of the control
+session with zstd. Step 6 is the next milestone.
 
 ## 1. Build and inspect a local index
 
@@ -157,6 +157,8 @@ Design coverage: §§3, 4.5, 5.1–5.3, 5.5, 6.2–6.7, 7–8.
 - Favor bandwidth over output latency: flush the compression stream only
   before the sender waits for a reply, and finish it after END. Keep query
   progress independent of compression and output backpressure.
+- Compress both directions of the control session at the same level, and
+  flush each one whenever its writer's queue becomes empty.
 - Detect truncated or invalid compressed streams before declaring success.
   Preserve complete stderr forwarding and command-status handling.
 - Report run byte counts and account for compression in the summary's wire

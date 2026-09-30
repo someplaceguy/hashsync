@@ -868,7 +868,7 @@ existing stderr channel; both local SSH subprocesses inherit the receiver's
 stderr. The relay finishes only after command stderr reaches
 EOF and all copied bytes have been written and flushed to SSH. It runs
 independently of stdout scanning and control traffic. Stderr is outside the
-hashsync protocol and compression stream. Successful sender exit requires
+hashsync protocol and its compression streams. Successful sender exit requires
 relay completion; its coordination with stdout completion is an implementation
 decision (section 6.7). The receiver waits for both SSH exits before returning.
 
@@ -964,13 +964,24 @@ stdin pipes open until DONE (section 6.7).
 After HELLO, all sender-to-receiver data-session frames through END share one
 zstd stream, unless compression is disabled. This includes HASHFULL and
 CACHE_RESULT. DONE follows the stream, outside it.
-Control traffic and all receiver-to-sender traffic are uncompressed.
 Output latency does not matter, only bandwidth. So the sender flushes the
 stream only before it waits for a reply, after HASHFULL, and finishes the
 stream after END. Other frames can stay in the compressor and the transport
 buffer until more output fills them or the stream ends. No wait depends on
 them: queries and answers use the control session. Compression settings are
 in section 7.
+
+After the protocol version, each direction of the control session is also
+one zstd stream at the same level, unless compression is disabled. The
+frames are small, so the stream uses no long-distance matching and no
+worker threads. A control writer flushes its stream each time its queue
+becomes empty, because the scanner waits for answers. When a slow link
+makes the writer wait, more frames share each flush and compress better.
+No frame ends the stream: the closure of the session ends it (section 6.7).
+
+The receiver-to-sender direction of the data session is not compressed.
+Almost all its bytes are the hash list, and zstd cannot make the list
+smaller (section 10).
 
 ### 6.3 The sender's scanner
 
@@ -1239,9 +1250,10 @@ No extent is punched while its append or REF read is still using it.
   SIGINT/SIGTERM end the run unsuccessfully without a core dump.
 - Stderr relay read, write, or flush failures also end the run with `die`
   without a core dump.
-- Invalid frames, a compressed stream that ends before END, unexpected
-  answers, missing pins, protocol arithmetic overflow, database errors, and
-  invariant violations are bugs: panic and abort.
+- Invalid frames, a compressed stream that ends before END or on the
+  control session, unexpected answers, missing pins, protocol arithmetic
+  overflow, database errors, and invariant violations are bugs: panic and
+  abort.
 - Conflicting immutable-copy policies, duplicate or nested root paths, and
   repeated directory identities detected during expansion or traversal call
   `die` without a core dump.
@@ -1388,8 +1400,8 @@ Receiver completion:
    discarded. It keeps both session stdin pipes open until DONE. Workers
    returning later discard their results, including results of unfinished
    pin-file writes; closing the pin file in step 6 frees their extents.
-   Control EOF, broken pipes, and a partial final control frame in
-   Completing are expected closure, not failures.
+   Control EOF, broken pipes, and a partial final control frame or
+   compressed block in Completing are expected closure, not failures.
 3. The receiver reads DONE, which directly follows the zstd frame. EOF or
    another frame before DONE fails the run.
 4. The receiver closes both session stdin pipes, in this order:
@@ -1736,6 +1748,38 @@ decision history is in version control.
   responsive when the command pauses, but each flush ends a zstd block or
   job early. With a command paced at 2 MB/s, level 9 sent 5.7% more bytes
   and used 53% more compression CPU. Output latency does not matter here.
+- **Compressing the hash list:** the weak hashes are uniform 64-bit
+  values. For all of `/nix/store` at 4 KiB blocks, 14.0M values in
+  73.3 MB, the Rice code of section 5.4 is only 0.16% larger than the
+  smallest encoding of a random set of that size, and zstd at levels 1 to
+  19 added 1.7 KB. For random lists of 1M and 4M values, the sorted values
+  as `u64`, compressed with zstd at levels 3 to 19, were 33–40% larger
+  than the Rice code. Only fewer values make the list smaller: cached
+  lists and deltas (section 5.6).
+- **An uncompressed control session:** in a transfer of 3.29 GB of
+  `/nix/store` files, 97% references at 4 KiB blocks, the queries took
+  35.0 MB, the answers 10.9 MB, and the data session 6.3 MB. The 32-byte
+  digest of a query does not compress, but the rest of a query and almost
+  all of an answer do. In one zstd frame at level 9, queries are 25%
+  smaller and answers 92% smaller. But each flush adds a block header:
+  with a flush after each frame, they are 0.6% and 21% larger. Between
+  two processes on one host, with a flush each time the writer's queue
+  becomes empty, the transfer sent 18% fewer query bytes and 9% fewer
+  answer bytes, in the same time. A link that limits a direction makes
+  its writer wait, so more frames share each flush. In a transfer of
+  0.98 GB, with the queries limited to 400 KiB/s, the queries were 24%
+  smaller, and the transfer took 22.5 s instead of 28.6 s. With the
+  answers limited to 50 KiB/s, the answers were 60% smaller, and the
+  transfer took 28.1 s instead of 65.3 s. From level 9 to 19, the control
+  bytes shrink by about 1%, but the cost per frame in a control writer
+  grows from at most 4 µs to 33 µs.
+- **Flushing the control streams less often:** a writer that kept queries
+  until the scanner waits would hold a query in the compressor while the
+  scanner fills its lookahead with literal bytes, and the output would
+  wait for that query's answer. Answers kept until the lookup workers are
+  idle would stop the scanner in the same way. Small flushes happen only
+  while a link keeps up with the writer; a slower link makes the writer
+  wait, and its flushes grow.
 - **Stdout EOF as the end of the sender:** `serve` could close its stdout
   when it has finished, and the receiver could close each session's stdin
   at the EOF of that session's stdout. With SSH multiplexing, this is a
@@ -1758,7 +1802,7 @@ decision history is in version control.
   until the first release. After that, any change that a peer can observe
   after the version exchange requires a protocol version bump, for example a
   change to frame layouts, frame order or meaning, the list encoding, or the
-  frames that the zstd stream carries. New weak and strong hashes are the
+  frames that the zstd streams carry. New weak and strong hashes are the
   exception: HELLO names both, and a sender that does not support them
   ends the run before command startup. The remote commands and the version
   exchange never change (sections 6.1 and 6.2).
@@ -1794,7 +1838,8 @@ decision history is in version control.
   completion without truncation or premature exit under the chosen
   synchronization scheme;
   complete stderr forwarding with backpressure and delayed stderr EOF from
-  descendants; truncated compression trailers, late lookups, relay
+  descendants; truncated compression trailers, compressed control
+  traffic in both directions that the closure ends, late lookups, relay
   closure with control writes in flight, shutdown on session loss, and fatal
   cleanup after a child's exit status has been collected without reaping. Use
   separate processes for locking tests and fuzz protocol decoding.

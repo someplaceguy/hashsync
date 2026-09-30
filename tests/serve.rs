@@ -5,21 +5,23 @@
 //! control session, and while command stderr still drains after END_ACK.
 //! After DONE, stdin EOF is the normal end. Queries and answers travel on
 //! the control session (DESIGN.md §6.2); obsolete queries still unsent at
-//! the normal end do not fail it. After HELLO, the data frames of `serve`
-//! through END form one zstd frame, and DONE follows it.
+//! the normal end do not fail it, also inside a compressed block. After
+//! HELLO, the data frames of `serve` through END form one zstd frame, and
+//! DONE follows it; after the protocol version, each direction of the
+//! control session is one zstd stream that no frame ends.
 
 mod common;
 
 use std::io::{BufReader, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::time::Duration;
 
 use common::{
     ANSWER, CACHE_RESULT, DONE, END, END_ACK, HASHLIST, HELLO, LIT, PROTOCOL_VERSION, QUERY, REF,
-    frame, proc_state, version,
+    frame, proc_state, recv_frame, try_recv_frame, version,
 };
 use rustix::event::{PollFd, PollFlags, poll};
 use rustix::io::retry_on_intr;
@@ -149,14 +151,141 @@ fn wait_until_asleep(pid: u32) {
     }
 }
 
-/// One frame from `reader`.
-fn recv_frame(reader: &mut impl Read) -> (u8, Vec<u8>) {
-    let mut header = [0u8; 5];
-    reader.read_exact(&mut header).unwrap();
-    let length = u32::from_le_bytes(header[1..].try_into().unwrap());
-    let mut payload = vec![0; length as usize];
-    reader.read_exact(&mut payload).unwrap();
-    (header[0], payload)
+/// The default send buffer of a socket, `net.core.wmem_default`, in
+/// bytes. A Unix socket holds at most about one and a half times as many.
+fn send_buffer() -> usize {
+    std::fs::read_to_string("/proc/sys/net/core/wmem_default")
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+/// The number of the system call in which the thread whose `syscall` file
+/// is at `path` sleeps; `None` while it runs or sleeps outside a system
+/// call. The file names a system call only while the thread sleeps in it.
+fn sleeping_syscall(path: &Path) -> std::io::Result<Option<u64>> {
+    let syscall = std::fs::read_to_string(path)?;
+    Ok(syscall
+        .split_whitespace()
+        .next()
+        .and_then(|nr| nr.parse().ok()))
+}
+
+/// The system call in which `UnixStream::write` sleeps on a full socket:
+/// `sendto`, `send`, or `socketcall`, by architecture and C library. A
+/// thread of this process fills a socket that nothing reads, and a process
+/// can always read the `syscall` files of its own threads.
+fn blocking_send_syscall() -> u64 {
+    let (mut full, reader) = UnixStream::pair().unwrap();
+    // More than the socket holds. The thread has its bytes before it tells
+    // its ID, so the write is the only call that it can then sleep in.
+    let bytes = vec![0; 4 * send_buffer()];
+    let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        tid_tx.send(rustix::thread::gettid()).unwrap();
+        // The write fails once `reader` closes.
+        full.write_all(&bytes).unwrap_err();
+    });
+    let tid = tid_rx.recv().unwrap().as_raw_nonzero();
+    let path = PathBuf::from(format!("/proc/self/task/{tid}/syscall"));
+    let nr = loop {
+        if let Some(nr) = sleeping_syscall(&path).unwrap() {
+            break nr;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    drop(reader);
+    writer.join().unwrap();
+    nr
+}
+
+/// Wait until the thread `name` of the process `pid` sleeps in the system
+/// call of a write to a full socket, polling with no deadline. It stays
+/// there while no one reads the socket. Reading its `syscall` file needs
+/// the ptrace access that a parent has. Fail when the process has ended.
+fn wait_until_blocked_in_send(pid: u32, name: &str) {
+    let send = blocking_send_syscall();
+    loop {
+        assert_ne!(
+            proc_state(format!("/proc/{pid}")),
+            Some('Z'),
+            "the process ended"
+        );
+        for task in std::fs::read_dir(format!("/proc/{pid}/task")).unwrap() {
+            let task = task.unwrap().path();
+            // A thread that ends meanwhile has no files.
+            let Ok(comm) = std::fs::read_to_string(task.join("comm")) else {
+                continue;
+            };
+            if comm.trim_end() != name {
+                continue;
+            }
+            match sleeping_syscall(&task.join("syscall")) {
+                Ok(nr) if nr == Some(send) => return,
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    panic!("cannot see the system call of {name}: {e}")
+                }
+                _ => {}
+            }
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// The frames from `reader` through END.
+fn frames_through_end(reader: &mut impl Read) -> Vec<(u8, Vec<u8>)> {
+    let mut frames = Vec::new();
+    loop {
+        let frame = recv_frame(reader);
+        let end = frame.0 == END;
+        frames.push(frame);
+        if end {
+            return frames;
+        }
+    }
+}
+
+/// This side of the control session after both versions, as the
+/// receiver's: each direction as plain frames at level 0, else as one zstd
+/// stream, which no frame ends (DESIGN.md §6.2).
+struct Control {
+    queries: Box<dyn Read>,
+    answers: Box<dyn Write>,
+}
+
+impl Control {
+    fn new(socket: &UnixStream, level: i32) -> Self {
+        let (read, write) = (socket.try_clone().unwrap(), socket.try_clone().unwrap());
+        if level == 0 {
+            return Control {
+                queries: Box::new(read),
+                answers: Box::new(write),
+            };
+        }
+        Control {
+            queries: Box::new(zstd::stream::read::Decoder::new(read).unwrap()),
+            answers: Box::new(zstd::stream::write::Encoder::new(write, level).unwrap()),
+        }
+    }
+
+    /// The next QUERY: its offset and its digest.
+    fn query(&mut self) -> (u64, Vec<u8>) {
+        let (kind, mut payload) = recv_frame(&mut self.queries);
+        assert_eq!(kind, QUERY);
+        let digest = payload.split_off(8);
+        (u64::from_le_bytes(payload.try_into().unwrap()), digest)
+    }
+
+    /// ANSWER frames, flushed: `serve` waits for them.
+    fn answer(&mut self, answers: &[(u64, bool)]) {
+        for &(offset, found) in answers {
+            let mut answer = offset.to_le_bytes().to_vec();
+            answer.push(found.into());
+            self.answers.write_all(&frame(ANSWER, &answer)).unwrap();
+        }
+        self.answers.flush().unwrap();
+    }
 }
 
 struct Serve {
@@ -246,6 +375,42 @@ impl Serve {
         UnixStream::connect(address).unwrap()
     }
 
+    /// Attach, send `list`, and exchange the versions of the control
+    /// session, whose later frames use compression at `level`.
+    fn control_session(&mut self, list: &[u8], level: i32) -> Control {
+        let mut socket = self.attach();
+        socket.write_all(&version()).unwrap();
+        self.send_list(list);
+        let mut theirs = [0u8; 4];
+        socket.read_exact(&mut theirs).unwrap();
+        assert_eq!(theirs, version());
+        Control::new(&socket, level)
+    }
+
+    /// The data frames after the list, from CACHE_RESULT through END,
+    /// then the normal end of the data session: END_ACK, and DONE
+    /// (DESIGN.md §6.7). At a `level` other than 0, the frames through END
+    /// form one zstd frame, and DONE follows it, outside it
+    /// (DESIGN.md §6.2).
+    fn frames_through_done(&mut self, level: i32) -> Vec<(u8, Vec<u8>)> {
+        let mut transport = BufReader::new(&mut self.data_out);
+        let frames = if level == 0 {
+            frames_through_end(&mut transport)
+        } else {
+            let mut decoder = zstd::stream::read::Decoder::with_buffer(&mut transport)
+                .unwrap()
+                .single_frame();
+            let frames = frames_through_end(&mut decoder);
+            assert_eq!(decoder.read(&mut [0]).unwrap(), 0, "the frame goes on");
+            frames
+        };
+        let data_in = self.data_in.as_mut().unwrap();
+        data_in.write_all(&frame(END_ACK, b"")).unwrap();
+        assert_eq!(recv_frame(&mut transport), (DONE, Vec::new()));
+        assert!(transport.buffer().is_empty(), "bytes after DONE");
+        frames
+    }
+
     /// The full empty list, whose bytes follow HASHLIST directly.
     fn send_empty_list(&mut self) {
         self.send_list(&empty_list());
@@ -297,14 +462,6 @@ impl Serve {
         let mut pipe = self.child.stderr.take().unwrap();
         pipe.read_to_string(&mut stderr).unwrap();
         (self.child.wait().unwrap(), stderr)
-    }
-
-    /// The normal end after END (DESIGN.md §6.7): END_ACK, DONE from
-    /// `serve`, and the end after DONE.
-    fn end_normally(mut self) {
-        self.send(END_ACK, b"");
-        assert_eq!(self.recv(), (DONE, Vec::new()));
-        self.expect_success();
     }
 
     /// The normal exit after DONE: close stdin, as the receiver does.
@@ -455,75 +612,85 @@ fn an_answer_decides_between_a_reference_and_literals() {
     // The receiver's list holds the weak hash of the command's only
     // window, so the scanner queries it on the control session. A yes
     // makes it a REF; a no makes the scanner rescan, and the window's
-    // bytes go out as literals (DESIGN.md §6.3).
-    for found in [true, false] {
-        let mut serve = Serve::start();
-        let block: Vec<u8> = (0..4096u32)
-            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
-            .collect();
-        let file = serve.home.path().join("block");
-        std::fs::write(&file, &block).unwrap();
-        let list = encode_list(&[weak_hash(&block)]);
-        serve.hello_with(4096, &list, &["cat", file.to_str().unwrap()], 0);
-        let mut control = serve.attach();
-        control.write_all(&version()).unwrap();
-        serve.send_list(&list);
+    // bytes go out as literals (DESIGN.md §6.3). With compression, each
+    // direction of the control session is one zstd stream at the level of
+    // the data session, and no frame ends it: the closure of the session
+    // ends it, before DONE (DESIGN.md §6.2 and §6.7).
+    let block: Vec<u8> = (0..4096u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    let list = encode_list(&[weak_hash(&block)]);
+    for level in [0, 3] {
+        for found in [true, false] {
+            let mut serve = Serve::start();
+            let file = serve.home.path().join("block");
+            std::fs::write(&file, &block).unwrap();
+            serve.hello_with(4096, &list, &["cat", file.to_str().unwrap()], level);
+            let mut control = serve.control_session(&list, level);
+            let digest = blake3::hash(&block).as_bytes().to_vec();
+            assert_eq!(control.query(), (0, digest), "the window at offset 0");
+            control.answer(&[(0, found)]);
 
-        let mut theirs = [0u8; 4];
-        control.read_exact(&mut theirs).unwrap();
-        assert_eq!(theirs, version());
-        let (kind, query) = recv_frame(&mut control);
-        assert_eq!(kind, QUERY);
-        assert_eq!(query[..8], 0u64.to_le_bytes(), "the window at offset 0");
-        assert_eq!(&query[8..], blake3::hash(&block).as_bytes());
-        let mut answer = 0u64.to_le_bytes().to_vec();
-        answer.push(found.into());
-        control.write_all(&frame(ANSWER, &answer)).unwrap();
-
-        serve.recv_result();
-        let mut literal = Vec::new();
-        let mut references = 0;
-        loop {
-            match serve.recv() {
-                (LIT, payload) => literal.extend_from_slice(&payload),
-                (REF, payload) => {
-                    assert!(payload.is_empty());
-                    references += 1;
+            let frames = serve.frames_through_done(level);
+            assert_eq!(frames[0], (CACHE_RESULT, Vec::new()));
+            let mut literal = Vec::new();
+            let mut references = 0;
+            for (kind, payload) in &frames[1..frames.len() - 1] {
+                match *kind {
+                    LIT => literal.extend_from_slice(payload),
+                    REF => {
+                        assert!(payload.is_empty());
+                        references += 1;
+                    }
+                    kind => panic!("unexpected frame type {kind}"),
                 }
-                (END, _) => break,
-                (kind, _) => panic!("unexpected frame type {kind}"),
             }
+            if found {
+                assert_eq!((references, literal.len()), (1, 0));
+            } else {
+                assert_eq!(references, 0);
+                assert_eq!(literal, block);
+            }
+            let error = try_recv_frame(&mut control.queries).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+            serve.expect_success();
         }
-        if found {
-            assert_eq!((references, literal.len()), (1, 0));
-        } else {
-            assert_eq!(references, 0);
-            assert_eq!(literal, block);
-        }
-        serve.end_normally();
     }
 }
 
 #[test]
 fn obsolete_queries_in_flight_do_not_fail_the_normal_end() {
-    // Obsolete queries do not delay completion (DESIGN.md §6.3). Here they
-    // are the last queries, and the receiver reads none of them, so the
-    // control writer is still blocked on them when the normal end closes
-    // the control socket. That failed write is expected closure (DESIGN.md
-    // §6.7). On one CPU, the woken writer runs before the main thread can
-    // exit, so a writer that took the closure as a failure would win.
-    //
-    // With 64-byte windows, the first scan queries 0 and the chain
-    // w_k = 74 + 64k. Once 0 is rejected, the rescan queries 20 and the
-    // chain q_k = 92 + 64k, which jumps over the w chain. Once 20 is
-    // rejected, the next rescan follows the w chain, answered yes, and
-    // jumps over the q chain: every q query is obsolete.
+    obsolete_queries_in_flight(0);
+}
+
+#[test]
+fn a_compressed_block_in_flight_does_not_fail_the_normal_end() {
+    obsolete_queries_in_flight(3);
+}
+
+/// Obsolete queries do not delay completion (DESIGN.md §6.3). Here they
+/// are the last queries, and the receiver reads none of them, so the
+/// control writer is still blocked on a full socket when the normal end
+/// closes it. That failed write is expected closure (DESIGN.md §6.7),
+/// also when compression at a `level` other than 0 leaves a zstd block
+/// half written. On one CPU, the woken writer runs before the main thread
+/// can exit, so a writer that took the closure as a failure would win.
+///
+/// With 64-byte windows, the first scan queries 0 and the chain
+/// w_k = 74 + 64k. Once 0 is rejected, the rescan queries 20 and the
+/// chain q_k = 92 + 64k, which jumps over the w chain. Once 20 is
+/// rejected, the next rescan follows the w chain, answered yes, and jumps
+/// over the q chain: every q query is obsolete.
+fn obsolete_queries_in_flight(level: i32) {
     const B: u64 = 64;
-    const CHAIN: u64 = 8000;
-    let w: Vec<u64> = (0..=CHAIN).map(|k| 74 + B * k).collect();
-    let data = common::random((138 + B * CHAIN + 10) as usize, 21);
+    // A query keeps its 32-byte digest also when compressed, so the q
+    // chain takes at least three send buffers, twice what the socket
+    // holds, at any level.
+    let chain = (3 * send_buffer() as u64 / 32).max(8000);
+    let w: Vec<u64> = (0..=chain).map(|k| 74 + B * k).collect();
+    let data = common::random((138 + B * chain + 10) as usize, 21);
     let window = |offset: u64| &data[offset as usize..(offset + B) as usize];
-    let q = (0..CHAIN).map(|k| 92 + B * k);
+    let q = (0..chain).map(|k| 92 + B * k);
     let mut values: Vec<u64> = [0, 20]
         .into_iter()
         .chain(w.iter().copied())
@@ -535,53 +702,57 @@ fn obsolete_queries_in_flight_do_not_fail_the_normal_end() {
     let list = encode_list(&values);
 
     let mut serve = on_one_cpu(Serve::start);
+    // The wait for the blocked writer needs ptrace access to `serve`.
+    if let Err(e) = std::fs::read_to_string(format!("/proc/{}/syscall", serve.child.id())) {
+        eprintln!("skipped: cannot see the system calls of serve: {e}");
+        return;
+    }
     let file = serve.home.path().join("output");
     std::fs::write(&file, &data).unwrap();
-    serve.hello_with(B as u32, &list, &["cat", file.to_str().unwrap()], 0);
-    let mut control = serve.attach();
-    control.write_all(&version()).unwrap();
-    serve.send_list(&list);
-    let mut theirs = [0u8; 4];
-    control.read_exact(&mut theirs).unwrap();
-    assert_eq!(theirs, version());
-
-    let next_query = |control: &mut UnixStream| {
-        let (kind, query) = recv_frame(control);
-        assert_eq!(kind, QUERY);
-        u64::from_le_bytes(query[..8].try_into().unwrap())
-    };
-    let answer = |offset: u64, found: bool| {
-        let mut payload = offset.to_le_bytes().to_vec();
-        payload.push(found.into());
-        frame(ANSWER, &payload)
-    };
-    assert_eq!(next_query(&mut control), 0);
+    serve.hello_with(B as u32, &list, &["cat", file.to_str().unwrap()], level);
+    let mut control = serve.control_session(&list, level);
+    assert_eq!(control.query().0, 0);
     for &offset in &w {
-        assert_eq!(next_query(&mut control), offset);
+        assert_eq!(control.query().0, offset);
     }
-    let mut answers: Vec<u8> = w.iter().flat_map(|&offset| answer(offset, true)).collect();
-    answers.extend(answer(0, false));
-    control.write_all(&answers).unwrap();
-    assert_eq!(next_query(&mut control), 20);
-    // Give the rescan time to queue the whole q chain, more than the
-    // socket holds. A slower rescan only makes the test weaker. No check
-    // can replace the pause: the only sign of the queued chain is its
-    // queries, which must stay unread.
-    std::thread::sleep(Duration::from_millis(300));
-    control.write_all(&answer(20, false)).unwrap();
+    let mut answers: Vec<(u64, bool)> = w.iter().map(|&offset| (offset, true)).collect();
+    answers.push((0, false));
+    control.answer(&answers);
+    assert_eq!(control.query().0, 20);
+    // The rescan queues the q chain, and nothing reads it: once the
+    // control writer sleeps in a write, it stays there until the normal
+    // end closes the socket.
+    wait_until_blocked_in_send(serve.child.id(), "control-writer");
+    control.answer(&[(20, false)]);
 
-    serve.recv_result();
+    let frames = serve.frames_through_done(level);
+    assert_eq!(frames[0], (CACHE_RESULT, Vec::new()));
     let mut output = Vec::new();
-    loop {
-        match serve.recv() {
-            (LIT, payload) => output.extend_from_slice(&payload),
-            (REF, _) => output.extend_from_slice(window(output.len() as u64)),
-            (END, _) => break,
-            (kind, _) => panic!("unexpected frame type {kind}"),
+    for (kind, payload) in &frames[1..frames.len() - 1] {
+        match *kind {
+            LIT => output.extend_from_slice(payload),
+            REF => output.extend_from_slice(window(output.len() as u64)),
+            kind => panic!("unexpected frame type {kind}"),
         }
     }
     assert!(output == data, "the output differs");
-    serve.end_normally();
+
+    // The closure cut the writer's stream: only the start of the q chain
+    // arrived. Compressed, the stream ends inside its zstd frame.
+    let mut arrived = 0;
+    let error = loop {
+        match try_recv_frame(&mut control.queries) {
+            Ok((kind, query)) => {
+                assert_eq!(kind, QUERY);
+                assert_eq!(query[..8], (92 + B * arrived).to_le_bytes());
+                arrived += 1;
+            }
+            Err(e) => break e,
+        }
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+    assert!(arrived < chain, "all {chain} q queries arrived");
+    serve.expect_success();
 }
 
 #[test]
