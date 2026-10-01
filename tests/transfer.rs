@@ -456,27 +456,41 @@ fn pins_live_in_the_configured_directory() {
     assert_eq!(mode(&pins), 0o700);
     assert_eq!(std::fs::read_dir(&pins).unwrap().count(), 0);
 
-    // A pin directory that cannot exist fails the run before the
-    // sessions start.
+    // A pin directory that cannot exist, or that cannot hold the first
+    // segment, fails the run before the sessions start: the command does
+    // not run (DESIGN.md §6.4).
     transfer.env.write("not-a-directory", b"x");
     let blocked = transfer.env.path("not-a-directory/pins");
-    transfer.reconfigure(hashsync, &pin_directory(&blocked));
-    let output = transfer.run(&[], &refs(&command));
-    assert_eq!(output.status.code(), Some(1));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("cannot create pin directory"), "{stderr}");
+    transfer.env.mkdir("read-only");
+    transfer.env.chmod("read-only", 0o500);
+    let read_only = transfer.env.path("read-only");
+    let marker = transfer.env.path("marker");
+    let command = args(&["touch", marker.to_str().unwrap()]);
+    for (path, message) in [
+        (&blocked, "cannot create pin directory"),
+        (&read_only, "cannot create a segment in pin directory"),
+    ] {
+        transfer.reconfigure(hashsync, &pin_directory(path));
+        let output = transfer.run(&[], &refs(&command));
+        assert_eq!(output.status.code(), Some(1));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(message), "{stderr}");
+        assert!(!marker.exists(), "the command ran");
+    }
 }
 
 #[test]
-fn a_pin_directory_without_hole_punching_fails_the_run() {
-    // ramfs cannot punch holes; the setup probe finds out before the
-    // sessions start (DESIGN.md §6.4).
+fn a_full_pin_directory_fails_the_run() {
+    // The pin directory is a tmpfs in a new user and mount namespace. It
+    // holds 64 KiB, also with pages of 64 KiB, and the pins of the output
+    // need 128 KiB in the first segment: a segment write fails, which ends
+    // the run (DESIGN.md §6.5).
     if !common::namespaces_available() {
         eprintln!("skipped: no unprivileged user namespaces");
         return;
     }
     let transfer = Transfer::new("");
-    let pins = transfer.env.path("ramfs");
+    let pins = transfer.env.path("tmpfs");
     std::fs::create_dir(&pins).unwrap();
     transfer.reconfigure(
         env!("CARGO_BIN_EXE_hashsync").as_bytes(),
@@ -485,26 +499,28 @@ fn a_pin_directory_without_hole_punching_fails_the_run() {
             toml_literal(pins.as_os_str().as_bytes())
         ),
     );
-    let run = transfer.invocation(&[], &refs(&args(&["true"])));
-    let mut command = Command::new("unshare");
-    command
+    transfer.env.write("tree/blocks", &tiled(32, 19));
+    let command = args(&["cat", transfer.env.path("tree/blocks").to_str().unwrap()]);
+    let run = transfer.invocation(&[], &refs(&command));
+    let mut unshare = Command::new("unshare");
+    unshare
         .args([
             "-Urm",
             "sh",
             "-c",
-            "mount -t ramfs none \"$0\" || exit 99; exec \"$@\"",
+            "mount -t tmpfs -o size=64k none \"$0\" || exit 99; exec \"$@\"",
         ])
         .arg(&pins)
         .arg(run.get_program())
         .args(run.get_args());
     for (key, value) in run.get_envs() {
-        command.env(key, value.unwrap());
+        unshare.env(key, value.unwrap());
     }
-    let output = command.output().unwrap();
+    let output = unshare.output().unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(1), "{stderr}");
     assert!(
-        stderr.contains("does not support hole punching"),
+        stderr.contains("cannot write a segment in pin directory"),
         "{stderr}"
     );
 }

@@ -57,7 +57,8 @@ pub struct Config {
     /// The sender's compression threads; 0 selects half the sender's
     /// cores, at least one.
     pub compression_threads: u32,
-    /// Path bytes of the directory that holds the receiver's pin file.
+    /// Path bytes of the directory that holds the receiver's segments
+    /// (DESIGN.md §6.4).
     pub pin_directory: Vec<u8>,
     /// The transfer options a host override can replace; read them
     /// through `transfer_options`.

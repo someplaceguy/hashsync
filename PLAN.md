@@ -26,7 +26,7 @@ files by identity, size, and ctime, and recover interrupted work; `run`
 (with `--no-update` and `--ssh`), `serve`, and `attach` transfer a remote
 command's output over two SSH sessions, with the full hash-list exchange,
 account identities, and durable list caches, replace indexed blocks with
-references verified through the pin file, send constant-byte runs
+references verified through the receiver's pins, send constant-byte runs
 compactly, and compress the data stream and both directions of the control
 session with zstd. Step 6 is the next milestone.
 
@@ -132,8 +132,8 @@ Design coverage: §§3, 5.4–5.6, 6.1–6.2, 6.5–6.7, 7–8.
 - Verify candidate bytes before accepting a reference and verify retained
   bytes again before output. Once a match is accepted, later source changes
   must not affect reconstruction.
-- Support `pin_directory`, its storage requirements, and reclamation as
-  output advances. Pin storage failures or corruption fail the run without
+- Support `pin_directory`, its segments, and their closure as output
+  advances. Pin storage failures or corruption fail the run without
   emitting the affected block.
 - Preserve ordered output with slow consumers, concurrent lookups, and
   out-of-order, late, or obsolete answers. Honor `lookahead` and

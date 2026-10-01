@@ -2,7 +2,7 @@
 //! (DESIGN.md §3, §5.6, §6, §8): the receiver.
 //!
 //! The run updates the index (or opens it read-only), exports and
-//! publishes the hash list, prepares the pin file and the lookup workers,
+//! publishes the hash list, prepares the pins and the lookup workers,
 //! starts both SSH sessions, and completes the exchange. It then
 //! reconstructs stdout from literals, runs, and references, which arrive
 //! through the compression stream, while the lookup workers answer the
@@ -37,7 +37,7 @@ use crate::hash::weak;
 use crate::hashlist::{self, ListId};
 use crate::index::{self, Settings};
 use crate::lookup;
-use crate::pins::{PinFile, Pins};
+use crate::pins::Pins;
 use crate::protocol::{
     self, Answer, Compressor, Decompressor, End, FrameReader, FrameWriter, HashList, Query,
     ReceiverHello, Rle, SenderHello, frame,
@@ -92,12 +92,12 @@ pub fn run(
         digest: config.strong_hash.digest(&encoded),
     };
 
-    // The pin file and the lookup workers, which answer queries as soon as
-    // they arrive (DESIGN.md §6.4).
+    // The pins, with their first segment, and the lookup workers, which
+    // answer queries as soon as they arrive (DESIGN.md §6.4). An unusable
+    // pin directory ends the run here, before the sessions start.
     let (answer_tx, answer_rx) = unbounded();
-    let pin_file = PinFile::create(&config.pin_directory, config.block_size);
     let pins = Arc::new(Pins::new(
-        pin_file,
+        &config.pin_directory,
         config.strong_hash,
         config.block_size,
         answer_tx,

@@ -40,7 +40,8 @@ asynchronous runtime or event loop.
   offset, and the receiver's yes/no response. Each offset is queried at most
   once per run.
 - **Pin**: a query offset's verified block, retained in an open, unlinked
-  receiver file and identified by its offset in that file.
+  receiver file, a **segment**, and identified by its **extent**: the
+  segment and the block's offset in it.
 - **Record**: a sender-side description of scanned but un-emitted output:
   a Literal, Run, Query, or Ref.
 
@@ -49,8 +50,9 @@ asynchronous runtime or event loop.
 1. The receiver resolves configured roots and updates the index.
    `--no-update` skips the update and acquires read-only access. Index access
    is held throughout the run.
-2. It exports the hash list from one database snapshot, prepares the temporary
-   pin file, and starts data and control SSH sessions to the sender.
+2. It exports the hash list from one database snapshot, creates the first
+   segment for its pins, and starts data and control SSH sessions to the
+   sender.
 3. After both sides exchange protocol versions, HELLO negotiates parameters
    and cached lists. The receiver durably publishes its target list, then
    sends a full list, a delta, or confirmation that the sender's list is
@@ -58,10 +60,12 @@ asynchronous runtime or event loop.
    when caching is enabled, and acknowledges the accepted target.
 4. The sender starts the command. Its scanner sends literals for misses,
    runs for repeated bytes, and queries for possible block matches.
-5. The receiver reads and verifies candidates, appending their bytes to its
-   temporary pin file before answering yes. The sender emits references for
+5. The receiver reads and verifies candidates, appending their bytes to a
+   temporary segment before answering yes. The sender emits references for
    yes answers and rescans rejected windows from the next byte. Output is
-   always emitted in order; releasing a pin punches a hole in its file range.
+   always emitted in order; when it has passed the pins of a segment that
+   receives no more blocks, the receiver closes that segment, which frees
+   its storage.
 6. The receiver reconstructs stdout. After all command stdout is processed,
    and the command's exit status is available, the sender sends END. The
    receiver validates stream completion and flushes stdout before sending
@@ -633,9 +637,9 @@ changing it rebuilds the index.
 
 Treat full strong-hash equality as byte equality. Only the index stores
 16-byte prefixes. Queries, content caches, and list IDs use full digests.
-Candidate verification hashes the exact buffer written to the pin file.
-Reconstruction verifies the buffer read from that file before using it for
-output.
+Candidate verification hashes the exact buffer written to the pin's extent.
+Reconstruction verifies the buffer read from that extent before using it
+for output.
 
 ### 5.4 The hash list
 
@@ -1119,48 +1123,127 @@ completion.
 
 ### 6.4 The receiver's answering and reconstruction
 
-The receiver keeps pin payloads in one open, unlinked temporary file per
-run. Its map from query offsets contains only pin-file offsets and full
-strong hashes. File offsets are independent of command-output offsets.
-Each pin has its own file range, including pins with identical content.
+The receiver keeps pin payloads in open, unlinked temporary files, the
+segments. Its map from query offsets contains only extents and full strong
+hashes. Extents are independent of command-output offsets. Each pin has
+its own extent, including pins with identical content.
 
 **Pin storage.**
 
-Before command startup, create the file in `pin_directory`, defaulting to
-`$XDG_CACHE_HOME/hashsync/pins/` (fallback `~/.cache/hashsync/pins/`). Use a
-private directory (0700), a read/write file (0600), and close-on-exec.
-Prefer `O_TMPFILE`; otherwise create a unique file securely and unlink it
-before writing any payload. Keep the descriptor open through the run.
-Choose a disk-backed directory to move payload storage out of RAM; a tmpfs
-directory would store it in memory or swap instead.
+Let `B = block_size`. The receiver writes the verified block of each pin
+to a segment, which is an open, unlinked file. One segment at a time
+receives the new blocks, until it is full. The receiver closes a segment
+that receives no more blocks as soon as nothing uses its blocks. Closing
+an unlinked file frees its storage and writes nothing to disk. The more
+segments are open, the more bytes a segment holds before it is full, so
+the open files stay few. There is no hole punching: any filesystem that
+can hold files works as `pin_directory`.
 
-Append verified blocks at monotonically increasing offsets. Give each pin
-an extent aligned to the filesystem's block allocation granularity, with
-`stride = round_up(B, granularity)`. The first `B` bytes contain the block;
-any padding belongs exclusively to that pin. Releasing it punches the whole
-extent using `fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)`. This
-frees its `[offset, offset + B)` data and padding without moving other pins.
-Alignment matters because partial filesystem blocks are zeroed rather than
-deallocated (see [fallocate(2)](https://man7.org/linux/man-pages/man2/fallocate.2.html)).
-Do not reuse released extents during the run; the logical file length grows
-with appends while holes reclaim allocated storage.
+Data structures:
 
-Require hole-punch support and probe it on a written range during setup.
-Pin-file creation, append, read, or hole-punch failures, including exhaustion
-of space or file-size limits, end the run with `die` without a core dump.
-If writing a pin runs out of disk space, fail the run. No fsync or crash
-recovery is required for this transient file; closing its last
-descriptor reclaims all remaining storage.
+- **Pin directory**: `pin_directory`, defaulting to
+  `$XDG_CACHE_HOME/hashsync/pins/` (fallback `~/.cache/hashsync/pins/`).
+  Use a private directory (0700). The receiver keeps it open through the
+  run, to create the segments in it. Choose a disk-backed directory to
+  move payload storage out of RAM; a tmpfs directory would store it in
+  memory or swap instead.
+- **Segment**: one open, unlinked file in the pin directory, with its size
+  and its count of extents in use. The size is the bytes of the extents
+  appended to the segment. The file is read/write (0600) and
+  close-on-exec. Prefer `O_TMPFILE`; otherwise create a unique file
+  securely and unlink it before writing any payload.
+- **Open segments**: the receiver keeps the open segments in creation
+  order. At most one of them, the newest, is the **current segment**: it
+  receives the new extents. The others are **sealed**: they receive no
+  more extents.
+- **Extent**: the `B` bytes of one pin: a segment and an offset in it. The
+  extents of a segment follow each other without gaps, alignment, or
+  padding, in allocation order, and are never used again. A pin stores its
+  extent.
+- **Count of extents in use**: the extents of a segment that are allocated
+  and not yet **released**. An extent is released when nothing uses it any
+  more: the output has passed its pin, or its lookup worker has found its
+  write obsolete, or has finished it in Completing.
 
-The receiver tracks output offset `c`, its pin map, and the next append
-offset. A bounded 256 MiB LRU cache of verified buffers, keyed by full strong
+The current segment is **full** when it holds at least `16 MiB × 2^n`
+bytes, where `n` is the number of sealed segments that are open at that
+moment. The limit is not fixed when the segment is created: `n` decreases
+when sealed segments close. Seal the current segment as soon as it is
+full: evaluate the rule after each extent allocation, and after each
+release that closes a sealed segment. Thus the current segment is never
+full, and after a seal there is no current segment until the next
+allocation. The 16 MiB are a constant, not a configuration key.
+
+Setup, before the SSH sessions start: create the pin directory if it does
+not exist, open it, and create the first segment, which is the current
+segment. An unusable pin directory thus ends the run before command
+startup.
+
+Allocate an extent, under the lock (step 6 of the QUERY procedure below):
+
+- **A1.** If there is no current segment, create one.
+- **A2.** The extent is the next `B` bytes of the current segment. Check
+  the file-offset arithmetic first: `pwrite` takes a signed offset. Add
+  `B` to the size of the segment and 1 to its count of extents in use.
+- **A3.** If the current segment is now full, seal it. It stays open: the
+  new extent is in use.
+
+Release an extent, under the lock (step 8 of the QUERY procedure, and the
+advance of `c` below):
+
+- **R1.** Subtract 1 from the count of extents in use of the extent's
+  segment.
+- **R2.** If the count is 0 and the segment is sealed, remove it from the
+  open segments, and close its file after the lock is released, on the
+  thread that released the extent. The current segment stays open when
+  its count is 0: it is not full.
+- **R3.** If step R2 removed a segment, `n` is now smaller. If the current
+  segment is now full, seal it. If its count of extents in use is 0, also
+  remove it from the open segments, and close its file as in step R2.
+
+End: closing the pins closes all open segments (section 6.7). Process exit
+closes them too. No fsync or crash recovery is required for these
+transient files; closing a segment frees all its storage.
+
+Failures to create the pin directory or a segment, and failures of segment
+writes or reads, including exhaustion of space, descriptors, or file-size
+limits, end the run with `die` without a core dump.
+
+Properties:
+
+- **Descriptors**, for any release order. A segment is sealed at a size of
+  at least `16 MiB × 2^m`, where `m` is the number of sealed segments that
+  are open at that moment. All of them are older, and afterwards they only
+  close. Thus the i-th oldest sealed open segment holds at least
+  `16 MiB × 2^(i−1)`, and `k` sealed open segments hold at least
+  `16 MiB × (2^k − 1)`. So there are at most `log2(R / 16 MiB + 1) + 1`
+  open segments, where `R` is the bytes that they hold: 13 for 64 GiB and
+  17 for 1 TiB. There are never more than 40: a segment holds less than
+  2^63 bytes, because `pwrite` takes a signed offset. The pin directory
+  uses one more descriptor.
+- **Retention**, when releases follow the allocation order. No segment
+  gets an extent after its size passes the bytes of the extents in use at
+  that moment plus 32 MiB. Only the oldest open segment holds released
+  extents. If it is sealed, their bytes stay allocated until the output
+  passes its last pin. If it is the current segment, no sealed segment is
+  open, and it is not full, so it holds less than 16 MiB.
+- **File creations**: a sealed segment holds at least 16 MiB, so there is
+  at most one file creation per 16 MiB of pins.
+- **Accepted cost**: when pins pile up, the last sealed segment holds
+  about half of them, and its released bytes stay allocated until its last
+  pin is released.
+
+The receiver tracks output offset `c`, its pin map, and the open segments.
+A bounded 256 MiB LRU cache of verified buffers, keyed by full strong
 hash, can serve candidate lookups. Populate it on verified reads; its
 eviction is independent of pin lifetimes. Pins never retain those buffers.
-One lock protects this state and the completion state. Source reads, pin-file
-I/O, and stdout writes occur outside the lock. In-memory payload storage is
-limited to the cache and worker/reconstruction buffers; pin metadata and
-queued requests still scale with outstanding work. The filesystem manages
-reclaimable page-cache pages and backing storage for pin payloads.
+One lock protects this state and the completion state. Source reads,
+segment I/O, and stdout writes occur outside the lock; the file creation
+of step A1 is the one exception, and it occurs once per segment. In-memory
+payload storage is limited to the cache and worker/reconstruction buffers;
+pin metadata and queued requests still scale with outstanding work. The
+filesystem manages reclaimable page-cache pages and backing storage for
+pin payloads.
 
 A pool of 4–8 lookup workers, which share the database handle, answers
 queries out of order. The receiver does not reject a match merely because
@@ -1193,22 +1276,22 @@ For `QUERY { offset: x, strong: h }`:
    try the next location or candidate; filesystem failures are misses, not
    fatal. Alternate copies need not share the indexed inode identity.
 6. If nothing verified, answer no. Otherwise recheck `c` under the lock. If
-   `x < c`, answer no without appending. If still needed, allocate a distinct
-   append extent by advancing the file's append offset under the lock.
-   Check file-offset arithmetic before allocating it.
-7. Outside the lock, write the verified buffer's `B` bytes with `pwrite`,
-   accumulating short writes. Open the file without `O_APPEND`; concurrent
-   workers write only their assigned, nonoverlapping extents. Finish every
-   write before publishing the pin or answering yes.
+   `x < c`, answer no without an extent. If still needed, allocate an
+   extent under the lock (steps A1 to A3).
+7. Outside the lock, write the verified buffer's `B` bytes to the extent
+   with `pwrite`, accumulating short writes. Segments are open without
+   `O_APPEND`; concurrent workers write only their assigned,
+   nonoverlapping extents. Finish every write before publishing the pin or
+   answering yes.
 8. Reacquire the lock and recheck `x < c`. If now obsolete, leave the extent
-   unpublished, release it to the reclaimer, and answer no. Otherwise publish
-   `{ file_offset, strong: h }` at `x` and queue yes nonblockingly under the
-   lock. Release the worker's buffer. The Completing state prevents new
-   appends or pin publication; late workers discard their results, and
-   closing the pin file at the end frees their extents (section 6.7).
+   unpublished, release it (steps R1 to R3), and answer no. Otherwise
+   publish `{ extent, strong: h }` at `x` and queue yes nonblockingly under
+   the lock. Release the worker's buffer. The Completing state prevents new
+   extents or pin publication; late workers discard their results, and
+   release the extents that they wrote.
 
 A yes is binding because the receiver owns an independent copy of the
-verified bytes in its pin file. A later source-file change cannot affect
+verified bytes in a segment. A later source-file change cannot affect
 REF. Output may pass `x` and release its extent before the answer is sent;
 the sender then discards that obsolete answer.
 
@@ -1217,28 +1300,28 @@ Process data frames in order at `c`:
 - LIT writes its payload; RLE writes the repeated byte. Accept any positive
   RLE length, though the sender emits runs of at least `B`.
 - REF obtains the pin at `c` under the lock. Outside it, read exactly `B`
-  bytes from the pin-file offset with `pread`, accumulating short reads,
+  bytes from the pin's extent with `pread`, accumulating short reads,
   and verify the full digest against the pin's stored hash before writing
-  that buffer to stdout. Keep the extent live until the write completes and
-  `c` advances. A missing pin is a protocol error; pin-file EOF, read errors,
-  or a digest mismatch end the run unsuccessfully without emitting that
-  block or attempting to reread the source file.
+  that buffer to stdout. Keep the extent in use until the write completes
+  and `c` advances. A missing pin is a protocol error; segment EOF, read
+  errors, or a digest mismatch end the run unsuccessfully without emitting
+  that block or attempting to reread the source file.
 - After each frame's output is written, advance `c` under the lock. In
   bounded batches, detach pins whose query offsets are below it, including
-  pins covered by literals or runs, and release their extents to the
-  reclaimer. An unpublished write that becomes obsolete is released by its
-  lookup worker after that write finishes. The reclaimer punches released
-  extents outside the lock and merges adjacent extents into one call. To
-  merge more, it can hold released extents back until they total 128 MiB.
-  Neither reconstruction nor the lookups wait for it.
+  pins covered by literals or runs, and release their extents (steps R1
+  to R3). After each batch, release the lock and close the files of the
+  segments that the batch removed from the open segments. An unpublished
+  write that becomes obsolete is released by its lookup worker after that
+  write finishes.
 - END carries the command status into shutdown. Validate compression
   completion and flush stdout before END_ACK (section 6.7). EOF without
   END or before the compressed stream is complete is failure.
 
 The shared lock makes pin publication and output advancement atomic relative
 to each other: a lookup either publishes before the offset passes and has its
-extent released, or observes the obsolete offset and discards its extent.
-No extent is punched while its append or REF read is still using it.
+extent released, or observes the obsolete offset and releases its extent.
+No extent is released while its write or REF read is still using it, so no
+segment is closed while one of its extents is in use.
 
 ### 6.5 Failures and trust
 
@@ -1258,9 +1341,9 @@ No extent is punched while its append or REF read is still using it.
   repeated directory identities detected during expansion or traversal call
   `die` without a core dump.
 - Filesystem failures during indexing abandon entries; during lookup they
-  reject source candidates. Pin-file setup, I/O, reclamation, or verification
-  failures end the run with `die` without a core dump; a yes answer cannot
-  be retracted.
+  reject source candidates. Pin directory setup, segment creation, segment
+  I/O, or verification failures end the run with `die` without a core dump;
+  a yes answer cannot be retracted.
 - Cache directory and file operation failures on either role end the run
   with `die` without a core dump, subject to the absence and invalid-content
   rules in section 5.6. Invalid cached files are removed and treated as
@@ -1297,7 +1380,6 @@ threads.
 | Receiver main | Start SSH sessions, reconstruct stdout, validate completion, send END_ACK, and close both session stdin pipes after DONE. |
 | Receiver control reader/writer | Dispatch queries to lookup workers and send answers promptly. |
 | Receiver lookup workers | Answer queries out of order (section 6.4). |
-| Receiver reclaimer | Punch the extents of released pins. |
 | Receiver signal thread | Handle SIGINT/SIGTERM with status `128 + signal`. |
 | Attach relay | Copy both directions; half-close on stdin EOF. Once the socket is closed, discard stdin; at socket EOF, wait for stdin EOF, then exit zero. |
 
@@ -1325,8 +1407,8 @@ callers wait for that cleanup rather than exiting ahead of it:
 
 - Sender: SIGKILL the command's process group and remove the rendezvous socket.
 - Receiver: SIGKILL both SSH processes, causing sender stdin EOF and cleanup.
-- Process exit closes the receiver's unlinked pin file, reclaiming all
-  remaining extents without a separate cleanup pass.
+- Process exit closes the receiver's unlinked segments, which frees all
+  their storage without a separate cleanup pass.
 - Abandoned cache temporaries remain for expiry.
 
 Build with `panic = "abort"`; install a panic hook that performs the same
@@ -1399,7 +1481,7 @@ Receiver completion:
    replies, and closes the queue of replies. Late control traffic can be
    discarded. It keeps both session stdin pipes open until DONE. Workers
    returning later discard their results, including results of unfinished
-   pin-file writes; closing the pin file in step 6 frees their extents.
+   segment writes, and release the extents of those writes.
    Control EOF, broken pipes, and a partial final control frame or
    compressed block in Completing are expected closure, not failures.
 3. The receiver reads DONE, which directly follows the zstd frame. EOF or
@@ -1426,8 +1508,8 @@ Receiver completion:
 6. The receiver observes both SSH exits without reaping. Both must exit
    zero; otherwise the transfer failed even if END was received. Then it
    closes what the threads used, in this order:
-   1. Close the pins: close the reclaimer's queue, join the reclaimer, and
-      close the pin file, which frees all its remaining storage.
+   1. Close the pins: close all open segments, which frees all their
+      storage, and close the pin directory.
    2. Close the index: first the database, then its lock (section 4.4).
 7. The receiver prints the summary (section 8) and exits with END's command
    status.
@@ -1445,7 +1527,7 @@ keeps the run open, as under plain SSH; this is expected behavior. In the
 same way, a process that inherited a session's stdout pipe from SSH delays
 the receiver's end until it closes the pipe. It does not delay the sender:
 the receiver closes both stdin pipes after DONE, before it waits for the
-EOF of either stdout. A lookup or pin-file I/O that stalls, for example on
+EOF of either stdout. A lookup or segment I/O that stalls, for example on
 an unresponsive NFS mount, delays the receiver's end until the I/O
 completes. After fatal cleanup, a descendant that left the process group can
 survive and will get a broken pipe on its next write to either closed output
@@ -1463,7 +1545,7 @@ hashlist_max_age = "90d"
 index_path     = "~/.local/state/hashsync/default.db"  # a directory
 threads        = 0         # 0 = 4 × cores, clamped to 16–64
 lookahead      = "256MiB"  # at least block_size
-pin_directory  = "~/.cache/hashsync/pins"  # receiver file storage; supports hole punching
+pin_directory  = "~/.cache/hashsync/pins"  # receiver file storage; any filesystem
 negative_cache = "128MiB"
 probe_threads  = 0         # 0 = half the sender's cores, at least one
 compression_level   = 9    # zstd 1–19; 0 disables
@@ -1608,7 +1690,7 @@ separate pure-Rust build.
 | Thread pools and channels | `rayon` for indexing, the hash-list sort, and sender probes, `crossbeam-channel`; blocking standard threads for transfer |
 | Compression | `zstd-sys` binding libzstd with worker-thread support |
 | Memory allocation | `mimalloc` for Rust code, RocksDB, and libzstd, with the `mimalloc` feature (on by default): the global allocator, replacements of the C++ allocation functions from mimalloc's `mimalloc-new-delete.h`, and libzstd's allocator interface; never its `override`, so other C code keeps libc `malloc` |
-| Anonymous pin files | `tempfile`; hole punching through `rustix` |
+| Unlinked segment files | `O_TMPFILE` through `rustix` |
 | Configuration and CLI | `serde`, `toml`, `clap`; `gix-glob` for byte patterns and paths |
 | Maps and caches | Standard maps with a fast hasher; `lru` for bounded caches |
 | Signals | Blocked signals and a polled `signalfd` through `libc`; no signal handlers |
@@ -1744,6 +1826,41 @@ decision history is in version control.
   Use buffered `pread`.
 - **Opening candidates by inode handle:** requires privileges. Open indexed
   paths and verify the resulting bytes instead.
+- **Hole punching in one pin file:** one open, unlinked file held all
+  extents, and a reclaimer thread punched the released extents out of it
+  with `fallocate(FALLOC_FL_PUNCH_HOLE)`, from the start of the file,
+  128 MiB at a time. XFS and btrfs write a range back before they punch
+  it, so punching forces every pin byte to disk, and it holds the inode
+  lock that pin writes and reads need. On XFS, for 2 GiB of pins written
+  in 16 KiB `pwrite` calls, one punch per 128 MiB took 425–441 ms in
+  `fallocate` and wrote 2068 MiB to disk; closing one unlinked file per
+  128 MiB instead took 71 ms in `close` and wrote nothing. Smaller punches
+  cost more: with a punch for each filesystem block of released extents,
+  one transfer spent 14.9 s in 36.5k punches. Punching also needs a
+  filesystem that supports it, the allocation granularity of that
+  filesystem, and a probe at setup. Segments need none of these, and no
+  thread: creating an unlinked file takes 40–180 µs, and closing one takes
+  about 35 µs per MiB written in 16 KiB writes.
+- **Segments of one fixed size:** descriptors are scarce: a common soft
+  limit is 1024, and RocksDB uses many. Segments of 128 MiB keep 512 files
+  open when 64 GiB of pins pile up, and 128 when one pin in each 16 MiB of
+  16 GiB of pins is never released. In a simulation with 16 KiB extents,
+  released almost in allocation order, the full rule of section 6.4 kept
+  13 and 11 files open. Its cost is the retention: while the 64 GiB of
+  pins drained, its last sealed segment kept up to 32 GiB of released
+  bytes allocated, 10.7 GiB on average.
+- **One open segment per size:** segments of 16 MiB, 32 MiB, 64 MiB, and
+  so on, where a new segment takes the smallest size that no open segment
+  has. The open segments stay few, but a segment keeps the size that it
+  got at its creation, so a large segment stays the current segment after
+  the pins that made it large are released. In the same simulation, with
+  3 GiB of pins in use at all times, 9 files were open, and up to 4 GiB of
+  released bytes stayed allocated, 1.1 GiB on average. The full rule of
+  section 6.4 kept 8 files open, and up to 1.0 GiB allocated, 254 MiB on
+  average. After 8 GiB of pins piled up and drained, the output kept up
+  for 16 GiB of pins. The segment of 8 GiB stayed the current segment
+  until it was full: up to 8 GiB of released bytes stayed allocated, 2 GiB
+  on average. With the full rule, at most 16 MiB stayed allocated.
 - **Flushing the compression stream when the scanner waits:** kept output
   responsive when the command pauses, but each flush ends a zstd block or
   job early. With a command paced at 2 MB/s, level 9 sent 5.7% more bytes
@@ -1812,11 +1929,13 @@ decision history is in version control.
   table false negatives;
   byte-exact reconstruction under rescans, late answers, backpressure,
   and any split of a stretch among probe threads;
-  pin-file appends and reclamation with slow stdout, concurrent lookups,
+  segment appends and closure with slow stdout, concurrent lookups,
   rejected-query rescans, and late answers; obsolete writes, unaligned block
-  sizes, neighbor preservation during hole punching, pin-file failures,
-  corruption detection, and cleanup on exit; filesystem races and sparse
-  files; reopening regular files and directories after rename or unlink;
+  sizes, the full rule after each allocation and each closure of a sealed
+  segment, the bound on open segments for any release order, sealed
+  segments held open by extents in use, pin storage failures, corruption
+  detection, and cleanup on exit; filesystem races and sparse files;
+  reopening regular files and directories after rename or unlink;
   skipping symlinks and special files without opening them for I/O;
   configuration byte escapes, TOML quoting, literal glob metacharacters,
   and non-UTF-8 root, exclusion, and identifier values; symlinks and cycles

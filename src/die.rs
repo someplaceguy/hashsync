@@ -164,8 +164,8 @@ static CHILD_SIGNAL_MASK: OnceLock<sys::SignalMask> = OnceLock::new();
 ///
 /// SIGXFSZ stays blocked too. Then a write past the file-size limit fails
 /// with `EFBIG` and the run ends with `die`, as for any other failure to
-/// write the pin file or stdout (DESIGN.md §6.4), instead of the default
-/// end of SIGXFSZ, which dumps core.
+/// write a segment or stdout (DESIGN.md §6.4), instead of the default end
+/// of SIGXFSZ, which dumps core.
 ///
 /// Call this before any other thread starts: threads inherit the signal
 /// mask of the thread that starts them. Children get the old mask back
