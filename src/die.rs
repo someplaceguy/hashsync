@@ -1,4 +1,4 @@
-//! How the process ends, and what it reports on stderr (DESIGN.md §6.7).
+//! How the process ends, and what it reports on stderr (DESIGN.md §6.8).
 //!
 //! Every end goes through this module: `die` after an external failure,
 //! `finish` at the normal end, and the receiver's termination signals. So
@@ -12,7 +12,7 @@
 //! hook of this module runs the fatal cleanup, and the process aborts with
 //! a core dump. A panic does not wait for another end in progress: it
 //! reports a bug. Only the normal end runs the C library's exit handlers
-//! (DESIGN.md §6.7).
+//! (DESIGN.md §6.8).
 //!
 //! Diagnostics are best effort: a failed write to stderr is ignored. There
 //! is no other channel to report it on, and a panic would turn the failure
@@ -44,7 +44,7 @@ const EXIT_FAILURE: i32 = 1;
 /// reported cause instead, and the status is `128 + signal`. The same
 /// signal usually also ends the SSH sessions and the consumer of stdout,
 /// so the failure that `message` describes can be its consequence
-/// (DESIGN.md §6.5 and §6.6).
+/// (DESIGN.md §6.6 and §6.7).
 pub fn die(message: impl Display) -> ! {
     end(End::Failure(&message))
 }
@@ -146,12 +146,34 @@ fn signal_name(signal: i32) -> String {
     }
 }
 
-/// The signal mask from before `handle_termination_signals`, which
-/// children get back. Set only in a process that holds the termination
-/// signals: the receiver.
+/// The signal mask that this process started with, which children get
+/// back. Every role blocks SIGXFSZ in every thread
+/// (`block_file_size_signal`), and the receiver also blocks SIGINT and
+/// SIGTERM (`handle_termination_signals`).
 static CHILD_SIGNAL_MASK: OnceLock<sys::SignalMask> = OnceLock::new();
 
-/// The receiver's handling of SIGINT and SIGTERM (DESIGN.md §6.6): end the
+/// Block SIGXFSZ in every thread, in every role. Then a write past the
+/// file-size limit fails with `EFBIG`, and the writer handles that failure
+/// as any other one. A write to a segment, stdout, or a cache file ends
+/// the run with `die`, whose cleanup kills the children and removes the
+/// rendezvous socket (DESIGN.md §6.6 and §6.8). A database write panics.
+/// The default action of SIGXFSZ would end the process with a core dump,
+/// without a message and without that cleanup.
+///
+/// Call this at the start of `main`, before any other thread starts:
+/// threads inherit the signal mask of the thread that starts them.
+/// Children get the old mask back (`spawn_guarded`).
+pub fn block_file_size_signal() {
+    let old_mask = sys::block_signals(&[libc::SIGXFSZ]);
+    if CHILD_SIGNAL_MASK.set(old_mask).is_err() {
+        panic!("SIGXFSZ blocked twice");
+    }
+}
+
+/// Set in a process that holds the termination signals: the receiver.
+static HOLDS_TERMINATION_SIGNALS: AtomicBool = AtomicBool::new(false);
+
+/// The receiver's handling of SIGINT and SIGTERM (DESIGN.md §6.7): end the
 /// run with `128 + signal`, whatever failure the signal causes first.
 ///
 /// Both signals stay blocked in every thread and are never accepted, so a
@@ -162,17 +184,12 @@ static CHILD_SIGNAL_MASK: OnceLock<sys::SignalMask> = OnceLock::new();
 /// killed can already make another thread fail. A dedicated thread waits
 /// until a signal is pending, and then ends the process.
 ///
-/// SIGXFSZ stays blocked too. Then a write past the file-size limit fails
-/// with `EFBIG` and the run ends with `die`, as for any other failure to
-/// write a segment or stdout (DESIGN.md §6.4), instead of the default end
-/// of SIGXFSZ, which dumps core.
-///
 /// Call this before any other thread starts: threads inherit the signal
-/// mask of the thread that starts them. Children get the old mask back
-/// (`spawn_guarded`).
+/// mask of the thread that starts them. Children start without these
+/// signals blocked (`spawn_guarded`).
 pub fn handle_termination_signals() {
-    let (old_mask, pending) = sys::block_termination_signals();
-    if CHILD_SIGNAL_MASK.set(old_mask).is_err() {
+    let pending = sys::block_termination_signals();
+    if HOLDS_TERMINATION_SIGNALS.swap(true, Relaxed) {
         panic!("termination signals handled twice");
     }
     std::thread::Builder::new()
@@ -192,7 +209,9 @@ pub fn handle_termination_signals() {
 /// that does not hold the signals has none to report, even when one stays
 /// pending under a mask that it inherited.
 fn received_termination_signal() -> Option<i32> {
-    CHILD_SIGNAL_MASK.get()?;
+    if !HOLDS_TERMINATION_SIGNALS.load(Relaxed) {
+        return None;
+    }
     sys::pending_termination_signal()
 }
 
@@ -205,7 +224,7 @@ pub fn install_panic_hook() {
     }));
 }
 
-/// What an end must undo (DESIGN.md §6.7). A fatal end kills the children:
+/// What an end must undo (DESIGN.md §6.8). A fatal end kills the children:
 /// the receiver's SSH sessions, and the sender's command with its process
 /// group. Every end removes the files: the sender's rendezvous socket.
 /// Registered identifiers stay valid because children are never reaped:
@@ -253,7 +272,7 @@ pub enum KillGuard {
 /// Spawn `command` and register its fatal-end kill as one step, so that a
 /// concurrent end either runs after the registration or blocks the spawn.
 /// The child starts with the signal mask that this process started with,
-/// without the termination signals that the receiver blocks.
+/// without the signals that this process blocks in every thread.
 pub fn spawn_guarded(guard: KillGuard, command: &mut Command) -> std::io::Result<Child> {
     if let Some(&mask) = CHILD_SIGNAL_MASK.get() {
         sys::set_child_signal_mask(command, mask);

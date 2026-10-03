@@ -1,7 +1,7 @@
 //! `hashsync serve` driven directly through its standard streams and its
 //! rendezvous socket, the way the receiver and `attach` drive it. The
 //! receiver's disappearance is fatal at every stage before DONE
-//! (DESIGN.md §6.7): during rendezvous, while `serve` waits for the
+//! (DESIGN.md §6.8): during rendezvous, while `serve` waits for the
 //! control session, and while command stderr still drains after END_ACK.
 //! After DONE, stdin EOF is the normal end. Queries and answers travel on
 //! the control session (DESIGN.md §6.2); obsolete queries still unsent at
@@ -113,6 +113,7 @@ fn hello_payload(block_size: u32, list: &[u8], command: &[&str], level: i32) -> 
     hello.extend_from_slice(&0u32.to_le_bytes()); // probe threads
     hello.extend_from_slice(&(256u64 << 20).to_le_bytes()); // lookahead
     hello.extend_from_slice(&(128u64 << 20).to_le_bytes()); // negative cache
+    hello.extend_from_slice(&(2u64 << 30).to_le_bytes()); // sender spool limit
     hello.extend_from_slice(&(command.len() as u32).to_le_bytes());
     for arg in command {
         string(&mut hello, arg.as_bytes());
@@ -389,7 +390,7 @@ impl Serve {
 
     /// The data frames after the list, from CACHE_RESULT through END,
     /// then the normal end of the data session: END_ACK, and DONE
-    /// (DESIGN.md §6.7). At a `level` other than 0, the frames through END
+    /// (DESIGN.md §6.8). At a `level` other than 0, the frames through END
     /// form one zstd frame, and DONE follows it, outside it
     /// (DESIGN.md §6.2).
     fn frames_through_done(&mut self, level: i32) -> Vec<(u8, Vec<u8>)> {
@@ -615,7 +616,7 @@ fn an_answer_decides_between_a_reference_and_literals() {
     // bytes go out as literals (DESIGN.md §6.3). With compression, each
     // direction of the control session is one zstd stream at the level of
     // the data session, and no frame ends it: the closure of the session
-    // ends it, before DONE (DESIGN.md §6.2 and §6.7).
+    // ends it, before DONE (DESIGN.md §6.2 and §6.8).
     let block: Vec<u8> = (0..4096u32)
         .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
         .collect();
@@ -671,7 +672,7 @@ fn a_compressed_block_in_flight_does_not_fail_the_normal_end() {
 /// Obsolete queries do not delay completion (DESIGN.md §6.3). Here they
 /// are the last queries, and the receiver reads none of them, so the
 /// control writer is still blocked on a full socket when the normal end
-/// closes it. That failed write is expected closure (DESIGN.md §6.7),
+/// closes it. That failed write is expected closure (DESIGN.md §6.8),
 /// also when compression at a `level` other than 0 leaves a zstd block
 /// half written. On one CPU, the woken writer runs before the main thread
 /// can exit, so a writer that took the closure as a failure would win.
@@ -795,7 +796,7 @@ fn stdin_eof_after_done_is_the_normal_end() {
     // after it shut down the control socket. Then it waits, with every
     // thread asleep, until its data reader reads the stdin EOF that the
     // receiver causes after DONE. It joins that thread and exits with
-    // status 0 (DESIGN.md §6.7).
+    // status 0 (DESIGN.md §6.8).
     let mut serve = Serve::start();
     serve.hello(&["printf", "%s", "output"]);
     let mut control = serve.attach();

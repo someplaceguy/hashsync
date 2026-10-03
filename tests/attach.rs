@@ -22,7 +22,7 @@ fn after_socket_closure_attach_discards_stdin_until_eof() {
     // than a pipe holds, so that the receiver's control writer does not
     // block. At socket EOF, `attach` waits for that relay, and exits zero
     // only at stdin EOF, which the receiver causes after DONE
-    // (DESIGN.md §6.1 and §6.7).
+    // (DESIGN.md §6.1 and §6.8).
     let home = tempfile::Builder::new()
         .prefix("hashsync-attach-")
         .tempdir()

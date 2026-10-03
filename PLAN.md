@@ -28,7 +28,9 @@ command's output over two SSH sessions, with the full hash-list exchange,
 account identities, and durable list caches, replace indexed blocks with
 references verified through the receiver's pins, send constant-byte runs
 compactly, and compress the data stream and both directions of the control
-session with zstd. Step 6 is the next milestone.
+session with zstd. The command's stdout and the data session go through
+spools, so that a slow stage of the transfer does not stop the others.
+Step 6 is the next milestone.
 
 ## 1. Build and inspect a local index
 
@@ -119,7 +121,7 @@ disabled. Block references and compressed output follow in steps 4 and 5.
 Result: users can pipe a remote command's output directly into a local
 consumer and rely on its output and exit status.
 
-Design coverage: §§3, 5.4–5.6, 6.1–6.2, 6.5–6.7, 7–8.
+Design coverage: §§3, 5.4–5.6, 6.1–6.2, 6.6–6.8, 7–8.
 
 ## 4. Replace transferred content with verified local blocks
 
@@ -132,21 +134,25 @@ Design coverage: §§3, 5.4–5.6, 6.1–6.2, 6.5–6.7, 7–8.
 - Verify candidate bytes before accepting a reference and verify retained
   bytes again before output. Once a match is accepted, later source changes
   must not affect reconstruction.
-- Support `pin_directory`, its segments, and their closure as output
+- Support `tmp_data_dir`, its segments, and their closure as output
   advances. Pin storage failures or corruption fail the run without
   emitting the affected block.
+- Spool the command's stdout on the sender, up to `sender_spool_limit`,
+  and the data session on the receiver, up to `receiver_spool_limit`, so
+  that neither the command nor the transfer waits for a slower stage
+  until a spool is full (DESIGN.md §6.5).
 - Preserve ordered output with slow consumers, concurrent lookups, and
   out-of-order, late, or obsolete answers. Honor `lookahead` and
   `negative_cache`, along with the design's limits on retained payloads;
   obsolete lookups must not delay END_ACK. At the normal end, the receiver
   skips the queued lookups and waits only for the lookups in progress
-  (DESIGN.md §6.7).
+  (DESIGN.md §6.8).
 - Include reference byte counts in the summary.
 
 Result: transfers save network traffic by using verified local content,
 while producing exactly the remote command's stdout.
 
-Design coverage: §§3, 4.5, 5.1–5.3, 5.5, 6.2–6.7, 7–8.
+Design coverage: §§3, 4.5, 5.1–5.3, 5.5, 6.2–6.8, 7–8.
 
 ## 5. Reduce traffic for repeated and compressible output
 
@@ -167,7 +173,7 @@ Design coverage: §§3, 4.5, 5.1–5.3, 5.5, 6.2–6.7, 7–8.
 Result: zeros, repeated bytes, and other compressible content require less
 network traffic even when local block reuse is limited.
 
-Design coverage: §§6.2–6.7, 7–8.
+Design coverage: §§6.2–6.8, 7–8.
 
 ## 6. Reuse immutable trees and their alternate copies
 
@@ -236,7 +242,7 @@ Design coverage: §§4.2, 4.4, 8.
 Result: subsequent transfers spend less bandwidth on setup and remain
 usable when cached data is missing or stale.
 
-Design coverage: §§5.6, 6.1–6.2, 6.5–6.7, 7–8.
+Design coverage: §§5.6, 6.1–6.2, 6.6–6.8, 7–8.
 
 ## 9. Deliver installable builds
 

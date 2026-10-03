@@ -3,8 +3,8 @@
 //!
 //! This build implements PLAN.md steps 1–5: `update` and `stats` for
 //! mutable roots, and `run` transfers that replace indexed blocks with
-//! verified references, send constant-byte runs compactly, and compress
-//! the data stream.
+//! verified references, send constant-byte runs compactly, compress the
+//! data stream, and spool the command's output and the data session.
 
 mod attach;
 mod blocks;
@@ -27,7 +27,9 @@ mod roots;
 mod run;
 mod scan;
 mod scanner;
+mod segments;
 mod serve;
+mod spool;
 mod ssh;
 mod stats;
 mod sys;
@@ -113,6 +115,10 @@ enum Command {
 
 fn main() {
     die::install_panic_hook();
+    // Before any other thread starts, in every role: a write past the
+    // file-size limit then fails with `EFBIG`, which the writer reports
+    // as a failure, in place of SIGXFSZ, which skips the cleanup.
+    die::block_file_size_signal();
     let cli = Cli::parse();
     if cli.quiet {
         die::disable_notes();

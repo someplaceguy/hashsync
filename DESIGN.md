@@ -39,9 +39,14 @@ asynchronous runtime or event loop.
 - **Query / answer**: a request for a window's full strong hash at an output
   offset, and the receiver's yes/no response. Each offset is queried at most
   once per run.
-- **Pin**: a query offset's verified block, retained in an open, unlinked
-  receiver file, a **segment**, and identified by its **extent**: the
-  segment and the block's offset in it.
+- **Pin**: a query offset's verified block, retained by the receiver in
+  its own **extent**: a segment and the block's offset in it.
+- **Segment**: an open, unlinked file in the **tmp_data directory** of a
+  host. It holds the extents of pins, or the bytes of a spool.
+- **Spool**: a pipe whose bytes wait in segments, so that the producer of
+  the bytes waits for their consumer only at the limit of the spool. The
+  sender spools the command's stdout, and the receiver spools the data
+  session.
 - **Record**: a sender-side description of scanned but un-emitted output:
   a Literal, Run, Query, or Ref.
 
@@ -50,28 +55,34 @@ asynchronous runtime or event loop.
 1. The receiver resolves configured roots and updates the index.
    `--no-update` skips the update and acquires read-only access. Index access
    is held throughout the run.
-2. It exports the hash list from one database snapshot, creates the first
-   segment for its pins, and starts data and control SSH sessions to the
-   sender.
+2. It exports the hash list from one database snapshot, opens its
+   tmp_data directory and makes sure that it can create segments in it,
+   and starts data and control SSH sessions to the sender. It reads the
+   data session through a spool.
 3. After both sides exchange protocol versions, HELLO negotiates parameters
    and cached lists. The receiver durably publishes its target list, then
    sends a full list, a delta, or confirmation that the sender's list is
    current. The sender verifies it, builds its table, durably publishes it
    when caching is enabled, and acknowledges the accepted target.
-4. The sender starts the command. Its scanner sends literals for misses,
-   runs for repeated bytes, and queries for possible block matches.
+4. The sender starts the command, whose stdout goes through a spool: the
+   command waits for the transfer only when `sender_spool_limit` bytes
+   wait in the spool. The scanner sends literals for misses, runs for
+   repeated bytes, and queries for possible block matches.
 5. The receiver reads and verifies candidates, appending their bytes to a
-   temporary segment before answering yes. The sender emits references for
+   segment before answering yes. The sender emits references for
    yes answers and rescans rejected windows from the next byte. Output is
    always emitted in order; when it has passed the pins of a segment that
    receives no more blocks, the receiver closes that segment, which frees
    its storage.
-6. The receiver reconstructs stdout. After all command stdout is processed,
-   and the command's exit status is available, the sender sends END. The
-   receiver validates stream completion and flushes stdout before sending
-   END_ACK. When the sender needs neither session any more, it sends DONE,
-   and the receiver closes both session stdin pipes. Both SSH sessions must
-   exit successfully before the receiver returns the command's status.
+6. The receiver reconstructs stdout from its spool of the data session.
+   While stdout is blocked, the receiver keeps reading the session until
+   `receiver_spool_limit` bytes wait in the spool, so the transfer goes
+   on. After all command stdout is processed, and the command's exit
+   status is available, the sender sends END. The receiver validates
+   stream completion and flushes stdout before sending END_ACK. When the
+   sender needs neither session any more, it sends DONE, and the receiver
+   closes both session stdin pipes. Both SSH sessions must exit
+   successfully before the receiver returns the command's status.
 
 **Verification is authoritative.** The index, hash lists, caches, and weak
 hash table are hints. Verify candidates before writing pins and verify the
@@ -82,7 +93,7 @@ deduplication, never change the reconstructed output.
 **No timeouts.** Waits end when the expected event occurs or a peer,
 descriptor, or process goes away. Slow systems must not fail because of a
 deadline; a stalled process can be inspected with a debugger. Fatal errors
-end the process (section 6.7). Retry intervals and cache age bounds are not
+end the process (section 6.8). Retry intervals and cache age bounds are not
 operation deadlines.
 
 **No artificial size limits.** Valid input never fails because of an
@@ -836,7 +847,8 @@ bytes. Passing separate local argv elements to SSH does not quote them for
 the remote shell. The sender needs a compatible `hashsync` in PATH or at
 `sender_command`.
 
-The receiver generates token `T` and starts both sessions together:
+The receiver generates token `T` and starts both sessions together, with
+the signal mask that the receiver started with (section 6.8):
 
 - Data: `SSH HOST hashsync serve --token T`.
 - Control: `SSH HOST hashsync attach --token T`.
@@ -856,15 +868,16 @@ thread, and exits zero. After a peer-closed error on a write, the relay
 from stdin writes nothing more to the socket, but reads stdin to EOF and
 discards the bytes. This prevents a deadlock: the receiver closes the
 control session's stdin only after its control writer has ended
-(section 6.7), and that writer could otherwise block on a full pipe.
+(section 6.8), and that writer could otherwise block on a full pipe.
 Either direction may observe closure first. The receiver decides from its
 completion state whether a closure was expected; other relay failures end
 the relay unsuccessfully.
-Rendezvous waits must also observe receiver disappearance (section 6.7).
+Rendezvous waits must also observe receiver disappearance (section 6.8).
 
 The command's argv travels in HELLO, not on the SSH command line. Start it
-without a shell, with stdin from `/dev/null`, piped stdout and stderr, and
-its own process group for cleanup.
+without a shell, with stdin from `/dev/null`, piped stdout and stderr, its
+own process group for cleanup, and the signal mask that `serve` started
+with (section 6.8).
 
 A dedicated sender thread copies command stderr to `serve`'s stderr with
 bounded buffering and prompt writes. SSH forwards these bytes through its
@@ -874,7 +887,7 @@ EOF and all copied bytes have been written and flushed to SSH. It runs
 independently of stdout scanning and control traffic. Stderr is outside the
 hashsync protocol and its compression streams. Successful sender exit requires
 relay completion; its coordination with stdout completion is an implementation
-decision (section 6.7). The receiver waits for both SSH exits before returning.
+decision (section 6.8). The receiver waits for both SSH exits before returning.
 
 ### 6.2 Protocol version and frames
 
@@ -913,9 +926,11 @@ Payloads:
   `strong_hash_id string`, `target [u8; S]`, `account_id [u8; 16]`,
   `index_id [u8; 16]`, `sender_cache u8`, `hashlist_max_age u64` (seconds),
   `compression_level i32`, `compression_long u8`, `compression_threads u32`,
-  `probe_threads u32`, `lookahead u64`, `negative_cache u64` (bytes), and
-  `command`, a list of argv byte strings. Find argv[0] in PATH and run
-  directly; a shell requires explicit `sh -c`.
+  `probe_threads u32`, `lookahead u64`, `negative_cache u64` (bytes),
+  `sender_spool_limit u64` (bytes; `2^64 − 1` for `unlimited`), and
+  `command`, a list of argv byte strings.
+  Find argv[0] in PATH and run directly; a shell requires explicit
+  `sh -c`.
 - HELLO, sender to receiver: `account_id [u8; 16]` and an optional
   `base [u8; S]`.
 - HASHLIST: `length u64`. That many encoded bytes of the target follow the
@@ -942,8 +957,8 @@ Payloads:
   sender-to-receiver data frames, only DONE follows.
 - END_ACK: empty. The receiver has validated END and compression completion
   and flushed reconstructed stdout. Send exactly once on the data session;
-  it is the receiver's last data-session frame. Section 6.7 defines shutdown.
-- DONE: empty. The completion conditions of section 6.7 hold, and the
+  it is the receiver's last data-session frame. Section 6.8 defines shutdown.
+- DONE: empty. The completion conditions of section 6.8 hold, and the
   sender needs neither session any more, so the receiver can close both
   session stdin pipes. The sender sends it once, after it has received
   END_ACK. It directly follows the compression stream, outside it. Nothing
@@ -963,7 +978,7 @@ durable receiver publication, then HASHLIST/HASHDELTA/HASHKEEP and its data.
 The sender replies with CACHE_RESULT, possibly after one HASHFULL fallback.
 The receiver handles the result and cache cleanup before entering its output
 loop. Its only remaining data-session frame is END_ACK; it keeps both session
-stdin pipes open until DONE (section 6.7).
+stdin pipes open until DONE (section 6.8).
 
 After HELLO, all sender-to-receiver data-session frames through END share one
 zstd stream, unless compression is disabled. This includes HASHFULL and
@@ -981,7 +996,7 @@ frames are small, so the stream uses no long-distance matching and no
 worker threads. A control writer flushes its stream each time its queue
 becomes empty, because the scanner waits for answers. When a slow link
 makes the writer wait, more frames share each flush and compress better.
-No frame ends the stream: the closure of the session ends it (section 6.7).
+No frame ends the stream: the closure of the session ends it (section 6.8).
 
 The receiver-to-sender direction of the data session is not compressed.
 Almost all its bytes are the hash list, and zstd cannot make the list
@@ -999,8 +1014,10 @@ for the scanner. Let `B = block_size`.
   command bytes read. Initially all are zero, with `e <= p <= r`.
 - The lookahead buffer retains immutable bytes `[e, r)`, including scanned
   bytes that a rejection may require again. Its capacity is `lookahead + B`;
-  the command reader pauses when full. Scanning starts a step only while
-  `p - e < lookahead`; a full-window step may advance `p` by `B`.
+  the output reader, which takes command stdout from its spool
+  (section 6.5), pauses when the buffer is full. Scanning starts a step
+  only while `p - e < lookahead`; a full-window step may advance `p` by
+  `B`.
 - Ordered records cover exactly `[e, p)`, without gaps or overlaps:
   `Literal { offset, length }`, `Run { offset, length, byte }`,
   `Query { offset }`, and `Ref { offset }`. Queries and references each
@@ -1113,127 +1130,42 @@ queries or receiver pins.
 When progress requires input, answers, or data-queue space, wait on
 notifications for those events, continuing to prioritize answers.
 Backpressure propagates from the data writer through the lookahead buffer
-to the command. Pin allocation and release are entirely receiver-local.
+to the spool of command stdout. It reaches the command only when
+`sender_spool_limit` bytes wait in the spool (section 6.5). Pin
+allocation and release are entirely receiver-local.
 
 Finish only after stdout EOF, `p = r`, and no Query records remain. Drain all
 records so `e = p = r`. END can be queued once the exit status is available;
-coordinate shutdown according to section 6.7. Flush queued data before waiting
+coordinate shutdown according to section 6.8. Flush queued data before waiting
 for further completion conditions. Obsolete unanswered requests do not delay
 completion.
 
 ### 6.4 The receiver's answering and reconstruction
 
-The receiver keeps pin payloads in open, unlinked temporary files, the
-segments. Its map from query offsets contains only extents and full strong
-hashes. Extents are independent of command-output offsets. Each pin has
-its own extent, including pins with identical content.
+The receiver keeps pin payloads in extents of segments: open, unlinked
+files in its tmp_data directory (section 6.5). Its map from query offsets
+contains only extents and full strong hashes. Extents are independent of
+command-output offsets. Each pin has its own extent, including pins with
+identical content.
 
 **Pin storage.**
 
-Let `B = block_size`. The receiver writes the verified block of each pin
-to a segment, which is an open, unlinked file. One segment at a time
-receives the new blocks, until it is full. The receiver closes a segment
-that receives no more blocks as soon as nothing uses its blocks. Closing
-an unlinked file frees its storage and writes nothing to disk. The more
-segments are open, the more bytes a segment holds before it is full, so
-the open files stay few. There is no hole punching: any filesystem that
-can hold files works as `pin_directory`.
+Let `B = block_size`. The pins are one user of segments, with extents of
+`B` bytes (section 6.5). The receiver writes the verified block of each
+pin to its own extent. It releases the extent when nothing uses it any
+more: the output has passed its pin, or its lookup worker has found its
+write obsolete, or has finished it in Completing.
 
-Data structures:
+Setup, before the SSH sessions start: open the tmp_data directory, which
+makes sure that segments can be created in it (section 6.5). An unusable
+tmp_data directory thus ends the run before command startup. The QUERY
+procedure below allocates extents with steps A1 to A3 of section 6.5. The
+QUERY procedure and the advance of `c` release them with steps R1 to R3.
+At the end, closing the pins closes all their open segments (section
+6.8).
 
-- **Pin directory**: `pin_directory`, defaulting to
-  `$XDG_CACHE_HOME/hashsync/pins/` (fallback `~/.cache/hashsync/pins/`).
-  Use a private directory (0700). The receiver keeps it open through the
-  run, to create the segments in it. Choose a disk-backed directory to
-  move payload storage out of RAM; a tmpfs directory would store it in
-  memory or swap instead.
-- **Segment**: one open, unlinked file in the pin directory, with its size
-  and its count of extents in use. The size is the bytes of the extents
-  appended to the segment. The file is read/write (0600) and
-  close-on-exec. Prefer `O_TMPFILE`; otherwise create a unique file
-  securely and unlink it before writing any payload.
-- **Open segments**: the receiver keeps the open segments in creation
-  order. At most one of them, the newest, is the **current segment**: it
-  receives the new extents. The others are **sealed**: they receive no
-  more extents.
-- **Extent**: the `B` bytes of one pin: a segment and an offset in it. The
-  extents of a segment follow each other without gaps, alignment, or
-  padding, in allocation order, and are never used again. A pin stores its
-  extent.
-- **Count of extents in use**: the extents of a segment that are allocated
-  and not yet **released**. An extent is released when nothing uses it any
-  more: the output has passed its pin, or its lookup worker has found its
-  write obsolete, or has finished it in Completing.
-
-The current segment is **full** when it holds at least `16 MiB × 2^n`
-bytes, where `n` is the number of sealed segments that are open at that
-moment. The limit is not fixed when the segment is created: `n` decreases
-when sealed segments close. Seal the current segment as soon as it is
-full: evaluate the rule after each extent allocation, and after each
-release that closes a sealed segment. Thus the current segment is never
-full, and after a seal there is no current segment until the next
-allocation. The 16 MiB are a constant, not a configuration key.
-
-Setup, before the SSH sessions start: create the pin directory if it does
-not exist, open it, and create the first segment, which is the current
-segment. An unusable pin directory thus ends the run before command
-startup.
-
-Allocate an extent, under the lock (step 6 of the QUERY procedure below):
-
-- **A1.** If there is no current segment, create one.
-- **A2.** The extent is the next `B` bytes of the current segment. Check
-  the file-offset arithmetic first: `pwrite` takes a signed offset. Add
-  `B` to the size of the segment and 1 to its count of extents in use.
-- **A3.** If the current segment is now full, seal it. It stays open: the
-  new extent is in use.
-
-Release an extent, under the lock (step 8 of the QUERY procedure, and the
-advance of `c` below):
-
-- **R1.** Subtract 1 from the count of extents in use of the extent's
-  segment.
-- **R2.** If the count is 0 and the segment is sealed, remove it from the
-  open segments, and close its file after the lock is released, on the
-  thread that released the extent. The current segment stays open when
-  its count is 0: it is not full.
-- **R3.** If step R2 removed a segment, `n` is now smaller. If the current
-  segment is now full, seal it. If its count of extents in use is 0, also
-  remove it from the open segments, and close its file as in step R2.
-
-End: closing the pins closes all open segments (section 6.7). Process exit
-closes them too. No fsync or crash recovery is required for these
-transient files; closing a segment frees all its storage.
-
-Failures to create the pin directory or a segment, and failures of segment
-writes or reads, including exhaustion of space, descriptors, or file-size
-limits, end the run with `die` without a core dump.
-
-Properties:
-
-- **Descriptors**, for any release order. A segment is sealed at a size of
-  at least `16 MiB × 2^m`, where `m` is the number of sealed segments that
-  are open at that moment. All of them are older, and afterwards they only
-  close. Thus the i-th oldest sealed open segment holds at least
-  `16 MiB × 2^(i−1)`, and `k` sealed open segments hold at least
-  `16 MiB × (2^k − 1)`. So there are at most `log2(R / 16 MiB + 1) + 1`
-  open segments, where `R` is the bytes that they hold: 13 for 64 GiB and
-  17 for 1 TiB. There are never more than 40: a segment holds less than
-  2^63 bytes, because `pwrite` takes a signed offset. The pin directory
-  uses one more descriptor.
-- **Retention**, when releases follow the allocation order. No segment
-  gets an extent after its size passes the bytes of the extents in use at
-  that moment plus 32 MiB. Only the oldest open segment holds released
-  extents. If it is sealed, their bytes stay allocated until the output
-  passes its last pin. If it is the current segment, no sealed segment is
-  open, and it is not full, so it holds less than 16 MiB.
-- **File creations**: a sealed segment holds at least 16 MiB, so there is
-  at most one file creation per 16 MiB of pins.
-- **Accepted cost**: when pins pile up, the last sealed segment holds
-  about half of them, and its released bytes stay allocated until its last
-  pin is released.
-
-The receiver tracks output offset `c`, its pin map, and the open segments.
+The receiver tracks output offset `c`, its pin map, and the open segments
+of the pins.
 A bounded 256 MiB LRU cache of verified buffers, keyed by full strong
 hash, can serve candidate lookups. Populate it on verified reads; its
 eviction is independent of pin lifetimes. Pins never retain those buffers.
@@ -1277,25 +1209,34 @@ For `QUERY { offset: x, strong: h }`:
    fatal. Alternate copies need not share the indexed inode identity.
 6. If nothing verified, answer no. Otherwise recheck `c` under the lock. If
    `x < c`, answer no without an extent. If still needed, allocate an
-   extent under the lock (steps A1 to A3).
+   extent under the lock (section 6.5, steps A1 to A3).
 7. Outside the lock, write the verified buffer's `B` bytes to the extent
    with `pwrite`, accumulating short writes. Segments are open without
    `O_APPEND`; concurrent workers write only their assigned,
    nonoverlapping extents. Finish every write before publishing the pin or
    answering yes.
 8. Reacquire the lock and recheck `x < c`. If now obsolete, leave the extent
-   unpublished, release it (steps R1 to R3), and answer no. Otherwise
-   publish `{ extent, strong: h }` at `x` and queue yes nonblockingly under
-   the lock. Release the worker's buffer. The Completing state prevents new
-   extents or pin publication; late workers discard their results, and
-   release the extents that they wrote.
+   unpublished, release it (section 6.5, steps R1 to R3), and answer no.
+   Otherwise publish `{ extent, strong: h }` at `x` and queue yes
+   nonblockingly under the lock. Release the worker's buffer. The
+   Completing state prevents new extents or pin publication; late workers
+   discard their results, and release the extents that they wrote.
 
 A yes is binding because the receiver owns an independent copy of the
 verified bytes in a segment. A later source-file change cannot affect
 REF. Output may pass `x` and release its extent before the answer is sent;
 the sender then discards that obsolete answer.
 
-Process data frames in order at `c`:
+The receiver reads the data session through a spool whose limit is
+`receiver_spool_limit` (section 6.5). The thread of the spool reads the
+session as its bytes arrive, so until that many bytes wait in the spool,
+a blocked stdout stops only reconstruction. The sender keeps sending,
+scanning, and querying, the lookups keep writing pins, and the spool and
+the pins hold the output until stdout takes it. The limit counts bytes of
+the data session, which is compressed; it does not bound the pins.
+
+Process data frames in order at `c`, as reconstruction reads them from the
+spool:
 
 - LIT writes its payload; RLE writes the repeated byte. Accept any positive
   RLE length, though the sender emits runs of at least `B`.
@@ -1308,13 +1249,13 @@ Process data frames in order at `c`:
   that block or attempting to reread the source file.
 - After each frame's output is written, advance `c` under the lock. In
   bounded batches, detach pins whose query offsets are below it, including
-  pins covered by literals or runs, and release their extents (steps R1
-  to R3). After each batch, release the lock and close the files of the
-  segments that the batch removed from the open segments. An unpublished
-  write that becomes obsolete is released by its lookup worker after that
-  write finishes.
+  pins covered by literals or runs, and release their extents (section
+  6.5, steps R1 to R3). After each batch, release the lock and close the
+  files of the segments that the batch removed from the open segments. An
+  unpublished write that becomes obsolete is released by its lookup worker
+  after that write finishes.
 - END carries the command status into shutdown. Validate compression
-  completion and flush stdout before END_ACK (section 6.7). EOF without
+  completion and flush stdout before END_ACK (section 6.8). EOF without
   END or before the compressed stream is complete is failure.
 
 The shared lock makes pin publication and output advancement atomic relative
@@ -1323,7 +1264,200 @@ extent released, or observes the obsolete offset and releases its extent.
 No extent is released while its write or REF read is still using it, so no
 segment is closed while one of its extents is in use.
 
-### 6.5 Failures and trust
+### 6.5 Segments and spools
+
+Both roles keep temporary data in **segments**: open, unlinked files in
+the **tmp_data directory** of their host. The receiver keeps its pins in
+segments (section 6.4), and both roles keep the bytes of their spools in
+segments. Closing an unlinked file frees its storage and writes nothing
+to disk. There is no hole punching: any filesystem that can hold files
+works as a tmp_data directory.
+
+**Segments.**
+
+Each **user** of segments, the pins or one spool, has its own open
+segments and its own extent size: `B` for the pins, 1 MiB for a spool.
+One segment of a user at a time receives the new extents, until it is
+full. The user closes a segment that receives no more extents as soon as
+nothing uses its extents. The more segments of a user are open, the more
+bytes a segment holds before it is full, so the open files stay few.
+
+Data structures:
+
+- **tmp_data directory**: on the receiver, `tmp_data_dir`, defaulting to
+  `$XDG_CACHE_HOME/hashsync/tmp-data/` (fallback
+  `~/.cache/hashsync/tmp-data/`). The sender always uses that default, in
+  its own environment. To move it on a sender host, set the
+  `sender_command` of that host to a script that runs
+  `export XDG_CACHE_HOME=DIR; exec hashsync "$@"`; the sender's list cache
+  (section 5.6) moves with it. Use a private directory (0700). A role
+  creates it if it does not exist, opens it, and keeps it open through
+  the run, to create the segments in it. When it opens the directory, it
+  creates a segment and closes it at once, to make sure that segments can
+  be created in it. The receiver opens the directory before the SSH
+  sessions start (section 6.4), and the sender opens it when it has
+  accepted HELLO, before the list exchange. So an unusable directory ends
+  the run before command startup. Choose a disk-backed directory to move
+  the data out of RAM; a tmpfs directory would store it in memory or swap
+  instead. Avoid NFS: its client writes the data of a file to the server
+  before it closes the file, so every byte of the segments would go to
+  the server (section 10).
+- **Segment**: one open, unlinked file in the tmp_data directory, with its
+  size and its count of extents in use. The size is the bytes of the
+  extents appended to the segment. The file is read/write (0600) and
+  close-on-exec. Prefer `O_TMPFILE`; otherwise create a unique file
+  securely and unlink it before writing any data.
+- **Open segments**: each user keeps its open segments in creation order.
+  At most one of them, the newest, is the **current segment**: it
+  receives the new extents. The others are **sealed**: they receive no
+  more extents.
+- **Extent**: a range of bytes in one segment, as long as the extent size
+  of its user. A segment and an offset in it identify the extent. The
+  extents of a segment follow each other without gaps, alignment, or
+  padding, in allocation order, and are never used again.
+- **Count of extents in use**: the extents of a segment that are allocated
+  and not yet **released**. The user releases an extent when nothing uses
+  it any more.
+
+The current segment is **full** when it holds at least `16 MiB × 2^n`
+bytes, where `n` is the number of sealed segments of its user that are
+open at that moment. The limit is not fixed when the segment is created:
+`n` decreases when sealed segments close. Seal the current segment as
+soon as it is full: evaluate the rule after each extent allocation, and
+after each release that closes a sealed segment. Thus the current segment
+is never full, and after a seal there is no current segment until the
+next allocation. The 16 MiB are a constant, not a configuration key.
+
+A user starts without open segments: its first allocation creates its
+first segment (step A1). Allocate an extent, under the lock of the user:
+
+- **A1.** If there is no current segment, create one.
+- **A2.** The extent starts at the size of the current segment. Check the
+  file-offset arithmetic first: `pwrite` takes a signed offset. Add the
+  extent size to the size of the segment and 1 to its count of extents in
+  use.
+- **A3.** If the current segment is now full, seal it. It stays open: the
+  new extent is in use.
+
+Release an extent, under the lock of the user:
+
+- **R1.** Subtract 1 from the count of extents in use of the extent's
+  segment.
+- **R2.** If the count is 0 and the segment is sealed, remove it from the
+  open segments, and close its file after the lock is released, on the
+  thread that released the extent. The current segment stays open when
+  its count is 0: it is not full.
+- **R3.** If step R2 removed a segment, `n` is now smaller. If the current
+  segment is now full, seal it. If its count of extents in use is 0, also
+  remove it from the open segments, and close its file as in step R2.
+
+End: closing a user closes all its open segments (section 6.8). Process
+exit closes them too. No fsync or crash recovery is required for these
+transient files; closing a segment frees all its storage.
+
+Failures to create the tmp_data directory or a segment, and failures of
+segment writes or reads, including exhaustion of space, descriptors, or
+file-size limits, end the run with `die` without a core dump.
+
+Properties, for each user:
+
+- **Descriptors**, for any release order. A segment is sealed at a size of
+  at least `16 MiB × 2^m`, where `m` is the number of sealed segments that
+  are open at that moment. All of them are older, and afterwards they only
+  close. Thus the i-th oldest sealed open segment holds at least
+  `16 MiB × 2^(i−1)`, and `k` sealed open segments hold at least
+  `16 MiB × (2^k − 1)`. So there are at most `log2(R / 16 MiB + 1) + 1`
+  open segments, where `R` is the bytes that they hold: 13 for 64 GiB and
+  17 for 1 TiB. There are never more than 40: a segment holds less than
+  2^63 bytes, because `pwrite` takes a signed offset. The tmp_data
+  directory uses one more descriptor.
+- **Retention**, when releases follow the allocation order, as in a spool.
+  No segment gets an extent after its size passes the bytes of the extents
+  in use at that moment plus 32 MiB. Only the oldest open segment holds
+  released extents. If it is sealed, their bytes stay allocated until its
+  last extent is released. If it is the current segment, no sealed segment
+  is open, and it is not full, so it holds less than 16 MiB.
+- **File creations**: a sealed segment holds at least 16 MiB, so there is
+  at most one file creation per 16 MiB of extents.
+- **Accepted cost**: when the extents in use pile up, the last sealed
+  segment holds about half of them, and its released bytes stay allocated
+  until its last extent is released.
+
+**Spools.**
+
+A **spool** is a pipe whose bytes wait in segments, so that the producer
+of the bytes waits for their consumer only at the **limit** of the spool.
+The thread of the spool reads its **source** as the bytes arrive and
+appends them; it waits for the reader only at the limit. The reader takes
+the bytes in order, and waits only while no byte waits for it.
+
+| Role | Source | Reader | Limit |
+|---|---|---|---|
+| Sender | Command stdout | The output reader, for the lookahead buffer (section 6.3) | `sender_spool_limit`, from HELLO |
+| Receiver | Data-session stdout | Reconstruction (section 6.4) | `receiver_spool_limit` |
+
+Each limit is 2 GiB by default, and `unlimited` removes it. Without a
+limit, a spool can grow to almost the whole output when its reader stays
+slower than its source (section 10).
+
+Data structures:
+
+- **Spool extents**: the extents of 1 MiB of the spool's segments, which
+  the thread allocates in stream order. The reader is in the first extent
+  that is not released, and the thread appends to the last one.
+- **Written** and **read**: the bytes that the thread has appended, and
+  that the reader has taken. The bytes between them **wait**.
+- **End**: the source reached EOF, and the thread has appended all its
+  bytes.
+- **Limit**: the bytes that can wait before the thread stops reading its
+  source. `unlimited` is the largest value, `2^64 − 1`, which no spool
+  reaches.
+
+The thread of the spool:
+
+- **W1.** Wait while bytes wait and at least `limit` bytes wait. The
+  reader wakes the thread when it takes bytes. With a limit of 0, the
+  thread reads when no byte waits.
+- **W2.** Read the source. At EOF, mark the end, wake the reader, and
+  stop. A read error ends the run with `die` without a core dump.
+- **W3.** Append the bytes, one extent at a time. If there is no extent,
+  or the last extent is full, allocate an extent (steps A1 to A3) under
+  the lock. Write the bytes that fit in the last extent with `pwrite`
+  outside the lock. Then add them to written under the lock, and wake the
+  reader. Repeat until all bytes are appended, then go to step W1.
+
+The reader:
+
+- **T1.** Under the lock, wait until bytes wait or the end is marked. If
+  no byte waits and the end is marked, release the remaining extent, if
+  one remains (steps R1 to R3), and report EOF. That extent is the last
+  one, which is not full, so step T3 did not release it.
+- **T2.** Read the waiting bytes of the first extent with `pread`, outside
+  the lock.
+- **T3.** Under the lock, add them to read, and wake the thread. If the
+  reader has passed the first extent, release it (steps R1 to R3). Close
+  the files of the segments that this removes after the lock is released.
+
+The waits of the thread and of the reader have no timeout. The reader
+releases the extents in allocation order, so the retention property above
+holds for a spool: its files hold its waiting bytes and, in its oldest
+open segment, bytes that the reader has passed. With a limit, at most the
+limit plus one read of the source (256 KiB) wait, so the files hold less
+than twice the limit plus 40 MiB. In a simulation of the default
+limit of 2 GiB, with readers 2 to 10 times slower than the source and
+with stalls, the files held at most 2.5 GiB, in at most 8 files.
+
+Cost: on XFS, a spool passed 1 GiB in 0.36 s, with 0.27 s of CPU in the
+thread and 0.16 s in the reader. That is about the cost of two copies in
+memory (0.18–0.22 s each), as a channel of chunks makes. While the reader
+keeps up, a segment can fill and close before the kernel writes back its
+dirty pages, by default after 30 s. Then the close discards the pages,
+and nothing reaches the disk. A slow source keeps its current segment
+open longer, and the kernel writes those pages to the disk. The data
+session can be such a source: it took 6.3 MB for 3.29 GB of output
+(section 10).
+
+### 6.6 Failures and trust
 
 - Different protocol versions and unsupported HELLO parameters fail before
   command startup.
@@ -1341,9 +1475,9 @@ segment is closed while one of its extents is in use.
   repeated directory identities detected during expansion or traversal call
   `die` without a core dump.
 - Filesystem failures during indexing abandon entries; during lookup they
-  reject source candidates. Pin directory setup, segment creation, segment
-  I/O, or verification failures end the run with `die` without a core dump;
-  a yes answer cannot be retracted.
+  reject source candidates. Failures of the tmp_data directory setup,
+  segment creation, segment I/O, or verification end the run with `die`
+  without a core dump; a yes answer cannot be retracted.
 - Cache directory and file operation failures on either role end the run
   with `die` without a core dump, subject to the absence and invalid-content
   rules in section 5.6. Invalid cached files are removed and treated as
@@ -1353,38 +1487,42 @@ Use trusted peers: the sender learns hashes of all indexed content.
 `sender_cache = false` disables retention and removes earlier caches for
 that receiver/index.
 
-### 6.6 Threads at run time
+### 6.7 Threads at run time
 
 Both roles use blocking threads and channels, with the threads of the table
 below. At the normal end, a thread ends when its work ends: its input
 reaches EOF or END, its queue closes because no thread can send to it any
-more, or a write fails at an expected closure (section 6.7). Then the main
-thread joins it, in the order of section 6.7. One thread is the exception:
-the receiver's signal thread stays until the process exits, and no thread
-joins it, so that SIGINT and SIGTERM during the end still give
-`128 + signal`.
+more, or a write fails at an expected closure (section 6.8). Then the main
+thread joins it, in the order of section 6.8; the reader of a spool joins
+the thread of the spool when it closes the spool. One thread is the
+exception: the receiver's signal thread stays until the process exits,
+and no thread joins it, so that SIGINT and SIGTERM during the end still
+give `128 + signal`.
 
 Fatal shutdown ends the process rather than cancelling or joining blocked
 threads.
 
 | Role | Responsibilities |
 |---|---|
-| Sender main | Handshake and command startup, then wait for the completion conditions of section 6.7 and send DONE. |
+| Sender main | Handshake and command startup, then obtain the command's exit status without reaping, wait for the completion conditions of section 6.8, and send DONE. |
 | Sender data reader | Read the data session for the whole run: the protocol version, HELLO, the list, END_ACK, and EOF. EOF before DONE means that the receiver disappeared. |
-| Sender command reader | Fill lookahead until stdout EOF; obtain the command's exit status without reaping. |
+| Sender spool thread | Copy command stdout into its spool until EOF, waiting at the limit of the spool (section 6.5). |
+| Sender output reader | Fill lookahead from the spool of command stdout until its EOF, then close the spool. |
 | Sender stderr relay | Copy command stderr to sender stderr through EOF and flush. |
 | Sender scanner | Own records and query states; queue queries and output. |
 | Sender probe threads | Probe the parts of long stretches of windows for the scanner (section 6.3). |
 | Sender data writer | Drain output in order, compress, and finish and flush the stream after END. |
 | Sender control reader/writer | Receive answers and send queries promptly, independently of data output. |
-| Receiver main | Start SSH sessions, reconstruct stdout, validate completion, send END_ACK, and close both session stdin pipes after DONE. |
+| Receiver main | Start SSH sessions, reconstruct stdout from the spool of the data session, validate completion, send END_ACK, and close both session stdin pipes after DONE. |
+| Receiver spool thread | Copy data-session stdout into its spool until EOF, waiting at the limit of the spool (section 6.5). |
 | Receiver control reader/writer | Dispatch queries to lookup workers and send answers promptly. |
 | Receiver lookup workers | Answer queries out of order (section 6.4). |
 | Receiver signal thread | Handle SIGINT/SIGTERM with status `128 + signal`. |
 | Attach relay | Copy both directions; half-close on stdin EOF. Once the socket is closed, discard stdin; at socket EOF, wait for stdin EOF, then exit zero. |
 
-Blocking output provides backpressure; it must not prevent independent
-control traffic. Completion requirements are in section 6.7.
+Blocking output provides backpressure, which the spools absorb up to their
+limits (section 6.5); it must not prevent independent control traffic.
+Completion requirements are in section 6.8.
 
 Keep successfully spawned children unreaped until their owning `hashsync`
 process exits. Obtain command and SSH exit statuses with
@@ -1394,7 +1532,7 @@ process exits. Obtain command and SSH exit statuses with
 reserves its process-group ID, and retaining the SSH children reserves their
 PIDs, so late cleanup cannot signal an unrelated process after ID reuse.
 
-### 6.7 Shutdown
+### 6.8 Shutdown
 
 Fatal errors end the process rather than attempting to interrupt arbitrary
 blocked threads. Persistent state is recoverable: RocksDB recovers from its
@@ -1407,13 +1545,21 @@ callers wait for that cleanup rather than exiting ahead of it:
 
 - Sender: SIGKILL the command's process group and remove the rendezvous socket.
 - Receiver: SIGKILL both SSH processes, causing sender stdin EOF and cleanup.
-- Process exit closes the receiver's unlinked segments, which frees all
+- Process exit closes the unlinked segments of both roles, which frees all
   their storage without a separate cleanup pass.
 - Abandoned cache temporaries remain for expiry.
 
 Build with `panic = "abort"`; install a panic hook that performs the same
 cleanup before aborting. External failures use `die` without a core dump;
 bugs and database errors abort. Per-entry failures remain local.
+
+Both roles block SIGXFSZ in every thread. Then a write past the file-size
+limit fails with `EFBIG`, and the run ends through `die`, with its
+cleanup; the default action of the signal would end the process without
+it. The receiver also blocks SIGINT and SIGTERM in every thread, for its
+signal thread (section 6.7). A blocked signal stays blocked across
+`exec`, so each role starts its children with the signal mask that it
+started with.
 
 Only the normal end runs the C library's exit handlers. One of them, a C++
 static destructor of RocksDB (`JoinThreadsOnExit`), joins RocksDB's
@@ -1451,8 +1597,9 @@ coordinate concurrent completion; no particular event ordering or state
 machine is required. Startup failure has no command streams to drain.
 
 Keep sender stdout open until process exit. Join the threads whose work
-ends with the command's streams or with END: the command reader after
-command stdout EOF, the stderr relay for its completion condition, and the
+ends with the command's streams or with END: the output reader after the
+EOF of the spool of command stdout, which it closes, so that it joins the
+spool's thread; the stderr relay for its completion condition; and the
 data writer after END. Once the completion conditions hold, perform normal
 cleanup once:
 
@@ -1496,8 +1643,10 @@ Receiver completion:
    multiplexing client, or through a wrapper that waits for SSH, that EOF
    comes only when SSH exits, and SSH exits only after the sender has read
    stdin EOF (section 10).
-5. The receiver drains data-session stdout to transport EOF, rejecting any
-   bytes after DONE. Then it ends its other threads, in this order:
+5. The receiver drains the spool of the data session to its EOF, which
+   follows transport EOF, rejecting any bytes after DONE. It closes the
+   spool, which joins the spool's thread. Then it ends its other threads,
+   in this order:
    1. Join the control reader. It reads control-session stdout to EOF, also
       in Completing, so it does not close the pipe while SSH can still
       write to it: SSH would fail with a broken pipe. Its end closes the
@@ -1508,8 +1657,9 @@ Receiver completion:
 6. The receiver observes both SSH exits without reaping. Both must exit
    zero; otherwise the transfer failed even if END was received. Then it
    closes what the threads used, in this order:
-   1. Close the pins: close all open segments, which frees all their
-      storage, and close the pin directory.
+   1. Close the pins: close all their open segments, which frees all their
+      storage. The tmp_data directory closes with its last user, the
+      pins.
    2. Close the index: first the database, then its lock (section 4.4).
 7. The receiver prints the summary (section 8) and exits with END's command
    status.
@@ -1545,7 +1695,9 @@ hashlist_max_age = "90d"
 index_path     = "~/.local/state/hashsync/default.db"  # a directory
 threads        = 0         # 0 = 4 × cores, clamped to 16–64
 lookahead      = "256MiB"  # at least block_size
-pin_directory  = "~/.cache/hashsync/pins"  # receiver file storage; any filesystem
+sender_spool_limit   = "2GiB"  # command stdout that can wait on the sender, or "unlimited"
+receiver_spool_limit = "2GiB"  # data session that can wait on the receiver, or "unlimited"
+tmp_data_dir   = "~/.cache/hashsync/tmp-data"  # receiver segments; any filesystem
 negative_cache = "128MiB"
 probe_threads  = 0         # 0 = half the sender's cores, at least one
 compression_level   = 9    # zstd 1–19; 0 disables
@@ -1585,7 +1737,7 @@ these are TOML options.
 **Byte strings.** TOML strings contain Unicode characters, not arbitrary
 bytes. Even TOML 1.1's `"\xFF"` denotes U+00FF, whose UTF-8 bytes are
 `C3 BF`, not the single byte `FF`. After TOML parsing, `hashsync` interprets
-the following syntax in `index_path`, `pin_directory`, `sender_command`,
+the following syntax in `index_path`, `tmp_data_dir`, `sender_command`,
 root `path` and `exclude` values, and identifier `literal` and `strip_prefix`
 values. For `ssh`, shell-split first, then decode each argv word.
 
@@ -1646,7 +1798,7 @@ exclude = ['*.tmp', 'literal\x2Aname', 'back\\slash']
      speedup: the output bytes divided by the sent and received bytes.
      These counts do not include the bytes that SSH adds or the command's
      stderr. They are exact: the receiver prints the summary after the
-     threads that count the bytes have ended (section 6.7).
+     threads that count the bytes have ended (section 6.8).
 - `hashsync serve --token T` and `hashsync attach --token T`: internal
   sender entry points.
 - `hashsync stats`: report index statistics.
@@ -1845,7 +1997,7 @@ decision history is in version control.
   limit is 1024, and RocksDB uses many. Segments of 128 MiB keep 512 files
   open when 64 GiB of pins pile up, and 128 when one pin in each 16 MiB of
   16 GiB of pins is never released. In a simulation with 16 KiB extents,
-  released almost in allocation order, the full rule of section 6.4 kept
+  released almost in allocation order, the full rule of section 6.5 kept
   13 and 11 files open. Its cost is the retention: while the 64 GiB of
   pins drained, its last sealed segment kept up to 32 GiB of released
   bytes allocated, 10.7 GiB on average.
@@ -1856,11 +2008,59 @@ decision history is in version control.
   the pins that made it large are released. In the same simulation, with
   3 GiB of pins in use at all times, 9 files were open, and up to 4 GiB of
   released bytes stayed allocated, 1.1 GiB on average. The full rule of
-  section 6.4 kept 8 files open, and up to 1.0 GiB allocated, 254 MiB on
+  section 6.5 kept 8 files open, and up to 1.0 GiB allocated, 254 MiB on
   average. After 8 GiB of pins piled up and drained, the output kept up
   for 16 GiB of pins. The segment of 8 GiB stayed the current segment
   until it was full: up to 8 GiB of released bytes stayed allocated, 2 GiB
   on average. With the full rule, at most 16 MiB stayed allocated.
+- **Spooling the reconstructed output:** a spool between reconstruction
+  and stdout would let reconstruction go on while stdout is blocked. But
+  it writes every referenced block a second time, from its pin to the
+  spool, and every run in full. In a transfer of 3.29 GB of `/nix/store`
+  files, 97% references at 4 KiB blocks, the data session took 6.3 MB,
+  and such a spool would take 3.29 GB; a run of 10 GiB of zeros is one
+  RLE frame of 14 bytes. The spool of the data session keeps the transfer
+  going too; only reconstruction, which is local, waits for stdout.
+- **Spools without a limit:** the sender does not keep the command's
+  output, so with a slow link its spool would grow to almost the whole
+  output on the sender's disk. For `tar` of 2 TB at 200 MB/s over a link
+  of 10 MB/s, the spool would hold about 1.9 TB when `tar` ends, and a
+  full disk ends the run. Only the command would end sooner, not the
+  transfer. On the receiver, a consumer that stops for a long time would
+  let almost the whole data session wait on the receiver's disk, which
+  the consumer can be writing to as well. At its limit, the source of a
+  spool waits instead.
+- **A lookahead mapped from the spool:** the scanner could map the
+  segments of the spool of command stdout into a reserved address range,
+  in place of the copy into its lookahead buffer. The buffer would then
+  use pages of the page cache, and `lookahead` could be much larger. But a
+  rejection makes the scanner scan again up to `lookahead` bytes
+  (section 6.3): at 2.7–19.3 ns per byte (12 to 1 probe threads, 10M list
+  values), up to 0.7–5.2 s for 256 MiB, and 6–44 min for 128 GiB. The
+  query states of the sender, and the queued queries and the pins of the
+  receiver, grow with the lookahead too. The spool already lets the
+  command run ahead of the scanner. In a benchmark of the copies, the
+  mapping would save about 0.15–0.35 s per GiB on the scanner thread. It
+  would cost unsafe slices over mappings, SIGBUS in place of `die` when a
+  page cannot be read, and a second interface on the spool.
+- **The scanner reading the spool of command stdout itself:** without the
+  output reader, its thread, and its queue of chunks, the scanner would
+  read the spool when its buffer has room, and wait for the spool in the
+  same wait as for answers. But the read from the segment would move to
+  the scanner thread, which limits the sender on new output: about
+  0.15–0.35 s per GiB, as in the benchmark above, up to 12% of a scan at
+  2.7 ns per byte. A read straight into the lookahead buffer would avoid
+  that copy, but the buffer would have to keep initialized room, and the
+  spool would need a second interface that does not wait.
+- **Truncating a segment before it closes:** on NFS, a close writes the
+  dirty pages of a file to the server, also for an unlinked file. A
+  truncation to size 0 before the close does not prevent that: the NFS
+  client writes all dirty data to the server before it sends the
+  truncation (`nfs_setattr`, Linux 6.18), and so does the SMB client. On
+  local filesystems, the close of an unlinked file already discards its
+  pages, so a truncation would only add a metadata transaction per
+  segment. Use a tmp_data directory that is not on NFS instead (section
+  6.5).
 - **Flushing the compression stream when the scanner waits:** kept output
   responsive when the command pauses, but each flush ends a zstd block or
   job early. With a command paced at 2 MB/s, level 9 sent 5.7% more bytes
@@ -1934,7 +2134,11 @@ decision history is in version control.
   sizes, the full rule after each allocation and each closure of a sealed
   segment, the bound on open segments for any release order, sealed
   segments held open by extents in use, pin storage failures, corruption
-  detection, and cleanup on exit; filesystem races and sparse files;
+  detection, and cleanup on exit; spool order and EOF, the limit of a
+  spool, segments that close behind the reader of a spool, a command that
+  ends while the consumer of stdout reads nothing, a command that waits
+  when both spools are full, and a receiver that stops reading the data
+  session at its own limit; filesystem races and sparse files;
   reopening regular files and directories after rename or unlink;
   skipping symlinks and special files without opening them for I/O;
   configuration byte escapes, TOML quoting, literal glob metacharacters,
@@ -1962,6 +2166,10 @@ decision history is in version control.
   closure with control writes in flight, shutdown on session loss, and fatal
   cleanup after a child's exit status has been collected without reaping. Use
   separate processes for locking tests and fuzz protocol decoding.
+- Tests wait for events, also to check that something does not happen.
+  Only when no event can show it can a test wait a fixed time, and then
+  the end of that wait must be the success of the test: a slow machine
+  can make such a test miss a fault, but never fail a correct build.
 - Package with Nix `rustPlatform.buildRustPackage`, including support for
   cross and static builds.
 

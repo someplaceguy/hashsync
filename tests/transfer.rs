@@ -5,8 +5,11 @@
 //! rules on both sides, block references with their pins, runs, and the
 //! compression stream.
 //!
-//! No wait of these tests has a deadline: a regression hangs the test, so
-//! that a debugger can examine it.
+//! The tests wait for events, and no wait has a deadline whose end fails a
+//! test: a regression hangs the test, so that a debugger can examine it.
+//! One test must see that the command does not end, which no event shows,
+//! so it waits a fixed time. On a slow machine, that wait can miss a
+//! fault, but it cannot fail a correct build.
 
 mod common;
 
@@ -23,9 +26,9 @@ use common::{
     ANSWER, BLOCK, CACHE_RESULT, END, Env, HELLO, KillOnDrop, LIT, QUERY, frame, proc_state,
     random, recv_frame, tiled, toml_literal, version,
 };
-use rustix::event::{PollFd, PollFlags, poll};
-use rustix::fs::{CWD, Mode, mkfifoat};
-use rustix::io::retry_on_intr;
+use rustix::event::{PollFd, PollFlags, Timespec, poll};
+use rustix::fs::{CWD, Mode, OFlags, inotify, mkfifoat};
+use rustix::io::{Errno, read, retry_on_intr};
 use rustix::process::{
     Pid, PidfdFlags, Signal, WaitId, WaitIdOptions, kill_process, pidfd_open, waitid,
 };
@@ -341,7 +344,8 @@ fn output_reproduces_byte_for_byte_and_lists_are_cached() {
 fn indexed_blocks_become_references_at_any_offset() {
     // The blocks of an indexed file appear twice in the output, at
     // unaligned offsets. Every block becomes a reference; the lookups run
-    // concurrently, and the pins leave nothing behind (DESIGN.md §6.4).
+    // concurrently, and the pins and the spools leave nothing behind in
+    // the tmp_data directories of both sides (DESIGN.md §6.5).
     let transfer = Transfer::new("");
     let blocks = tiled(64, 7);
     transfer.env.write("tree/blocks", &blocks);
@@ -354,9 +358,14 @@ fn indexed_blocks_become_references_at_any_offset() {
     assert_eq!(output.stdout, expected);
     assert_eq!(summary(&output), [expected.len(), 7, 2 * blocks.len(), 0]);
 
-    let pins = transfer.env.path("receiver/cache/hashsync/pins");
-    assert_eq!(mode(&pins), 0o700, "the pin directory is private");
-    assert_eq!(std::fs::read_dir(&pins).unwrap().count(), 0);
+    for tmp_data in [
+        "receiver/cache/hashsync/tmp-data",
+        "sender/home/.cache/hashsync/tmp-data",
+    ] {
+        let tmp_data = transfer.env.path(tmp_data);
+        assert_eq!(mode(&tmp_data), 0o700, "{tmp_data:?} is not private");
+        assert_eq!(std::fs::read_dir(&tmp_data).unwrap().count(), 0);
+    }
 }
 
 #[test]
@@ -436,41 +445,41 @@ fn a_rejected_window_does_not_hide_an_overlapping_match() {
 }
 
 #[test]
-fn pins_live_in_the_configured_directory() {
+fn the_receiver_keeps_its_temporary_data_in_the_configured_directory() {
     let transfer = Transfer::new("");
-    let pins = transfer.env.path("pins/nested");
+    let tmp_data = transfer.env.path("tmp/nested");
     let hashsync = env!("CARGO_BIN_EXE_hashsync").as_bytes();
-    let pin_directory = |path: &std::path::Path| {
+    let configure = |path: &std::path::Path| {
         format!(
-            "pin_directory = '{}'\n",
+            "tmp_data_dir = '{}'\n",
             toml_literal(path.as_os_str().as_bytes())
         )
     };
-    transfer.reconfigure(hashsync, &pin_directory(&pins));
+    transfer.reconfigure(hashsync, &configure(&tmp_data));
     let blocks = tiled(8, 16);
     transfer.env.write("tree/blocks", &blocks);
     let command = args(&["cat", transfer.env.path("tree/blocks").to_str().unwrap()]);
     let output = transfer.run_ok(&refs(&command));
     assert_eq!(output.stdout, blocks);
     assert_eq!(summary(&output), [8 * BLOCK, 0, 8 * BLOCK, 0]);
-    assert_eq!(mode(&pins), 0o700);
-    assert_eq!(std::fs::read_dir(&pins).unwrap().count(), 0);
+    assert_eq!(mode(&tmp_data), 0o700);
+    assert_eq!(std::fs::read_dir(&tmp_data).unwrap().count(), 0);
 
-    // A pin directory that cannot exist, or that cannot hold the first
-    // segment, fails the run before the sessions start: the command does
-    // not run (DESIGN.md §6.4).
+    // A tmp_data directory that cannot exist, or that cannot hold
+    // segments, fails the run when it opens, before the sessions start:
+    // the command does not run (DESIGN.md §6.5).
     transfer.env.write("not-a-directory", b"x");
-    let blocked = transfer.env.path("not-a-directory/pins");
+    let blocked = transfer.env.path("not-a-directory/tmp");
     transfer.env.mkdir("read-only");
     transfer.env.chmod("read-only", 0o500);
     let read_only = transfer.env.path("read-only");
     let marker = transfer.env.path("marker");
     let command = args(&["touch", marker.to_str().unwrap()]);
     for (path, message) in [
-        (&blocked, "cannot create pin directory"),
-        (&read_only, "cannot create a segment in pin directory"),
+        (&blocked, "cannot create tmp_data directory"),
+        (&read_only, "cannot create a segment in tmp_data directory"),
     ] {
-        transfer.reconfigure(hashsync, &pin_directory(path));
+        transfer.reconfigure(hashsync, &configure(path));
         let output = transfer.run(&[], &refs(&command));
         assert_eq!(output.status.code(), Some(1));
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -480,23 +489,23 @@ fn pins_live_in_the_configured_directory() {
 }
 
 #[test]
-fn a_full_pin_directory_fails_the_run() {
-    // The pin directory is a tmpfs in a new user and mount namespace. It
-    // holds 64 KiB, also with pages of 64 KiB, and the pins of the output
-    // need 128 KiB in the first segment: a segment write fails, which ends
-    // the run (DESIGN.md §6.5).
+fn a_full_tmp_data_directory_fails_the_run() {
+    // The receiver's tmp_data directory is a tmpfs in a new user and mount
+    // namespace. It holds 64 KiB, also with pages of 64 KiB, and the pins
+    // of the output need 128 KiB in their first segment: a segment write
+    // fails, which ends the run (DESIGN.md §6.6).
     if !common::namespaces_available() {
         eprintln!("skipped: no unprivileged user namespaces");
         return;
     }
     let transfer = Transfer::new("");
-    let pins = transfer.env.path("tmpfs");
-    std::fs::create_dir(&pins).unwrap();
+    let tmp_data = transfer.env.path("tmpfs");
+    std::fs::create_dir(&tmp_data).unwrap();
     transfer.reconfigure(
         env!("CARGO_BIN_EXE_hashsync").as_bytes(),
         &format!(
-            "pin_directory = '{}'\n",
-            toml_literal(pins.as_os_str().as_bytes())
+            "tmp_data_dir = '{}'\n",
+            toml_literal(tmp_data.as_os_str().as_bytes())
         ),
     );
     transfer.env.write("tree/blocks", &tiled(32, 19));
@@ -510,7 +519,7 @@ fn a_full_pin_directory_fails_the_run() {
             "-c",
             "mount -t tmpfs -o size=64k none \"$0\" || exit 99; exec \"$@\"",
         ])
-        .arg(&pins)
+        .arg(&tmp_data)
         .arg(run.get_program())
         .args(run.get_args());
     for (key, value) in run.get_envs() {
@@ -520,18 +529,111 @@ fn a_full_pin_directory_fails_the_run() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(1), "{stderr}");
     assert!(
-        stderr.contains("cannot write a segment in pin directory"),
+        stderr.contains("cannot write a segment in tmp_data directory"),
         "{stderr}"
     );
 }
 
 #[test]
+fn a_sender_tmp_data_directory_that_cannot_hold_a_segment_fails_before_the_command() {
+    // The sender's tmp_data directory exists, but it is read-only: the
+    // sender cannot create segments in it, and the run must end before
+    // the command starts (DESIGN.md §6.5). A command that started would
+    // be killed at once, before it could leave a mark of its own, so the
+    // test watches the command's script: `exec` opens it.
+    let transfer = Transfer::new("");
+    let tmp_data = "sender/home/.cache/hashsync/tmp-data";
+    transfer.env.mkdir(tmp_data);
+    transfer.env.chmod(tmp_data, 0o500);
+    let script = transfer.env.path("command");
+    std::fs::write(&script, "#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let opens =
+        inotify::init(inotify::CreateFlags::CLOEXEC | inotify::CreateFlags::NONBLOCK).unwrap();
+    inotify::add_watch(&opens, &script, inotify::WatchFlags::OPEN).unwrap();
+    let output = transfer.run(&[], &[script.as_os_str()]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("cannot create a segment in tmp_data directory"),
+        "{stderr}"
+    );
+    let mut event = [0u8; 256];
+    assert_eq!(
+        read(&opens, &mut event),
+        Err(Errno::AGAIN),
+        "the command started"
+    );
+}
+
+#[test]
+fn a_file_size_limit_on_the_sender_ends_the_run_with_its_cleanup() {
+    // The sender runs under a file-size limit of 64 KiB (128 KiB where
+    // `ulimit -f` counts KiB), and the command writes 1 MiB of new data,
+    // which the sender's spool writes to a segment. SIGXFSZ stays blocked
+    // in the sender, so that write fails with `EFBIG`, and `die` ends the
+    // run: it kills the command and removes the rendezvous socket
+    // (DESIGN.md §6.5 and §6.8). The default end of SIGXFSZ would skip
+    // that cleanup.
+    let transfer = Transfer::new("");
+    let limited = transfer.env.path("limited-hashsync");
+    let script = format!(
+        "#!/bin/sh\nulimit -f 128\nexec '{}' \"$@\"\n",
+        env!("CARGO_BIN_EXE_hashsync")
+    );
+    std::fs::write(&limited, script).unwrap();
+    std::fs::set_permissions(&limited, std::fs::Permissions::from_mode(0o755)).unwrap();
+    transfer.reconfigure(limited.as_os_str().as_bytes(), "");
+    transfer.env.write("payload", &random(1 << 20, 23));
+    let command = args(&["cat", transfer.env.path("payload").to_str().unwrap()]);
+    let output = transfer.run(&[], &refs(&command));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("cannot write a segment in tmp_data directory")
+            && stderr.contains("File too large"),
+        "{stderr}"
+    );
+    let sockets = transfer.env.path("sender/runtime/hashsync");
+    assert_eq!(
+        std::fs::read_dir(sockets).unwrap().count(),
+        0,
+        "the rendezvous socket remains"
+    );
+}
+
+#[test]
+fn the_command_starts_without_the_signals_that_hashsync_blocks() {
+    // Every role blocks SIGXFSZ in every thread, and the receiver also
+    // blocks SIGINT and SIGTERM. Each gives its children the mask from
+    // before, because a blocked signal stays blocked across `exec`. So the
+    // command, `cat` here, starts with none of these signals blocked.
+    let transfer = Transfer::new("");
+    let output = transfer.run_ok(&refs(&args(&["cat", "/proc/self/status"])));
+    let status = String::from_utf8(output.stdout).unwrap();
+    let blocked = status
+        .lines()
+        .find_map(|line| line.strip_prefix("SigBlk:"))
+        .expect("a SigBlk line");
+    let blocked = u64::from_str_radix(blocked.trim(), 16).unwrap();
+    for signal in [Signal::INT, Signal::TERM, Signal::XFSZ] {
+        // Bit `n - 1` of the mask stands for signal `n`.
+        let bit = 1 << (signal.as_raw() - 1);
+        assert_eq!(blocked & bit, 0, "{signal:?} is blocked: {blocked:x}");
+    }
+}
+
+#[test]
 fn a_slow_consumer_and_a_one_window_lookahead_keep_the_output_exact() {
     // The scanner may look only one window ahead, so every query waits for
-    // its answer before scanning goes on, and stdout drains slowly.
-    // Backpressure reaches the sender; output, answers, and pin release
-    // stay in order (DESIGN.md §6.3 and §6.4).
-    let transfer = Transfer::new(&format!("lookahead = {BLOCK}\n"));
+    // its answer before scanning goes on, and the command waits for the
+    // scanner once 64 KiB of its output are in the sender's spool. Stdout
+    // drains slowly, so the pins wait for stdout. The data session, about
+    // 100 bytes of references, waits in the receiver's spool. Output,
+    // answers, and pin release stay in order (DESIGN.md §6.3 to §6.5).
+    let transfer = Transfer::new(&format!(
+        "lookahead = {BLOCK}\nsender_spool_limit = \"64KiB\"\n"
+    ));
     let blocks = tiled(256, 17);
     transfer.env.write("tree/big", &blocks);
     let script = format!(
@@ -620,7 +722,7 @@ fn empty_output_and_command_failure_status() {
     assert!(output.stdout.is_empty());
 
     // A failing command still transfers its output and returns its
-    // status (DESIGN.md §6.5).
+    // status (DESIGN.md §6.6).
     let command = args(&["sh", "-c", "echo partial; exit 3"]);
     let output = transfer.run(&[], &refs(&command));
     assert_eq!(output.stdout, b"partial\n");
@@ -764,7 +866,7 @@ fn stderr_is_forwarded() {
 fn stderr_from_a_descendant_is_forwarded_after_the_command_exits() {
     // The descendant closes stdout but keeps stderr: command stdout hits
     // EOF at once, while stderr EOF and the relayed bytes come later.
-    // Successful completion requires the full relay (DESIGN.md §6.7).
+    // Successful completion requires the full relay (DESIGN.md §6.8).
     let transfer = Transfer::new("");
     let command = args(&[
         "sh",
@@ -815,34 +917,205 @@ fn no_update_requires_a_current_index() {
 #[test]
 fn cache_failures_are_fatal_on_either_side() {
     // Receiver: an unwritable cache root fails the run at publication
-    // (DESIGN.md §5.6 and §6.5).
+    // (DESIGN.md §5.6 and §6.6). The tmp_data directory is in the same
+    // root and opens earlier, so it exists already: else its creation
+    // would fail first, and the run would end before the publication.
     let transfer = Transfer::new("");
     let command = args(&["true"]);
-    transfer.env.chmod("receiver/cache", 0o555);
+    transfer.env.mkdir("receiver/cache/hashsync/tmp-data");
+    transfer.env.chmod("receiver/cache/hashsync", 0o555);
     let output = transfer.run(&[], &refs(&command));
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("cannot create"),
+        stderr.contains("cannot create ") && stderr.contains("/hashsync/local-hashlists:"),
         "receiver cache failure:\n{stderr}"
     );
-    transfer.env.chmod("receiver/cache", 0o755);
+    transfer.env.chmod("receiver/cache/hashsync", 0o755);
 
     // Sender: the same policy; its death fails the whole run, and its
-    // message reaches the receiver's stderr through SSH.
-    transfer.env.mkdir("sender/home/.cache");
-    transfer.env.chmod("sender/home/.cache", 0o555);
+    // message reaches the receiver's stderr through SSH. Its tmp_data
+    // directory exists too.
+    transfer.env.mkdir("sender/home/.cache/hashsync/tmp-data");
+    transfer.env.chmod("sender/home/.cache/hashsync", 0o555);
     let output = transfer.run(&[], &refs(&command));
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("cannot create"),
+        stderr.contains("cannot create ") && stderr.contains("/hashsync/remote-hashlists:"),
         "sender cache failure:\n{stderr}"
     );
-    transfer.env.chmod("sender/home/.cache", 0o755);
+    transfer.env.chmod("sender/home/.cache/hashsync", 0o755);
 
     // Writable again: the run succeeds.
     transfer.run_ok(&refs(&command));
+}
+
+#[test]
+fn the_command_ends_while_the_consumer_reads_nothing() {
+    // The consumer reads nothing until the command has written all its
+    // output, which is larger than all the buffers in memory between the
+    // command and the consumer: the scanner looks one window ahead, and
+    // the data queue holds 4 MiB. One spool holds at most 64 KiB. So the
+    // command ends first only because the other spool holds the output
+    // (DESIGN.md §6.4 and §6.5): the receiver's, which keeps reading the
+    // data session while stdout is blocked, or the sender's, without a
+    // limit.
+    for limits in [
+        "sender_spool_limit = \"64KiB\"\n",
+        "sender_spool_limit = \"unlimited\"\nreceiver_spool_limit = \"64KiB\"\n",
+    ] {
+        let transfer = Transfer::new(&format!(
+            "lookahead = {BLOCK}\n{limits}compression_level = 0\n"
+        ));
+        let payload = random(12 << 20, 21);
+        let path = transfer.env.path("payload");
+        std::fs::write(&path, &payload).unwrap();
+        let ended = transfer.env.path("ended");
+        mkfifoat(CWD, &ended, Mode::RUSR | Mode::WUSR).unwrap();
+        let script = format!(
+            "cat '{}'; echo ended > '{}'",
+            path.display(),
+            ended.display()
+        );
+        let receiver = transfer
+            .invocation(&[EXACT], &refs(&args(&["sh", "-c", &script])))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // The open waits for the command to open the FIFO, after its
+        // output.
+        let mut message = String::new();
+        File::open(&ended)
+            .unwrap()
+            .read_to_string(&mut message)
+            .unwrap();
+        assert_eq!(message, "ended\n");
+        let output = succeeded(receiver.wait_with_output().unwrap());
+        assert!(output.stdout == payload, "{limits}: the output differs");
+        assert_eq!(summary(&output), [payload.len(), payload.len(), 0, 0]);
+    }
+}
+
+#[test]
+fn the_command_waits_when_both_spools_reach_their_limits() {
+    // The consumer reads nothing at first, and each spool holds at most
+    // 64 KiB. The command's output, 16 MiB, is larger than the two spools
+    // and all the buffers in memory between the command and the consumer
+    // (about 6 MiB, mostly the data queue, or 9 MiB where a pipe holds
+    // 1 MiB), so the command cannot end before the consumer reads. If a
+    // spool ignored its limit, it would take the rest of the output, and
+    // the command would end (DESIGN.md §6.5). No event shows that the
+    // command stays blocked, so the test waits a fixed time for its end.
+    // On a slow machine, the wait can miss such a fault, but it cannot
+    // fail a correct build. Then the consumer reads everything.
+    let transfer = Transfer::new(&format!(
+        "lookahead = {BLOCK}\nsender_spool_limit = \"64KiB\"\n\
+         receiver_spool_limit = \"64KiB\"\ncompression_level = 0\n"
+    ));
+    let payload = random(16 << 20, 22);
+    let path = transfer.env.path("payload");
+    std::fs::write(&path, &payload).unwrap();
+    let ended = transfer.env.path("ended");
+    mkfifoat(CWD, &ended, Mode::RUSR | Mode::WUSR).unwrap();
+    // Opened for reading without a wait for a writer, and kept open, so
+    // that the command never waits to open the FIFO for writing.
+    let flags = OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let fifo = File::from(rustix::fs::open(&ended, flags, Mode::empty()).unwrap());
+    let script = format!(
+        "cat '{}'; echo ended > '{}'",
+        path.display(),
+        ended.display()
+    );
+    let receiver = transfer
+        .invocation(&[EXACT], &refs(&args(&["sh", "-c", &script])))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut fds = [PollFd::new(&fifo, PollFlags::IN)];
+    let wait = Timespec {
+        tv_sec: 5,
+        tv_nsec: 0,
+    };
+    let ready = retry_on_intr(|| poll(&mut fds, Some(&wait))).unwrap();
+    assert_eq!(
+        ready, 0,
+        "the command ended while the consumer read nothing: a spool ignored its limit"
+    );
+    let output = succeeded(receiver.wait_with_output().unwrap());
+    assert!(output.stdout == payload, "the output differs");
+    assert_eq!(summary(&output), [payload.len(), payload.len(), 0, 0]);
+    // The command wrote to the FIFO before it ended, and the receiver
+    // ended after the command.
+    let mut message = String::new();
+    (&fifo).read_to_string(&mut message).unwrap();
+    assert_eq!(message, "ended\n");
+}
+
+#[test]
+fn the_receiver_stops_reading_the_data_session_at_its_spool_limit() {
+    // Each spool has its own limit: the sender's comes from HELLO, and the
+    // receiver's from the receiver's configuration (DESIGN.md §6.5). Here
+    // the sender's spool has no limit, and the receiver's holds at most
+    // 64 KiB. The consumer reads nothing until the command has ended, so
+    // most of the 24 MiB of output waits in the sender's spool. Then the
+    // test kills the sender, and those bytes are lost: the receiver can
+    // write only the bytes that it read before, at most about 3.5 MiB of
+    // buffers, also where a pipe holds 1 MiB. If the receiver used the
+    // sender's limit, it would hold most of the output, and write it.
+    let transfer = Transfer::new(&format!(
+        "lookahead = {BLOCK}\nsender_spool_limit = \"unlimited\"\n\
+         receiver_spool_limit = \"64KiB\"\ncompression_level = 0\n"
+    ));
+    let payload = random(24 << 20, 24);
+    let path = transfer.env.path("payload");
+    std::fs::write(&path, &payload).unwrap();
+    let ended = transfer.env.path("ended");
+    mkfifoat(CWD, &ended, Mode::RUSR | Mode::WUSR).unwrap();
+    let script = format!(
+        "cat '{}'; echo ended > '{}'",
+        path.display(),
+        ended.display()
+    );
+    let receiver = transfer
+        .invocation(&[], &refs(&args(&["sh", "-c", &script])))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // The open waits for the command to open the FIFO, after its output.
+    let mut message = String::new();
+    File::open(&ended)
+        .unwrap()
+        .read_to_string(&mut message)
+        .unwrap();
+    assert_eq!(message, "ended\n");
+    // The sender is the SSH session that runs `serve`. The control
+    // session stays, so that only the end of the data session ends the
+    // run, after the receiver has written what it holds.
+    let sender = children(receiver.id())
+        .into_iter()
+        .find(|pid| {
+            let argv = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+            argv.split(|&byte| byte == 0).any(|arg| arg == b"serve")
+        })
+        .expect("no SSH session runs serve");
+    signal(sender, Signal::KILL);
+    let output = receiver.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("the data session ended unexpectedly"),
+        "{stderr}"
+    );
+    assert!(payload.starts_with(&output.stdout), "the output differs");
+    assert!(
+        output.stdout.len() < 10 << 20,
+        "the receiver held {} bytes of output: it read past its spool limit",
+        output.stdout.len()
+    );
 }
 
 #[test]
@@ -924,7 +1197,7 @@ fn a_data_session_that_ends_before_done_fails_the_run() {
     // data session without DONE, as a sender that fails after END_ACK
     // does. The receiver wrote the output, so it read END; without
     // compression, only DONE can then fail. The run fails although the
-    // output is complete (DESIGN.md §6.7). The fake control session sends
+    // output is complete (DESIGN.md §6.8). The fake control session sends
     // its version and stays open until its stdin ends.
     let transfer = Transfer::new("");
     // HELLO: an account ID and no base. END: status 0 and no error text.
@@ -1030,7 +1303,7 @@ fn children(pid: u32) -> Vec<u32> {
 fn a_termination_signal_decides_the_status_even_after_the_sessions_break() {
     // Ctrl-C reaches the receiver and its SSH children together. The dying
     // sessions can make another thread fail before the signal is handled,
-    // but the status must report the signal (DESIGN.md §6.6). Force that
+    // but the status must report the signal (DESIGN.md §6.7). Force that
     // order: stop the receiver, send it the signal, kill both sessions,
     // and let the receiver continue with both events already present.
     let transfer = Transfer::new("");
@@ -1116,7 +1389,7 @@ fn the_receiver_closes_stdin_before_either_stdout_ends() {
     // each session open until its SSH child exits, and the sender exits
     // only after stdin EOF. The receiver closes both stdin pipes after
     // DONE, without waiting for the EOF of either stdout, so the run still
-    // ends (DESIGN.md §6.7 and §10).
+    // ends (DESIGN.md §6.8 and §10).
     let transfer = Transfer::new("");
     let blocks = tiled(16, 28);
     transfer.env.write("tree/blocks", &blocks);
@@ -1132,7 +1405,7 @@ fn the_end_waits_for_a_process_that_keeps_the_control_session_open() {
     // After the control session's SSH exits, a process that inherited its
     // stdout keeps the pipe open for a moment, creates the marker, and
     // exits. The receiver reads each session to EOF and ends its threads
-    // before it exits (DESIGN.md §6.7), so it cannot exit before the
+    // before it exits (DESIGN.md §6.8), so it cannot exit before the
     // marker exists, however the processes are scheduled. The normal run,
     // the read-only run, and a command that fails to start end the same
     // way.
@@ -1179,7 +1452,7 @@ fn the_summary_counts_every_byte_that_the_sessions_deliver() {
     // `tee` copies the stdout of each session to a file. After the control
     // session's SSH exits, a process that inherited its stdout sends one
     // more QUERY, which the receiver skips in Completing. The receiver reads
-    // both sessions to EOF before the summary (DESIGN.md §6.7 and §8), so
+    // both sessions to EOF before the summary (DESIGN.md §6.8 and §8), so
     // the summary counts exactly the bytes of both files, that QUERY
     // included. One changed block makes the scanner rescan. The late QUERY
     // is a plain frame, so this run has no compression: inside a zstd
@@ -1299,8 +1572,8 @@ fn a_termination_signal_during_the_end_decides_the_status() {
     // After the control session's SSH exits, a process that inherited its
     // stdout keeps the pipe open while the hold file exists, until the test
     // ends and removes its directory. So the receiver waits in its end
-    // (DESIGN.md §6.7). The signal thread still runs then: SIGTERM ends the
-    // run with `128 + signal` (DESIGN.md §6.6).
+    // (DESIGN.md §6.8). The signal thread still runs then: SIGTERM ends the
+    // run with `128 + signal` (DESIGN.md §6.7).
     let transfer = Transfer::new("");
     let hold = transfer.env.path("hold");
     std::fs::write(&hold, b"").unwrap();

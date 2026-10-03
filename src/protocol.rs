@@ -18,7 +18,7 @@
 //! are the hash list, which is already as small as zstd can make it.
 //!
 //! Malformed payloads, invalid compressed data, and violated frame rules
-//! are bugs in a compatible peer: parsers panic (DESIGN.md §6.5). Transport
+//! are bugs in a compatible peer: parsers panic (DESIGN.md §6.6). Transport
 //! failures, including EOF inside a frame, surface as `io::Error` for the
 //! caller to turn into `die`.
 
@@ -95,6 +95,10 @@ pub struct ReceiverHello {
     pub lookahead: u64,
     /// Bytes.
     pub negative_cache: u64,
+    /// The most bytes of command output that wait in the sender's spool
+    /// before the command waits; `u64::MAX` sets no limit (DESIGN.md
+    /// §6.5).
+    pub sender_spool_limit: u64,
     /// The command's argv; argv[0] is found in PATH and run directly.
     pub command: Vec<Vec<u8>>,
 }
@@ -116,6 +120,7 @@ impl ReceiverHello {
         enc.u32(self.probe_threads);
         enc.u64(self.lookahead);
         enc.u64(self.negative_cache);
+        enc.u64(self.sender_spool_limit);
         enc.u32(list_len(self.command.len()));
         for arg in &self.command {
             enc.bytes(arg);
@@ -152,6 +157,7 @@ impl ReceiverHello {
             probe_threads: dec.u32(),
             lookahead: dec.u64(),
             negative_cache: dec.u64(),
+            sender_spool_limit: dec.u64(),
             command: dec.list(Dec::string_bytes),
         };
         dec.done();
@@ -369,7 +375,7 @@ impl Enc {
 }
 
 /// A payload parser. Truncation, trailing bytes, and invalid values are
-/// protocol errors and panic (DESIGN.md §6.5).
+/// protocol errors and panic (DESIGN.md §6.6).
 pub struct Dec<'a> {
     buf: &'a [u8],
     what: &'static str,
@@ -612,7 +618,7 @@ impl<W: Write> FrameWriter<W> {
     /// the queue delivers. When nothing is queued, flush first: the
     /// scanner waits for answers, so queries and answers must not stay in
     /// a buffer or in the compressor while this thread waits (DESIGN.md
-    /// §6.2 and §6.6). `None`, after a flush, once the queue is closed and
+    /// §6.2 and §6.7). `None`, after a flush, once the queue is closed and
     /// empty.
     pub fn next_from<T>(&mut self, queue: &Receiver<T>) -> std::io::Result<Option<T>> {
         match queue.try_recv() {
@@ -639,7 +645,7 @@ const LONG_WINDOW_LOG: u32 = 27;
 /// `flush` makes every byte written so far decodable by the peer, for a
 /// frame that it must answer. The sender's data session begins the stream
 /// after its HELLO, and `finish` ends it after END. The zstd frame has a
-/// checksum: the trailer that the receiver checks (DESIGN.md §6.7). Each
+/// checksum: the trailer that the receiver checks (DESIGN.md §6.8). Each
 /// direction of the control session begins its stream after the protocol
 /// version, and no frame ends it: the closure of the session ends it.
 ///
@@ -761,7 +767,7 @@ impl<W: Write> Write for Compressor<W> {
 /// stream, or the closure of a control session. Other transport failures
 /// are `io::Error`s too, for the caller. Invalid compressed data, including
 /// a wrong checksum, and a frame that ends before END or on the control
-/// session are protocol errors and panic (DESIGN.md §6.5): a truncated
+/// session are protocol errors and panic (DESIGN.md §6.6): a truncated
 /// stream cannot end a frame, because its end needs the last block and the
 /// checksum.
 pub struct Decompressor<R: BufRead> {
@@ -794,7 +800,7 @@ impl<R: BufRead> Decompressor<R> {
 
     /// After END: read the rest of the zstd frame, which must hold no more
     /// decoded bytes, and return the transport, right after the frame
-    /// (DESIGN.md §6.7). Only the frame is read: this does not wait for the
+    /// (DESIGN.md §6.8). Only the frame is read: this does not wait for the
     /// transport's EOF. Without compression, END ends the stream.
     pub fn finish(mut self) -> std::io::Result<R> {
         if let Some(zstd) = &mut self.zstd {
@@ -994,6 +1000,7 @@ mod tests {
             probe_threads: 5,
             lookahead: 256 << 20,
             negative_cache: 128 << 20,
+            sender_spool_limit: 2 << 30,
             command: vec![b"printf".to_vec(), b"%s".to_vec(), b"\xff\xfe".to_vec()],
         }
     }
@@ -1041,6 +1048,8 @@ mod tests {
         assert!(decoded.sender_cache);
         assert!(decoded.compression_long);
         assert_eq!(decoded.probe_threads, 5);
+        assert_eq!(decoded.negative_cache, 128 << 20);
+        assert_eq!(decoded.sender_spool_limit, 2 << 30);
         assert_eq!(decoded.command, hello.command);
     }
 
@@ -1290,7 +1299,7 @@ mod tests {
     fn a_truncated_stream_is_unexpected_eof() {
         // Wherever the stream ends early, even inside the trailer after
         // END, reading reports UnexpectedEof, never a clean end
-        // (DESIGN.md §6.7).
+        // (DESIGN.md §6.8).
         let stream = compressed(
             3,
             false,
@@ -1406,7 +1415,7 @@ mod tests {
     #[should_panic(expected = "protocol error: the compressed stream ended early")]
     fn a_frame_that_ends_before_end_is_a_protocol_error() {
         // Only the sender ends the zstd frame, after END; a truncated
-        // stream cannot end it (DESIGN.md §6.5).
+        // stream cannot end it (DESIGN.md §6.6).
         read_after_lit(&ended_before_end(b""));
     }
 

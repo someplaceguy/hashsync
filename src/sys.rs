@@ -141,7 +141,7 @@ fn last_errno() -> Errno {
 
 /// Wait for a child to exit without reaping it (`WEXITED | WNOWAIT`), so
 /// its process and group IDs stay reserved until this process exits
-/// (DESIGN.md §6.6). Returns the child's exit status, or `128 + signal`
+/// (DESIGN.md §6.7). Returns the child's exit status, or `128 + signal`
 /// when a signal terminated it.
 pub fn wait_exit_status(pid: rustix::process::Pid) -> i32 {
     use rustix::process::{WaitId, WaitIdOptions, waitid};
@@ -171,7 +171,7 @@ pub fn exit_now(status: i32) -> ! {
 
 /// Set `SIGCHLD` to `SIG_DFL` with `SA_NOCLDWAIT` clear, so children stay
 /// unreaped until process exit and `waitid` with `WNOWAIT` can observe
-/// them (DESIGN.md §6.6). Call before spawning the first child.
+/// them (DESIGN.md §6.7). Call before spawning the first child.
 pub fn reset_sigchld() {
     // SAFETY: a zeroed `sigaction` with an empty mask installs `SIG_DFL`
     // with no flags, which is a valid disposition for `SIGCHLD`.
@@ -205,13 +205,9 @@ const TERMINATION_SIGNALS: [c_int; 2] = [libc::SIGINT, libc::SIGTERM];
 #[derive(Clone, Copy)]
 pub struct SignalMask(libc::sigset_t);
 
-/// Block SIGINT, SIGTERM, and SIGXFSZ in the calling thread. Returns the
-/// mask from before, and a `signalfd` that is readable while SIGINT or
-/// SIGTERM is pending. The descriptor is only polled, never read, so the
-/// signal stays pending. A blocked SIGXFSZ only stays pending: the write
-/// past the file-size limit that raised it fails with `EFBIG`.
-pub fn block_termination_signals() -> (SignalMask, OwnedFd) {
-    let blocked = signal_set(&[libc::SIGINT, libc::SIGTERM, libc::SIGXFSZ]);
+/// Block `signals` in the calling thread. Returns the mask from before.
+pub fn block_signals(signals: &[c_int]) -> SignalMask {
+    let blocked = signal_set(signals);
     // SAFETY: `blocked` is an initialized signal set, and the kernel
     // writes the old mask to `old`.
     let old = unsafe {
@@ -220,12 +216,20 @@ pub fn block_termination_signals() -> (SignalMask, OwnedFd) {
         assert_eq!(rc, 0, "pthread_sigmask: {}", Errno::from_raw_os_error(rc));
         old
     };
+    SignalMask(old)
+}
+
+/// Block SIGINT and SIGTERM in the calling thread. Returns a `signalfd`
+/// that is readable while one of them is pending. The descriptor is only
+/// polled, never read, so the signal stays pending.
+pub fn block_termination_signals() -> OwnedFd {
+    block_signals(&TERMINATION_SIGNALS);
     let set = signal_set(&TERMINATION_SIGNALS);
     // SAFETY: `-1` requests a new descriptor for the signals in `set`.
     let fd = unsafe { libc::signalfd(-1, &set, libc::SFD_CLOEXEC) };
     assert!(fd >= 0, "signalfd: {}", last_errno());
     // SAFETY: `signalfd` returned a new descriptor that nothing else owns.
-    (SignalMask(old), unsafe { OwnedFd::from_raw_fd(fd) })
+    unsafe { OwnedFd::from_raw_fd(fd) }
 }
 
 /// Start `command`'s child with `mask` blocked, instead of the mask of the

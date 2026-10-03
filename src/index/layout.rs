@@ -2,7 +2,7 @@
 //!
 //! Integers are big endian, so the byte order of keys is their numeric
 //! order. A malformed entry is a database error, which panics
-//! (DESIGN.md §6.5).
+//! (DESIGN.md §6.6).
 
 use crate::hash::PREFIX_LEN;
 

@@ -13,7 +13,7 @@
 //! run.
 //!
 //! A fatal end drops no pool: `die` and panics end the process without
-//! destructors, so without joins (DESIGN.md §6.7).
+//! destructors, so without joins (DESIGN.md §6.8).
 
 use std::ops::Deref;
 use std::thread::JoinHandle;

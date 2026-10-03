@@ -25,6 +25,7 @@ pub const DEFAULT_HASHLIST_MAX_AGE: u64 = 90 * 24 * 3600;
 
 const DEFAULT_LOOKAHEAD: u64 = 256 << 20;
 const DEFAULT_NEGATIVE_CACHE: u64 = 128 << 20;
+const DEFAULT_SPOOL_LIMIT: u64 = 2 << 30;
 const DEFAULT_CANDIDATE_ATTEMPTS: u32 = 128;
 const DEFAULT_COMPRESSION_LEVEL: i32 = 9;
 
@@ -43,6 +44,14 @@ pub struct Config {
     pub lookahead: u64,
     /// The sender's cache of hashes answered no, in bytes.
     pub negative_cache: u64,
+    /// The most bytes of command output that wait in the sender's spool
+    /// before the command waits (DESIGN.md §6.5); `u64::MAX` for
+    /// `unlimited`.
+    pub sender_spool_limit: u64,
+    /// The most bytes of the data session that wait in the receiver's
+    /// spool before the receiver stops reading the session (DESIGN.md
+    /// §6.5); `u64::MAX` for `unlimited`.
+    pub receiver_spool_limit: u64,
     /// The sender's weak-table probe threads; 0 selects half the sender's
     /// cores, at least one (DESIGN.md §6.3).
     pub probe_threads: u32,
@@ -57,9 +66,9 @@ pub struct Config {
     /// The sender's compression threads; 0 selects half the sender's
     /// cores, at least one.
     pub compression_threads: u32,
-    /// Path bytes of the directory that holds the receiver's segments
-    /// (DESIGN.md §6.4).
-    pub pin_directory: Vec<u8>,
+    /// Path bytes of the receiver's tmp_data directory, which holds the
+    /// segments of the pins and of the spool (DESIGN.md §6.5).
+    pub tmp_data_dir: Vec<u8>,
     /// The transfer options a host override can replace; read them
     /// through `transfer_options`.
     ssh: Vec<Vec<u8>>,
@@ -158,12 +167,14 @@ struct RawConfig {
     hashlist_max_age: Option<String>,
     lookahead: Option<Size>,
     negative_cache: Option<Size>,
+    sender_spool_limit: Option<Size>,
+    receiver_spool_limit: Option<Size>,
     probe_threads: Option<u32>,
     candidate_attempts: Option<u32>,
     compression_level: Option<i32>,
     compression_long: Option<bool>,
     compression_threads: Option<u32>,
-    pin_directory: Option<String>,
+    tmp_data_dir: Option<String>,
     ssh: Option<String>,
     sender_command: Option<String>,
     sender_cache: Option<bool>,
@@ -256,6 +267,10 @@ pub fn parse(text: &str) -> Result<Config, String> {
         None => DEFAULT_NEGATIVE_CACHE,
         Some(size) => size.bytes().map_err(|e| format!("negative_cache: {e}"))?,
     };
+    let sender_spool_limit = parse_spool_limit(raw.sender_spool_limit)
+        .map_err(|e| format!("sender_spool_limit: {e}"))?;
+    let receiver_spool_limit = parse_spool_limit(raw.receiver_spool_limit)
+        .map_err(|e| format!("receiver_spool_limit: {e}"))?;
     let candidate_attempts = raw.candidate_attempts.unwrap_or(DEFAULT_CANDIDATE_ATTEMPTS);
     if candidate_attempts == 0 {
         return Err("candidate_attempts must be at least 1".into());
@@ -268,9 +283,9 @@ pub fn parse(text: &str) -> Result<Config, String> {
             COMPRESSION_LEVELS.end()
         ));
     }
-    let pin_directory = match raw.pin_directory {
-        None => default_pin_directory(),
-        Some(text) => parse_path(&text).map_err(|e| format!("pin_directory: {e}"))?,
+    let tmp_data_dir = match raw.tmp_data_dir {
+        None => default_tmp_data_dir(),
+        Some(text) => parse_path(&text).map_err(|e| format!("tmp_data_dir: {e}"))?,
     };
     let hashlist_max_age = match raw.hashlist_max_age {
         None => DEFAULT_HASHLIST_MAX_AGE,
@@ -314,18 +329,31 @@ pub fn parse(text: &str) -> Result<Config, String> {
         hashlist_max_age,
         lookahead,
         negative_cache,
+        sender_spool_limit,
+        receiver_spool_limit,
         probe_threads: raw.probe_threads.unwrap_or(0),
         candidate_attempts,
         compression_level,
         compression_long: raw.compression_long.unwrap_or(true),
         compression_threads: raw.compression_threads.unwrap_or(0),
-        pin_directory,
+        tmp_data_dir,
         ssh,
         sender_command,
         sender_cache: raw.sender_cache.unwrap_or(true),
         hosts,
         roots,
     })
+}
+
+/// A spool limit: a size, or `unlimited` for none. No limit is `u64::MAX`
+/// bytes, which no spool reaches, so the spools need no special case for
+/// it (DESIGN.md §6.5).
+fn parse_spool_limit(size: Option<Size>) -> Result<u64, String> {
+    match size {
+        None => Ok(DEFAULT_SPOOL_LIMIT),
+        Some(Size::Text(text)) if text.trim().eq_ignore_ascii_case("unlimited") => Ok(u64::MAX),
+        Some(size) => size.bytes().map_err(|e| format!("{e} (or \"unlimited\")")),
+    }
 }
 
 impl Size {
@@ -576,9 +604,11 @@ pub fn default_index_path() -> Vec<u8> {
     path
 }
 
-fn default_pin_directory() -> Vec<u8> {
+/// `$XDG_CACHE_HOME/hashsync/tmp-data`: the receiver's default tmp_data
+/// directory, and the sender's only one (DESIGN.md §6.5).
+pub fn default_tmp_data_dir() -> Vec<u8> {
     let mut path = xdg_dir("XDG_CACHE_HOME", ".cache");
-    path.extend_from_slice(b"/hashsync/pins");
+    path.extend_from_slice(b"/hashsync/tmp-data");
     path
 }
 
@@ -683,12 +713,14 @@ index_path = '/tmp/\xFF/default.db'
 threads = 24
 lookahead = "1MiB"
 negative_cache = 0
+sender_spool_limit = "64MiB"
+receiver_spool_limit = "unlimited"
 probe_threads = 5
 candidate_attempts = 3
 compression_level = 19
 compression_long = false
 compression_threads = 2
-pin_directory = '/var/\xFE/pins'
+tmp_data_dir = '/var/\xFE/tmp'
 
 [[roots]]
 path = '/srv/archive-\xFF'
@@ -706,12 +738,14 @@ one_filesystem = true
         assert_eq!(config.threads, 24);
         assert_eq!(config.lookahead, 1 << 20);
         assert_eq!(config.negative_cache, 0);
+        assert_eq!(config.sender_spool_limit, 64 << 20);
+        assert_eq!(config.receiver_spool_limit, u64::MAX);
         assert_eq!(config.probe_threads, 5);
         assert_eq!(config.candidate_attempts, 3);
         assert_eq!(config.compression_level, 19);
         assert!(!config.compression_long);
         assert_eq!(config.compression_threads, 2);
-        assert_eq!(config.pin_directory, b"/var/\xfe/pins");
+        assert_eq!(config.tmp_data_dir, b"/var/\xfe/tmp");
         assert_eq!(config.roots.len(), 2);
         assert_eq!(config.roots[0].pattern, b"/srv/archive-\xff");
         let exclude = &config.roots[0].exclude;
@@ -741,12 +775,18 @@ one_filesystem = true
         assert_eq!(config.threads, 0);
         assert_eq!(config.lookahead, 256 << 20);
         assert_eq!(config.negative_cache, 128 << 20);
+        assert_eq!(config.sender_spool_limit, 2 << 30);
+        assert_eq!(config.receiver_spool_limit, 2 << 30);
         assert_eq!(config.probe_threads, 0);
         assert_eq!(config.candidate_attempts, 128);
         assert_eq!(config.compression_level, 9);
         assert!(config.compression_long);
         assert_eq!(config.compression_threads, 0);
-        assert!(config.pin_directory.ends_with(b"/hashsync/pins"));
+        assert!(config.tmp_data_dir.ends_with(b"/hashsync/tmp-data"));
+        let limits =
+            parse("sender_spool_limit = 0\nreceiver_spool_limit = \" Unlimited \"").unwrap();
+        assert_eq!(limits.sender_spool_limit, 0);
+        assert_eq!(limits.receiver_spool_limit, u64::MAX);
         assert_eq!(parse("compression_level = 0").unwrap().compression_level, 0);
         assert_eq!(config.roots[0].pattern, b"/srv/\xff/*");
         let config = parse("[[roots]]\npath = '/srv/\\xFF/*'\n").unwrap();
@@ -786,11 +826,16 @@ one_filesystem = true
                 .contains("at least 1")
         );
         assert!(parse("negative_cache = \"lots\"").is_err());
+        assert!(
+            parse("sender_spool_limit = \"lots\"")
+                .unwrap_err()
+                .contains("sender_spool_limit: expected a number: \"lots\" (or \"unlimited\")")
+        );
         assert!(parse("probe_threads = -1").is_err());
         assert!(
-            parse("pin_directory = '/a\\x00b'")
+            parse("tmp_data_dir = '/a\\x00b'")
                 .unwrap_err()
-                .contains("NUL")
+                .contains("tmp_data_dir: NUL byte is not allowed")
         );
         for level in ["-1", "20"] {
             assert!(

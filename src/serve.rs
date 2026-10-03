@@ -10,20 +10,23 @@
 //!
 //! Each incoming direction has one owner for the whole run, so session
 //! loss is fatal at any moment — during rendezvous, setup, startup
-//! failure, and transfer alike (DESIGN.md §6.7). The data reader owns
+//! failure, and transfer alike (DESIGN.md §6.8). The data reader owns
 //! stdin and walks the receiver's fixed sequence: the protocol version,
 //! HELLO, HASHLIST and the list bytes, END_ACK, closure. From acceptance,
 //! the control reader owns the incoming direction of the control socket:
 //! the protocol version, then answers. The control writer owns the
 //! outgoing one: the protocol version, then queries. The main thread
 //! writes the setup frames, then gives the data session to the data
-//! writer and runs the scanner (DESIGN.md §6.6): it
+//! writer and runs the scanner (DESIGN.md §6.7): it
 //! takes command output from the output reader and answers from the
 //! control reader, lends long stretches of windows to the probe threads,
 //! and queues queries for the control writer and frames for the data
-//! writer. Command success and startup failure share one completion path.
+//! writer. The command's stdout goes through a spool, so the command
+//! waits for the scanner only when `sender_spool_limit` bytes wait for it
+//! (DESIGN.md §6.5). Command success and startup failure share one
+//! completion path.
 //!
-//! The normal end joins every thread (DESIGN.md §6.7). After the cleanup,
+//! The normal end joins every thread (DESIGN.md §6.8). After the cleanup,
 //! DONE tells the receiver that this side needs neither session any more,
 //! and the receiver then closes both stdin pipes. The data reader monitors
 //! the receiver until that EOF, and the main thread joins it last. Until
@@ -34,7 +37,7 @@ use std::net::Shutdown;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
-use std::process::{ChildStdout, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering::SeqCst};
 
@@ -43,6 +46,7 @@ use crossbeam_channel::{Receiver, Select, Sender, TryRecvError, bounded, unbound
 use rustix::process::Pid;
 
 use crate::cache::{self, ListStore, PublishedList};
+use crate::config;
 use crate::die::{self, die};
 use crate::fsops::{self, FdWriter, retry_interrupted};
 use crate::hash;
@@ -55,6 +59,8 @@ use crate::protocol::{
 };
 use crate::rendezvous;
 use crate::scanner::{Frame, Scanner};
+use crate::segments::Directory;
+use crate::spool::Spool;
 use crate::sys;
 
 /// The read size of the output reader.
@@ -76,7 +82,7 @@ enum Output {
     End(End),
 }
 
-/// How far the end of the run has come (DESIGN.md §6.7). The main thread
+/// How far the end of the run has come (DESIGN.md §6.8). The main thread
 /// moves it forward, one phase after the other. The reader and writer
 /// threads read it to tell the frames and closures that the end expects
 /// from failures.
@@ -145,6 +151,10 @@ pub fn run(token: &str) -> ! {
     // after it accepted the receiver's parameters.
     let hello: ReceiverHello = hello_rx.recv().expect("the data reader ended before HELLO");
     validate_hello(&hello);
+    // This side's tmp_data directory, for the spool of the command's
+    // output. An unusable directory ends the run when it opens: here,
+    // before the list exchange and command startup (DESIGN.md §6.5).
+    let tmp_data = Arc::new(Directory::open(&config::default_tmp_data_dir()));
     let reply = SenderHello {
         account_id: cache::account_id(),
         // Cached-list reuse arrives with PLAN.md step 8: advertise
@@ -257,7 +267,7 @@ pub fn run(token: &str) -> ! {
     let probe_pool = start_probe_pool(hello.probe_threads);
 
     // The command. Keep it unreaped and in its own process group
-    // (DESIGN.md §6.6); a fatal exit SIGKILLs the group, and the spawn
+    // (DESIGN.md §6.7); a fatal exit SIGKILLs the group, and the spawn
     // is atomic with that registration.
     sys::reset_sigchld();
     let argv: Vec<&std::ffi::OsStr> = hello
@@ -286,12 +296,20 @@ pub fn run(token: &str) -> ! {
 
                 // Stdout EOF and the exit status are separate conditions;
                 // the scan needs the first, END the second (DESIGN.md
-                // §6.3).
+                // §6.3). Stdout goes through a spool, so the command does
+                // not wait for the scanner until `sender_spool_limit` bytes
+                // wait in the spool.
                 let command_stdout = child.stdout.take().unwrap();
+                let output = Spool::start(
+                    "the command's output",
+                    command_stdout,
+                    tmp_data,
+                    hello.sender_spool_limit,
+                );
                 let (chunk_tx, chunk_rx) = bounded(1);
                 let output_reader = std::thread::Builder::new()
                     .name("output-reader".into())
-                    .spawn(move || read_output(command_stdout, &chunk_tx))
+                    .spawn(move || read_output(output, &chunk_tx))
                     .expect("cannot start the output reader");
                 let mut scanner = Scanner::new(
                     table,
@@ -302,7 +320,8 @@ pub fn run(token: &str) -> ! {
                     probe_pool.as_deref(),
                 );
                 transfer(&mut scanner, &chunk_rx, &answer_rx, &output_tx, &query_tx);
-                // The scan ended after the output reader closed its queue.
+                // The scan ended after the output reader closed its queue,
+                // at the end of the spool, which it closed too.
                 output_reader.join().expect("the output reader panicked");
                 let status = sys::wait_exit_status(Pid::from_child(&child));
                 (status, String::new(), Some(relay))
@@ -314,7 +333,7 @@ pub fn run(token: &str) -> ! {
     // No more queries: the control writer can end.
     drop(query_tx);
 
-    // The completion conditions of DESIGN.md §6.7, one path for command
+    // The completion conditions of DESIGN.md §6.8, one path for command
     // success and startup failure: END, one valid END_ACK, and a
     // finished stderr relay when command streams exist. Enter `EndSent`
     // first so an immediate acknowledgement is valid.
@@ -332,7 +351,7 @@ pub fn run(token: &str) -> ! {
         relay.join().expect("the stderr relay panicked");
     }
 
-    // Normal cleanup once (DESIGN.md §6.7): shut down the control socket,
+    // Normal cleanup once (DESIGN.md §6.8): shut down the control socket,
     // join the control threads and the probe threads, send DONE, join the
     // data reader, then end normally, which removes the rendezvous socket.
     // Sender stdout stays open until process exit. From here on, both
@@ -449,22 +468,26 @@ fn queue_frames(scanner: &mut Scanner, output: &Sender<Output>) -> bool {
     queued
 }
 
-/// Read the command's stdout into chunks for the scanner, until EOF closes
-/// the queue. The bounded queue pauses reading while the scanner's buffer
-/// is full.
-fn read_output(mut stdout: ChildStdout, chunks: &Sender<Vec<u8>>) {
+/// Read the command's output from its spool into chunks for the scanner,
+/// until the EOF of the spool. Then close the spool, which joins its
+/// thread (DESIGN.md §6.8), and return, which closes the queue. The
+/// bounded queue pauses reading while the scanner's buffer is full;
+/// meanwhile, the output waits in the spool (DESIGN.md §6.3).
+fn read_output(mut output: Spool, chunks: &Sender<Vec<u8>>) {
     let mut buf = vec![0u8; READ_CHUNK];
     loop {
-        match retry_interrupted(|| stdout.read(&mut buf)) {
-            Ok(0) => return,
-            Ok(n) => {
-                if chunks.send(buf[..n].to_vec()).is_err() {
-                    return;
-                }
-            }
-            Err(e) => die(format!("cannot read the command's output: {e}")),
+        // A spool read never fails: the spool itself ends the run when it
+        // cannot read the command's output or a segment.
+        let n = output.read(&mut buf).expect("a spool read failed");
+        if n == 0 {
+            break;
         }
+        // The scanner takes chunks until this thread closes the queue.
+        chunks
+            .send(buf[..n].to_vec())
+            .expect("the scanner ended before the command's output");
     }
+    output.close();
 }
 
 /// The data session's outgoing direction after setup: frames in order,
@@ -502,7 +525,7 @@ fn write_output(
 /// (DESIGN.md §6.2). Obsolete queries do not delay completion (DESIGN.md
 /// §6.3), so normal cleanup can close the socket while this thread still
 /// has some to send. In Completing, a failed write is expected closure,
-/// not a failure (DESIGN.md §6.7).
+/// not a failure (DESIGN.md §6.8).
 fn write_queries(stream: UnixStream, level: i32, queries: &Receiver<Query>, progress: &Progress) {
     let mut control_out = FrameWriter::new(BufWriter::new(stream));
     let mut result = control_out
@@ -526,7 +549,7 @@ fn write_queries(stream: UnixStream, level: i32, queries: &Receiver<Query>, prog
 /// The single owner of the data session's incoming direction, for the
 /// whole run: the protocol version, HELLO, the list, END_ACK, then
 /// closure. EOF before DONE is the receiver's disappearance and is fatal
-/// (DESIGN.md §6.7). The receiver closes the session after DONE, so EOF
+/// (DESIGN.md §6.8). The receiver closes the session after DONE, so EOF
 /// then is the normal end of this thread, and the main thread joins it.
 fn data_reader<R: Read>(
     mut data_in: FrameReader<R>,
@@ -599,7 +622,7 @@ fn data_reader<R: Read>(
 /// The owner of the control session's incoming direction: the protocol
 /// version, whose check gates command startup, then answers for the
 /// scanner until closure, which is fatal before the normal cleanup
-/// (DESIGN.md §6.7). The answers are one zstd stream when `compressed`
+/// (DESIGN.md §6.8). The answers are one zstd stream when `compressed`
 /// (DESIGN.md §6.2).
 fn read_answers(
     stream: UnixStream,
@@ -639,7 +662,7 @@ fn read_answers(
 }
 
 /// Copy command stderr to this process's stderr through EOF, with
-/// prompt writes. Failures are fatal (DESIGN.md §6.5).
+/// prompt writes. Failures are fatal (DESIGN.md §6.6).
 fn relay_stderr(command_stderr: &mut std::process::ChildStderr) {
     let mut stderr = fsops::stderr();
     let mut buf = vec![0u8; 64 * 1024];
@@ -683,7 +706,7 @@ fn clone_control(control: &UnixStream) -> UnixStream {
 }
 
 /// The receiver's HELLO parameters are the run's: use them, or end the
-/// run before command startup (DESIGN.md §6.2, §6.5). Decoding already
+/// run before command startup (DESIGN.md §6.2, §6.6). Decoding already
 /// checked the strong hash.
 fn validate_hello(hello: &ReceiverHello) {
     if hello.weak_hash_id != hash::weak::ID {
@@ -852,6 +875,7 @@ mod tests {
             probe_threads: 0,
             lookahead: u64::from(BS),
             negative_cache: 0,
+            sender_spool_limit: 0,
             command: vec![b"true".to_vec()],
         };
         let header = HashList {
@@ -871,7 +895,7 @@ mod tests {
     /// A byte after END_ACK is a protocol error, also after DONE, and also
     /// when no whole frame follows it: here the first byte of a second
     /// END_ACK, then EOF. Only EOF after DONE is the normal end
-    /// (DESIGN.md §6.7).
+    /// (DESIGN.md §6.8).
     #[test]
     #[should_panic(expected = "protocol error: data after END_ACK")]
     fn a_byte_after_end_ack_is_a_protocol_error() {

@@ -48,7 +48,7 @@ pub fn random_bytes<const N: usize>() -> [u8; N] {
 }
 
 /// A cache operation failed for a reason other than absence
-/// (DESIGN.md §5.6 and §6.5).
+/// (DESIGN.md §5.6 and §6.6).
 fn fatal(action: &str, path: &Path, error: impl std::fmt::Display) -> ! {
     die(format!("cannot {action} {}: {error}", path.display()))
 }
@@ -318,7 +318,7 @@ impl ListStore {
     /// Durably publish `encoded` under its content-derived name.
     /// Republishes an existing name rather than trusting it. Failures
     /// are fatal; a failure can leave the hidden temporary for expiry
-    /// (DESIGN.md §6.7).
+    /// (DESIGN.md §6.8).
     pub fn publish(&self, id: &ListId, encoded: &[u8]) -> PublishedList {
         create_dirs(&self.base, &self.dir, 0o700);
         let temp = self.dir.join(format!(".{}", hex(&random_bytes::<8>())));

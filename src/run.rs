@@ -6,11 +6,14 @@
 //! starts both SSH sessions, and completes the exchange. It then
 //! reconstructs stdout from literals, runs, and references, which arrive
 //! through the compression stream, while the lookup workers answer the
-//! sender's queries (DESIGN.md §6.4). Queries and answers have compression
-//! streams of their own (DESIGN.md §6.2). It returns the command's status
-//! once both sessions exited successfully, after a summary.
+//! sender's queries (DESIGN.md §6.4). The data session goes through a
+//! spool, so that a blocked stdout does not stop the transfer until
+//! `receiver_spool_limit` bytes wait in the spool (DESIGN.md §6.5).
+//! Queries and answers have compression streams of their own (DESIGN.md
+//! §6.2). It returns the command's status once both sessions
+//! exited successfully, after a summary.
 //!
-//! The end is orderly (DESIGN.md §6.7). After END_ACK, DONE tells the
+//! The end is orderly (DESIGN.md §6.8). After END_ACK, DONE tells the
 //! receiver that the sender needs neither session any more. The main
 //! thread then closes both stdin pipes, without waiting for the EOF of
 //! either stdout, and joins each thread of the transfer once its work
@@ -44,6 +47,8 @@ use crate::protocol::{
 };
 use crate::rendezvous;
 use crate::roots::{self, Location};
+use crate::segments::Directory;
+use crate::spool::Spool;
 use crate::ssh;
 use crate::sys;
 use crate::units::Bytes;
@@ -70,7 +75,7 @@ pub fn run(
 ) -> ! {
     let start = Instant::now();
     // Before any other thread starts: SIGINT and SIGTERM end the run with
-    // `128 + signal`, and the end kills the SSH children (DESIGN.md §6.6).
+    // `128 + signal`, and the end kills the SSH children (DESIGN.md §6.7).
     die::handle_termination_signals();
 
     let options = config.transfer_options(host.as_bytes(), cli_ssh.map(OsStr::as_bytes));
@@ -92,12 +97,14 @@ pub fn run(
         digest: config.strong_hash.digest(&encoded),
     };
 
-    // The pins, with their first segment, and the lookup workers, which
-    // answer queries as soon as they arrive (DESIGN.md §6.4). An unusable
-    // pin directory ends the run here, before the sessions start.
+    // The tmp_data directory holds the segments of the pins and of the
+    // spool of the data session (DESIGN.md §6.5). An unusable directory
+    // ends the run when it opens, before the sessions start. The lookup
+    // workers answer queries as soon as they arrive (DESIGN.md §6.4).
+    let tmp_data = Arc::new(Directory::open(&config.tmp_data_dir));
     let (answer_tx, answer_rx) = unbounded();
     let pins = Arc::new(Pins::new(
-        &config.pin_directory,
+        Arc::clone(&tmp_data),
         config.strong_hash,
         config.block_size,
         answer_tx,
@@ -116,9 +123,9 @@ pub fn run(
     let sessions = [(data.pid(), "data"), (control.pid(), "control")];
 
     // Each direction of the control session has one thread, from the
-    // protocol version on (DESIGN.md §6.2 and §6.6). The control writer
+    // protocol version on (DESIGN.md §6.2 and §6.7). The control writer
     // gives the session's stdin back when it ends: the pipe must stay open
-    // until DONE (DESIGN.md §6.7).
+    // until DONE (DESIGN.md §6.8).
     let control_writer = {
         let pins = Arc::clone(&pins);
         let control_stdin = control.stdin;
@@ -139,18 +146,25 @@ pub fn run(
     };
 
     // The data session, with the bytes of both directions counted for the
-    // summary.
+    // summary. Its incoming bytes go through a spool: while stdout is
+    // blocked, the receiver still reads the session, so the sender keeps
+    // sending, and the bytes wait in the spool, until
+    // `receiver_spool_limit` bytes wait (DESIGN.md §6.4).
     let mut data_out = FrameWriter::new(Counting {
         inner: data.stdin,
         count: &SENT,
     });
-    let mut data_in = FrameReader::new(BufReader::with_capacity(
-        READ_BUFFER,
-        Counting {
-            inner: data.stdout,
-            count: &DATA_RECEIVED,
-        },
-    ));
+    let received = Counting {
+        inner: data.stdout,
+        count: &DATA_RECEIVED,
+    };
+    let spool = Spool::start(
+        "the data session",
+        received,
+        tmp_data,
+        config.receiver_spool_limit,
+    );
+    let mut data_in = FrameReader::new(BufReader::with_capacity(READ_BUFFER, spool));
 
     let hello = ReceiverHello {
         block_size: config.block_size,
@@ -167,6 +181,7 @@ pub fn run(
         probe_threads: config.probe_threads,
         lookahead: config.lookahead,
         negative_cache: config.negative_cache,
+        sender_spool_limit: config.sender_spool_limit,
         command: command.iter().map(|arg| arg.as_bytes().to_vec()).collect(),
     };
     // HELLO follows the version at once. The sender uses its parameters
@@ -218,7 +233,7 @@ pub fn run(
     let mut stdout = fsops::stdout();
     let (end, counts) = reconstruct(&mut data_in, &pins, &mut stdout, config.block_size);
 
-    // Completion (DESIGN.md §6.7): the compression stream must end right
+    // Completion (DESIGN.md §6.8): the compression stream must end right
     // after END. Then flush reconstructed stdout, enter Completing, which
     // closes the answer queue, and send the single END_ACK.
     let transport = data_in
@@ -247,21 +262,23 @@ pub fn run(
     drop(control_stdin);
 
     // Nothing follows DONE. Then join the other threads in order
-    // (DESIGN.md §6.7). The control reader ends at the EOF of its session,
-    // and its end closes the query queue: the lookup workers skip the
-    // queries that remain.
-    match protocol::drain_to_eof(data_in.into_inner()) {
-        Ok(true) => {}
-        Ok(false) => panic!("protocol error: data after DONE"),
-        Err(e) => die_data(&e),
-    }
+    // (DESIGN.md §6.8): the thread of the spool, which ended at the EOF of
+    // the data session, then the control reader. The control reader ends
+    // at the EOF of its session, and its end closes the query queue: the
+    // lookup workers skip the queries that remain. A spool read never
+    // fails: the spool itself ends the run when it cannot read the session
+    // or a segment.
+    let mut transport = data_in.into_inner();
+    let drained = protocol::drain_to_eof(&mut transport).expect("a spool read failed");
+    assert!(drained, "protocol error: data after DONE");
+    transport.into_inner().close();
     control_reader.join().expect("the control reader panicked");
     for worker in lookups {
         worker.join().expect("a lookup worker panicked");
     }
 
     // Both sessions must exit successfully before the command's status
-    // is returned, without reaping (DESIGN.md §6.6–6.7). Then nothing uses
+    // is returned, without reaping (DESIGN.md §6.7–6.8). Then nothing uses
     // the pins or the index any more.
     for (pid, name) in sessions {
         let status = sys::wait_exit_status(pid);
@@ -432,11 +449,17 @@ impl<W: Write> Write for Counting<W> {
     }
 }
 
+/// End the run after the data session ended inside a frame or inside the
+/// compressed stream, because the sender or SSH went away. A read of the
+/// session fails in no other way: the spool itself ends the run when it
+/// cannot read the session.
 fn die_data(e: &std::io::Error) -> ! {
-    if e.kind() == std::io::ErrorKind::UnexpectedEof {
-        die("the data session ended unexpectedly");
-    }
-    die(format!("data session: {e}"))
+    assert_eq!(
+        e.kind(),
+        std::io::ErrorKind::UnexpectedEof,
+        "a read of the data session failed: {e}"
+    );
+    die("the data session ended unexpectedly")
 }
 
 fn send_data<W: Write>(out: &mut FrameWriter<W>, kind: u8, payload: &[u8]) {
@@ -493,7 +516,7 @@ fn advance(offset: u64, length: u64) -> u64 {
 /// The owner of the control session's incoming direction: the sender's
 /// protocol version, then queries for the lookup workers, one zstd stream
 /// when `compressed` (DESIGN.md §6.2). Loss before Completing is fatal
-/// (DESIGN.md §6.7); in Completing, EOF, errors, and a partial frame are
+/// (DESIGN.md §6.8); in Completing, EOF, errors, and a partial frame are
 /// expected closure. Also in Completing, reading goes on until closure. So
 /// the sender's relay never blocks on a full pipe, and the pipe closes
 /// only at EOF, when SSH cannot write to it any more: a write to a closed
@@ -536,7 +559,7 @@ fn read_queries(stdout: ChildStdout, compressed: bool, pins: &Pins, lookups: Sen
 /// `level`, 0 for none, flushed whenever the queue runs empty (DESIGN.md
 /// §6.2). It ends in Completing: once the queue is closed and empty, or
 /// when a write fails, which is then expected closure; before Completing,
-/// a failed write is fatal (DESIGN.md §6.7). It gives back the session's
+/// a failed write is fatal (DESIGN.md §6.8). It gives back the session's
 /// stdin without closing it or ending the stream, and discards the answers
 /// that a failed write left in the buffer.
 fn write_answers(
