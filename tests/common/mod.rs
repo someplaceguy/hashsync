@@ -545,6 +545,9 @@ pub const END_ACK: u8 = 11;
 pub const QUERY: u8 = 12;
 pub const ANSWER: u8 = 13;
 pub const DONE: u8 = 14;
+pub const INPUT: u8 = 15;
+pub const INPUT_END: u8 = 16;
+pub const INPUT_STOP: u8 = 17;
 
 /// The first bytes of each session, in both directions.
 pub fn version() -> [u8; 4] {

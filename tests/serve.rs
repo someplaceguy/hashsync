@@ -1,9 +1,10 @@
 //! `hashsync serve` driven directly through its standard streams and its
 //! rendezvous socket, the way the receiver and `attach` drive it. The
 //! receiver's disappearance is fatal at every stage before DONE
-//! (DESIGN.md §6.8): during rendezvous, while `serve` waits for the
-//! control session, and while command stderr still drains after END_ACK.
-//! After DONE, stdin EOF is the normal end. Queries and answers travel on
+//! (DESIGN.md §6.9): during rendezvous, while `serve` waits for the
+//! control session, while the data reader waits at the limit of the input
+//! spool, and while command stderr still drains after END_ACK. After DONE,
+//! stdin EOF is the normal end. Queries, answers, and INPUT_STOP travel on
 //! the control session (DESIGN.md §6.2); obsolete queries still unsent at
 //! the normal end do not fail it, also inside a compressed block. After
 //! HELLO, the data frames of `serve` through END form one zstd frame, and
@@ -20,12 +21,13 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::time::Duration;
 
 use common::{
-    ANSWER, CACHE_RESULT, DONE, END, END_ACK, HASHLIST, HELLO, LIT, PROTOCOL_VERSION, QUERY, REF,
-    frame, proc_state, recv_frame, try_recv_frame, version,
+    ANSWER, CACHE_RESULT, DONE, END, END_ACK, HASHLIST, HELLO, INPUT, INPUT_END, INPUT_STOP, LIT,
+    PROTOCOL_VERSION, QUERY, REF, frame, proc_state, recv_frame, try_recv_frame, version,
 };
 use rustix::event::{PollFd, PollFlags, poll};
+use rustix::fs::{CWD, Mode, mkfifoat};
 use rustix::io::retry_on_intr;
-use rustix::process::{Pid, PidfdFlags, pidfd_open};
+use rustix::process::{Pid, PidfdFlags, Signal, kill_process, pidfd_open};
 use rustix::thread::{CpuSet, sched_getaffinity, sched_setaffinity};
 use tempfile::TempDir;
 
@@ -99,8 +101,15 @@ fn hello_prefix(block_size: u32, strong: &[u8]) -> Vec<u8> {
 }
 
 /// The receiver's HELLO payload for `list`, with BLAKE3 as its strong
-/// hash and zstd compression at `level`, 0 for none.
-fn hello_payload(block_size: u32, list: &[u8], command: &[&str], level: i32) -> Vec<u8> {
+/// hash, zstd compression at `level`, 0 for none, and a sender input spool
+/// that holds at most `input_limit` bytes.
+fn hello_payload(
+    block_size: u32,
+    list: &[u8],
+    command: &[&str],
+    level: i32,
+    input_limit: u64,
+) -> Vec<u8> {
     let mut hello = hello_prefix(block_size, b"blake3");
     hello.extend_from_slice(blake3::hash(list).as_bytes()); // target
     hello.extend_from_slice(&[0xaa; 16]); // account ID
@@ -113,7 +122,8 @@ fn hello_payload(block_size: u32, list: &[u8], command: &[&str], level: i32) -> 
     hello.extend_from_slice(&0u32.to_le_bytes()); // probe threads
     hello.extend_from_slice(&(256u64 << 20).to_le_bytes()); // lookahead
     hello.extend_from_slice(&(128u64 << 20).to_le_bytes()); // negative cache
-    hello.extend_from_slice(&(2u64 << 30).to_le_bytes()); // sender spool limit
+    hello.extend_from_slice(&(2u64 << 30).to_le_bytes()); // sender output spool limit
+    hello.extend_from_slice(&input_limit.to_le_bytes()); // sender input spool limit
     hello.extend_from_slice(&(command.len() as u32).to_le_bytes());
     for arg in command {
         string(&mut hello, arg.as_bytes());
@@ -174,14 +184,29 @@ fn sleeping_syscall(path: &Path) -> std::io::Result<Option<u64>> {
 }
 
 /// The system call in which `UnixStream::write` sleeps on a full socket:
-/// `sendto`, `send`, or `socketcall`, by architecture and C library. A
-/// thread of this process fills a socket that nothing reads, and a process
-/// can always read the `syscall` files of its own threads.
+/// `sendto`, `send`, or `socketcall`, by architecture and C library.
 fn blocking_send_syscall() -> u64 {
-    let (mut full, reader) = UnixStream::pair().unwrap();
-    // More than the socket holds. The thread has its bytes before it tells
-    // its ID, so the write is the only call that it can then sleep in.
-    let bytes = vec![0; 4 * send_buffer()];
+    let (full, reader) = UnixStream::pair().unwrap();
+    blocking_write_syscall(full, reader, 4 * send_buffer())
+}
+
+/// The system call in which a write to a full pipe sleeps, as the write of
+/// `serve` to the command's stdin does: `write`, by its number on this
+/// architecture. 16 MiB are more than a pipe holds by default.
+fn blocking_pipe_write_syscall() -> u64 {
+    let (reader, full) = std::io::pipe().unwrap();
+    blocking_write_syscall(full, reader, 16 << 20)
+}
+
+/// The system call in which a thread sleeps while it writes `size` bytes
+/// to `full`, more than it holds, while nothing reads `reader`, its other
+/// end. A thread of this process does that write, and a process can
+/// always read the `syscall` files of its own threads. Then the drop of
+/// `reader` ends the write.
+fn blocking_write_syscall<R>(mut full: impl Write + Send + 'static, reader: R, size: usize) -> u64 {
+    // The thread has its bytes before it tells its ID, so the write is the
+    // only call that it can then sleep in.
+    let bytes = vec![0; size];
     let (tid_tx, tid_rx) = std::sync::mpsc::channel();
     let writer = std::thread::spawn(move || {
         tid_tx.send(rustix::thread::gettid()).unwrap();
@@ -203,10 +228,15 @@ fn blocking_send_syscall() -> u64 {
 
 /// Wait until the thread `name` of the process `pid` sleeps in the system
 /// call of a write to a full socket, polling with no deadline. It stays
-/// there while no one reads the socket. Reading its `syscall` file needs
-/// the ptrace access that a parent has. Fail when the process has ended.
+/// there while no one reads the socket.
 fn wait_until_blocked_in_send(pid: u32, name: &str) {
-    let send = blocking_send_syscall();
+    wait_until_asleep_in(pid, name, blocking_send_syscall());
+}
+
+/// Wait until the thread `name` of the process `pid` sleeps in the system
+/// call `nr`, polling with no deadline. Reading its `syscall` file needs
+/// the ptrace access that a parent has. Fail when the process has ended.
+fn wait_until_asleep_in(pid: u32, name: &str, nr: u64) {
     loop {
         assert_ne!(
             proc_state(format!("/proc/{pid}")),
@@ -223,7 +253,7 @@ fn wait_until_blocked_in_send(pid: u32, name: &str) {
                 continue;
             }
             match sleeping_syscall(&task.join("syscall")) {
-                Ok(nr) if nr == Some(send) => return,
+                Ok(sleeping) if sleeping == Some(nr) => return,
                 Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
                     panic!("cannot see the system call of {name}: {e}")
                 }
@@ -253,29 +283,62 @@ fn frames_through_end(reader: &mut impl Read) -> Vec<(u8, Vec<u8>)> {
 struct Control {
     queries: Box<dyn Read>,
     answers: Box<dyn Write>,
+    /// INPUT_STOP arrived. `serve` sends it once, at `EPIPE` or at the exit
+    /// of the command, so it can come between any two queries (DESIGN.md
+    /// §6.6).
+    input_stopped: bool,
 }
 
 impl Control {
     fn new(socket: &UnixStream, level: i32) -> Self {
         let (read, write) = (socket.try_clone().unwrap(), socket.try_clone().unwrap());
-        if level == 0 {
-            return Control {
-                queries: Box::new(read),
-                answers: Box::new(write),
-            };
-        }
+        let (queries, answers): (Box<dyn Read>, Box<dyn Write>) = if level == 0 {
+            (Box::new(read), Box::new(write))
+        } else {
+            (
+                Box::new(zstd::stream::read::Decoder::new(read).unwrap()),
+                Box::new(zstd::stream::write::Encoder::new(write, level).unwrap()),
+            )
+        };
         Control {
-            queries: Box::new(zstd::stream::read::Decoder::new(read).unwrap()),
-            answers: Box::new(zstd::stream::write::Encoder::new(write, level).unwrap()),
+            queries,
+            answers,
+            input_stopped: false,
+        }
+    }
+
+    /// The next frame from `serve` other than INPUT_STOP, which this
+    /// notes; else the error that ends the session first, `UnexpectedEof`
+    /// at its closure.
+    fn next(&mut self) -> std::io::Result<(u8, Vec<u8>)> {
+        loop {
+            let frame = try_recv_frame(&mut self.queries)?;
+            if frame.0 != INPUT_STOP {
+                return Ok(frame);
+            }
+            assert!(frame.1.is_empty(), "INPUT_STOP with a payload");
+            assert!(!self.input_stopped, "a second INPUT_STOP");
+            self.input_stopped = true;
         }
     }
 
     /// The next QUERY: its offset and its digest.
     fn query(&mut self) -> (u64, Vec<u8>) {
-        let (kind, mut payload) = recv_frame(&mut self.queries);
+        let (kind, mut payload) = self.next().unwrap();
         assert_eq!(kind, QUERY);
         let digest = payload.split_off(8);
         (u64::from_le_bytes(payload.try_into().unwrap()), digest)
+    }
+
+    /// Wait for INPUT_STOP, unless it arrived already; no other frame may
+    /// come first. `serve` stops its input before END, and closes the
+    /// session only after END_ACK, so a test that waits here before it
+    /// sends END_ACK always gets INPUT_STOP (DESIGN.md §6.6).
+    fn input_stop(&mut self) {
+        if !self.input_stopped {
+            assert_eq!(recv_frame(&mut self.queries), (INPUT_STOP, Vec::new()));
+            self.input_stopped = true;
+        }
     }
 
     /// ANSWER frames, flushed: `serve` waits for them.
@@ -361,8 +424,18 @@ impl Serve {
     }
 
     fn hello_with(&mut self, block_size: u32, list: &[u8], command: &[&str], level: i32) {
+        self.send_hello(&hello_payload(block_size, list, command, level, 2 << 30));
+    }
+
+    /// The versions and the data HELLOs, as `hello` exchanges them, with
+    /// a sender input spool that holds at most `input_limit` bytes.
+    fn hello_with_input_limit(&mut self, command: &[&str], input_limit: u64) {
+        self.send_hello(&hello_payload(4096, &empty_list(), command, 0, input_limit));
+    }
+
+    fn send_hello(&mut self, payload: &[u8]) {
         self.send_raw(&version());
-        self.send(HELLO, &hello_payload(block_size, list, command, level));
+        self.send(HELLO, payload);
         assert_eq!(self.recv_version(), version());
         assert_eq!(self.recv().0, HELLO);
     }
@@ -389,11 +462,16 @@ impl Serve {
     }
 
     /// The data frames after the list, from CACHE_RESULT through END,
-    /// then the normal end of the data session: END_ACK, and DONE
-    /// (DESIGN.md §6.8). At a `level` other than 0, the frames through END
-    /// form one zstd frame, and DONE follows it, outside it
-    /// (DESIGN.md §6.2).
+    /// then the normal end of the data session (`end_ack`).
     fn frames_through_done(&mut self, level: i32) -> Vec<(u8, Vec<u8>)> {
+        let frames = self.recv_through_end(level);
+        self.end_ack();
+        frames
+    }
+
+    /// The data frames after the list, from CACHE_RESULT through END. At a
+    /// `level` other than 0, they form one zstd frame (DESIGN.md §6.2).
+    fn recv_through_end(&mut self, level: i32) -> Vec<(u8, Vec<u8>)> {
         let mut transport = BufReader::new(&mut self.data_out);
         let frames = if level == 0 {
             frames_through_end(&mut transport)
@@ -405,11 +483,20 @@ impl Serve {
             assert_eq!(decoder.read(&mut [0]).unwrap(), 0, "the frame goes on");
             frames
         };
+        // `serve` sends nothing after END until END_ACK, so this buffer
+        // holds no byte that `end_ack` must read.
+        assert!(transport.buffer().is_empty(), "bytes after END");
+        frames
+    }
+
+    /// The normal end of the data session after END: END_ACK, then DONE,
+    /// which follows the zstd frame, outside it (DESIGN.md §6.2 and §6.9).
+    fn end_ack(&mut self) {
         let data_in = self.data_in.as_mut().unwrap();
         data_in.write_all(&frame(END_ACK, b"")).unwrap();
+        let mut transport = BufReader::new(&mut self.data_out);
         assert_eq!(recv_frame(&mut transport), (DONE, Vec::new()));
         assert!(transport.buffer().is_empty(), "bytes after DONE");
-        frames
     }
 
     /// The full empty list, whose bytes follow HASHLIST directly.
@@ -423,8 +510,8 @@ impl Serve {
     }
 
     /// CACHE_RESULT, the first data frame after the list, without a
-    /// payload. `serve` does not flush it: it can arrive with the
-    /// command's output (DESIGN.md §6.2).
+    /// payload. `serve` flushes it: the receiver sends the input only
+    /// after it (DESIGN.md §6.2).
     fn recv_result(&mut self) {
         assert_eq!(self.recv(), (CACHE_RESULT, Vec::new()));
     }
@@ -527,7 +614,10 @@ fn an_unsupported_compression_level_is_rejected() {
     // (DESIGN.md §6.2).
     let mut serve = Serve::start();
     serve.send_raw(&version());
-    serve.send(HELLO, &hello_payload(4096, &empty_list(), &["true"], 20));
+    serve.send(
+        HELLO,
+        &hello_payload(4096, &empty_list(), &["true"], 20, 2 << 30),
+    );
     serve.expect_death("incompatible receiver: compression level 20");
 }
 
@@ -563,6 +653,25 @@ fn receiver_loss_while_serve_waits_for_the_control_version_is_fatal() {
     let _control = serve.attach();
     serve.send_empty_list();
     serve.wait_for_published_list();
+    serve.lose_data_session();
+    serve.expect_death("the receiver disappeared");
+}
+
+#[test]
+fn receiver_loss_while_the_input_waits_at_the_spool_limit_is_fatal() {
+    // With a limit of 0, the data reader appends one INPUT payload to the
+    // sender's input spool, then waits until the stdin writer takes it.
+    // Before the receiver's control version, no command runs, so no stdin
+    // writer exists, and the data reader waits for good: it reads nothing,
+    // so it cannot see the loss of the data session. The session watcher
+    // sees it instead (DESIGN.md §6.6). The control session stays open,
+    // without its version, so only the data session shows the loss.
+    let mut serve = Serve::start();
+    serve.hello_with_input_limit(&["true"], 0);
+    let _control = serve.attach();
+    serve.send_empty_list();
+    serve.recv_result();
+    serve.send(INPUT, b"waits");
     serve.lose_data_session();
     serve.expect_death("the receiver disappeared");
 }
@@ -616,7 +725,9 @@ fn an_answer_decides_between_a_reference_and_literals() {
     // bytes go out as literals (DESIGN.md §6.3). With compression, each
     // direction of the control session is one zstd stream at the level of
     // the data session, and no frame ends it: the closure of the session
-    // ends it, before DONE (DESIGN.md §6.2 and §6.8).
+    // ends it, before DONE (DESIGN.md §6.2 and §6.9). The exit of the
+    // command stops the input, which INPUT_STOP tells before END, between
+    // any two frames of the control session (DESIGN.md §6.6).
     let block: Vec<u8> = (0..4096u32)
         .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
         .collect();
@@ -632,7 +743,11 @@ fn an_answer_decides_between_a_reference_and_literals() {
             assert_eq!(control.query(), (0, digest), "the window at offset 0");
             control.answer(&[(0, found)]);
 
-            let frames = serve.frames_through_done(level);
+            let frames = serve.recv_through_end(level);
+            // INPUT_STOP before END_ACK, and only then the closure of the
+            // session, which follows END_ACK.
+            control.input_stop();
+            serve.end_ack();
             assert_eq!(frames[0], (CACHE_RESULT, Vec::new()));
             let mut literal = Vec::new();
             let mut references = 0;
@@ -652,7 +767,7 @@ fn an_answer_decides_between_a_reference_and_literals() {
                 assert_eq!(references, 0);
                 assert_eq!(literal, block);
             }
-            let error = try_recv_frame(&mut control.queries).unwrap_err();
+            let error = control.next().unwrap_err();
             assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
             serve.expect_success();
         }
@@ -672,7 +787,7 @@ fn a_compressed_block_in_flight_does_not_fail_the_normal_end() {
 /// Obsolete queries do not delay completion (DESIGN.md §6.3). Here they
 /// are the last queries, and the receiver reads none of them, so the
 /// control writer is still blocked on a full socket when the normal end
-/// closes it. That failed write is expected closure (DESIGN.md §6.8),
+/// closes it. That failed write is expected closure (DESIGN.md §6.9),
 /// also when compression at a `level` other than 0 leaves a zstd block
 /// half written. On one CPU, the woken writer runs before the main thread
 /// can exit, so a writer that took the closure as a failure would win.
@@ -739,10 +854,12 @@ fn obsolete_queries_in_flight(level: i32) {
     assert!(output == data, "the output differs");
 
     // The closure cut the writer's stream: only the start of the q chain
-    // arrived. Compressed, the stream ends inside its zstd frame.
+    // arrived, with or without the INPUT_STOP of the command's exit, which
+    // the writer queued at any point. Compressed, the stream ends inside
+    // its zstd frame.
     let mut arrived = 0;
     let error = loop {
-        match try_recv_frame(&mut control.queries) {
+        match control.next() {
             Ok((kind, query)) => {
                 assert_eq!(kind, QUERY);
                 assert_eq!(query[..8], (92 + B * arrived).to_le_bytes());
@@ -791,12 +908,202 @@ fn compressed_frames_form_one_zstd_frame_that_ends_with_end() {
 }
 
 #[test]
+fn the_input_reaches_the_command() {
+    // `serve` flushes CACHE_RESULT, and the receiver sends the input after
+    // it: the command, `cat`, writes no output before it reads the input.
+    // The payloads of the INPUT frames are pieces of the input stream: at
+    // level 3, one zstd frame from an independent encoder, and at level 0,
+    // the input itself. INPUT_END ends the input, so the command reads EOF
+    // after it, and the run ends normally (DESIGN.md §6.2 and §6.6).
+    let input = b"the input of the command\n".repeat(10_000);
+    for level in [0, 3] {
+        let mut serve = Serve::start();
+        serve.hello_with(4096, &empty_list(), &["cat"], level);
+        let mut control = serve.attach();
+        control.write_all(&version()).unwrap();
+        serve.send_empty_list();
+        let stream = match level {
+            0 => input.clone(),
+            level => zstd::stream::encode_all(&input[..], level).unwrap(),
+        };
+        let mut frames: Vec<u8> = stream
+            .chunks(1000)
+            .flat_map(|piece| frame(INPUT, piece))
+            .collect();
+        frames.extend_from_slice(&frame(INPUT_END, b""));
+        let Serve {
+            data_in, data_out, ..
+        } = &mut serve;
+        let mut transport = BufReader::new(data_out);
+        let mut output = Vec::new();
+        {
+            let mut stream: Box<dyn Read> = match level {
+                0 => Box::new(&mut transport),
+                _ => Box::new(
+                    zstd::stream::read::Decoder::with_buffer(&mut transport)
+                        .unwrap()
+                        .single_frame(),
+                ),
+            };
+            assert_eq!(recv_frame(&mut stream), (CACHE_RESULT, Vec::new()));
+            data_in.as_mut().unwrap().write_all(&frames).unwrap();
+            loop {
+                match recv_frame(&mut stream) {
+                    (LIT, payload) => output.extend_from_slice(&payload),
+                    // Status 0, without error text.
+                    (END, payload) => break assert_eq!(payload, [0; 8]),
+                    (kind, _) => panic!("unexpected frame type {kind}"),
+                }
+            }
+            if level != 0 {
+                assert_eq!(stream.read(&mut [0]).unwrap(), 0, "the frame goes on");
+            }
+        }
+        assert!(output == input, "level {level}: the output differs");
+        data_in
+            .as_mut()
+            .unwrap()
+            .write_all(&frame(END_ACK, b""))
+            .unwrap();
+        assert_eq!(recv_frame(&mut transport), (DONE, Vec::new()));
+        *data_in = None;
+        let mut rest = Vec::new();
+        transport.read_to_end(&mut rest).unwrap();
+        assert!(rest.is_empty(), "bytes after DONE");
+        serve.expect_success();
+    }
+}
+
+#[test]
+fn a_command_that_closes_its_stdin_stops_the_input_at_once() {
+    // The command closes its stdin, and runs on until this test ends it.
+    // The first write of the input then fails with EPIPE, and the input
+    // has no use any more: `serve` sends INPUT_STOP while the command
+    // still runs, and discards the INPUT frames that still arrive
+    // (DESIGN.md §6.6). A `serve` that stopped the input only at the
+    // command's exit would hang this test, which ends the command only
+    // after INPUT_STOP.
+    let mut serve = Serve::start();
+    let (closed, go) = (
+        serve.home.path().join("closed"),
+        serve.home.path().join("go"),
+    );
+    for fifo in [&closed, &go] {
+        mkfifoat(CWD, fifo, Mode::RUSR | Mode::WUSR).unwrap();
+    }
+    let script = format!(
+        "exec <&-; echo closed >'{}'; read go <'{}'",
+        closed.display(),
+        go.display()
+    );
+    serve.hello(&["sh", "-c", &script]);
+    let mut control = serve.control_session(&empty_list(), 0);
+    serve.recv_result();
+    // The open waits for the command to open the FIFO, after it closed
+    // its stdin.
+    let mut message = String::new();
+    std::fs::File::open(&closed)
+        .unwrap()
+        .read_to_string(&mut message)
+        .unwrap();
+    assert_eq!(message, "closed\n");
+    serve.send(INPUT, b"no process reads this");
+    control.input_stop();
+    serve.send(INPUT, b"discarded");
+    std::fs::write(&go, b"go\n").unwrap();
+    // Status 0, without error text.
+    assert_eq!(serve.frames_through_done(0), [(END, vec![0; 8])]);
+    serve.expect_success();
+}
+
+#[test]
+fn the_exit_of_the_command_stops_the_input_while_stdout_stays_open() {
+    // The command exits at once, but a descendant holds its stdout until
+    // this test lets it end. The input has no use any more once the
+    // command has exited, so `serve` stops it then, and sends INPUT_STOP,
+    // while the scan still waits for the EOF of stdout (DESIGN.md §6.6). A
+    // `serve` that stopped the input only at that EOF would hang this
+    // test, which lets the descendant end only after INPUT_STOP.
+    let mut serve = Serve::start();
+    let go = serve.home.path().join("go");
+    mkfifoat(CWD, &go, Mode::RUSR | Mode::WUSR).unwrap();
+    let script = format!("( read go <'{}' ) & exit 0", go.display());
+    serve.hello(&["sh", "-c", &script]);
+    let mut control = serve.control_session(&empty_list(), 0);
+    serve.recv_result();
+    control.input_stop();
+    std::fs::write(&go, b"go\n").unwrap();
+    // Status 0, without error text.
+    assert_eq!(serve.frames_through_done(0), [(END, vec![0; 8])]);
+    serve.expect_success();
+}
+
+#[test]
+fn end_does_not_wait_for_a_descendant_that_holds_the_command_stdin() {
+    // A descendant of the command holds the command's stdin and reads
+    // nothing, so the stdin writer waits in a write once the pipe is full.
+    // When the command exits, END still goes out at once: `serve` joins
+    // the stdin writer only after END_ACK, as it joins the stderr relay
+    // (DESIGN.md §6.9). Then the end waits for the descendant: once this
+    // test kills it, the write fails with EPIPE, and DONE follows. The
+    // descendant runs until this test process ends, so a `serve` that
+    // waited for it before END would hang the test.
+    let mut serve = Serve::start();
+    // The wait for the blocked stdin writer needs ptrace access to `serve`.
+    if let Err(e) = std::fs::read_to_string(format!("/proc/{}/syscall", serve.child.id())) {
+        eprintln!("skipped: cannot see the system calls of serve: {e}");
+        return;
+    }
+    let go = serve.home.path().join("go");
+    mkfifoat(CWD, &go, Mode::RUSR | Mode::WUSR).unwrap();
+    let script = format!(
+        "exec 3<&0; ( exec <&3 3<&- >/dev/null 2>&1; exec tail --pid={} -f /dev/null ) & \
+         echo $!; exec 3<&-; read go <'{}'",
+        std::process::id(),
+        go.display()
+    );
+    serve.hello(&["sh", "-c", &script]);
+    let mut control = serve.attach();
+    control.write_all(&version()).unwrap();
+    serve.send_empty_list();
+    serve.recv_result();
+    // 4 MiB, more than a pipe holds by default: the sender's input spool
+    // takes them all, and the stdin writer fills the command's stdin.
+    let input = vec![b'x'; 64 << 10];
+    for _ in 0..64 {
+        serve.send(INPUT, &input);
+    }
+    wait_until_asleep_in(
+        serve.child.id(),
+        "stdin-writer",
+        blocking_pipe_write_syscall(),
+    );
+    std::fs::write(&go, b"go\n").unwrap();
+    let mut output = Vec::new();
+    loop {
+        match serve.recv() {
+            (LIT, payload) => output.extend_from_slice(&payload),
+            // Status 0, without error text.
+            (END, payload) => break assert_eq!(payload, [0; 8]),
+            (kind, _) => panic!("unexpected frame type {kind}"),
+        }
+    }
+    serve.send(END_ACK, b"");
+    // Nothing ends the descendant before this kill, so no other process
+    // can have its PID yet.
+    let descendant: i32 = String::from_utf8(output).unwrap().trim().parse().unwrap();
+    kill_process(Pid::from_raw(descendant).unwrap(), Signal::KILL).unwrap();
+    assert_eq!(serve.recv(), (DONE, Vec::new()));
+    serve.expect_success();
+}
+
+#[test]
 fn stdin_eof_after_done_is_the_normal_end() {
     // `serve` sends DONE once it needs neither session: after END_ACK, and
     // after it shut down the control socket. Then it waits, with every
     // thread asleep, until its data reader reads the stdin EOF that the
     // receiver causes after DONE. It joins that thread and exits with
-    // status 0 (DESIGN.md §6.8).
+    // status 0 (DESIGN.md §6.9).
     let mut serve = Serve::start();
     serve.hello(&["printf", "%s", "output"]);
     let mut control = serve.attach();
@@ -805,11 +1112,17 @@ fn stdin_eof_after_done_is_the_normal_end() {
     serve.recv_result();
     assert_eq!(serve.recv(), (LIT, b"output".to_vec()));
     assert_eq!(serve.recv().0, END);
+    // After the version, the INPUT_STOP of the command's exit, which comes
+    // before END, and before the closure of the session that END_ACK
+    // allows (DESIGN.md §6.6).
+    let mut stopped = vec![0; 9];
+    control.read_exact(&mut stopped).unwrap();
+    assert_eq!(stopped, [&version()[..], &frame(INPUT_STOP, b"")].concat());
     serve.send(END_ACK, b"");
     assert_eq!(serve.recv(), (DONE, Vec::new()));
     let mut received = Vec::new();
     control.read_to_end(&mut received).unwrap();
-    assert_eq!(received, version(), "the control session after the version");
+    assert!(received.is_empty(), "the control session after INPUT_STOP");
     wait_until_asleep(serve.child.id());
     serve.expect_success();
 }

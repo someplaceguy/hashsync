@@ -13,16 +13,20 @@
 //! zstd stream unless compression is disabled: `Compressor` writes it and
 //! `Decompressor` reads it. DONE follows the stream, outside it. After the
 //! protocol version, each direction of the control session is one zstd
-//! stream too, which the closure of the session ends. The receiver-to-sender
-//! direction of the data session is not compressed: nearly all its bytes
-//! are the hash list, which is already as small as zstd can make it.
+//! stream too, which the closure of the session ends. The frames of the
+//! receiver-to-sender direction of the data session are not compressed:
+//! the hash list is already as small as zstd can make it, and the sender
+//! must find END_ACK after input that it discards without decoding. The
+//! input has a zstd stream of its own, in the payloads of the INPUT frames
+//! (DESIGN.md §6.6).
 //!
 //! Malformed payloads, invalid compressed data, and violated frame rules
-//! are bugs in a compatible peer: parsers panic (DESIGN.md §6.6). Transport
+//! are bugs in a compatible peer: parsers panic (DESIGN.md §6.7). Transport
 //! failures, including EOF inside a frame, surface as `io::Error` for the
-//! caller to turn into `die`.
+//! caller to turn into `die`; `send_data` and `flush_data` do that for the
+//! writes of the data session.
 
-use std::io::{BufRead, Read, Write};
+use std::io::{BufRead, IoSlice, Read, Write};
 use std::ops::RangeInclusive;
 
 use crossbeam_channel::{Receiver, TryRecvError};
@@ -56,6 +60,9 @@ pub mod frame {
     pub const QUERY: u8 = 12;
     pub const ANSWER: u8 = 13;
     pub const DONE: u8 = 14;
+    pub const INPUT: u8 = 15;
+    pub const INPUT_END: u8 = 16;
+    pub const INPUT_STOP: u8 = 17;
 }
 
 /// Require the peer's protocol version, read before any frame, to equal
@@ -98,7 +105,11 @@ pub struct ReceiverHello {
     /// The most bytes of command output that wait in the sender's spool
     /// before the command waits; `u64::MAX` sets no limit (DESIGN.md
     /// §6.5).
-    pub sender_spool_limit: u64,
+    pub sender_output_spool_limit: u64,
+    /// The most bytes of the input stream that wait in the sender's input
+    /// spool before the sender stops reading the data session; `u64::MAX`
+    /// sets no limit (DESIGN.md §6.6).
+    pub sender_input_spool_limit: u64,
     /// The command's argv; argv[0] is found in PATH and run directly.
     pub command: Vec<Vec<u8>>,
 }
@@ -120,7 +131,8 @@ impl ReceiverHello {
         enc.u32(self.probe_threads);
         enc.u64(self.lookahead);
         enc.u64(self.negative_cache);
-        enc.u64(self.sender_spool_limit);
+        enc.u64(self.sender_output_spool_limit);
+        enc.u64(self.sender_input_spool_limit);
         enc.u32(list_len(self.command.len()));
         for arg in &self.command {
             enc.bytes(arg);
@@ -157,7 +169,8 @@ impl ReceiverHello {
             probe_threads: dec.u32(),
             lookahead: dec.u64(),
             negative_cache: dec.u64(),
-            sender_spool_limit: dec.u64(),
+            sender_output_spool_limit: dec.u64(),
+            sender_input_spool_limit: dec.u64(),
             command: dec.list(Dec::string_bytes),
         };
         dec.done();
@@ -280,6 +293,15 @@ impl Query {
     }
 }
 
+/// A frame of the sender's control session, in the queue of its control
+/// writer, which sends the frames in queue order (DESIGN.md §6.2): the
+/// scanner's queries, and INPUT_STOP, which tells the receiver that the
+/// sender stopped the input (DESIGN.md §6.6).
+pub enum SenderControl {
+    Query(Query),
+    InputStop,
+}
+
 /// ANSWER: whether the receiver pinned a verified block for the query at
 /// `offset`.
 pub struct Answer {
@@ -375,7 +397,7 @@ impl Enc {
 }
 
 /// A payload parser. Truncation, trailing bytes, and invalid values are
-/// protocol errors and panic (DESIGN.md §6.6).
+/// protocol errors and panic (DESIGN.md §6.7).
 pub struct Dec<'a> {
     buf: &'a [u8],
     what: &'static str,
@@ -571,11 +593,13 @@ pub fn drain_to_eof(mut reader: impl Read) -> std::io::Result<bool> {
     }
 }
 
-/// Writes frames to a transport: one header write and one payload write
-/// per frame. A writer that sends many small frames wraps its transport in
-/// a `BufWriter`. A control writer flushes before it waits (`next_from`).
-/// On the data session, a side flushes only before it waits for a reply
-/// (DESIGN.md §6.2).
+/// Writes frames to a transport, each frame with one write call where the
+/// transport takes it whole (`send`). A writer that sends many small
+/// frames also wraps its transport in a `BufWriter`, which makes fewer
+/// calls. A control writer flushes before it waits (`next_from`). On the
+/// data session, the sender flushes its stream only before it waits for a
+/// reply, and the receiver sends each INPUT frame at once (DESIGN.md §6.2
+/// and §6.6).
 pub struct FrameWriter<W: Write> {
     writer: W,
 }
@@ -595,13 +619,29 @@ impl<W: Write> FrameWriter<W> {
         self.writer.write_all(&PROTOCOL_VERSION.to_le_bytes())
     }
 
+    /// Write one frame: its header and its payload in one vectored write
+    /// call, and the rest in more calls if the transport takes only a part
+    /// of it. This function exists so that SSH does not send the header of
+    /// a frame alone: SSH sends what one read of its stdin returns in
+    /// packets of its own, so with two write calls, it can read the header
+    /// before the payload arrives, and the header costs a packet
+    /// (DESIGN.md §6.2).
     pub fn send(&mut self, kind: u8, payload: &[u8]) -> std::io::Result<()> {
         let length = u32::try_from(payload.len())
             .unwrap_or_else(|_| panic!("frame type {kind} with {} bytes", payload.len()));
         let mut header = [kind, 0, 0, 0, 0];
         header[1..].copy_from_slice(&length.to_le_bytes());
-        self.writer.write_all(&header)?;
-        self.writer.write_all(payload)
+        let mut parts = [IoSlice::new(&header), IoSlice::new(payload)];
+        let mut parts = &mut parts[..];
+        while !parts.is_empty() {
+            match self.writer.write_vectored(parts) {
+                Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+                Ok(n) => IoSlice::advance_slices(&mut parts, n),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
     }
 
     /// Bytes that follow a frame outside any frame: the list bytes after
@@ -618,7 +658,7 @@ impl<W: Write> FrameWriter<W> {
     /// the queue delivers. When nothing is queued, flush first: the
     /// scanner waits for answers, so queries and answers must not stay in
     /// a buffer or in the compressor while this thread waits (DESIGN.md
-    /// §6.2 and §6.7). `None`, after a flush, once the queue is closed and
+    /// §6.2 and §6.8). `None`, after a flush, once the queue is closed and
     /// empty.
     pub fn next_from<T>(&mut self, queue: &Receiver<T>) -> std::io::Result<Option<T>> {
         match queue.try_recv() {
@@ -628,6 +668,21 @@ impl<W: Write> FrameWriter<W> {
                 Ok(queue.recv().ok())
             }
         }
+    }
+}
+
+/// Send one frame on the data session. A failure is the loss of the
+/// session, which ends the run (DESIGN.md §6.9).
+pub fn send_data<W: Write>(out: &mut FrameWriter<W>, kind: u8, payload: &[u8]) {
+    if let Err(e) = out.send(kind, payload) {
+        die(format!("data session: {e}"));
+    }
+}
+
+/// Flush the data session. A failure ends the run, as in `send_data`.
+pub fn flush_data<W: Write>(out: &mut FrameWriter<W>) {
+    if let Err(e) = out.flush() {
+        die(format!("data session: {e}"));
     }
 }
 
@@ -645,7 +700,7 @@ const LONG_WINDOW_LOG: u32 = 27;
 /// `flush` makes every byte written so far decodable by the peer, for a
 /// frame that it must answer. The sender's data session begins the stream
 /// after its HELLO, and `finish` ends it after END. The zstd frame has a
-/// checksum: the trailer that the receiver checks (DESIGN.md §6.8). Each
+/// checksum: the trailer that the receiver checks (DESIGN.md §6.9). Each
 /// direction of the control session begins its stream after the protocol
 /// version, and no frame ends it: the closure of the session ends it.
 ///
@@ -767,7 +822,7 @@ impl<W: Write> Write for Compressor<W> {
 /// stream, or the closure of a control session. Other transport failures
 /// are `io::Error`s too, for the caller. Invalid compressed data, including
 /// a wrong checksum, and a frame that ends before END or on the control
-/// session are protocol errors and panic (DESIGN.md §6.6): a truncated
+/// session are protocol errors and panic (DESIGN.md §6.7): a truncated
 /// stream cannot end a frame, because its end needs the last block and the
 /// checksum.
 pub struct Decompressor<R: BufRead> {
@@ -800,7 +855,7 @@ impl<R: BufRead> Decompressor<R> {
 
     /// After END: read the rest of the zstd frame, which must hold no more
     /// decoded bytes, and return the transport, right after the frame
-    /// (DESIGN.md §6.8). Only the frame is read: this does not wait for the
+    /// (DESIGN.md §6.9). Only the frame is read: this does not wait for the
     /// transport's EOF. Without compression, END ends the stream.
     pub fn finish(mut self) -> std::io::Result<R> {
         if let Some(zstd) = &mut self.zstd {
@@ -984,6 +1039,56 @@ mod tests {
         }
     }
 
+    /// A transport that keeps the bytes of each write call apart, and
+    /// takes at most `most` bytes in one call.
+    struct Calls {
+        calls: Vec<Vec<u8>>,
+        most: usize,
+    }
+
+    impl Write for Calls {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.write_vectored(&[IoSlice::new(buf)])
+        }
+
+        fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> std::io::Result<usize> {
+            let mut call: Vec<u8> = bufs.iter().flat_map(|buf| buf.iter().copied()).collect();
+            call.truncate(self.most);
+            let n = call.len();
+            self.calls.push(call);
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_frame_is_one_write_call() {
+        // SSH sends what one read of its stdin returns in packets of its
+        // own, so the header of a frame must not arrive alone (DESIGN.md
+        // §6.2). A transport that takes only a part of a frame gets the
+        // rest in more calls.
+        let input = [&[frame::INPUT, 7, 0, 0, 0][..], b"payload"].concat();
+        let mut writer = FrameWriter::new(Calls {
+            calls: Vec::new(),
+            most: usize::MAX,
+        });
+        writer.send(frame::INPUT, b"payload").unwrap();
+        writer.send(frame::INPUT_END, b"").unwrap();
+        let input_end = vec![frame::INPUT_END, 0, 0, 0, 0];
+        assert_eq!(writer.into_inner().calls, [input.clone(), input_end]);
+        let mut writer = FrameWriter::new(Calls {
+            calls: Vec::new(),
+            most: 5,
+        });
+        writer.send(frame::INPUT, b"payload").unwrap();
+        let calls = writer.into_inner().calls;
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls.concat(), input);
+    }
+
     fn receiver_hello() -> ReceiverHello {
         ReceiverHello {
             block_size: 4096,
@@ -1000,7 +1105,8 @@ mod tests {
             probe_threads: 5,
             lookahead: 256 << 20,
             negative_cache: 128 << 20,
-            sender_spool_limit: 2 << 30,
+            sender_output_spool_limit: 2 << 30,
+            sender_input_spool_limit: 3 << 30,
             command: vec![b"printf".to_vec(), b"%s".to_vec(), b"\xff\xfe".to_vec()],
         }
     }
@@ -1049,7 +1155,8 @@ mod tests {
         assert!(decoded.compression_long);
         assert_eq!(decoded.probe_threads, 5);
         assert_eq!(decoded.negative_cache, 128 << 20);
-        assert_eq!(decoded.sender_spool_limit, 2 << 30);
+        assert_eq!(decoded.sender_output_spool_limit, 2 << 30);
+        assert_eq!(decoded.sender_input_spool_limit, 3 << 30);
         assert_eq!(decoded.command, hello.command);
     }
 
@@ -1299,7 +1406,7 @@ mod tests {
     fn a_truncated_stream_is_unexpected_eof() {
         // Wherever the stream ends early, even inside the trailer after
         // END, reading reports UnexpectedEof, never a clean end
-        // (DESIGN.md §6.8).
+        // (DESIGN.md §6.9).
         let stream = compressed(
             3,
             false,
@@ -1415,7 +1522,7 @@ mod tests {
     #[should_panic(expected = "protocol error: the compressed stream ended early")]
     fn a_frame_that_ends_before_end_is_a_protocol_error() {
         // Only the sender ends the zstd frame, after END; a truncated
-        // stream cannot end it (DESIGN.md §6.6).
+        // stream cannot end it (DESIGN.md §6.7).
         read_after_lit(&ended_before_end(b""));
     }
 

@@ -13,13 +13,13 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use rustix::event::{PollFd, PollFlags, Timespec};
+use rustix::event::{PollFd, PollFlags};
 use rustix::fs::{FileType, Mode, OFlags};
 use rustix::io::retry_on_intr;
 
 use crate::cache;
 use crate::die::{self, die};
-use crate::fsops::retry_interrupted;
+use crate::fsops::{any_ready, retry_interrupted};
 
 const RETRY_INTERVAL: Duration = Duration::from_millis(20);
 
@@ -90,17 +90,10 @@ fn address_in(dir: BorrowedFd<'_>, name: &str) -> PathBuf {
 /// True when this process's stdin has no writer left: the SSH session
 /// that carries the peer is gone.
 fn stdin_gone() -> bool {
-    // Only HUP and ERR matter, and poll always reports them; pending
-    // readable data must not end the wait.
-    let stdin = rustix::stdio::stdin();
-    let mut fds = [PollFd::new(&stdin, PollFlags::empty())];
-    let zero = Timespec::default();
-    match retry_on_intr(|| rustix::event::poll(&mut fds, Some(&zero))) {
-        Ok(_) => fds[0]
-            .revents()
-            .intersects(PollFlags::HUP | PollFlags::ERR | PollFlags::NVAL),
-        Err(_) => false,
-    }
+    // No event is requested, so only a hangup or an error makes stdin
+    // ready: `poll` always reports those. Pending readable data must not
+    // end the wait.
+    any_ready(&mut [PollFd::new(&rustix::stdio::stdin(), PollFlags::empty())])
 }
 
 /// `serve`'s listening socket. The socket file is removed when the

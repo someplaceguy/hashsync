@@ -9,7 +9,8 @@ the design changes. `PLAN.md` orders the implementation.
 data already held in local files with block references. The receiver reads
 and verifies those blocks before inserting them into the output. This is
 useful for package trees and archive streams that repeat existing content
-at different positions and alignments.
+at different positions and alignments. The command reads the receiver's
+stdin as its own stdin.
 
 One Rust binary contains both roles. The receiver starts the sender through
 SSH. Parallelism uses threads and blocking system calls, with no
@@ -45,8 +46,11 @@ asynchronous runtime or event loop.
   host. It holds the extents of pins, or the bytes of a spool.
 - **Spool**: a pipe whose bytes wait in segments, so that the producer of
   the bytes waits for their consumer only at the limit of the spool. The
-  sender spools the command's stdout, and the receiver spools the data
-  session.
+  sender spools the command's stdout, the receiver spools the data
+  session, and each role spools the input.
+- **Input**: the bytes that the command reads as its stdin: the receiver's
+  stdin when the run has `--stdin` (section 8), else none. The **input
+  stream** carries them from the receiver to the sender, compressed.
 - **Record**: a sender-side description of scanned but un-emitted output:
   a Literal, Run, Query, or Ref.
 
@@ -65,9 +69,14 @@ asynchronous runtime or event loop.
    current. The sender verifies it, builds its table, durably publishes it
    when caching is enabled, and acknowledges the accepted target.
 4. The sender starts the command, whose stdout goes through a spool: the
-   command waits for the transfer only when `sender_spool_limit` bytes
-   wait in the spool. The scanner sends literals for misses, runs for
-   repeated bytes, and queries for possible block matches.
+   command waits for the transfer only when `sender_output_spool_limit`
+   bytes wait in the spool. The scanner sends literals for misses, runs for
+   repeated bytes, and queries for possible block matches. From the
+   acknowledgement on, the receiver sends the input to the command's
+   stdin, through an input spool on each side: its own stdin when the run
+   has `--stdin`, else no bytes. The sender stops the input when no
+   process reads the command's stdin any more, or when the command exits,
+   and INPUT_STOP on the control session makes the receiver stop it too.
 5. The receiver reads and verifies candidates, appending their bytes to a
    segment before answering yes. The sender emits references for
    yes answers and rescans rejected windows from the next byte. Output is
@@ -76,13 +85,15 @@ asynchronous runtime or event loop.
    its storage.
 6. The receiver reconstructs stdout from its spool of the data session.
    While stdout is blocked, the receiver keeps reading the session until
-   `receiver_spool_limit` bytes wait in the spool, so the transfer goes
-   on. After all command stdout is processed, and the command's exit
-   status is available, the sender sends END. The receiver validates
-   stream completion and flushes stdout before sending END_ACK. When the
-   sender needs neither session any more, it sends DONE, and the receiver
-   closes both session stdin pipes. Both SSH sessions must exit
-   successfully before the receiver returns the command's status.
+   `receiver_output_spool_limit` bytes wait in the spool, so the transfer
+   goes on. After all command stdout is processed, and the command's exit
+   status is available, the sender sends END, which follows the stop of
+   the input. The receiver stops the input at END at the latest,
+   validates stream completion, and flushes stdout before sending
+   END_ACK. When the sender needs neither session any more, it sends
+   DONE, and the receiver closes both session stdin pipes. Both SSH
+   sessions must exit successfully before the receiver returns the
+   command's status.
 
 **Verification is authoritative.** The index, hash lists, caches, and weak
 hash table are hints. Verify candidates before writing pins and verify the
@@ -93,7 +104,7 @@ deduplication, never change the reconstructed output.
 **No timeouts.** Waits end when the expected event occurs or a peer,
 descriptor, or process goes away. Slow systems must not fail because of a
 deadline; a stalled process can be inspected with a debugger. Fatal errors
-end the process (section 6.8). Retry intervals and cache age bounds are not
+end the process (section 6.9). Retry intervals and cache age bounds are not
 operation deadlines.
 
 **No artificial size limits.** Valid input never fails because of an
@@ -113,6 +124,16 @@ sockets this program uses: an interrupted `connect` leaves them unconnected.
 A TCP connection attempt instead continues after `EINTR` and a retried
 `connect` reports `EALREADY`, so TCP would need another exception; this
 program opens no TCP sockets (section 6.1).
+
+**Wait on non-blocking standard descriptors.** A standard descriptor
+shares its open file description with other processes, and one of them
+can make it non-blocking. Then a read or a write that would wait fails
+with `EAGAIN` instead. Each role reads and writes its standard
+descriptors as blocking ones: after `EAGAIN`, it waits with `poll` until
+the descriptor is ready, and tries again. A wait that also watches other
+descriptors, such as that of the receiver's stdin reader (section 6.6),
+goes back to its own `poll`. The stdin reader also makes a stdin that is
+not a terminal non-blocking itself while it reads it, as `ssh` does.
 
 ## 4. The receiver's index
 
@@ -858,7 +879,7 @@ the remote shell. The sender needs a compatible `hashsync` in PATH or at
 `sender_command`.
 
 The receiver generates token `T` and starts both sessions together, with
-the signal mask that the receiver started with (section 6.8):
+the signal mask that the receiver started with (section 6.9):
 
 - Data: `SSH HOST hashsync serve --token T`.
 - Control: `SSH HOST hashsync attach --token T`.
@@ -878,16 +899,16 @@ thread, and exits zero. After a peer-closed error on a write, the relay
 from stdin writes nothing more to the socket, but reads stdin to EOF and
 discards the bytes. This prevents a deadlock: the receiver closes the
 control session's stdin only after its control writer has ended
-(section 6.8), and that writer could otherwise block on a full pipe.
+(section 6.9), and that writer could otherwise block on a full pipe.
 Either direction may observe closure first. The receiver decides from its
 completion state whether a closure was expected; other relay failures end
 the relay unsuccessfully.
-Rendezvous waits must also observe receiver disappearance (section 6.8).
+Rendezvous waits must also observe receiver disappearance (section 6.9).
 
 The command's argv travels in HELLO, not on the SSH command line. Start it
-without a shell, with stdin from `/dev/null`, piped stdout and stderr, its
-own process group for cleanup, and the signal mask that `serve` started
-with (section 6.8).
+without a shell, with piped stdin, stdout, and stderr, its own process
+group for cleanup, and the signal mask that `serve` started with (section
+6.9).
 
 A dedicated sender thread copies command stderr to `serve`'s stderr with
 bounded buffering and prompt writes. SSH forwards these bytes through its
@@ -897,7 +918,7 @@ EOF and all copied bytes have been written and flushed to SSH. It runs
 independently of stdout scanning and control traffic. Stderr is outside the
 hashsync protocol and its compression streams. Successful sender exit requires
 relay completion; its coordination with stdout completion is an implementation
-decision (section 6.8). The receiver waits for both SSH exits before returning.
+decision (section 6.9). The receiver waits for both SSH exits before returning.
 
 ### 6.2 Protocol version and frames
 
@@ -925,9 +946,9 @@ repeating them.
 
 | Session | Direction | Types |
 |---|---|---|
-| data | receiver to sender | HELLO, HASHLIST, HASHDELTA, HASHKEEP, END_ACK |
+| data | receiver to sender | HELLO, HASHLIST, HASHDELTA, HASHKEEP, INPUT, INPUT_END, END_ACK |
 | data | sender to receiver | HELLO, HASHFULL, CACHE_RESULT, LIT, REF, RLE, END, DONE |
-| control | sender to receiver | QUERY |
+| control | sender to receiver | QUERY, INPUT_STOP |
 | control | receiver to sender | ANSWER |
 
 Payloads:
@@ -937,8 +958,8 @@ Payloads:
   `index_id [u8; 16]`, `sender_cache u8`, `hashlist_max_age u64` (seconds),
   `compression_level i32`, `compression_long u8`, `compression_threads u32`,
   `probe_threads u32`, `lookahead u64`, `negative_cache u64` (bytes),
-  `sender_spool_limit u64` (bytes; `2^64 − 1` for `unlimited`), and
-  `command`, a list of argv byte strings.
+  `sender_output_spool_limit u64` and `sender_input_spool_limit u64` (bytes;
+  `2^64 − 1` for `unlimited`), and `command`, a list of argv byte strings.
   Find argv[0] in PATH and run directly; a shell requires explicit
   `sh -c`.
 - HELLO, sender to receiver: `account_id [u8; 16]` and an optional
@@ -959,22 +980,32 @@ Payloads:
   enabled. With `sender_cache = false`, send it after removing earlier
   files for this receiver/index. Cache operation failures are fatal as
   specified in section 5.6. Repeated acknowledgements are protocol errors.
+  The receiver sends the input only after CACHE_RESULT.
 - LIT: literal bytes.
 - REF: empty; use the pin at the current output offset.
 - RLE: `byte u8, length u64`.
 - END: `status i32, error string`. Status is the command's exit status,
   `128 + signal`, or 127 plus error text if startup failed. Of the
   sender-to-receiver data frames, only DONE follows.
+- INPUT: the next bytes of the input stream, at least one (section 6.6).
+- INPUT_END: empty. The input ended, at the EOF of what the stdin reader
+  reads (section 6.6), and the input stream ended with the last INPUT:
+  with compression, its zstd frame ended there. At most once; no INPUT
+  follows it.
 - END_ACK: empty. The receiver has validated END and compression completion
   and flushed reconstructed stdout. Send exactly once on the data session;
-  it is the receiver's last data-session frame. Section 6.8 defines shutdown.
-- DONE: empty. The completion conditions of section 6.8 hold, and the
+  it is the receiver's last data-session frame. Section 6.9 defines shutdown.
+- DONE: empty. The completion conditions of section 6.9 hold, and the
   sender needs neither session any more, so the receiver can close both
   session stdin pipes. The sender sends it once, after it has received
   END_ACK. It directly follows the compression stream, outside it. Nothing
   follows DONE: a byte after it is a protocol error.
 - QUERY: `offset u64, strong [u8; S]`. At most one per offset; offsets may
   go backwards after rescanning.
+- INPUT_STOP: empty. The sender stopped the input, and the receiver stops
+  it too when it has not stopped it at END yet (section 6.6). At most
+  once, after CACHE_RESULT; the receiver can read it before it reads
+  CACHE_RESULT on the data session, and also in Completing.
 - ANSWER: `offset u64, found u8` (0 or 1). Answers may arrive out of order.
 
 The receiver's HELLO sets the block size, weak hash, and strong hash of the
@@ -987,30 +1018,39 @@ The data handshake is the version exchange, receiver HELLO, sender HELLO,
 durable receiver publication, then HASHLIST/HASHDELTA/HASHKEEP and its data.
 The sender replies with CACHE_RESULT, possibly after one HASHFULL fallback.
 The receiver handles the result and cache cleanup before entering its output
-loop. Its only remaining data-session frame is END_ACK; it keeps both session
-stdin pipes open until DONE (section 6.8).
+loop. Its remaining data-session frames are the input, in INPUT frames and
+INPUT_END, until the stop of the input, and then END_ACK. It keeps both
+session stdin pipes open until DONE (section 6.9).
 
 After HELLO, all sender-to-receiver data-session frames through END share one
 zstd stream, unless compression is disabled. This includes HASHFULL and
 CACHE_RESULT. DONE follows the stream, outside it.
 Output latency does not matter, only bandwidth. So the sender flushes the
-stream only before it waits for a reply, after HASHFULL, and finishes the
-stream after END. Other frames can stay in the compressor and the transport
-buffer until more output fills them or the stream ends. No wait depends on
-them: queries and answers use the control session. Compression settings are
-in section 7.
+stream only before it waits for a reply, after HASHFULL, and after
+CACHE_RESULT, and finishes the stream after END. The receiver sends the
+input only after CACHE_RESULT, and the command can wait for the input
+before it writes output. Other frames can stay in the compressor and the
+transport buffer until more output fills them or the stream ends. No wait
+depends on them: queries and answers use the control session. Compression
+settings are in section 7.
 
 After the protocol version, each direction of the control session is also
 one zstd stream at the same level, unless compression is disabled. The
 frames are small, so the stream uses no long-distance matching and no
 worker threads. A control writer flushes its stream each time its queue
-becomes empty, because the scanner waits for answers. When a slow link
-makes the writer wait, more frames share each flush and compress better.
-No frame ends the stream: the closure of the session ends it (section 6.8).
+becomes empty, because the scanner waits for answers, and the receiver
+must stop sending the input as soon as the sender has stopped it. When a
+slow link makes the writer wait, more frames share each flush and
+compress better.
+No frame ends the stream: the closure of the session ends it (section 6.9).
 
-The receiver-to-sender direction of the data session is not compressed.
-Almost all its bytes are the hash list, and zstd cannot make the list
-smaller (section 10).
+The frames of the receiver-to-sender direction of the data session are not
+compressed. zstd cannot make the hash list smaller (section 10). The input
+stream has a zstd stream of its own, in the payloads of INPUT frames, so
+the sender can find END_ACK after input that it discards without
+decompressing it (section 6.6). Each frame goes to SSH in one write:
+SSH sends what one read of its stdin returns in packets of its own, so a
+header that arrives alone, before its payload, can cost a packet.
 
 ### 6.3 The sender's scanner
 
@@ -1049,7 +1089,7 @@ ready prefix can be emitted before it stops growing.
 **Scanning.**
 
 Each iteration processes available answers, resolves Query records in
-offset order, and emits ready records before scanning more input.
+offset order, and emits ready records before scanning more bytes.
 
 With a full window at `p`:
 
@@ -1140,16 +1180,16 @@ queue and remain ordered even when offsets go backwards. Discarded records
 can leave obsolete requests; lookahead is not a bound on all outstanding
 queries or receiver pins.
 
-When progress requires input, answers, or data-queue space, wait on
+When progress requires command output, answers, or data-queue space, wait on
 notifications for those events, continuing to prioritize answers.
 Backpressure propagates from the data writer through the lookahead buffer
 to the spool of command stdout. It reaches the command only when
-`sender_spool_limit` bytes wait in the spool (section 6.5). Pin
+`sender_output_spool_limit` bytes wait in the spool (section 6.5). Pin
 allocation and release are entirely receiver-local.
 
 Finish only after stdout EOF, `p = r`, and no Query records remain. Drain all
 records so `e = p = r`. END can be queued once the exit status is available;
-coordinate shutdown according to section 6.8. Flush queued data before waiting
+coordinate shutdown according to section 6.9. Flush queued data before waiting
 for further completion conditions. Obsolete unanswered requests do not delay
 completion.
 
@@ -1175,7 +1215,7 @@ tmp_data directory thus ends the run before command startup. The QUERY
 procedure below allocates extents with steps A1 to A3 of section 6.5. The
 QUERY procedure and the advance of `c` release them with steps R1 to R3.
 At the end, closing the pins closes all their open segments (section
-6.8).
+6.9).
 
 The receiver tracks output offset `c`, its pin map, and the open segments
 of the pins.
@@ -1242,9 +1282,9 @@ REF. Output may pass `x` and release its extent before the answer is sent;
 the sender then discards that obsolete answer.
 
 The receiver reads the data session through a spool whose limit is
-`receiver_spool_limit` (section 6.5). The thread of the spool reads the
-session as its bytes arrive, so until that many bytes wait in the spool,
-a blocked stdout stops only reconstruction. The sender keeps sending,
+`receiver_output_spool_limit` (section 6.5). The thread of the spool reads
+the session as its bytes arrive, so until that many bytes wait in the
+spool, a blocked stdout stops only reconstruction. The sender keeps sending,
 scanning, and querying, the lookups keep writing pins, and the spool and
 the pins hold the output until stdout takes it. The limit counts bytes of
 the data session, which is compressed; it does not bound the pins.
@@ -1269,7 +1309,7 @@ spool:
   unpublished write that becomes obsolete is released by its lookup worker
   after that write finishes.
 - END carries the command status into shutdown. Validate compression
-  completion and flush stdout before END_ACK (section 6.8). EOF without
+  completion and flush stdout before END_ACK (section 6.9). EOF without
   END or before the compressed stream is complete is failure.
 
 The shared lock makes pin publication and output advancement atomic relative
@@ -1365,7 +1405,7 @@ Release an extent, under the lock of the user:
   segment is now full, seal it. If its count of extents in use is 0, also
   remove it from the open segments, and close its file as in step R2.
 
-End: closing a user closes all its open segments (section 6.8). Process
+End: closing a user closes all its open segments (section 6.9). Process
 exit closes them too. No fsync or crash recovery is required for these
 transient files; closing a segment frees all its storage.
 
@@ -1401,77 +1441,245 @@ Properties, for each user:
 
 A **spool** is a pipe whose bytes wait in segments, so that the producer
 of the bytes waits for their consumer only at the **limit** of the spool.
-The thread of the spool reads its **source** as the bytes arrive and
-appends them; it waits for the reader only at the limit. The reader takes
-the bytes in order, and waits only while no byte waits for it.
+The **writer** of the spool takes the bytes from the **source** of the
+spool as they arrive, and appends them; it waits for the reader only at
+the limit. The reader takes the bytes in order, and waits only while no
+byte waits for it. The writer of the spools of command stdout and of the
+data session is a thread of their own, the **thread of the spool**, which
+reads the source. The writers of the input spools are threads of the
+input (section 6.6).
 
-| Role | Source | Reader | Limit |
-|---|---|---|---|
-| Sender | Command stdout | The output reader, for the lookahead buffer (section 6.3) | `sender_spool_limit`, from HELLO |
-| Receiver | Data-session stdout | Reconstruction (section 6.4) | `receiver_spool_limit` |
+| Role | Source | Writer | Reader | Limit |
+|---|---|---|---|---|
+| Sender | Command stdout | The thread of the spool | The output reader, for the lookahead buffer (section 6.3) | `sender_output_spool_limit`, from HELLO |
+| Receiver | Data-session stdout | The thread of the spool | Reconstruction (section 6.4) | `receiver_output_spool_limit` |
+| Receiver | The input stream, from stdin | The stdin reader | The input writer | `receiver_input_spool_limit` |
+| Sender | The input stream, from INPUT frames | The data reader | The stdin writer | `sender_input_spool_limit`, from HELLO |
 
 Each limit is 2 GiB by default, and `unlimited` removes it. Without a
-limit, a spool can grow to almost the whole output when its reader stays
-slower than its source (section 10).
+limit, a spool can grow to almost the whole output, or the whole input,
+when its reader stays slower than its source (section 10).
 
 Data structures:
 
 - **Spool extents**: the extents of 1 MiB of the spool's segments, which
-  the thread allocates in stream order. The reader is in the first extent
-  that is not released, and the thread appends to the last one.
-- **Written** and **read**: the bytes that the thread has appended, and
+  the writer allocates in stream order. The reader is in the first extent
+  that is not released, and the writer appends to the last one.
+- **Written** and **read**: the bytes that the writer has appended, and
   that the reader has taken. The bytes between them **wait**.
-- **End**: the source reached EOF, and the thread has appended all its
-  bytes.
-- **Limit**: the bytes that can wait before the thread stops reading its
-  source. `unlimited` is the largest value, `2^64 − 1`, which no spool
-  reaches.
+- **End**: the source ended, and the writer has appended all its bytes.
+- **Stopped**: a role stopped the spool, before or after its end, because
+  its bytes have no use any more. Only the input spools stop
+  (section 6.6).
+- **Limit**: the bytes that can wait before the writer stops taking bytes
+  from its source. `unlimited` is the largest value, `2^64 − 1`, which no
+  spool reaches.
 
-The thread of the spool:
+The writer:
 
-- **W1.** Wait while bytes wait and at least `limit` bytes wait. The
-  reader wakes the thread when it takes bytes. With a limit of 0, the
-  thread reads when no byte waits.
-- **W2.** Read the source. At EOF, mark the end, wake the reader, and
-  stop. A read error ends the run with `die` without a core dump.
+- **W1.** Wait while bytes wait and at least `limit` bytes wait, unless
+  the spool is stopped. The reader wakes the writer when it takes bytes.
+  With a limit of 0, the writer takes bytes from its source when no byte
+  waits.
+- **W2.** Take the next bytes from the source. At the end of the source,
+  mark the end, wake the reader, and stop. A thread of a spool reads its
+  source; a read error ends the run with `die` without a core dump.
 - **W3.** Append the bytes, one extent at a time. If there is no extent,
   or the last extent is full, allocate an extent (steps A1 to A3) under
   the lock. Write the bytes that fit in the last extent with `pwrite`
   outside the lock. Then add them to written under the lock, and wake the
-  reader. Repeat until all bytes are appended, then go to step W1.
+  reader. Repeat until all bytes are appended, then go to step W1. When
+  the spool is stopped, discard the bytes that are not appended.
 
 The reader:
 
-- **T1.** Under the lock, wait until bytes wait or the end is marked. If
-  no byte waits and the end is marked, release the remaining extent, if
-  one remains (steps R1 to R3), and report EOF. That extent is the last
-  one, which is not full, so step T3 did not release it.
+- **T1.** Under the lock, wait until bytes wait, the end is marked, or the
+  spool is stopped. If it is stopped, report EOF. If no byte waits and the
+  end is marked, release the remaining extent, if one remains (steps R1 to
+  R3), and report EOF. That extent is the last one, which is not full, so
+  step T3 did not release it.
 - **T2.** Read the waiting bytes of the first extent with `pread`, outside
   the lock.
-- **T3.** Under the lock, add them to read, and wake the thread. If the
+- **T3.** Under the lock, add them to read, and wake the writer. If the
   reader has passed the first extent, release it (steps R1 to R3). Close
   the files of the segments that this removes after the lock is released.
+  If the spool was stopped meanwhile, report EOF instead of the bytes.
 
-The waits of the thread and of the reader have no timeout. The reader
+A role stops a spool under its lock: it marks the spool stopped, and
+wakes the writer and the reader. A stop is final, so the spool needs its
+extents no more, nor the full rule: the stop takes all its extents and
+open segments at once, without steps R1 to R3, which discards the bytes
+that wait. Their files close after the lock is released, or after the
+I/O of the writer or the reader that still uses one of them. The reader
+can tell the EOF of a stopped spool from the end.
+
+The waits of the writer and of the reader have no timeout. The reader
 releases the extents in allocation order, so the retention property above
 holds for a spool: its files hold its waiting bytes and, in its oldest
 open segment, bytes that the reader has passed. With a limit, at most the
-limit plus one read of the source (256 KiB) wait, so the files hold less
-than twice the limit plus 40 MiB. In a simulation of the default
-limit of 2 GiB, with readers 2 to 10 times slower than the source and
-with stalls, the files held at most 2.5 GiB, in at most 8 files.
+limit plus one append (256 KiB) wait, so the files hold less than twice
+the limit plus 40 MiB. In a simulation of the default limit of 2 GiB,
+with readers 2 to 10 times slower than the source and with stalls, the
+files held at most 2.5 GiB, in at most 8 files.
 
 Cost: on XFS, a spool passed 1 GiB in 0.36 s, with 0.27 s of CPU in the
-thread and 0.16 s in the reader. That is about the cost of two copies in
-memory (0.18–0.22 s each), as a channel of chunks makes. While the reader
-keeps up, a segment can fill and close before the kernel writes back its
-dirty pages, by default after 30 s. Then the close discards the pages,
-and nothing reaches the disk. A slow source keeps its current segment
-open longer, and the kernel writes those pages to the disk. The data
-session can be such a source: it took 6.3 MB for 3.29 GB of output
-(section 10).
+thread of the spool and 0.16 s in the reader. That is about the cost of
+two copies in memory (0.18–0.22 s each), as a channel of chunks makes.
+While the reader keeps up, a segment can fill and close before the kernel
+writes back its dirty pages, by default after 30 s. Then the close
+discards the pages, and nothing reaches the disk. A slow source keeps its
+current segment open longer, and the kernel writes those pages to the
+disk. The data session can be such a source: it took 6.3 MB for 3.29 GB
+of output (section 10).
 
-### 6.6 Failures and trust
+### 6.6 The input
+
+The **input** is the bytes that the command reads as its stdin: the
+receiver's stdin when the run has `--stdin`, else none, because the
+receiver then reads `/dev/null` in its place (section 8). The receiver
+sends the input in INPUT frames on the data session, from CACHE_RESULT
+until the stop of the input. Each role keeps it in an **input spool** on
+the way (section 6.5). So the producer of the receiver's stdin waits for
+a command that reads slowly, or late, only when both input spools hold
+their limits.
+
+The **input stream** carries the input: one zstd frame at the level and
+long-distance matching of the data stream, or the input itself when
+compression is disabled. The input spools hold the input stream, and their
+limits count its bytes. The command can wait for its input before it
+writes output, so the stdin reader flushes the stream before each wait
+for stdin, and the EOF of stdin ends the zstd frame. The stdin reader
+compresses on its own thread, without worker threads: with them, each
+flush would end a zstd job, which costs much more than the end of a block
+(section 10). The frames that carry the stream are not compressed
+(section 6.2): a role can stop the input after any frame, and the zstd
+frame then stays incomplete.
+
+Data structures:
+
+- **Input spool**: on the receiver, with the limit
+  `receiver_input_spool_limit`; on the sender, with the limit
+  `sender_input_spool_limit` from HELLO. The receiver's input spool exists
+  before the sessions start, so that INPUT_STOP can stop it at any time.
+  The sender's exists from the sender's HELLO, before the command starts.
+- **Stop pipe**: a pipe of each role. At the stop of the input, the role
+  closes its write end, and the EOF that follows ends a wait of `poll`:
+  that of the receiver's stdin reader for stdin, and that of the sender's
+  session watcher for the hangup of the data session.
+- **Stopped**: the input of the role stopped. Each role stops its input
+  once; a later stop does nothing.
+
+The receiver's **stdin reader**, from CACHE_RESULT, reads stdin when the
+run has `--stdin`, else `/dev/null` (section 8). As `ssh` does, it makes a
+stdin that is not a terminal non-blocking while it reads it, unless it is
+non-blocking already, so that no read waits. A terminal stays as it is,
+because the shell of the user shares it. Other processes can share stdin
+too, so the stdin reader restores the flags of stdin when it stops to
+read it: at the EOF of stdin, or at the stop of the input. Every end of
+the process restores them too, also a fatal one (section 6.9).
+
+- **I1.** If neither stdin nor the stop pipe is ready, which `poll` shows
+  without a wait, flush the stream, append the output of the flush to the
+  input spool, and wait until one of them is ready. At the EOF of the
+  stop pipe, end. So every wait for stdin follows a flush, also when
+  another process that shares stdin took the bytes that `poll` reported.
+- **I2.** Read stdin. If the read finds no bytes, because another process
+  that shares stdin took them first (`EAGAIN`, section 3), go to step I1.
+  At the EOF of stdin, end the zstd frame, append its last bytes to the
+  input spool, mark the end of the spool, and end. A read error ends the
+  run with `die` without a core dump.
+- **I3.** Compress the bytes, and append the output to the input spool,
+  which waits while the spool holds its limit (section 6.5, steps W1 and
+  W3). Go to step I1.
+
+The receiver's **input writer**, from CACHE_RESULT:
+
+- **S1.** Take the next bytes of the input spool, at most 256 KiB, and
+  send them in one INPUT frame. Go to step S1.
+- **S2.** At the end of the spool, send INPUT_END, and end. At the EOF of
+  a stopped spool, end without INPUT_END.
+
+The sender's data reader appends the payload of each INPUT frame to the
+input spool, and waits while the spool holds its limit (section 6.5,
+steps W1 and W3). INPUT_END marks the end of the spool. While the data
+reader waits, it reads nothing from the data session, so it cannot see
+the EOF that the loss of the session causes (section 6.9).
+
+The sender's **session watcher**, from the sender's HELLO:
+
+- **M1.** Wait until the data session hangs up, or the stop pipe reaches
+  EOF. At the EOF of the stop pipe, end. A hangup ends the run with `die`
+  without a core dump: the receiver disappeared. A pipe tells its hangup
+  with `POLLHUP`, and a socket whose peer shut down its writes with
+  `POLLRDHUP`; bytes that arrive do not end the wait.
+
+The sender's **stdin writer**, from command startup:
+
+- **C1.** Take the next bytes of the input spool. At the end of the spool,
+  require that the zstd frame ended with the last byte, if the stream is
+  compressed. Then close the command's stdin, and end. At the EOF of a
+  stopped spool, close the command's stdin, and end.
+- **C2.** Decompress the bytes, and write the output to the command's
+  stdin, at most 256 KiB in each write. A failed write with `EPIPE` means
+  that no process reads the command's stdin any more: stop the input
+  (below), close the command's stdin, and end. Other write failures end
+  the run with `die` without a core dump. When the input is stopped after
+  a write, close the command's stdin, and end: a few bytes of the input
+  stream can decompress to gigabytes, which have no use any more. Else go
+  to step C1 once all the output is written.
+
+The sender's **exit watcher**, from command startup:
+
+- **E1.** Wait until the command exits, without reaping it (section 6.8).
+  Then stop the input (below), and end. The exit can come long before the
+  EOF of the command's stdout, which a descendant can hold. A descendant
+  that reads the command's stdin then reads EOF, as under SSH, where
+  `sshd` closes the stdin of a command that exited.
+
+The input has no use any more once no process reads the command's stdin,
+or once the command has exited. Then each role stops it, once:
+
+1. The sender stops the input at `EPIPE` (step C2), at the exit of the
+   command (step E1), or after a startup failure, whichever comes first.
+   It stops its input spool (section 6.5), closes the write end of its
+   stop pipe, and sends INPUT_STOP on the control session, which the
+   control writer flushes at once (section 6.2). Before it sends END, the
+   sender stops the input too. A stop waits until a stop in progress on
+   another thread is done, so END always follows the stop. From then on,
+   the data reader discards the payloads of INPUT frames, until END_ACK.
+2. The receiver stops the input at INPUT_STOP, or at END when END comes
+   first: the two sessions are independent. It stops its input spool, and
+   closes the write end of its stop pipe. The input spool stops first, so
+   the input writer reads the EOF of a stopped spool, and sends no
+   INPUT_END. At END, before END_ACK, it joins the stdin reader and the
+   input writer.
+
+Between the two stops, the sender discards the input that arrives: about
+what the link carries in one round trip. INPUT_STOP travels on the
+control session, so it does not wait behind the output that the receiver
+must write before it reads END (section 10). As with SSH, the input that
+the receiver has read and not sent is lost. A command that does not read
+its stdin, and does not close it, makes a run with `--stdin` send up to
+the sender's limit of input for nothing. A run with `--stdin` in the
+background of an interactive shell stops at its first read of the
+terminal, as SSH does.
+
+Two waits can delay the end. The stdin reader reads stdin only after
+`poll` reported it readable. If stdin is a terminal, and another program
+reads the same terminal, such as a pager in the same pipeline, and takes
+the bytes first, the read waits for the next bytes of the terminal, or
+its EOF, and so does the receiver's join of the stdin reader at END, as
+`ssh` waits in its read. Until then, the stream holds the input that the
+stdin reader compressed after its last flush. The stdin writer can wait
+in a write to the command's stdin. After the command's exit, the write
+fails with `EPIPE` at once, unless another process, such as a descendant
+of the command, holds the command's stdin and does not read it. Then the
+stdin writer ends only when that process reads or exits. The sender
+joins it after END_ACK, as it joins the stderr relay, so END does not
+wait for that process, and DONE does, as for a descendant that holds
+command stderr (section 6.9).
+
+### 6.7 Failures and trust
 
 - Different protocol versions and unsupported HELLO parameters fail before
   command startup.
@@ -1480,11 +1688,13 @@ session can be such a source: it took 6.3 MB for 3.29 GB of output
 - Truncated streams, broken sessions or receiver stdout, and receiver
   SIGINT/SIGTERM end the run unsuccessfully without a core dump.
 - Stderr relay read, write, or flush failures also end the run with `die`
-  without a core dump.
+  without a core dump. So do failed reads of the receiver's stdin, and
+  failed writes to the command's stdin other than `EPIPE` (section 6.6).
 - Invalid frames, a compressed stream that ends before END or on the
-  control session, unexpected answers, missing pins, protocol arithmetic
-  overflow, database errors, and invariant violations are bugs: panic and
-  abort.
+  control session, invalid compressed input, an input stream that does not
+  end with its zstd frame, unexpected answers, missing pins, protocol
+  arithmetic overflow, database errors, and invariant violations are bugs:
+  panic and abort.
 - Conflicting immutable-copy policies, duplicate or nested root paths, and
   repeated directory identities detected during expansion or traversal call
   `die` without a core dump.
@@ -1501,14 +1711,15 @@ Use trusted peers: the sender learns hashes of all indexed content.
 `sender_cache = false` disables retention and removes earlier caches for
 that receiver/index.
 
-### 6.7 Threads at run time
+### 6.8 Threads at run time
 
 Both roles use blocking threads and channels, with the threads of the table
-below. At the normal end, a thread ends when its work ends: its input
+below. At the normal end, a thread ends when its work ends: what it reads
 reaches EOF or END, its queue closes because no thread can send to it any
-more, or a write fails at an expected closure (section 6.8). Then the main
-thread joins it, in the order of section 6.8; the reader of a spool joins
-the thread of the spool when it closes the spool. One thread is the
+more, a write fails at an expected closure (section 6.9), the command
+exits, or a role stops the input (section 6.6). Then the main thread
+joins it, in the order of section 6.9; the reader of a spool joins the
+thread of the spool when it closes the spool. One thread is the
 exception: the receiver's signal thread stays until the process exits,
 and no thread joins it, so that SIGINT and SIGTERM during the end still
 give `128 + signal`.
@@ -1518,25 +1729,30 @@ threads.
 
 | Role | Responsibilities |
 |---|---|
-| Sender main | Handshake and command startup, then obtain the command's exit status without reaping, wait for the completion conditions of section 6.8, and send DONE. |
-| Sender data reader | Read the data session for the whole run: the protocol version, HELLO, the list, END_ACK, and EOF. EOF before DONE means that the receiver disappeared. |
+| Sender main | Handshake and command startup, then obtain the command's exit status without reaping, wait for the completion conditions of section 6.9, and send DONE. |
+| Sender data reader | Read the data session for the whole run: the protocol version, HELLO, the list, the input, END_ACK, and EOF. EOF before DONE means that the receiver disappeared. Append the input to the input spool, waiting at its limit (section 6.6). |
 | Sender spool thread | Copy command stdout into its spool until EOF, waiting at the limit of the spool (section 6.5). |
 | Sender output reader | Fill lookahead from the spool of command stdout until its EOF, then close the spool. |
 | Sender stderr relay | Copy command stderr to sender stderr through EOF and flush. |
+| Sender session watcher | Until the stop of the input, end the run at the hangup of the data session, which the data reader does not see while it waits at the limit of the input spool (section 6.6). |
+| Sender stdin writer | Decompress the input spool into the command's stdin until the end or the stop of the input; at `EPIPE`, stop the input (section 6.6). |
+| Sender exit watcher | Wait for the exit of the command, without reaping it, then stop the input (section 6.6). |
 | Sender scanner | Own records and query states; queue queries and output. |
 | Sender probe threads | Probe the parts of long stretches of windows for the scanner (section 6.3). |
 | Sender data writer | Drain output in order, compress, and finish and flush the stream after END. |
-| Sender control reader/writer | Receive answers and send queries promptly, independently of data output. |
-| Receiver main | Start SSH sessions, reconstruct stdout from the spool of the data session, validate completion, send END_ACK, and close both session stdin pipes after DONE. |
+| Sender control reader/writer | Receive answers, and send queries and INPUT_STOP promptly, independently of data output. |
+| Receiver main | Start SSH sessions, reconstruct stdout from the spool of the data session, stop the input at END if INPUT_STOP has not, validate completion, send END_ACK, and close both session stdin pipes after DONE. |
 | Receiver spool thread | Copy data-session stdout into its spool until EOF, waiting at the limit of the spool (section 6.5). |
-| Receiver control reader/writer | Dispatch queries to lookup workers and send answers promptly. |
+| Receiver stdin reader | Compress stdin into the input spool until EOF or the stop of the input, waiting at the limit of the spool; meanwhile keep a stdin that is not a terminal non-blocking (section 6.6). |
+| Receiver input writer | Send the input spool in INPUT frames, and INPUT_END at its end, until the stop of the input (section 6.6). |
+| Receiver control reader/writer | Dispatch queries to lookup workers, stop the input at INPUT_STOP, and send answers promptly. |
 | Receiver lookup workers | Answer queries out of order (section 6.4). |
 | Receiver signal thread | Handle SIGINT/SIGTERM with status `128 + signal`. |
 | Attach relay | Copy both directions; half-close on stdin EOF. Once the socket is closed, discard stdin; at socket EOF, wait for stdin EOF, then exit zero. |
 
 Blocking output provides backpressure, which the spools absorb up to their
 limits (section 6.5); it must not prevent independent control traffic.
-Completion requirements are in section 6.8.
+Completion requirements are in section 6.9.
 
 Keep successfully spawned children unreaped until their owning `hashsync`
 process exits. Obtain command and SSH exit statuses with
@@ -1546,7 +1762,7 @@ process exits. Obtain command and SSH exit statuses with
 reserves its process-group ID, and retaining the SSH children reserves their
 PIDs, so late cleanup cannot signal an unrelated process after ID reuse.
 
-### 6.8 Shutdown
+### 6.9 Shutdown
 
 Fatal errors end the process rather than attempting to interrupt arbitrary
 blocked threads. Persistent state is recoverable: RocksDB recovers from its
@@ -1558,7 +1774,10 @@ the error, performs cleanup once, and exits without unwinding. Concurrent
 callers wait for that cleanup rather than exiting ahead of it:
 
 - Sender: SIGKILL the command's process group and remove the rendezvous socket.
-- Receiver: SIGKILL both SSH processes, causing sender stdin EOF and cleanup.
+- Receiver: SIGKILL both SSH processes, causing sender stdin EOF and
+  cleanup, and restore the flags of stdin, when the stdin reader made it
+  non-blocking (section 6.6). Unlike `ssh`, which leaves them changed at
+  a fatal exit, every end restores them, also the normal end.
 - Process exit closes the unlinked segments of both roles, which frees all
   their storage without a separate cleanup pass.
 - Abandoned cache temporaries remain for expiry.
@@ -1571,7 +1790,7 @@ Both roles block SIGXFSZ in every thread. Then a write past the file-size
 limit fails with `EFBIG`, and the run ends through `die`, with its
 cleanup; the default action of the signal would end the process without
 it. The receiver also blocks SIGINT and SIGTERM in every thread, for its
-signal thread (section 6.7). A blocked signal stays blocked across
+signal thread (section 6.8). A blocked signal stays blocked across
 `exec`, so each role starts its children with the signal mask that it
 started with.
 
@@ -1587,8 +1806,11 @@ neither wait for a background job nor destroy RocksDB's static objects
 under them. The index recovers from its write-ahead log, as after a crash.
 
 The receiver monitors both sessions and termination signals. The sender
-monitors stdin and the control socket. Unexpected EOF or session loss is
-fatal. Monitoring also applies during rendezvous and setup, when no command
+monitors stdin and the control socket. The data reader monitors stdin
+while it reads it, and until the stop of the input, the session watcher
+monitors it too, because the data reader can wait at the limit of the
+input spool (section 6.6). Unexpected EOF or session loss is fatal.
+Monitoring also applies during rendezvous and setup, when no command
 output is flowing. A broken stdout is detected when a write to it fails;
 neither role watches an idle stdout. As under plain SSH, a consumer that
 exits after it reads all output does not fail the run. Normal shutdown uses
@@ -1613,9 +1835,12 @@ machine is required. Startup failure has no command streams to drain.
 Keep sender stdout open until process exit. Join the threads whose work
 ends with the command's streams or with END: the output reader after the
 EOF of the spool of command stdout, which it closes, so that it joins the
-spool's thread; the stderr relay for its completion condition; and the
-data writer after END. Once the completion conditions hold, perform normal
-cleanup once:
+spool's thread; the data writer after END; and after END_ACK, the session
+watcher, which ends at the stop of the input, the exit watcher, which
+ends at the exit of the command, the stdin writer, which can wait for a
+descendant that holds the command's stdin (section 6.6), and the stderr
+relay for its completion condition. Once the completion conditions hold,
+perform normal cleanup once:
 
 1. Shut down the control socket. `attach` then relays the rest of the
    socket to its stdout, and discards its stdin until EOF (section 6.1).
@@ -1633,9 +1858,11 @@ cleanup once:
 
 Receiver completion:
 
-1. After END, the receiver consumes the rest of that zstd frame, checking its
-   trailer and rejecting any further decoded bytes. Stop at frame completion
-   without waiting for transport EOF; when compression is disabled END is
+1. After END, the receiver stops the input, unless INPUT_STOP has stopped
+   it, and joins the stdin reader and the input writer (section 6.6). It
+   consumes the rest of that zstd frame, checking its trailer and
+   rejecting any further decoded bytes. Stop at frame completion without
+   waiting for transport EOF; when compression is disabled END is
    sufficient framing. Flush reconstructed stdout.
 2. The receiver enters Completing before sending and flushing END_ACK on
    the data session. It stops admitting lookups and publishing control
@@ -1687,15 +1914,17 @@ validation, stdout flushing, sending END_ACK, or reading DONE take the
 fatal cleanup path.
 
 No step has a deadline. A descendant retaining command stdout or stderr
-keeps the run open, as under plain SSH; this is expected behavior. In the
-same way, a process that inherited a session's stdout pipe from SSH delays
-the receiver's end until it closes the pipe. It does not delay the sender:
-the receiver closes both stdin pipes after DONE, before it waits for the
-EOF of either stdout. A lookup or segment I/O that stalls, for example on
-an unresponsive NFS mount, delays the receiver's end until the I/O
-completes. After fatal cleanup, a descendant that left the process group can
-survive and will get a broken pipe on its next write to either closed output
-pipe.
+keeps the run open, as under plain SSH; this is expected behavior. A
+descendant that holds the command's stdin, and does not read it, delays
+DONE too, but not END (section 6.6). In the same way, a process that
+inherited a session's stdout pipe from SSH delays the receiver's end
+until it closes the pipe. It does not delay the sender: the receiver
+closes both stdin pipes after DONE, before it waits for the EOF of either
+stdout. A lookup or segment I/O that stalls, for example on an
+unresponsive NFS mount, delays the receiver's end until the I/O
+completes. After fatal cleanup, a descendant that left the process group
+can survive and will get a broken pipe on its next write to either
+closed output pipe.
 
 ## 7. Configuration
 
@@ -1709,8 +1938,10 @@ hashlist_max_age = "90d"
 index_path     = "~/.local/state/hashsync/default.db"  # a directory
 threads        = 0         # 0 = 4 × cores, clamped to 16–64
 lookahead      = "256MiB"  # at least block_size; default max(256 MiB, 3 × block_size), for the probe threads
-sender_spool_limit   = "2GiB"  # command stdout that can wait on the sender, or "unlimited"
-receiver_spool_limit = "2GiB"  # data session that can wait on the receiver, or "unlimited"
+sender_output_spool_limit   = "2GiB"  # command stdout that can wait on the sender, or "unlimited"
+receiver_output_spool_limit = "2GiB"  # data session that can wait on the receiver, or "unlimited"
+receiver_input_spool_limit  = "2GiB"  # input stream that can wait on the receiver, or "unlimited"
+sender_input_spool_limit    = "2GiB"  # input stream that can wait on the sender, or "unlimited"
 tmp_data_dir   = "~/.cache/hashsync/tmp-data"  # receiver segments; any filesystem
 negative_cache = "128MiB"
 probe_threads  = 0         # 0 = half the sender's cores, at least one
@@ -1796,8 +2027,13 @@ exclude = ['*.tmp', 'literal\x2Aname', 'back\\slash']
 - `hashsync update [--rebuild] [-j N]`: update or rebuild the index;
   `-j` overrides the configured thread count. Use `--rebuild` after changing
   the indexing policy of completed immutable roots.
-- `hashsync run [--no-update] [--ssh CMD] [USER@]HOST -- COMMAND ARGS...`:
-  run the remote command, reproduce stdout, and return its status.
+- `hashsync run [--stdin] [--no-update] [--ssh CMD] [USER@]HOST --
+  COMMAND ARGS...`: run the remote command, reproduce stdout, and return
+  its status. The command reads EOF from its stdin at once, as with
+  `ssh -n`: the run reads `/dev/null` in place of its stdin, and nothing
+  from its stdin. `--stdin` gives the command this process's stdin
+  instead: as `ssh` does, the run then reads its stdin while the command
+  runs.
   Normal runs hold exclusive index access through update and transfer.
   `--no-update` shares read-only access and still resolves current roots.
   Pass HOST unchanged, preserving SSH aliases. Run argv without a shell.
@@ -1812,7 +2048,7 @@ exclude = ['*.tmp', 'literal\x2Aname', 'back\\slash']
      speedup: the output bytes divided by the sent and received bytes.
      These counts do not include the bytes that SSH adds or the command's
      stderr. They are exact: the receiver prints the summary after the
-     threads that count the bytes have ended (section 6.8).
+     threads that count the bytes have ended (section 6.9).
 - `hashsync serve --token T` and `hashsync attach --token T`: internal
   sender entry points.
 - `hashsync stats`: report index statistics.
@@ -2090,6 +2326,67 @@ decision history is in version control.
   responsive when the command pauses, but each flush ends a zstd block or
   job early. With a command paced at 2 MB/s, level 9 sent 5.7% more bytes
   and used 53% more compression CPU. Output latency does not matter here.
+  The input stream has the opposite rule: the command can wait for its
+  input before it writes output, so the receiver flushes the stream when
+  stdin has no bytes ready (section 6.6).
+- **Worker threads for the input stream:** the stdin reader flushes the
+  stream each time it finds no byte of stdin ready, also between the
+  writes of a fast producer, whose pipe it empties sooner than the
+  producer fills it. With worker threads, each flush ends a zstd job, and
+  the jobs stay small. At level 9 with long-distance matching, for 16 MiB
+  of C++ source code paced at 2 MB/s, 12 worker threads sent 12.5% more
+  bytes than without flushes when the producer wrote 64 KiB at a time, and
+  49% more for 4 KiB at a time, with 1.5–2.5 times the CPU. Without
+  worker threads, the flushes added 0.3% and 7.7%, with 1.2–1.4 times the
+  CPU. For 64 MiB of source code that the producer wrote as fast as it
+  could, the stream took 2.3 s and 7.53 MB without worker threads, and
+  2.9 s and 7.86 MB with 12. Worker threads helped only when nothing
+  flushed the stream: 0.6 s and 7.58 MB.
+- **One zstd stream for the frames from the receiver to the sender:** the
+  INPUT frames and END_ACK could share one stream, as the sender's data
+  frames do. Then END_ACK would follow the end of a zstd frame after all
+  the input that the receiver has compressed. At END, the receiver would
+  send its whole input spool, up to `receiver_input_spool_limit` bytes,
+  for a command that has exited, and the sender would decompress all of
+  it to find END_ACK. Pieces of the input stream in frames that are not
+  compressed let each role stop the input after any frame.
+- **Discarding the input after `EPIPE`:** when no process reads the
+  command's stdin any more, every byte of input that crosses the link
+  from then on is wasted. `sshd` discards the data of a channel whose
+  stdin is closed, and goes on reading it: the receiver would then read
+  all its stdin and send it, for as long as the command runs on. A first
+  design abandoned the sender's input spool instead: its data reader read
+  nothing more until the command exited, so the buffers of the session
+  filled, and the receiver stopped at the limit of its input spool. But
+  then the data reader could not see the loss of the data session, and
+  the receiver still read its stdin into its input spool, up to its
+  limit. The sender stops the input at `EPIPE` instead, and INPUT_STOP
+  stops the receiver at once: only the input that is on its way crosses
+  the link. The cost: the producer of stdin waits until the run ends, as
+  it waits for a command that reads slowly, where with SSH it could
+  finish.
+- **Stopping the receiver's input only at END:** the receiver reads END
+  only after it has written the output before it, which can be up to
+  `receiver_output_spool_limit` bytes of the data session behind a slow
+  consumer of stdout. Until then, it would send its stdin for nothing.
+  With a command that closed its stdin and wrote 64 MiB, a consumer that
+  read 10 MiB/s, and an endless stdin, the receiver sent 3.54 GB in 6.4 s
+  over local pipes, which the sender discarded. INPUT_STOP on the control
+  session does not wait behind that output.
+- **Joining the stdin writer before END:** the stdin writer can wait in a
+  write while a descendant of the command holds the command's stdin. Then
+  END would wait for that descendant, and before INPUT_STOP existed, the
+  receiver sent its stdin for nothing all that time: 2.73 GB in 4 s over
+  local pipes, with both input spool limits at 64 KiB. The sender joins
+  the stdin writer after END_ACK, as it joins the stderr relay, so END
+  does not depend on that descendant.
+- **Credits for the input:** the receiver could send only the input that
+  the sender has room for, as an SSH channel window does. Then the data
+  reader would never wait at the limit of the input spool, and would see
+  the loss of the data session by itself. That needs a report on the
+  control session for each part of the input that the stdin writer takes,
+  and a wait for it in the input writer. The session watcher keeps the
+  backpressure of the data session, and only watches for its hangup.
 - **Compressing the hash list:** the weak hashes are uniform 64-bit
   values. For all of `/nix/store` at 4 KiB blocks, 14.0M values in
   73.3 MB, the Rice code of section 5.4 is only 0.16% larger than the
@@ -2163,8 +2460,25 @@ decision history is in version control.
   spool, segments that close behind the reader of a spool, a command that
   ends while the consumer of stdout reads nothing, a command that waits
   when both spools are full, and a receiver that stops reading the data
-  session at its own limit; filesystem races and sparse files;
-  reopening regular files and directories after rename or unlink;
+  session at its own limit; a stop that closes all the segments of a spool
+  and wakes both ends; the input byte for byte, with and without
+  compression, its flush when stdin waits, a run that ends with its command
+  while stdin stays open, the empty input without `--stdin`, a command that
+  reads a part of its input, a command that closes its stdin, which stops
+  the input at once with INPUT_STOP, the exit of the command, which stops
+  the input while a descendant holds stdout and gives EOF to a descendant
+  that reads the command's stdin, INPUT_STOP that comes before
+  CACHE_RESULT, END that does not wait for a descendant that holds the
+  command's stdin, the loss of the data session while the data reader waits
+  at the limit of the input spool, a producer of stdin that waits when both
+  input spools are full, input that waits in the sender's input spool, a
+  stop that ends the writes of the stdin writer inside the output of one
+  read of its spool, and input streams that do not end with their zstd
+  frame; a stdin that is non-blocking while the stdin reader reads it,
+  unless it is a terminal, with its flags restored at its EOF and at a
+  fatal end; one write call per frame; reads and writes of non-blocking
+  standard descriptors; filesystem races and sparse files; reopening
+  regular files and directories after rename or unlink;
   skipping symlinks and special files without opening them for I/O;
   configuration byte escapes, TOML quoting, literal glob metacharacters,
   and non-UTF-8 root, exclusion, and identifier values; symlinks and cycles

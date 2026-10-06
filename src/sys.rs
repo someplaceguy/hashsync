@@ -141,7 +141,7 @@ fn last_errno() -> Errno {
 
 /// Wait for a child to exit without reaping it (`WEXITED | WNOWAIT`), so
 /// its process and group IDs stay reserved until this process exits
-/// (DESIGN.md §6.7). Returns the child's exit status, or `128 + signal`
+/// (DESIGN.md §6.8). Returns the child's exit status, or `128 + signal`
 /// when a signal terminated it.
 pub fn wait_exit_status(pid: rustix::process::Pid) -> i32 {
     use rustix::process::{WaitId, WaitIdOptions, waitid};
@@ -171,7 +171,7 @@ pub fn exit_now(status: i32) -> ! {
 
 /// Set `SIGCHLD` to `SIG_DFL` with `SA_NOCLDWAIT` clear, so children stay
 /// unreaped until process exit and `waitid` with `WNOWAIT` can observe
-/// them (DESIGN.md §6.7). Call before spawning the first child.
+/// them (DESIGN.md §6.8). Call before spawning the first child.
 pub fn reset_sigchld() {
     // SAFETY: a zeroed `sigaction` with an empty mask installs `SIG_DFL`
     // with no flags, which is a valid disposition for `SIGCHLD`.

@@ -4,7 +4,8 @@
 //! This build implements PLAN.md steps 1–5: `update` and `stats` for
 //! mutable roots, and `run` transfers that replace indexed blocks with
 //! verified references, send constant-byte runs compactly, compress the
-//! data stream, and spool the command's output and the data session.
+//! data stream, spool the command's output and the data session, and, with
+//! `--stdin`, send the receiver's stdin to the command.
 
 mod attach;
 mod blocks;
@@ -18,6 +19,7 @@ mod hash;
 mod hashlist;
 mod hashtable;
 mod index;
+mod input;
 mod lookup;
 mod pins;
 mod pool;
@@ -83,6 +85,11 @@ enum Command {
     Stats,
     /// Run a remote command and reproduce its output locally
     Run {
+        /// Send stdin to the command's stdin, as `ssh` does; without this
+        /// option, the command reads EOF at once, as with `ssh -n`
+        #[arg(long)]
+        stdin: bool,
+
         /// Share read-only index access instead of updating first
         #[arg(long)]
         no_update: bool,
@@ -133,11 +140,19 @@ fn main() {
         Command::Update { rebuild, jobs } => update::run(&load_config(), rebuild, jobs),
         Command::Stats => stats::run(&load_config()),
         Command::Run {
+            stdin,
             no_update,
             ssh,
             host,
             command,
-        } => run::run(&load_config(), no_update, ssh.as_deref(), &host, &command),
+        } => run::run(
+            &load_config(),
+            no_update,
+            stdin,
+            ssh.as_deref(),
+            &host,
+            &command,
+        ),
         Command::Serve { token } => serve::run(&token),
         Command::Attach { token } => attach::run(&token),
     }

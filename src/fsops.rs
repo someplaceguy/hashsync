@@ -11,6 +11,7 @@
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 use std::path::Path;
 
+use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::fs::{AtFlags, Dir, DirEntry, FileType, Mode, OFlags, ResolveFlags, StatxFlags};
 use rustix::io::{Errno, retry_on_intr};
 use rustix::process::{Resource, getrlimit, setrlimit};
@@ -169,31 +170,78 @@ pub fn raise_descriptor_limit() {
     }
 }
 
-/// A standard descriptor as an `io::Read` that never reports `EINTR`.
-/// The standard library's `Stdin` cannot be used instead: it takes a
-/// process-wide reentrant lock whose guard cannot move to another thread,
-/// and the transfer roles hand their standard streams between threads.
+/// A standard descriptor as an `io::Read` that never reports `EINTR` or
+/// `EAGAIN` (`blocking_read`). The standard library's `Stdin` cannot be
+/// used instead: it takes a process-wide reentrant lock whose guard cannot
+/// move to another thread, and the transfer roles hand their standard
+/// streams between threads.
 pub struct FdReader(BorrowedFd<'static>);
 
 impl std::io::Read for FdReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        Ok(retry_on_intr(|| rustix::io::read(self.0, &mut *buf))?)
+        Ok(blocking_read(self.0, buf)?)
     }
 }
 
-/// A standard descriptor as an `io::Write` that never reports `EINTR`.
-/// Writes are unbuffered, so `flush` has nothing to do; `Stdout` is
-/// unsuitable because it inserts a line buffer.
+/// A standard descriptor as an `io::Write` that never reports `EINTR` or
+/// `EAGAIN` (`blocking_write`). Writes are unbuffered, so `flush` has
+/// nothing to do; `Stdout` is unsuitable because it inserts a line buffer.
 pub struct FdWriter(BorrowedFd<'static>);
 
 impl std::io::Write for FdWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        Ok(retry_on_intr(|| rustix::io::write(self.0, buf))?)
+        Ok(blocking_write(self.0, buf)?)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
+}
+
+/// Read `fd` as a blocking descriptor is read, also when it is not
+/// blocking. This function exists because a standard descriptor shares
+/// its open file description with other processes, and one of them can
+/// make it non-blocking (DESIGN.md §3). Then a read with no bytes ready
+/// fails with `EAGAIN`, and the wait happens here instead.
+fn blocking_read(fd: BorrowedFd<'_>, buf: &mut [u8]) -> Result<usize, Errno> {
+    loop {
+        match retry_on_intr(|| rustix::io::read(fd, &mut *buf)) {
+            Err(Errno::AGAIN) => wait_until_ready(fd, PollFlags::IN),
+            result => return result,
+        }
+    }
+}
+
+/// Write `fd` as a blocking descriptor is written, also when it is not
+/// blocking, as `blocking_read` reads it.
+fn blocking_write(fd: BorrowedFd<'_>, buf: &[u8]) -> Result<usize, Errno> {
+    loop {
+        match retry_on_intr(|| rustix::io::write(fd, buf)) {
+            Err(Errno::AGAIN) => wait_until_ready(fd, PollFlags::OUT),
+            result => return result,
+        }
+    }
+}
+
+/// Wait until `fd` is ready for `events`, or until a hangup or an error,
+/// which the next read or write reports; no timeout (DESIGN.md §3).
+fn wait_until_ready(fd: BorrowedFd<'_>, events: PollFlags) {
+    poll_fds(&mut [PollFd::new(&fd, events)]);
+}
+
+/// Wait with `poll` until one of the descriptors of `fds` is ready, without
+/// a timeout (DESIGN.md §3). The ready events are in `fds`. Interrupted
+/// calls are retried, and a failure panics.
+pub fn poll_fds(fds: &mut [PollFd<'_>]) {
+    retry_on_intr(|| poll(fds, None)).unwrap_or_else(|e| panic!("poll: {e}"));
+}
+
+/// True when one of the descriptors of `fds` is ready now: `poll` only
+/// looks, and does not wait. The ready events are in `fds`, as after
+/// `poll_fds`. A failure panics.
+pub fn any_ready(fds: &mut [PollFd<'_>]) -> bool {
+    let ready = retry_on_intr(|| poll(fds, Some(&Timespec::default())));
+    ready.unwrap_or_else(|e| panic!("poll: {e}")) > 0
 }
 
 pub fn stdin() -> FdReader {
@@ -239,6 +287,7 @@ pub fn stat(fd: BorrowedFd<'_>) -> Result<Meta, Errno> {
 #[cfg(test)]
 mod tests {
     use std::io::{Error, ErrorKind};
+    use std::os::fd::AsFd;
 
     use super::*;
 
@@ -277,8 +326,6 @@ mod tests {
 
     #[test]
     fn open_beneath_rejects_symlinks_and_escapes() {
-        use std::os::fd::AsFd;
-
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("root/sub")).unwrap();
         std::fs::write(dir.path().join("root/sub/file"), b"data").unwrap();
@@ -301,6 +348,75 @@ mod tests {
         for escape in [&b"../outside"[..], b"sub/../../outside", b"/etc/passwd"] {
             assert!(kind(escape).is_err(), "{}", String::from_utf8_lossy(escape));
         }
+    }
+
+    /// The state of the thread `tid` of this process, as `/proc` shows it,
+    /// such as `S` while it sleeps; `None` once it has ended.
+    fn thread_state(tid: rustix::thread::Pid) -> Option<char> {
+        let path = format!("/proc/self/task/{}/stat", tid.as_raw_nonzero());
+        let stat = std::fs::read_to_string(path).ok()?;
+        // The state follows the name, which ends with the last `)`.
+        let after_name = &stat[stat.rfind(')')? + 1..];
+        after_name.split_whitespace().next()?.chars().next()
+    }
+
+    /// Run `blocked` on a new thread, then `unblock` on this thread once
+    /// that thread sleeps, and return what `blocked` returned. A `blocked`
+    /// that returns without a sleep ends the wait too, so a fault cannot
+    /// hang the test. The wait has no timeout.
+    fn unblock_when_asleep<T: Send + 'static>(
+        blocked: impl FnOnce() -> T + Send + 'static,
+        unblock: impl FnOnce(),
+    ) -> T {
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            tid_tx.send(rustix::thread::gettid()).unwrap();
+            blocked()
+        });
+        let tid = tid_rx.recv().unwrap();
+        while !thread.is_finished() && thread_state(tid) != Some('S') {
+            std::thread::yield_now();
+        }
+        unblock();
+        thread.join().unwrap()
+    }
+
+    #[test]
+    fn non_blocking_descriptors_wait_as_blocking_ones_do() {
+        // Another process can make a standard descriptor that it shares
+        // non-blocking (DESIGN.md §3). Then a write to a full pipe waits
+        // for room, and a read of an empty pipe waits for bytes, where
+        // both would fail with EAGAIN.
+        let (reader, writer) = std::io::pipe().unwrap();
+        rustix::fs::fcntl_setfl(&reader, OFlags::NONBLOCK).unwrap();
+        rustix::fs::fcntl_setfl(&writer, OFlags::NONBLOCK).unwrap();
+        let mut full = 0;
+        while let Ok(n) = rustix::io::write(&writer, &[1u8; 4096]) {
+            full += n;
+        }
+        let written = {
+            let writer = writer.try_clone().unwrap();
+            let drain = || {
+                let mut buf = vec![0u8; full];
+                let mut drained = 0;
+                while drained < full {
+                    drained += rustix::io::read(&reader, &mut buf[drained..]).unwrap();
+                }
+            };
+            unblock_when_asleep(move || blocking_write(writer.as_fd(), b"x"), drain)
+        };
+        assert_eq!(written, Ok(1));
+        assert_eq!(rustix::io::read(&reader, &mut [0u8; 8][..]), Ok(1));
+        let read = {
+            let reader = reader.try_clone().unwrap();
+            let read = move || {
+                let mut buf = [0u8; 8];
+                blocking_read(reader.as_fd(), &mut buf).map(|n| buf[..n].to_vec())
+            };
+            let fill = || assert_eq!(rustix::io::write(&writer, b"y"), Ok(1));
+            unblock_when_asleep(read, fill)
+        };
+        assert_eq!(read, Ok(b"y".to_vec()));
     }
 
     #[test]

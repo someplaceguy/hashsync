@@ -18,9 +18,9 @@
 //! lock, until Completing closes the queue.
 //!
 //! At the normal end, after the lookups have ended, `close` closes all
-//! open segments of the pins, which frees their storage (DESIGN.md §6.8).
+//! open segments of the pins, which frees their storage (DESIGN.md §6.9).
 //!
-//! Pin storage failures end the run with `die` (DESIGN.md §6.6): a yes
+//! Pin storage failures end the run with `die` (DESIGN.md §6.7): a yes
 //! answer cannot be taken back.
 
 use std::collections::BTreeMap;
@@ -87,7 +87,7 @@ struct State {
 }
 
 impl State {
-    /// Completing (DESIGN.md §6.8): the answer queue is closed, and lookups
+    /// Completing (DESIGN.md §6.9): the answer queue is closed, and lookups
     /// neither append, publish, nor answer.
     fn completing(&self) -> bool {
         self.answers.is_none()
@@ -273,7 +273,7 @@ impl Pins {
         }
     }
 
-    /// Enter Completing (DESIGN.md §6.8), and close the answer queue: the
+    /// Enter Completing (DESIGN.md §6.9), and close the answer queue: the
     /// control writer ends after it has sent the answers that the queue
     /// holds.
     pub fn complete(&self) {
@@ -285,7 +285,7 @@ impl Pins {
     }
 
     /// The normal end of the pins, after the lookups have ended
-    /// (DESIGN.md §6.8): close all open segments of the pins, which frees
+    /// (DESIGN.md §6.9): close all open segments of the pins, which frees
     /// their storage. The tmp_data directory closes with its last user.
     pub fn close(self) {
         // This function exists so that no thread still holds the pins when
@@ -488,7 +488,7 @@ mod tests {
     #[test]
     fn completing_closes_the_answer_queue() {
         // The control writer takes the answers that the queue holds, and
-        // then finds the queue closed: it ends (DESIGN.md §6.8).
+        // then finds the queue closed: it ends (DESIGN.md §6.9).
         let setup = setup(BS);
         let (strong, data) = block(6, BS);
         setup.pins.answer(0, &strong, || Some(Arc::clone(&data)));

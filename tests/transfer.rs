@@ -7,24 +7,27 @@
 //!
 //! The tests wait for events, and no wait has a deadline whose end fails a
 //! test: a regression hangs the test, so that a debugger can examine it.
-//! One test must see that the command does not end, which no event shows,
-//! so it waits a fixed time. On a slow machine, that wait can miss a
-//! fault, but it cannot fail a correct build.
+//! A few tests must see that a process does not finish, which no event
+//! shows, so they wait a fixed time. On a slow machine, such a wait can
+//! miss a fault, but it cannot fail a correct build.
 
 mod common;
 
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::fd::AsFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use std::time::Duration;
 
 use common::{
-    ANSWER, BLOCK, CACHE_RESULT, END, Env, HELLO, KillOnDrop, LIT, QUERY, frame, proc_state,
-    random, recv_frame, tiled, toml_literal, version,
+    ANSWER, BLOCK, CACHE_RESULT, END, Env, HELLO, INPUT_STOP, KillOnDrop, LIT, QUERY, frame,
+    proc_state, random, tiled, toml_literal, try_recv_frame, version,
 };
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::fs::{CWD, Mode, OFlags, inotify, mkfifoat};
@@ -32,6 +35,7 @@ use rustix::io::{Errno, read, retry_on_intr};
 use rustix::process::{
     Pid, PidfdFlags, Signal, WaitId, WaitIdOptions, kill_process, pidfd_open, waitid,
 };
+use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
 
 const HOST: &str = "testhost";
 
@@ -105,7 +109,10 @@ exec /bin/sh -c "$1"
     }
 
     /// `hashsync run [flags] HOST -- command...` with the environments
-    /// of both sides prepared.
+    /// of both sides prepared. Its stdin is `/dev/null`, unless the test
+    /// gives it another: with `--stdin`, the receiver sends its stdin to
+    /// the command (DESIGN.md §6.6), and must not read the stdin of the
+    /// test process.
     fn invocation(&self, flags: &[&str], command: &[&OsStr]) -> Command {
         let mut invocation = self.env.command(&["run"]);
         invocation
@@ -113,6 +120,7 @@ exec /bin/sh -c "$1"
             .arg(HOST)
             .arg("--")
             .args(command)
+            .stdin(Stdio::null())
             .env("XDG_CONFIG_HOME", self.env.path("receiver/config"))
             .env("XDG_CACHE_HOME", self.env.path("receiver/cache"))
             .env("HASHSYNC_TEST_SENDER_HOME", self.env.path("sender/home"))
@@ -271,6 +279,27 @@ fn is_scaled_amount(number: &str, unit: &str) -> bool {
                     digits(whole) && fraction.len() == 2 && digits(fraction)
                 })
         }
+    }
+}
+
+/// Wait for `receiver` to end, and return its output, as
+/// `Child::wait_with_output` does. A test that fails before kills the
+/// receiver instead, so that it does not stay.
+fn output_of(mut receiver: KillOnDrop) -> Output {
+    let mut stderr = receiver.0.stderr.take().unwrap();
+    let errors = std::thread::spawn(move || {
+        let mut text = Vec::new();
+        stderr.read_to_end(&mut text).unwrap();
+        text
+    });
+    let mut stdout = Vec::new();
+    let mut pipe = receiver.0.stdout.take().unwrap();
+    pipe.read_to_end(&mut stdout).unwrap();
+    let status = receiver.0.wait().unwrap();
+    Output {
+        status,
+        stdout,
+        stderr: errors.join().unwrap(),
     }
 }
 
@@ -493,7 +522,7 @@ fn a_full_tmp_data_directory_fails_the_run() {
     // The receiver's tmp_data directory is a tmpfs in a new user and mount
     // namespace. It holds 64 KiB, also with pages of 64 KiB, and the pins
     // of the output need 128 KiB in their first segment: a segment write
-    // fails, which ends the run (DESIGN.md §6.6).
+    // fails, which ends the run (DESIGN.md §6.7).
     if !common::namespaces_available() {
         eprintln!("skipped: no unprivileged user namespaces");
         return;
@@ -573,7 +602,7 @@ fn a_file_size_limit_on_the_sender_ends_the_run_with_its_cleanup() {
     // which the sender's spool writes to a segment. SIGXFSZ stays blocked
     // in the sender, so that write fails with `EFBIG`, and `die` ends the
     // run: it kills the command and removes the rendezvous socket
-    // (DESIGN.md §6.5 and §6.8). The default end of SIGXFSZ would skip
+    // (DESIGN.md §6.5 and §6.9). The default end of SIGXFSZ would skip
     // that cleanup.
     let transfer = Transfer::new("");
     let limited = transfer.env.path("limited-hashsync");
@@ -632,7 +661,7 @@ fn a_slow_consumer_and_a_one_window_lookahead_keep_the_output_exact() {
     // 100 bytes of references, waits in the receiver's spool. Output,
     // answers, and pin release stay in order (DESIGN.md §6.3 to §6.5).
     let transfer = Transfer::new(&format!(
-        "lookahead = {BLOCK}\nsender_spool_limit = \"64KiB\"\n"
+        "lookahead = {BLOCK}\nsender_output_spool_limit = \"64KiB\"\n"
     ));
     let blocks = tiled(256, 17);
     transfer.env.write("tree/big", &blocks);
@@ -722,7 +751,7 @@ fn empty_output_and_command_failure_status() {
     assert!(output.stdout.is_empty());
 
     // A failing command still transfers its output and returns its
-    // status (DESIGN.md §6.6).
+    // status (DESIGN.md §6.7).
     let command = args(&["sh", "-c", "echo partial; exit 3"]);
     let output = transfer.run(&[], &refs(&command));
     assert_eq!(output.stdout, b"partial\n");
@@ -747,12 +776,20 @@ fn the_summary_counts_both_sessions() {
     let (output_bytes, wire, hash_list) = (counts[0], counts[4], counts[5]);
     assert_eq!(counts[2], blocks.len(), "every block is a reference");
 
-    // The receiver reads the sender's control version and one QUERY per
-    // block: a 5-byte frame header, the offset, and the full digest. It
-    // writes its two versions, the hash list, and one ANSWER per block:
-    // a header, the offset, and the flag.
+    // The receiver reads the sender's control version, one QUERY per
+    // block: a 5-byte frame header, the offset, and the full digest, and
+    // the INPUT_STOP of the command's exit, a header alone. The sender
+    // does not wait for its control writer at the end, so the closure of
+    // the session can cut INPUT_STOP off (DESIGN.md §6.6 and §6.9). The
+    // receiver writes its two versions, the hash list, and one ANSWER per
+    // block: a header, the offset, and the flag.
     let traffic = traffic(&output);
-    assert_eq!(traffic.received, wire + 4 + 64 * (5 + 8 + 32));
+    let queries = wire + 4 + 64 * (5 + 8 + 32);
+    assert!(
+        [queries, queries + 5].contains(&traffic.received),
+        "received {} bytes",
+        traffic.received
+    );
     assert!(traffic.sent > hash_list + 2 * 4 + 64 * (5 + 8 + 1));
 
     // The speedup is the output over the traffic. The rate is the
@@ -866,7 +903,7 @@ fn stderr_is_forwarded() {
 fn stderr_from_a_descendant_is_forwarded_after_the_command_exits() {
     // The descendant closes stdout but keeps stderr: command stdout hits
     // EOF at once, while stderr EOF and the relayed bytes come later.
-    // Successful completion requires the full relay (DESIGN.md §6.8).
+    // Successful completion requires the full relay (DESIGN.md §6.9).
     let transfer = Transfer::new("");
     let command = args(&[
         "sh",
@@ -917,7 +954,7 @@ fn no_update_requires_a_current_index() {
 #[test]
 fn cache_failures_are_fatal_on_either_side() {
     // Receiver: an unwritable cache root fails the run at publication
-    // (DESIGN.md §5.6 and §6.6). The tmp_data directory is in the same
+    // (DESIGN.md §5.6 and §6.7). The tmp_data directory is in the same
     // root and opens earlier, so it exists already: else its creation
     // would fail first, and the run would end before the publication.
     let transfer = Transfer::new("");
@@ -962,8 +999,8 @@ fn the_command_ends_while_the_consumer_reads_nothing() {
     // data session while stdout is blocked, or the sender's, without a
     // limit.
     for limits in [
-        "sender_spool_limit = \"64KiB\"\n",
-        "sender_spool_limit = \"unlimited\"\nreceiver_spool_limit = \"64KiB\"\n",
+        "sender_output_spool_limit = \"64KiB\"\n",
+        "sender_output_spool_limit = \"unlimited\"\nreceiver_output_spool_limit = \"64KiB\"\n",
     ] {
         let transfer = Transfer::new(&format!(
             "lookahead = {BLOCK}\n{limits}compression_level = 0\n"
@@ -1011,8 +1048,8 @@ fn the_command_waits_when_both_spools_reach_their_limits() {
     // On a slow machine, the wait can miss such a fault, but it cannot
     // fail a correct build. Then the consumer reads everything.
     let transfer = Transfer::new(&format!(
-        "lookahead = {BLOCK}\nsender_spool_limit = \"64KiB\"\n\
-         receiver_spool_limit = \"64KiB\"\ncompression_level = 0\n"
+        "lookahead = {BLOCK}\nsender_output_spool_limit = \"64KiB\"\n\
+         receiver_output_spool_limit = \"64KiB\"\ncompression_level = 0\n"
     ));
     let payload = random(16 << 20, 22);
     let path = transfer.env.path("payload");
@@ -1066,8 +1103,8 @@ fn the_receiver_stops_reading_the_data_session_at_its_spool_limit() {
     // buffers, also where a pipe holds 1 MiB. If the receiver used the
     // sender's limit, it would hold most of the output, and write it.
     let transfer = Transfer::new(&format!(
-        "lookahead = {BLOCK}\nsender_spool_limit = \"unlimited\"\n\
-         receiver_spool_limit = \"64KiB\"\ncompression_level = 0\n"
+        "lookahead = {BLOCK}\nsender_output_spool_limit = \"unlimited\"\n\
+         receiver_output_spool_limit = \"64KiB\"\ncompression_level = 0\n"
     ));
     let payload = random(24 << 20, 24);
     let path = transfer.env.path("payload");
@@ -1106,8 +1143,11 @@ fn the_receiver_stops_reading_the_data_session_at_its_spool_limit() {
     let output = receiver.wait_with_output().unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(1), "{stderr}");
+    // The kill cuts the data session at any byte: inside a frame, or, now
+    // and then, between two frames.
     assert!(
-        stderr.contains("the data session ended unexpectedly"),
+        stderr.contains("the data session ended unexpectedly")
+            || stderr.contains("the data session ended before END"),
         "{stderr}"
     );
     assert!(payload.starts_with(&output.stdout), "the output differs");
@@ -1116,6 +1156,423 @@ fn the_receiver_stops_reading_the_data_session_at_its_spool_limit() {
         "the receiver held {} bytes of output: it read past its spool limit",
         output.stdout.len()
     );
+}
+
+#[test]
+fn stdin_reaches_the_command() {
+    // Through `cat`, the receiver's stdin becomes the output, byte for
+    // byte, and the command reads EOF after it, so `echo` follows. The
+    // input stream is compressed as the data stream is: the text takes a
+    // small part of its size on the wire, and the noise its full size
+    // (DESIGN.md §6.6).
+    let text = "hashsync sends its stdin to the command\n".repeat(100_000);
+    let noise = random(2 << 20, 31);
+    let input = [text.as_bytes(), &noise].concat();
+    for (config, compressed) in [("", true), ("compression_level = 0\n", false)] {
+        let transfer = Transfer::new(config);
+        let path = transfer.env.path("input");
+        std::fs::write(&path, &input).unwrap();
+        let command = args(&["sh", "-c", "cat; echo end"]);
+        let output = transfer
+            .invocation(&[EXACT, "--stdin"], &refs(&command))
+            .stdin(File::open(&path).unwrap())
+            .output()
+            .unwrap();
+        let output = succeeded(output);
+        assert!(
+            output.stdout == [&input[..], b"end\n"].concat(),
+            "the output differs"
+        );
+        let sent = traffic(&output).sent;
+        if compressed {
+            assert!(sent < noise.len() + (64 << 10), "{sent} bytes sent");
+        } else {
+            assert!(sent > input.len(), "{sent} bytes sent");
+        }
+    }
+}
+
+#[test]
+fn the_run_ends_with_the_command_while_stdin_stays_open() {
+    // The receiver's stdin stays open, as a terminal does, but the run
+    // ends with the command: the receiver stops reading its stdin at
+    // INPUT_STOP or END (DESIGN.md §6.6). A command that reads a part of
+    // the input gets it at once, also with compression: the stdin reader
+    // flushes the input stream when stdin has no more bytes ready. A
+    // command that fails to start ends the run in the same way.
+    for config in ["", "compression_level = 0\n"] {
+        let transfer = Transfer::new(config);
+        let missing = "/nonexistent-hashsync-test-command";
+        for (command, status, expected) in [
+            (&["true"][..], 0, &b""[..]),
+            (&["head", "-c", "5"], 0, b"hello"),
+            (&[missing], 127, b""),
+        ] {
+            let (stdin, mut producer) = std::io::pipe().unwrap();
+            producer.write_all(b"hello, and more").unwrap();
+            let output = transfer
+                .invocation(&[EXACT, "--stdin"], &refs(&args(command)))
+                .stdin(stdin)
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let what = format!("{config:?} {command:?}");
+            assert_eq!(output.status.code(), Some(status), "{what}:\n{stderr}");
+            assert_eq!(output.stdout, expected, "{what}");
+            drop(producer);
+        }
+    }
+}
+
+#[test]
+fn a_descendant_that_reads_stdin_reads_eof_when_the_command_exits() {
+    // The command starts a descendant that reads the command's stdin and
+    // holds its stdout, and exits at once, while the receiver's stdin
+    // stays open. As under SSH, the descendant reads EOF once the command
+    // has exited: the sender stops the input at the exit, and does not
+    // wait for the EOF of stdout, which the descendant holds until its
+    // stdin ends (DESIGN.md §6.6). A sender that stopped the input only
+    // after that EOF would hang this test. The descendant copies the input
+    // that it read before the stop: a part of what the producer wrote.
+    let transfer = Transfer::new("");
+    let (stdin, mut producer) = std::io::pipe().unwrap();
+    producer.write_all(b"hello, and more").unwrap();
+    let script = "exec 3<&0; cat <&3 & exec 3<&-; exit 0";
+    let output = transfer
+        .invocation(&[EXACT, "--stdin"], &refs(&args(&["sh", "-c", script])))
+        .stdin(stdin)
+        .output()
+        .unwrap();
+    let output = succeeded(output);
+    assert!(
+        b"hello, and more".starts_with(&output.stdout),
+        "{:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    drop(producer);
+}
+
+#[test]
+fn a_stdin_that_is_not_a_terminal_is_non_blocking_while_it_is_read() {
+    // As ssh does, the receiver makes a stdin that is not a terminal
+    // non-blocking while its stdin reader reads it, and restores its flags
+    // when the reader stops: here at the EOF of stdin, while the command
+    // still runs (DESIGN.md §6.6). The test keeps a copy of the read end of
+    // the stdin pipe, which shares the flags, and waits for each change
+    // without a deadline: a receiver that does not make it hangs the test.
+    let transfer = Transfer::new("");
+    let go = transfer.env.path("go");
+    mkfifoat(CWD, &go, Mode::RUSR | Mode::WUSR).unwrap();
+    let script = format!("cat; read go <'{}'", go.display());
+    let (stdin, mut producer) = std::io::pipe().unwrap();
+    let shared = stdin.try_clone().unwrap();
+    let receiver = transfer
+        .invocation(&[EXACT, "--stdin"], &refs(&args(&["sh", "-c", &script])))
+        .stdin(stdin)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let receiver = KillOnDrop(receiver);
+    wait_for_non_blocking(&shared, true);
+    producer.write_all(b"input\n").unwrap();
+    drop(producer);
+    wait_for_non_blocking(&shared, false);
+    std::fs::write(&go, b"go\n").unwrap();
+    let output = succeeded(output_of(receiver));
+    assert_eq!(output.stdout, b"input\n");
+}
+
+#[test]
+fn a_fatal_end_restores_the_flags_of_stdin() {
+    // The flags of stdin go back to what they were also when the run ends
+    // fatally while the stdin reader reads stdin: here at the SIGTERM of
+    // the receiver, which ends the run with `128 + signal` (DESIGN.md §6.8
+    // and §6.9). Nothing else ends the stdin reader: stdin stays open, and
+    // the command, `cat`, goes on reading its own stdin.
+    let transfer = Transfer::new("");
+    let (stdin, producer) = std::io::pipe().unwrap();
+    let shared = stdin.try_clone().unwrap();
+    let receiver = transfer
+        .invocation(&[EXACT, "--stdin"], &refs(&args(&["cat"])))
+        .stdin(stdin)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let receiver = KillOnDrop(receiver);
+    wait_for_non_blocking(&shared, true);
+    signal(receiver.0.id(), Signal::TERM);
+    let output = output_of(receiver);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(143), "{stderr}");
+    let flags = rustix::fs::fcntl_getfl(&shared).unwrap();
+    assert!(
+        !flags.contains(OFlags::NONBLOCK),
+        "stdin stayed non-blocking"
+    );
+    drop(producer);
+}
+
+#[test]
+fn a_terminal_stdin_stays_blocking() {
+    // As ssh does, the receiver leaves a stdin that is a terminal as it
+    // is: the shell of the user shares it, and must not find it
+    // non-blocking (DESIGN.md §6.6). Here stdin is the slave of a new
+    // pseudo-terminal, which holds a typed line before the run starts.
+    // Only the stdin reader reads the terminal, so once the line is gone,
+    // the stdin reader has read it, and the flags of the terminal must
+    // still be as they were. The output of `cat`, the command, cannot show
+    // that sooner: for so short an output, the sender flushes its data
+    // stream only at END (DESIGN.md §6.2). Ctrl-D then ends the input.
+    let master = match openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC) {
+        Ok(master) => master,
+        Err(e) => {
+            eprintln!("skipped: no pseudo-terminals: {e}");
+            return;
+        }
+    };
+    grantpt(&master).unwrap();
+    unlockpt(&master).unwrap();
+    let path = ptsname(&master, Vec::new()).unwrap();
+    let slave = File::options()
+        .read(true)
+        .write(true)
+        .custom_flags(OFlags::NOCTTY.bits() as i32)
+        .open(OsStr::from_bytes(path.as_bytes()))
+        .unwrap();
+    let shared = slave.try_clone().unwrap();
+    let mut master = File::from(master);
+    master.write_all(b"typed\n").unwrap();
+    // The line discipline takes the line in on its own time.
+    wait_for_input(&shared, 6);
+    let transfer = Transfer::new("");
+    let receiver = transfer
+        .invocation(&[EXACT, "--stdin"], &refs(&args(&["cat"])))
+        .stdin(slave)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let receiver = KillOnDrop(receiver);
+    wait_for_input(&shared, 0);
+    let flags = rustix::fs::fcntl_getfl(&shared).unwrap();
+    assert!(
+        !flags.contains(OFlags::NONBLOCK),
+        "the terminal is non-blocking"
+    );
+    // Ctrl-D: the EOF of a terminal in canonical mode.
+    master.write_all(b"\x04").unwrap();
+    let output = succeeded(output_of(receiver));
+    assert_eq!(output.stdout, b"typed\n");
+}
+
+/// Wait until the terminal `fd` holds `bytes` bytes of whole lines in its
+/// input, polling with no deadline.
+fn wait_for_input(fd: impl AsFd, bytes: u64) {
+    while rustix::io::ioctl_fionread(&fd).unwrap() != bytes {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn the_command_reads_an_empty_stdin_by_default() {
+    // Without `--stdin`, the command reads EOF at once, as with `ssh -n`,
+    // and the run reads nothing from its own stdin: the bytes in it stay
+    // for the next reader (DESIGN.md §8).
+    let transfer = Transfer::new("");
+    let (stdin, mut producer) = std::io::pipe().unwrap();
+    let mut unread = stdin.try_clone().unwrap();
+    producer.write_all(b"not for the command").unwrap();
+    drop(producer);
+    let command = args(&["sh", "-c", "cat; echo end"]);
+    let output = transfer
+        .invocation(&[EXACT], &refs(&command))
+        .stdin(stdin)
+        .output()
+        .unwrap();
+    assert_eq!(succeeded(output).stdout, b"end\n");
+    let mut left = Vec::new();
+    unread.read_to_end(&mut left).unwrap();
+    assert_eq!(left, b"not for the command");
+}
+
+#[test]
+fn a_command_that_closes_its_stdin_stops_the_input() {
+    // The command closes its stdin, and runs on until this test ends it.
+    // No process reads the input any more, so the first write of the
+    // sender's stdin writer fails with EPIPE, and the sender stops the
+    // input: INPUT_STOP makes the receiver stop it too, while the command
+    // still runs (DESIGN.md §6.6). The end of the receiver's stdin reader
+    // shows that stop: the stdin reader is the only reader of the
+    // receiver's stdin, so from then on the producer of stdin can write
+    // only what the pipe holds. The test waits for that event, and for no
+    // fixed time (DESIGN.md §11). A build that goes on taking the input, or
+    // stops it only when the command ends, hangs the test.
+    let transfer = Transfer::new("");
+    let (closed, go) = (transfer.env.path("closed"), transfer.env.path("go"));
+    for fifo in [&closed, &go] {
+        mkfifoat(CWD, fifo, Mode::RUSR | Mode::WUSR).unwrap();
+    }
+    let script = format!(
+        "exec <&-; echo closed >'{}'; read go <'{}'",
+        closed.display(),
+        go.display()
+    );
+    let (stdin, mut producer) = std::io::pipe().unwrap();
+    let receiver = transfer
+        .invocation(&[EXACT, "--stdin"], &refs(&args(&["sh", "-c", &script])))
+        .stdin(stdin)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let receiver = KillOnDrop(receiver);
+    // The open waits for the command to open the FIFO, after it closed
+    // its stdin.
+    let mut message = String::new();
+    File::open(&closed)
+        .unwrap()
+        .read_to_string(&mut message)
+        .unwrap();
+    assert_eq!(message, "closed\n");
+    // The receiver starts its stdin reader after CACHE_RESULT. Only a stop
+    // or the EOF of stdin ends it, and neither can come before the input.
+    let pid = receiver.0.id();
+    wait_for_thread(pid, "stdin-reader", true);
+    producer.write_all(&random(64 << 10, 35)).unwrap();
+    wait_for_thread(pid, "stdin-reader", false);
+    std::fs::write(&go, b"go\n").unwrap();
+    let output = succeeded(output_of(receiver));
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn a_command_that_reads_a_part_of_its_input_ends_the_run() {
+    // `head` reads the first 100 bytes of 16 MiB of input, and exits. Then
+    // no process reads the command's stdin, so a write of the stdin writer
+    // fails with EPIPE, and the sender stops the input: INPUT_STOP makes
+    // the receiver stop reading its stdin, and the data reader discards
+    // the input that is still on its way, until END_ACK (DESIGN.md §6.6).
+    // With and without compression.
+    for config in ["", "compression_level = 0\n"] {
+        let transfer = Transfer::new(&format!(
+            "receiver_input_spool_limit = \"64KiB\"\n\
+             sender_input_spool_limit = \"64KiB\"\n{config}"
+        ));
+        let input = random(16 << 20, 34);
+        let path = transfer.env.path("input");
+        std::fs::write(&path, &input).unwrap();
+        let output = transfer
+            .invocation(&[EXACT, "--stdin"], &refs(&args(&["head", "-c", "100"])))
+            .stdin(File::open(&path).unwrap())
+            .output()
+            .unwrap();
+        let output = succeeded(output);
+        assert_eq!(output.stdout, input[..100], "{config}");
+    }
+}
+
+#[test]
+fn the_input_waits_in_the_sender_spool_until_the_command_reads_it() {
+    // Each input spool has its own limit: the sender's comes from HELLO,
+    // and the receiver's from the receiver's configuration (DESIGN.md
+    // §6.6). Here the receiver's input spool holds at most 64 KiB, and the
+    // sender's has no limit. The command reads its stdin only after the
+    // whole input, 16 MiB, has passed the wrapper of the data session,
+    // which copies what the receiver sends: the input waits in the
+    // sender's input spool. If the receiver used the sender's limit, the
+    // input would wait on the receiver instead, and the test would hang.
+    let transfer = Transfer::new(
+        "receiver_input_spool_limit = \"64KiB\"\n\
+         sender_input_spool_limit = \"unlimited\"\ncompression_level = 0\n",
+    );
+    let captured = transfer.env.path("captured");
+    wrap_ssh(
+        &transfer,
+        &format!(
+            r#"if [ $session = data ]; then
+    tee '{}' | "$ssh" "$@"
+    exit $?
+fi
+exec "$ssh" "$@""#,
+            captured.display()
+        ),
+    );
+    let input = random(16 << 20, 33);
+    let fifo = transfer.env.path("go");
+    mkfifoat(CWD, &fifo, Mode::RUSR | Mode::WUSR).unwrap();
+    let script = format!("read go <'{}'; exec cat", fifo.display());
+    let (stdin, mut producer) = std::io::pipe().unwrap();
+    let receiver = transfer
+        .invocation(&[EXACT, "--stdin"], &refs(&args(&["sh", "-c", &script])))
+        .stdin(stdin)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let receiver = KillOnDrop(receiver);
+    producer.write_all(&input).unwrap();
+    drop(producer);
+    // No deadline: if the input does not reach the sender, the test hangs.
+    while std::fs::metadata(&captured).map_or(0, |meta| meta.len()) < input.len() as u64 {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::fs::write(&fifo, b"go\n").unwrap();
+    let output = succeeded(output_of(receiver));
+    assert!(output.stdout == input, "the output differs");
+}
+
+#[test]
+fn the_producer_waits_when_both_input_spools_reach_their_limits() {
+    // Each input spool holds at most 64 KiB, and the command reads its
+    // stdin only after a signal. The producer of the receiver's stdin
+    // writes 32 MiB, more than both spools and all the buffers in memory
+    // between the producer and the command (about 2 MiB), so it cannot
+    // finish before the command reads. If an input spool ignored its
+    // limit, it would take the input, and the producer would write much
+    // more (DESIGN.md §6.6). No event shows that the producer stays
+    // blocked, so the test waits a fixed time for its writes. On a slow
+    // machine, the wait can miss such a fault, but it cannot fail a
+    // correct build. Then the command reads everything.
+    let transfer = Transfer::new(
+        "receiver_input_spool_limit = \"64KiB\"\n\
+         sender_input_spool_limit = \"64KiB\"\ncompression_level = 0\n",
+    );
+    let input = random(32 << 20, 32);
+    let fifo = transfer.env.path("go");
+    mkfifoat(CWD, &fifo, Mode::RUSR | Mode::WUSR).unwrap();
+    let script = format!("read go <'{}'; exec cat", fifo.display());
+    let (stdin, mut producer) = std::io::pipe().unwrap();
+    let receiver = transfer
+        .invocation(&[EXACT, "--stdin"], &refs(&args(&["sh", "-c", &script])))
+        .stdin(stdin)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let receiver = KillOnDrop(receiver);
+    let written = Arc::new(AtomicUsize::new(0));
+    let produced = {
+        let (written, input) = (Arc::clone(&written), input.clone());
+        std::thread::spawn(move || {
+            for chunk in input.chunks(64 << 10) {
+                producer.write_all(chunk).unwrap();
+                written.fetch_add(chunk.len(), SeqCst);
+            }
+        })
+    };
+    std::thread::sleep(Duration::from_secs(3));
+    let so_far = written.load(SeqCst);
+    assert!(
+        so_far < 8 << 20,
+        "the producer wrote {so_far} bytes while the command read nothing: \
+         an input spool ignored its limit"
+    );
+    std::fs::write(&fifo, b"go\n").unwrap();
+    let output = succeeded(output_of(receiver));
+    produced.join().unwrap();
+    assert!(output.stdout == input, "the output differs");
 }
 
 #[test]
@@ -1197,7 +1654,7 @@ fn a_data_session_that_ends_before_done_fails_the_run() {
     // data session without DONE, as a sender that fails after END_ACK
     // does. The receiver wrote the output, so it read END; without
     // compression, only DONE can then fail. The run fails although the
-    // output is complete (DESIGN.md §6.8). The fake control session sends
+    // output is complete (DESIGN.md §6.9). The fake control session sends
     // its version and stays open until its stdin ends.
     let transfer = Transfer::new("");
     // HELLO: an account ID and no base. END: status 0 and no error text.
@@ -1250,6 +1707,18 @@ fn signal(pid: u32, signal: Signal) {
     kill_process(pid, signal).unwrap();
 }
 
+/// Wait until the flags of `fd` say non-blocking, when `non_blocking`, or
+/// blocking, polling them with no deadline.
+fn wait_for_non_blocking(fd: impl AsFd, non_blocking: bool) {
+    while rustix::fs::fcntl_getfl(&fd)
+        .unwrap()
+        .contains(OFlags::NONBLOCK)
+        != non_blocking
+    {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 /// Make a FIFO at `path`, and hold it open for writing. A command that
 /// opens the FIFO for reading while the returned file is open reads EOF
 /// only after the file closes, at the latest when the test process ends.
@@ -1284,6 +1753,28 @@ fn wait_until_exited(pid: u32) {
     retry_on_intr(|| poll(&mut fds, None)).unwrap();
 }
 
+/// Wait until the process `pid` has a thread named `name`, when
+/// `running`, or has none, polling with no deadline. Fail when the process
+/// has ended: it stays a zombie until the test reaps it.
+fn wait_for_thread(pid: u32, name: &str, running: bool) {
+    loop {
+        assert_ne!(
+            proc_state(format!("/proc/{pid}")),
+            Some('Z'),
+            "the process ended"
+        );
+        // A thread that ends meanwhile has no name.
+        let found = std::fs::read_dir(format!("/proc/{pid}/task"))
+            .unwrap()
+            .filter_map(|task| std::fs::read_to_string(task.ok()?.path().join("comm")).ok())
+            .any(|comm| comm.trim_end() == name);
+        if found == running {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 /// The children of `pid`, started by any of its threads. A thread that
 /// ends meanwhile has no children file.
 fn children(pid: u32) -> Vec<u32> {
@@ -1303,7 +1794,7 @@ fn children(pid: u32) -> Vec<u32> {
 fn a_termination_signal_decides_the_status_even_after_the_sessions_break() {
     // Ctrl-C reaches the receiver and its SSH children together. The dying
     // sessions can make another thread fail before the signal is handled,
-    // but the status must report the signal (DESIGN.md §6.7). Force that
+    // but the status must report the signal (DESIGN.md §6.8). Force that
     // order: stop the receiver, send it the signal, kill both sessions,
     // and let the receiver continue with both events already present.
     let transfer = Transfer::new("");
@@ -1389,7 +1880,7 @@ fn the_receiver_closes_stdin_before_either_stdout_ends() {
     // each session open until its SSH child exits, and the sender exits
     // only after stdin EOF. The receiver closes both stdin pipes after
     // DONE, without waiting for the EOF of either stdout, so the run still
-    // ends (DESIGN.md §6.8 and §10).
+    // ends (DESIGN.md §6.9 and §10).
     let transfer = Transfer::new("");
     let blocks = tiled(16, 28);
     transfer.env.write("tree/blocks", &blocks);
@@ -1405,7 +1896,7 @@ fn the_end_waits_for_a_process_that_keeps_the_control_session_open() {
     // After the control session's SSH exits, a process that inherited its
     // stdout keeps the pipe open for a moment, creates the marker, and
     // exits. The receiver reads each session to EOF and ends its threads
-    // before it exits (DESIGN.md §6.8), so it cannot exit before the
+    // before it exits (DESIGN.md §6.9), so it cannot exit before the
     // marker exists, however the processes are scheduled. The normal run,
     // the read-only run, and a command that fails to start end the same
     // way.
@@ -1452,7 +1943,7 @@ fn the_summary_counts_every_byte_that_the_sessions_deliver() {
     // `tee` copies the stdout of each session to a file. After the control
     // session's SSH exits, a process that inherited its stdout sends one
     // more QUERY, which the receiver skips in Completing. The receiver reads
-    // both sessions to EOF before the summary (DESIGN.md §6.8 and §8), so
+    // both sessions to EOF before the summary (DESIGN.md §6.9 and §8), so
     // the summary counts exactly the bytes of both files, that QUERY
     // included. One changed block makes the scanner rescan. The late QUERY
     // is a plain frame, so this run has no compression: inside a zstd
@@ -1497,11 +1988,14 @@ exit $status"#,
 
 #[test]
 fn both_directions_of_the_control_session_are_compressed() {
-    // After the protocol version, the queries form one zstd stream, and the
-    // answers another. No frame ends either stream: the closure of the
-    // session does (DESIGN.md §6.2). `tee` copies both directions of the
-    // control session. Every block of the output is queried once, in
-    // order, and answered yes.
+    // After the protocol version, the queries and the INPUT_STOP of the
+    // command's exit form one zstd stream, and the answers another. No
+    // frame ends either stream: the closure of the session does
+    // (DESIGN.md §6.2). `tee` copies both directions of the control
+    // session. Every block of the output is queried once, in order, and
+    // answered yes. INPUT_STOP can come between any two queries, and as
+    // the sender does not wait for its control writer at the end, the
+    // closure can also cut it off (DESIGN.md §6.6 and §6.9).
     let transfer = Transfer::new("");
     let blocks = tiled(16, 29);
     transfer.env.write("tree/blocks", &blocks);
@@ -1523,22 +2017,36 @@ exec "$ssh" "$@""#,
     assert_eq!(summary(&output), [blocks.len(), 0, blocks.len(), 0]);
 
     let offsets: Vec<u64> = (0..16).map(|i| (i * BLOCK) as u64).collect();
+    // The frames of one direction, through the end of the copy, which
+    // comes inside the zstd frame.
     let decode = |direction: &str| {
         let stream = std::fs::read(format!("{}.{direction}", captured.display())).unwrap();
         assert_eq!(stream[..4], version(), "{direction}");
         let mut stream = zstd::stream::read::Decoder::new(&stream[4..]).unwrap();
-        let frames: Vec<(u8, Vec<u8>)> = std::iter::repeat_with(|| recv_frame(&mut stream))
-            .take(offsets.len())
-            .collect();
-        let error = stream.read(&mut [0]).unwrap_err();
-        assert_eq!(
-            error.kind(),
-            std::io::ErrorKind::UnexpectedEof,
-            "{direction}"
-        );
-        frames
+        let mut frames = Vec::new();
+        loop {
+            match try_recv_frame(&mut stream) {
+                Ok(frame) => frames.push(frame),
+                Err(error) => {
+                    assert_eq!(
+                        error.kind(),
+                        std::io::ErrorKind::UnexpectedEof,
+                        "{direction}"
+                    );
+                    return frames;
+                }
+            }
+        }
     };
-    for ((kind, query), (offset, block)) in decode("queries")
+    let mut queries = decode("queries");
+    let stops = queries
+        .iter()
+        .filter(|(kind, _)| *kind == INPUT_STOP)
+        .count();
+    assert!(stops <= 1, "{stops} INPUT_STOP frames");
+    queries.retain(|frame| *frame != (INPUT_STOP, Vec::new()));
+    assert_eq!(queries.len(), offsets.len());
+    for ((kind, query), (offset, block)) in queries
         .into_iter()
         .zip(offsets.iter().zip(blocks.chunks(BLOCK)))
     {
@@ -1546,7 +2054,9 @@ exec "$ssh" "$@""#,
         assert_eq!(query[..8], offset.to_le_bytes());
         assert_eq!(query[8..], *blake3::hash(block).as_bytes());
     }
-    let mut answered: Vec<u64> = decode("answers")
+    let answers = decode("answers");
+    assert_eq!(answers.len(), offsets.len());
+    let mut answered: Vec<u64> = answers
         .into_iter()
         .map(|(kind, answer)| {
             assert_eq!((kind, answer.len(), answer[8]), (ANSWER, 9, 1), "a yes");
@@ -1572,8 +2082,8 @@ fn a_termination_signal_during_the_end_decides_the_status() {
     // After the control session's SSH exits, a process that inherited its
     // stdout keeps the pipe open while the hold file exists, until the test
     // ends and removes its directory. So the receiver waits in its end
-    // (DESIGN.md §6.8). The signal thread still runs then: SIGTERM ends the
-    // run with `128 + signal` (DESIGN.md §6.7).
+    // (DESIGN.md §6.9). The signal thread still runs then: SIGTERM ends the
+    // run with `128 + signal` (DESIGN.md §6.8).
     let transfer = Transfer::new("");
     let hold = transfer.env.path("hold");
     std::fs::write(&hold, b"").unwrap();

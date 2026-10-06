@@ -54,7 +54,7 @@ const WRITE_BUFFERS: usize = 256 << 20;
 const COMMIT_WORK: usize = 50_000;
 
 /// Unwrap a database result. Database errors are fatal bugs or failures
-/// and abort (DESIGN.md §6.6).
+/// and abort (DESIGN.md §6.7).
 pub fn db<T>(result: Result<T, rocksdb::Error>) -> T {
     result.unwrap_or_else(|e| panic!("database error: {e}"))
 }

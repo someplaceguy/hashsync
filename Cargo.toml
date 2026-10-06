@@ -39,8 +39,9 @@ fearless_simd_macros = "0.1.0"
 
 [dev-dependencies]
 proptest = "1.11.0"
-# `thread`: CPU affinity in `tests/serve.rs`.
-rustix = { version = "1.1.5", features = ["thread"] }
+# `thread`: CPU affinity in `tests/serve.rs`. `pty`: a terminal as the
+# receiver's stdin in `tests/transfer.rs`.
+rustix = { version = "1.1.5", features = ["pty", "thread"] }
 tempfile = "3.27.0"
 # An independent zstd for the compressed streams in the integration tests.
 # Its default features would change the libzstd of test builds.

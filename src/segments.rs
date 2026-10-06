@@ -14,7 +14,7 @@
 //! cannot disturb the rules. Closing an unlinked file frees its storage.
 //!
 //! Failures to create the directory or a segment, and failures of segment
-//! I/O, end the run with `die` (DESIGN.md §6.6).
+//! I/O, end the run with `die` (DESIGN.md §6.7).
 
 use std::ffi::OsStr;
 use std::fs::File;
@@ -236,6 +236,22 @@ impl<F> Segments<F> {
         // be full now. Without an extent in use, it is given back too.
         let current = self.seal_if_full().and_then(Arc::into_inner);
         [Some(sealed.file), current.map(|segment| segment.file)]
+    }
+
+    /// Give up all the open segments at once, for a user that stops for
+    /// good and allocates no more extents. This function exists so that
+    /// such a stop needs no release of each extent: the full rule has no
+    /// use any more. The returned value holds the current segment, and the
+    /// extents in use hold the sealed ones. The caller drops both after it
+    /// releases its lock, which closes the files. `self` keeps no open
+    /// segment.
+    pub fn take(&mut self) -> Segments<F> {
+        Segments {
+            current: self.current.take(),
+            sealed: std::mem::take(&mut self.sealed),
+            extent_size: self.extent_size,
+            minimum: self.minimum,
+        }
     }
 
     /// Seal the current segment if it is full (DESIGN.md §6.5). Returns

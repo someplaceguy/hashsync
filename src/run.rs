@@ -1,5 +1,5 @@
-//! `hashsync run [--no-update] [--ssh CMD] [USER@]HOST -- COMMAND ...`
-//! (DESIGN.md §3, §5.6, §6, §8): the receiver.
+//! `hashsync run [--stdin] [--no-update] [--ssh CMD] [USER@]HOST --
+//! COMMAND ...` (DESIGN.md §3, §5.6, §6, §8): the receiver.
 //!
 //! The run updates the index (or opens it read-only), exports and
 //! publishes the hash list, prepares the pins and the lookup workers,
@@ -8,12 +8,14 @@
 //! through the compression stream, while the lookup workers answer the
 //! sender's queries (DESIGN.md §6.4). The data session goes through a
 //! spool, so that a blocked stdout does not stop the transfer until
-//! `receiver_spool_limit` bytes wait in the spool (DESIGN.md §6.5).
+//! `receiver_output_spool_limit` bytes wait in the spool (DESIGN.md §6.5).
 //! Queries and answers have compression streams of their own (DESIGN.md
-//! §6.2). It returns the command's status once both sessions
-//! exited successfully, after a summary.
+//! §6.2). Meanwhile, the input goes to the command's stdin, in INPUT
+//! frames on the data session, until END: with `--stdin`, the receiver's
+//! stdin, and else no bytes (DESIGN.md §6.6). It returns the command's
+//! status once both sessions exited successfully, after a summary.
 //!
-//! The end is orderly (DESIGN.md §6.8). After END_ACK, DONE tells the
+//! The end is orderly (DESIGN.md §6.9). After END_ACK, DONE tells the
 //! receiver that the sender needs neither session any more. The main
 //! thread then closes both stdin pipes, without waiting for the EOF of
 //! either stdout, and joins each thread of the transfer once its work
@@ -21,7 +23,9 @@
 //! counts.
 
 use std::ffi::OsStr;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::fs::File;
+use std::io::{BufReader, BufWriter, IoSlice, Read, Write};
+use std::os::fd::AsFd;
 use std::os::unix::ffi::OsStrExt;
 use std::process::{ChildStdin, ChildStdout};
 use std::sync::Arc;
@@ -39,11 +43,12 @@ use crate::fsops;
 use crate::hash::weak;
 use crate::hashlist::{self, ListId};
 use crate::index::{self, Settings};
+use crate::input::{InputStop, ReceiverInput};
 use crate::lookup;
 use crate::pins::Pins;
 use crate::protocol::{
     self, Answer, Compressor, Decompressor, End, FrameReader, FrameWriter, HashList, Query,
-    ReceiverHello, Rle, SenderHello, frame,
+    ReceiverHello, Rle, SenderHello, flush_data, frame, send_data,
 };
 use crate::rendezvous;
 use crate::roots::{self, Location};
@@ -69,13 +74,14 @@ static CONTROL_RECEIVED: AtomicU64 = AtomicU64::new(0);
 pub fn run(
     config: &Config,
     no_update: bool,
+    send_stdin: bool,
     cli_ssh: Option<&OsStr>,
     host: &OsStr,
     command: &[std::ffi::OsString],
 ) -> ! {
     let start = Instant::now();
     // Before any other thread starts: SIGINT and SIGTERM end the run with
-    // `128 + signal`, and the end kills the SSH children (DESIGN.md §6.7).
+    // `128 + signal`, and the end kills the SSH children (DESIGN.md §6.8).
     die::handle_termination_signals();
 
     let options = config.transfer_options(host.as_bytes(), cli_ssh.map(OsStr::as_bytes));
@@ -98,9 +104,10 @@ pub fn run(
     };
 
     // The tmp_data directory holds the segments of the pins and of the
-    // spool of the data session (DESIGN.md §6.5). An unusable directory
-    // ends the run when it opens, before the sessions start. The lookup
-    // workers answer queries as soon as they arrive (DESIGN.md §6.4).
+    // spools of the data session and of the input (DESIGN.md §6.5). An
+    // unusable directory ends the run when it opens, before the sessions
+    // start. The lookup workers answer queries as soon as they arrive
+    // (DESIGN.md §6.4).
     let tmp_data = Arc::new(Directory::open(&config.tmp_data_dir));
     let (answer_tx, answer_rx) = unbounded();
     let pins = Arc::new(Pins::new(
@@ -110,6 +117,10 @@ pub fn run(
         answer_tx,
     ));
     let (queries, lookups) = lookup::start(&index, locations, &pins, config);
+    // The input spool and the stop of the input exist before the sessions
+    // start: INPUT_STOP on the control session can stop the input at any
+    // time, also before CACHE_RESULT (DESIGN.md §6.6).
+    let input = ReceiverInput::new(Arc::clone(&tmp_data), config.receiver_input_spool_limit);
 
     let account_id = cache::account_id();
     let token = rendezvous::new_token();
@@ -123,9 +134,10 @@ pub fn run(
     let sessions = [(data.pid(), "data"), (control.pid(), "control")];
 
     // Each direction of the control session has one thread, from the
-    // protocol version on (DESIGN.md §6.2 and §6.7). The control writer
+    // protocol version on (DESIGN.md §6.2 and §6.8). The control writer
     // gives the session's stdin back when it ends: the pipe must stay open
-    // until DONE (DESIGN.md §6.8).
+    // until DONE (DESIGN.md §6.9). The control reader stops the input at
+    // INPUT_STOP.
     let control_writer = {
         let pins = Arc::clone(&pins);
         let control_stdin = control.stdin;
@@ -139,9 +151,10 @@ pub fn run(
         let pins = Arc::clone(&pins);
         let control_stdout = control.stdout;
         let compressed = config.compression_level != 0;
+        let input_stop = input.stopper();
         std::thread::Builder::new()
             .name("control-reader".into())
-            .spawn(move || read_queries(control_stdout, compressed, &pins, queries))
+            .spawn(move || read_control(control_stdout, compressed, &pins, queries, &input_stop))
             .expect("cannot start the control reader")
     };
 
@@ -149,7 +162,7 @@ pub fn run(
     // summary. Its incoming bytes go through a spool: while stdout is
     // blocked, the receiver still reads the session, so the sender keeps
     // sending, and the bytes wait in the spool, until
-    // `receiver_spool_limit` bytes wait (DESIGN.md §6.4).
+    // `receiver_output_spool_limit` bytes wait (DESIGN.md §6.4).
     let mut data_out = FrameWriter::new(Counting {
         inner: data.stdin,
         count: &SENT,
@@ -162,7 +175,7 @@ pub fn run(
         "the data session",
         received,
         tmp_data,
-        config.receiver_spool_limit,
+        config.receiver_output_spool_limit,
     );
     let mut data_in = FrameReader::new(BufReader::with_capacity(READ_BUFFER, spool));
 
@@ -181,7 +194,8 @@ pub fn run(
         probe_threads: config.probe_threads,
         lookahead: config.lookahead,
         negative_cache: config.negative_cache,
-        sender_spool_limit: config.sender_spool_limit,
+        sender_output_spool_limit: config.sender_output_spool_limit,
+        sender_input_spool_limit: config.sender_input_spool_limit,
         command: command.iter().map(|arg| arg.as_bytes().to_vec()).collect(),
     };
     // HELLO follows the version at once. The sender uses its parameters
@@ -230,10 +244,38 @@ pub fn run(
     drop(published);
     cache::expire(config.hashlist_max_age);
 
+    // The list exchange is complete: from here on until END, the input
+    // writer owns the outgoing direction of the data session, and sends
+    // the input to the command, at the level of the data stream, until the
+    // stop of the input (DESIGN.md §6.6). With `--stdin`, the stdin reader
+    // reads this process's stdin. Without it, the stdin reader reads
+    // `/dev/null` in its place, as `ssh -n` does: the command reads EOF at
+    // once, and this process reads nothing from its own stdin (DESIGN.md
+    // §8).
+    let stdin: Box<dyn AsFd + Send> = if send_stdin {
+        Box::new(rustix::stdio::stdin())
+    } else {
+        match File::open("/dev/null") {
+            Ok(null) => Box::new(null),
+            Err(e) => die(format!("cannot open /dev/null: {e}")),
+        }
+    };
+    let input = input.start(
+        stdin,
+        data_out,
+        config.compression_level,
+        config.compression_long,
+    );
+
     let mut stdout = fsops::stdout();
     let (end, counts) = reconstruct(&mut data_in, &pins, &mut stdout, config.block_size);
 
-    // Completion (DESIGN.md §6.8): the compression stream must end right
+    // The command has exited, so the input has no use any more: stop it,
+    // unless INPUT_STOP has stopped it, which gives back the outgoing
+    // direction of the data session.
+    let mut data_out = input.stop();
+
+    // Completion (DESIGN.md §6.9): the compression stream must end right
     // after END. Then flush reconstructed stdout, enter Completing, which
     // closes the answer queue, and send the single END_ACK.
     let transport = data_in
@@ -262,7 +304,7 @@ pub fn run(
     drop(control_stdin);
 
     // Nothing follows DONE. Then join the other threads in order
-    // (DESIGN.md §6.8): the thread of the spool, which ended at the EOF of
+    // (DESIGN.md §6.9): the thread of the spool, which ended at the EOF of
     // the data session, then the control reader. The control reader ends
     // at the EOF of its session, and its end closes the query queue: the
     // lookup workers skip the queries that remain. A spool read never
@@ -278,7 +320,7 @@ pub fn run(
     }
 
     // Both sessions must exit successfully before the command's status
-    // is returned, without reaping (DESIGN.md §6.7–6.8). Then nothing uses
+    // is returned, without reaping (DESIGN.md §6.8–6.9). Then nothing uses
     // the pins or the index any more.
     for (pid, name) in sessions {
         let status = sys::wait_exit_status(pid);
@@ -444,6 +486,15 @@ impl<W: Write> Write for Counting<W> {
         Ok(n)
     }
 
+    /// One vectored write of the inner writer, which `FrameWriter::send`
+    /// needs: the default would write only the first buffer, and a frame
+    /// header would go out alone.
+    fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> std::io::Result<usize> {
+        let n = self.inner.write_vectored(bufs)?;
+        self.count.fetch_add(n as u64, Relaxed);
+        Ok(n)
+    }
+
     fn flush(&mut self) -> std::io::Result<()> {
         self.inner.flush()
     }
@@ -460,18 +511,6 @@ fn die_data(e: &std::io::Error) -> ! {
         "a read of the data session failed: {e}"
     );
     die("the data session ended unexpectedly")
-}
-
-fn send_data<W: Write>(out: &mut FrameWriter<W>, kind: u8, payload: &[u8]) {
-    if let Err(e) = out.send(kind, payload) {
-        die(format!("data session: {e}"));
-    }
-}
-
-fn flush_data<W: Write>(out: &mut FrameWriter<W>) {
-    if let Err(e) = out.flush() {
-        die(format!("data session: {e}"));
-    }
 }
 
 fn expect_data<'a, R: Read>(
@@ -514,15 +553,22 @@ fn advance(offset: u64, length: u64) -> u64 {
 }
 
 /// The owner of the control session's incoming direction: the sender's
-/// protocol version, then queries for the lookup workers, one zstd stream
-/// when `compressed` (DESIGN.md §6.2). Loss before Completing is fatal
-/// (DESIGN.md §6.8); in Completing, EOF, errors, and a partial frame are
+/// protocol version, then queries for the lookup workers, and at most one
+/// INPUT_STOP, which stops the input with `input`, one zstd stream when
+/// `compressed` (DESIGN.md §6.2 and §6.6). Loss before Completing is fatal
+/// (DESIGN.md §6.9); in Completing, EOF, errors, and a partial frame are
 /// expected closure. Also in Completing, reading goes on until closure. So
 /// the sender's relay never blocks on a full pipe, and the pipe closes
 /// only at EOF, when SSH cannot write to it any more: a write to a closed
 /// pipe would make SSH fail. The end of this thread closes the query
 /// queue.
-fn read_queries(stdout: ChildStdout, compressed: bool, pins: &Pins, lookups: Sender<Query>) {
+fn read_control(
+    stdout: ChildStdout,
+    compressed: bool,
+    pins: &Pins,
+    lookups: Sender<Query>,
+    input: &InputStop,
+) {
     let mut control_in = FrameReader::new(BufReader::new(Counting {
         inner: stdout,
         count: &CONTROL_RECEIVED,
@@ -537,17 +583,28 @@ fn read_queries(stdout: ChildStdout, compressed: bool, pins: &Pins, lookups: Sen
         Ok(None) | Err(_) => return closed(),
     }
     let mut control_in = FrameReader::new(Decompressor::new(control_in.into_inner(), compressed));
+    let mut input_stopped = false;
     loop {
         match control_in.next() {
-            Ok(Some(received)) => {
-                assert!(
-                    received.kind == frame::QUERY,
-                    "protocol error: unexpected control frame type {}",
-                    received.kind
-                );
-                // The workers end only after this thread closes the queue.
-                let _ = lookups.send(Query::decode(received.payload));
-            }
+            Ok(Some(received)) => match received.kind {
+                frame::QUERY => {
+                    // The workers end only after this thread closes the
+                    // queue.
+                    let _ = lookups.send(Query::decode(received.payload));
+                }
+                frame::INPUT_STOP => {
+                    assert!(
+                        received.payload.is_empty(),
+                        "protocol error: INPUT_STOP with a payload"
+                    );
+                    assert!(!input_stopped, "protocol error: a second INPUT_STOP");
+                    input_stopped = true;
+                    // Before END, or after it in Completing: a stop at END
+                    // can come first, and then this one does nothing.
+                    input.stop();
+                }
+                kind => panic!("protocol error: unexpected control frame type {kind}"),
+            },
             Ok(None) | Err(_) => return closed(),
         }
     }
@@ -559,7 +616,7 @@ fn read_queries(stdout: ChildStdout, compressed: bool, pins: &Pins, lookups: Sen
 /// `level`, 0 for none, flushed whenever the queue runs empty (DESIGN.md
 /// §6.2). It ends in Completing: once the queue is closed and empty, or
 /// when a write fails, which is then expected closure; before Completing,
-/// a failed write is fatal (DESIGN.md §6.8). It gives back the session's
+/// a failed write is fatal (DESIGN.md §6.9). It gives back the session's
 /// stdin without closing it or ending the stream, and discards the answers
 /// that a failed write left in the buffer.
 fn write_answers(
