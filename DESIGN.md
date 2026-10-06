@@ -691,11 +691,21 @@ Use a custom open-addressing table of 32-bit fingerprints in a flat array:
 - Insert in the first empty slot, continuing to the next bucket when full.
   Lookup stops at the fingerprint or an empty slot and continues only
   through full buckets. It may return false positives, never false negatives.
+- A second flat array holds the high 32 bits of the value of each slot, at
+  the same bucket and slot. Lookups do not read it. The check of a value
+  stops at a slot that has both the fingerprint and the high bits of the
+  value, or at an empty slot. Like a lookup, it continues only through full
+  buckets. Values whose low 32 bits are 0 and 1, with equal high bits,
+  share a fingerprint, so the check does not tell them apart.
 
 Full 64-bit list values keep bucket selection and fingerprints sufficiently
 independent. The table favours one cache-line access per probe; SIMD bucket
 scans and batched independent probes can accelerate it without changing
-membership semantics.
+membership semantics. A lookup compares about 13 fingerprints, so about 3
+windows per GiB of new output are false positives. The scanner checks each
+hit against the whole value before it computes a strong hash (section 6.3),
+so a false positive costs no strong hash, no query, and no rescan. The
+check reads one more cache line, only for hits.
 
 ### 5.6 The hash list cache and direct deltas
 
@@ -1045,8 +1055,10 @@ With a full window at `p`:
 
 1. If all `B` bytes are equal, append or extend a Run and advance by `B`.
 2. Otherwise reuse the query-state entry at `p`, if present. If absent,
-   probe the weak table. A miss records one literal byte; a hit computes
-   the full strong hash and creates a Not_sent entry.
+   probe the weak table, and check a hit against the whole weak hash
+   (section 5.5). A miss of either records one literal byte. A hit of both
+   is a weak hit: it computes the full strong hash and creates a Not_sent
+   entry.
 3. Apply the entry's state:
 
    | State | Action |
@@ -1080,8 +1092,9 @@ window in order. After each weak hit, new or known, the scanner scans at
 most a short stretch on its own thread before it processes answers again.
 With more than one probe thread, each following stretch without a hit or
 a constant window doubles the next one, up to a bound per thread. A
-constant window neither doubles nor shortens the next stretch: the stretch
-that it ends did not use its full length, and the window makes no query.
+constant window, or a hit that the check rejects, neither doubles nor
+shortens the next stretch: the stretch that it ends did not use its full
+length, and the window makes no query.
 Short gaps between matches thus stay on one thread, and a long run of
 misses soon uses all probe threads. HELLO's `probe_threads` sets the
 thread count; 0 selects half the sender's cores, at least one.
@@ -1167,8 +1180,9 @@ At the end, closing the pins closes all their open segments (section
 The receiver tracks output offset `c`, its pin map, and the open segments
 of the pins.
 A bounded 256 MiB LRU cache of verified buffers, keyed by full strong
-hash, can serve candidate lookups. Populate it on verified reads; its
-eviction is independent of pin lifetimes. Pins never retain those buffers.
+hash, can serve candidate lookups. It holds at least one buffer, also when
+`B` is larger than 256 MiB. Populate it on verified reads; its eviction is
+independent of pin lifetimes. Pins never retain those buffers.
 One lock protects this state and the completion state. Source reads,
 segment I/O, and stdout writes occur outside the lock; the file creation
 of step A1 is the one exception, and it occurs once per segment. In-memory
@@ -1694,7 +1708,7 @@ candidate_attempts = 128  # candidates tried per query, at least 1
 hashlist_max_age = "90d"
 index_path     = "~/.local/state/hashsync/default.db"  # a directory
 threads        = 0         # 0 = 4 × cores, clamped to 16–64
-lookahead      = "256MiB"  # at least block_size
+lookahead      = "256MiB"  # at least block_size; default max(256 MiB, 3 × block_size), for the probe threads
 sender_spool_limit   = "2GiB"  # command stdout that can wait on the sender, or "unlimited"
 receiver_spool_limit = "2GiB"  # data session that can wait on the receiver, or "unlimited"
 tmp_data_dir   = "~/.cache/hashsync/tmp-data"  # receiver segments; any filesystem
@@ -1865,6 +1879,17 @@ decision history is in version control.
 - **Truncated weak-hash lists and membership filters:** truncation raises
   false-hit costs; binary fuse filters need several cache-line accesses per
   probe. The full list also supports direct set deltas.
+- **64-bit values in the weak table:** a probe runs for each byte of new
+  output and is most of the cost of a scan. In `Scanner::scan` on one
+  thread, with 32 KiB windows of random output and 100 to 10M list values,
+  64-bit slots made the scan slower: 16 slots in two cache lines by
+  36–44% in the baseline x86-64 build, which has no 64-bit compare, and by
+  19–23% from 1M values with AVX2; 8 slots in one cache line by 54–137%. A
+  check of the high bits inside the probe loop cost up to 25% in the
+  baseline build, and 4–8% in a cold function. A sorted copy of the list
+  for the check of a hit would take 8 bytes per value and a binary search;
+  the second array of section 5.5 takes 5.7 bytes per value and one cache
+  line.
 - **Reconciliation sketches or range recursion:** add decoding/fallback
   complexity or transfer poorly when changes are spread throughout the
   uniform hash space. Cached full lists allow straightforward direct deltas.

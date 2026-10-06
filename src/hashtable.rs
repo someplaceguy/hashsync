@@ -1,9 +1,13 @@
 //! The sender's in-memory membership table (DESIGN.md §5.5): open
 //! addressing over 32-bit fingerprints in a flat bucket array. Lookups can
-//! return false positives, never false negatives; a false positive only
-//! costs a query.
+//! return false positives, never false negatives. The high 32 bits of each
+//! value wait in a second array, which only `contains_value` reads: the
+//! scanner checks each hit with it, so that a false positive costs no
+//! strong hash and no query.
 
-/// 16 slots of one bucket, one cache line.
+/// 16 slots of one bucket, one cache line. The fingerprints and the high
+/// bits both use it, so that the slots of a bucket are one cache line in
+/// each array, whatever the alignment that the allocator gives.
 #[derive(Clone)]
 #[repr(align(64))]
 struct Bucket([u32; 16]);
@@ -13,6 +17,9 @@ const _: () = assert!(std::mem::size_of::<Bucket>() == 64);
 
 pub struct HashTable {
     buckets: Vec<Bucket>,
+    /// The high 32 bits of the value in each slot of `buckets`. Lookups do
+    /// not read them, so that a probe reads one cache line.
+    high: Vec<Bucket>,
 }
 
 /// A lookup of one value: the bucket where it begins and the fingerprint
@@ -34,6 +41,7 @@ impl HashTable {
         if values.is_empty() {
             return HashTable {
                 buckets: Vec::new(),
+                high: Vec::new(),
             };
         }
         // `buckets = ceil(N / (16 * 0.7))`, so at least 30% of the slots
@@ -42,6 +50,7 @@ impl HashTable {
         let buckets = (u128::from(n) * 10).div_ceil(u128::from(SLOTS) * 7) as usize;
         let mut table = HashTable {
             buckets: vec![Bucket([0; 16]); buckets],
+            high: vec![Bucket([0; 16]); buckets],
         };
         for &value in values {
             table.insert(value);
@@ -55,11 +64,10 @@ impl HashTable {
         let fingerprint = fingerprint(value);
         let mut bucket = self.bucket_of(value);
         loop {
-            for slot in &mut self.buckets[bucket].0 {
-                if *slot == 0 {
-                    *slot = fingerprint;
-                    return;
-                }
+            if let Some(slot) = self.buckets[bucket].0.iter().position(|&slot| slot == 0) {
+                self.buckets[bucket].0[slot] = fingerprint;
+                self.high[bucket].0[slot] = high_bits(value);
+                return;
             }
             bucket = (bucket + 1) % self.buckets.len();
         }
@@ -104,13 +112,45 @@ impl HashTable {
         if lookup.fingerprint == 0 {
             return false;
         }
-        let mut bucket = lookup.bucket;
-        loop {
-            let slots = &self.buckets[bucket].0;
-            if slots
+        self.probe(lookup.bucket, |slots, _| {
+            slots
                 .iter()
                 .fold(false, |found, &slot| found | (slot == lookup.fingerprint))
-            {
+        })
+    }
+
+    /// True when `value` is in the list: stop at a slot that has both the
+    /// fingerprint and the high bits of `value`, or at an empty slot, and
+    /// continue only through full buckets. The check cannot stop where a
+    /// lookup stops: a full bucket can have the fingerprint of `value` for
+    /// a different value, and `value` can be in a later bucket. Values
+    /// whose low 32 bits are 0 and 1, with equal high bits, share a
+    /// fingerprint, so they are not told apart (DESIGN.md §5.5). This reads
+    /// the second array too, so the scanner calls it only for the hits of
+    /// lookups.
+    pub fn contains_value(&self, value: u64) -> bool {
+        if self.buckets.is_empty() {
+            return false;
+        }
+        let (fingerprint, high) = (fingerprint(value), high_bits(value));
+        self.probe(self.bucket_of(value), |slots, bucket| {
+            slots
+                .iter()
+                .zip(&self.high[bucket].0)
+                .any(|(&slot, &bits)| slot == fingerprint && bits == high)
+        })
+    }
+
+    /// True when `found` is true for a bucket on the way of a lookup that
+    /// begins at `bucket`: the full buckets from `bucket` on, and the first
+    /// bucket with an empty slot. `found` gets the slots of the bucket and
+    /// its index. The lookup and the check share this, so that the check
+    /// visits the buckets of the lookup.
+    #[inline(always)]
+    fn probe(&self, mut bucket: usize, found: impl Fn(&[u32; 16], usize) -> bool) -> bool {
+        loop {
+            let slots = &self.buckets[bucket].0;
+            if found(slots, bucket) {
                 return true;
             }
             if slots[slots.len() - 1] == 0 {
@@ -137,6 +177,11 @@ fn fingerprint(value: u64) -> u32 {
         0 => 1,
         fingerprint => fingerprint,
     }
+}
+
+/// The value's high 32 bits, which the second array keeps.
+fn high_bits(value: u64) -> u32 {
+    (value >> 32) as u32
 }
 
 #[cfg(test)]
@@ -177,6 +222,7 @@ mod tests {
         assert!(table.buckets.is_empty());
         assert!(!look_up(&table, 0));
         assert!(!look_up(&table, u64::MAX));
+        assert!(!table.contains_value(0));
     }
 
     #[test]
@@ -209,6 +255,27 @@ mod tests {
         // An absent fingerprint passes the full buckets and stops at the
         // first bucket with an empty slot.
         assert!(!look_up(&table, 1000));
+        for &value in &values {
+            assert!(table.contains_value(value), "{value} lost");
+        }
+        // The fingerprint of 5 with other high bits: the lookup finds it,
+        // the check of the whole value does not.
+        let other = 5 | 1 << 32;
+        assert!(look_up(&table, other));
+        assert!(!table.contains_value(other));
+    }
+
+    #[test]
+    fn the_check_passes_buckets_full_of_its_fingerprint() {
+        // 20 values with one fingerprint and other high bits: the first
+        // bucket holds 16 of them, and the rest overflow into the next. A
+        // lookup of the last ones stops at the first bucket, which has
+        // their fingerprint; the check must go on to the next.
+        let values: Vec<u64> = (0..20).map(|high| high << 32 | 5).collect();
+        let table = HashTable::build(&values);
+        for &value in &values {
+            assert!(table.contains_value(value), "{value:#x} lost");
+        }
     }
 
     proptest! {
@@ -240,6 +307,26 @@ mod tests {
             let table = HashTable::build(&values);
             for &query in queries.iter().chain(&values) {
                 prop_assert_eq!(look_up(&table, query), look_up_by_slots(&table, query));
+            }
+        }
+
+        /// `contains_value` is true exactly for the values with the
+        /// fingerprint and the high bits of a list value. Some queries share
+        /// the fingerprint of a list value but differ in their high bits.
+        #[test]
+        fn contains_value_checks_the_whole_value(
+            values in proptest::collection::vec(
+                prop_oneof![0u64..4096, u64::MAX - 4095..=u64::MAX, any::<u64>()],
+                0..1000,
+            ),
+            queries in proptest::collection::vec(any::<u64>(), 0..200),
+        ) {
+            let table = HashTable::build(&values);
+            let key = |value: u64| (fingerprint(value), high_bits(value));
+            let listed: std::collections::HashSet<_> = values.iter().map(|&v| key(v)).collect();
+            let others = values.iter().flat_map(|&v| [v ^ 1 << 40, v ^ 1 << 63]);
+            for query in queries.iter().copied().chain(others).chain(values.iter().copied()) {
+                prop_assert_eq!(table.contains_value(query), listed.contains(&key(query)), "{:#x}", query);
             }
         }
 

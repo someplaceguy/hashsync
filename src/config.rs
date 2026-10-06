@@ -40,7 +40,8 @@ pub struct Config {
     /// Hash-list cache expiry, in seconds (DESIGN.md §5.6).
     pub hashlist_max_age: u64,
     /// How far the sender scans ahead of its output, in bytes; at least
-    /// `block_size` (DESIGN.md §6.3).
+    /// `block_size` (DESIGN.md §6.3). The default is the larger of 256 MiB
+    /// and 3 × `block_size`, so that the probe threads can work.
     pub lookahead: u64,
     /// The sender's cache of hashes answered no, in bytes.
     pub negative_cache: u64,
@@ -254,7 +255,11 @@ pub fn parse(text: &str) -> Result<Config, String> {
         Some(text) => parse_path(&text).map_err(|e| format!("index_path: {e}"))?,
     };
     let lookahead = match raw.lookahead {
-        None => DEFAULT_LOOKAHEAD,
+        // The default leaves room for the probe threads: a stretch of
+        // windows splits among them only when it has two parts of `B`
+        // windows, after up to `B` literal bytes that wait for a whole LIT
+        // frame (DESIGN.md §6.3).
+        None => DEFAULT_LOOKAHEAD.max(3 * u64::from(block_size)),
         Some(size) => size.bytes().map_err(|e| format!("lookahead: {e}"))?,
     };
     // A scan step needs a whole window of lookahead (DESIGN.md §6.3).
@@ -794,6 +799,18 @@ one_filesystem = true
         assert!(parse("").unwrap().roots.is_empty());
         assert_eq!(parse("block_size = 8192").unwrap().block_size, 8192);
         assert_eq!(parse("block_size = 512").unwrap().block_size, 512);
+    }
+
+    #[test]
+    fn the_default_lookahead_has_room_for_three_blocks() {
+        let lookahead = |text: &str| parse(text).unwrap().lookahead;
+        assert_eq!(lookahead("block_size = \"64MiB\""), 256 << 20);
+        assert_eq!(lookahead("block_size = \"128MiB\""), 384 << 20);
+        let largest = u64::from(u32::MAX);
+        assert_eq!(lookahead("block_size = 4294967295"), 3 * largest);
+        // A configured lookahead stays as it is.
+        let explicit = "block_size = \"512MiB\"\nlookahead = \"1GiB\"";
+        assert_eq!(lookahead(explicit), 1 << 30);
     }
 
     #[test]

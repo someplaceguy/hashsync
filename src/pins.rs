@@ -40,7 +40,8 @@ use crate::segments::{Directory, Extent, SEGMENT_MINIMUM, Segments};
 /// cache and a lookup share it until the lookup has written it.
 pub type Block = Arc<Vec<u8>>;
 
-/// The bytes of verified blocks that the cache holds (DESIGN.md §6.4).
+/// The bytes of verified blocks that the cache holds, or one block when a
+/// block is larger (DESIGN.md §6.4).
 const CACHE_BYTES: u64 = 256 << 20;
 
 /// The pins released per acquisition of the lock when the output advances,

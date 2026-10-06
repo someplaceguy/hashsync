@@ -2,8 +2,8 @@
 //! decisions.
 //!
 //! The scanner rolls the weak hash over the command's output. A window of
-//! equal bytes becomes part of a run. A window whose weak hash may be in
-//! the receiver's list becomes a query for the window's full strong hash; a
+//! equal bytes becomes part of a run. A window whose weak hash is in the
+//! receiver's list becomes a query for the window's full strong hash; a
 //! yes answer turns it into a reference, and everything else is literal.
 //! Output leaves strictly in order: a query blocks the records behind it
 //! until its answer arrives, and a no answer discards every record after
@@ -40,7 +40,7 @@ use crate::hashtable::{HashTable, Lookup};
 
 /// The bytes that one call of `scan` examines at most, so that answers and
 /// emission keep up with a long stretch of misses. With probe threads, this
-/// is the budget after a hit.
+/// is the budget after a weak hit.
 const SCAN_BUDGET: u64 = 64 << 10;
 
 /// With probe threads, each stretch without a hit doubles the budget, up to
@@ -182,10 +182,10 @@ pub struct Scanner<'a> {
     /// The threads that probe the parts of a long stretch; `None` probes
     /// on the scanner's thread.
     pool: Option<&'a ThreadPool>,
-    /// The bytes that a call of `scan` examines at most. Each hit sets it
-    /// to `min_budget` and limits the rest of that call to it; each stretch
-    /// that reaches its limit without a hit or a constant window doubles
-    /// it, up to `max_budget`.
+    /// The bytes that a call of `scan` examines at most. Each weak hit sets
+    /// it to `min_budget` and limits the rest of that call to it; each
+    /// stretch that reaches its limit without a hit or a constant window
+    /// doubles it, up to `max_budget`.
     budget: u64,
     min_budget: u64,
     max_budget: u64,
@@ -261,14 +261,29 @@ impl<'a> Scanner<'a> {
     /// Append command output.
     pub fn push(&mut self, bytes: &[u8]) {
         assert!(!self.ended, "command output after its end");
-        // Drop the emitted bytes once they fill half the buffer, so that
-        // moving the rest costs O(1) per byte.
-        let emitted = (self.e - self.base) as usize;
-        if emitted > 0 && emitted >= self.buffer.len() / 2 {
-            self.buffer.drain(..emitted);
+        // A buffer that grows copies itself to a larger allocation, and for
+        // a moment both copies use memory. So the first push reserves the
+        // whole buffer, twice as large as the bytes that it accepts,
+        // `lookahead + B`, and the emitted bytes stay until a push finds the
+        // buffer full. Then they fill about half of it, so moving the bytes
+        // after them costs about one copy per byte. A smaller buffer would
+        // move them more often: at 1.5 times the accepted bytes, about two
+        // copies per byte. While pushes come only when the buffer has room,
+        // only a push of more than the accepted bytes can make the buffer
+        // grow.
+        if bytes.len() > self.buffer.capacity() - self.buffer.len() {
+            self.buffer.drain(..(self.e - self.base) as usize);
             self.base = self.e;
+            let size = self.buffer_size().max(self.buffer.len() + bytes.len());
+            self.buffer.reserve_exact(size - self.buffer.len());
         }
         self.buffer.extend_from_slice(bytes);
+    }
+
+    /// The bytes that the buffer reserves: twice the bytes that it accepts.
+    fn buffer_size(&self) -> usize {
+        let accepted = self.lookahead.saturating_add(self.block_size);
+        usize::try_from(accepted.saturating_mul(2)).unwrap_or(usize::MAX)
     }
 
     /// The command's stdout reached EOF.
@@ -332,6 +347,18 @@ impl<'a> Scanner<'a> {
                     .min(budget_end)
                     .min(next_entry.unwrap_or(u64::MAX));
                 match self.skip_misses(limit) {
+                    // Lookups compare only the low 32 bits of each value, so
+                    // about 3 windows in each GiB of new output hit the table
+                    // without being in the list. The check of the whole weak
+                    // hash makes such a window a miss, which costs no strong
+                    // hash, no query, and no rescan after the answer
+                    // (DESIGN.md §5.5). The budget stays, as at a constant
+                    // window (DESIGN.md §6.3). The probes do not check, so
+                    // that they stay fast.
+                    Stop::Listed(_, rolling) if !self.table.contains_value(mix64(rolling.poly)) => {
+                        self.literal_byte();
+                        continue;
+                    }
                     Stop::Listed(..) => {}
                     // A stretch that a constant window cut short did not
                     // use up its budget, so it is no sign of a long run of
@@ -350,8 +377,9 @@ impl<'a> Scanner<'a> {
                 let state = State::NotSent;
                 self.entries.insert(self.p, Entry { strong, state });
             }
-            // A hit, new or known, limits the rest of this call too: closely
-            // spaced hits stay on this thread, and answers wait little.
+            // A weak hit, new or known, limits the rest of this call too:
+            // closely spaced hits stay on this thread, and answers wait
+            // little.
             self.budget = self.min_budget;
             budget_end = budget_end.min(self.p.saturating_add(self.budget));
             self.apply_entry(query);
@@ -387,11 +415,12 @@ impl<'a> Scanner<'a> {
     }
 
     /// Record literal bytes from `p` while their windows are neither
-    /// constant nor weak hits. Stops with `p` at the first window that is
-    /// constant or a weak hit, or at `limit`, which must be above `p`, and
-    /// returns the stop, whose window counts from the old `p`. The window
-    /// at `p` must be whole. The probe threads search a long stretch in
-    /// parts.
+    /// constant nor hits of the table. Stops with `p` at the first window
+    /// that is constant or a hit, or at `limit`, which must be above `p`,
+    /// and returns the stop, whose window counts from the old `p`. A hit is
+    /// not checked against the whole weak hash yet: `scan` does that. The
+    /// window at `p` must be whole. The probe threads search a long stretch
+    /// in parts.
     fn skip_misses(&mut self, limit: u64) -> Stop {
         let Some(first) = self.rolling() else {
             return Stop::Constant(0);
@@ -1102,6 +1131,31 @@ pub(crate) mod tests {
         assert!(scanner.finished());
     }
 
+    #[test]
+    fn a_window_that_only_shares_a_fingerprint_makes_no_query() {
+        // The one list value has the low 32 bits of the window's weak
+        // hash, which the table keeps, but other high bits. The table finds
+        // the window; the check of the whole weak hash does not.
+        let window = noise(BS as usize, 60);
+        let weak = WeakHasher::new(BS as usize).hash(&window);
+        let table = HashTable::build(&[weak ^ 1 << 63]);
+        assert!(table.finish_lookup(table.start_lookup(weak)));
+        let input = [noise(10, 61), window, noise(10, 62)].concat();
+        let mut scanner = Scanner::new(table, BS, StrongHash::Blake3, 1 << 20, 1 << 20, None);
+        scanner.push(&input);
+        scanner.end_input();
+        while scanner.scan(&mut |offset, _| panic!("a query at {offset}")) {}
+        let mut output = Vec::new();
+        while let Some(frame) = scanner.next_frame() {
+            let Frame::Literal(bytes) = frame else {
+                panic!("{frame:?} without a list value");
+            };
+            output.extend_from_slice(&bytes);
+        }
+        assert_eq!(output, input);
+        assert!(scanner.finished());
+    }
+
     /// Scan all of `scanner`'s input without a list, and take every frame.
     fn frames_without_a_list(scanner: &mut Scanner) -> Vec<Frame> {
         while scanner.scan(&mut |_, _| panic!("no query without a list")) {}
@@ -1266,6 +1320,37 @@ pub(crate) mod tests {
         run.transfer(&[7, 2, 200, 1, 3, 3, 9]);
         assert_eq!(run.receiver.output, input);
         assert_eq!(run.receiver.queries.len(), 5);
+    }
+
+    /// The buffer is reserved once, twice as large as the bytes that it
+    /// accepts, and never grows: a buffer that grows copies itself, and
+    /// both copies use memory for a moment.
+    #[test]
+    fn the_buffer_is_reserved_once() {
+        let lookahead = 64 << 10;
+        let accepted = (lookahead + u64::from(BS)) as usize;
+        let size = 2 * accepted;
+        let input = noise(1 << 20, 8);
+        let mut run = Run::new(&input, Receiver::new(&[], &[]), lookahead, 0, None);
+        let mut reserved = None;
+        while !run.scanner.finished() {
+            // The consumer takes one frame per round, so the buffer stays
+            // full, and only the drop of the emitted bytes makes room.
+            let mut progress = false;
+            while run.push(4096) {
+                let buffer = &run.scanner.buffer;
+                let place = (buffer.as_ptr(), buffer.capacity());
+                assert_eq!(*reserved.get_or_insert(place), place, "the buffer moved");
+                progress = true;
+            }
+            while run.scan() {
+                progress = true;
+            }
+            progress |= run.take_frame();
+            assert!(progress, "the scanner stalled");
+        }
+        assert_eq!(reserved.unwrap().1, size);
+        assert_eq!(run.receiver.output, input);
     }
 
     /// A hit limits the rest of its call of `scan` to `min_budget` bytes,
