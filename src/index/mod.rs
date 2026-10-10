@@ -184,7 +184,7 @@ fn db_options() -> Options {
     options
 }
 
-/// The column families and their options (DESIGN.md §4.4).
+/// The column families of DESIGN.md §4.4, and their options.
 fn column_families() -> Vec<ColumnFamilyDescriptor> {
     // A hyper clock cache, RocksDB's default kind, sized automatically: its
     // lookups take no lock, and it allocates through `new`, which the

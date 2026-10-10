@@ -232,7 +232,7 @@ pub struct Owner<'c, 'a> {
 impl<'c, 'a> Owner<'c, 'a> {
     /// Start to replace the blocks of the file: mark its inode incomplete,
     /// with the observed ctime, then remove the old blocks of an existing
-    /// row in bounded transactions (DESIGN.md §4.4). A new identity gets a
+    /// row in bounded transactions (DESIGN.md §4.6). A new identity gets a
     /// new row.
     pub fn begin(self) -> Hashing<'c, 'a> {
         let mut writer = self.changes.writer();
@@ -318,7 +318,7 @@ impl Hashing<'_, '_> {
 
     /// Hashing succeeded: store the size and the owner's path, which make
     /// the inode complete even when no block rows were added
-    /// (DESIGN.md §4.4). Commit, so that the row has committed before the
+    /// (DESIGN.md §4.6). Commit, so that the row has committed before the
     /// other links add their paths to it. Then publish the row, and add the
     /// paths that waited for it.
     pub fn end(mut self) {

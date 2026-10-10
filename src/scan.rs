@@ -52,7 +52,7 @@ pub struct Counters {
 
 /// Scan every root on a dedicated pool, writing the changes to `index`,
 /// then remove the orphaned inodes. The pool ends when this returns
-/// (DESIGN.md §4.6). `jobs` is the `-j` override.
+/// (DESIGN.md §3 and §4.6). `jobs` is the `-j` override.
 pub fn run(
     config: &Config,
     roots: Vec<ScanRoot<'_>>,
