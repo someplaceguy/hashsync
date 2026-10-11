@@ -198,15 +198,17 @@ pub fn run(
         sender_input_spool_limit: config.sender_input_spool_limit,
         command: command.iter().map(|arg| arg.as_bytes().to_vec()).collect(),
     };
-    // HELLO follows the version at once. The sender uses its parameters
-    // or ends the run, so its reply does not repeat them.
-    if let Err(e) = data_out.send_version() {
+    // HELLO follows the version and the features at once. It does not
+    // wait for the sender's features: this build supports none, so HELLO
+    // cannot depend on them (DESIGN.md §6.2). The sender uses HELLO's
+    // parameters or ends the run, so its reply does not repeat them.
+    if let Err(e) = data_out.send_version_and_features() {
         die(format!("data session: {e}"));
     }
     send_data(&mut data_out, frame::HELLO, &hello.encode());
     flush_data(&mut data_out);
 
-    check_sender_version(&mut data_in, host);
+    read_sender_version_and_features(&mut data_in, host);
     let sender = SenderHello::decode(expect_data(&mut data_in, frame::HELLO, "HELLO"));
     // After its HELLO, the sender's data frames share one zstd stream
     // unless compression is disabled (DESIGN.md §6.2).
@@ -524,12 +526,13 @@ fn expect_data<'a, R: Read>(
     }
 }
 
-/// The sender's protocol version, which it sends before anything else
-/// (DESIGN.md §6.2). EOF before it means that no usable `hashsync` ran.
-fn check_sender_version<R: Read>(data_in: &mut FrameReader<R>, host: &OsStr) {
-    match data_in.version() {
-        Ok(Some(version)) => protocol::check_version(version, "sender"),
-        Ok(None) => die(format!(
+/// The sender's protocol version, which it sends before anything else,
+/// then its features (DESIGN.md §6.2). EOF before the version means that
+/// no usable `hashsync` ran.
+fn read_sender_version_and_features<R: Read>(data_in: &mut FrameReader<R>, host: &OsStr) {
+    match data_in.read_version_and_features("sender") {
+        Ok(true) => {}
+        Ok(false) => die(format!(
             "the data session ended before the sender's protocol version; \
              is a compatible hashsync installed on {}?",
             host.as_bytes().as_bstr()
@@ -553,15 +556,15 @@ fn advance(offset: u64, length: u64) -> u64 {
 }
 
 /// The owner of the control session's incoming direction: the sender's
-/// protocol version, then queries for the lookup workers, and at most one
-/// INPUT_STOP, which stops the input with `input`, one zstd stream when
-/// `compressed` (DESIGN.md §6.2 and §6.6). Loss before Completing is fatal
-/// (DESIGN.md §6.9); in Completing, EOF, errors, and a partial frame are
-/// expected closure. Also in Completing, reading goes on until closure. So
-/// the sender's relay never blocks on a full pipe, and the pipe closes
-/// only at EOF, when SSH cannot write to it any more: a write to a closed
-/// pipe would make SSH fail. The end of this thread closes the query
-/// queue.
+/// protocol version and features, then queries for the lookup workers, and
+/// at most one INPUT_STOP, which stops the input with `input`, one zstd
+/// stream when `compressed` (DESIGN.md §6.2 and §6.6). Loss before
+/// Completing is fatal (DESIGN.md §6.9); in Completing, EOF, errors, and a
+/// partial frame are expected closure. Also in Completing, reading goes on
+/// until closure. So the sender's relay never blocks on a full pipe, and
+/// the pipe closes only at EOF, when SSH cannot write to it any more: a
+/// write to a closed pipe would make SSH fail. The end of this thread
+/// closes the query queue.
 fn read_control(
     stdout: ChildStdout,
     compressed: bool,
@@ -578,9 +581,9 @@ fn read_control(
             die("the control session closed unexpectedly");
         }
     };
-    match control_in.version() {
-        Ok(Some(version)) => protocol::check_version(version, "sender's control session"),
-        Ok(None) | Err(_) => return closed(),
+    match control_in.read_version_and_features("sender's control session") {
+        Ok(true) => {}
+        Ok(false) | Err(_) => return closed(),
     }
     let mut control_in = FrameReader::new(Decompressor::new(control_in.into_inner(), compressed));
     let mut input_stopped = false;
@@ -611,14 +614,14 @@ fn read_control(
 }
 
 /// The owner of the control session's outgoing direction: this side's
-/// protocol version, sent at once, without waiting for the sender's, then
-/// answers in the order the workers queue them, one zstd stream at
-/// `level`, 0 for none, flushed whenever the queue runs empty (DESIGN.md
-/// §6.2). It ends in Completing: once the queue is closed and empty, or
-/// when a write fails, which is then expected closure; before Completing,
-/// a failed write is fatal (DESIGN.md §6.9). It gives back the session's
-/// stdin without closing it or ending the stream, and discards the answers
-/// that a failed write left in the buffer.
+/// protocol version and features, sent at once, without waiting for the
+/// sender's, then answers in the order the workers queue them, one zstd
+/// stream at `level`, 0 for none, flushed whenever the queue runs empty
+/// (DESIGN.md §6.2). It ends in Completing: once the queue is closed and
+/// empty, or when a write fails, which is then expected closure; before
+/// Completing, a failed write is fatal (DESIGN.md §6.9). It gives back the
+/// session's stdin without closing it or ending the stream, and discards
+/// the answers that a failed write left in the buffer.
 fn write_answers(
     stdin: ChildStdin,
     level: i32,
@@ -630,7 +633,7 @@ fn write_answers(
         count: &SENT,
     }));
     let mut result = control_out
-        .send_version()
+        .send_version_and_features()
         .and_then(|()| control_out.flush());
     let mut control_out = FrameWriter::new(Compressor::control(control_out.into_inner(), level));
     while result.is_ok() {

@@ -8,8 +8,8 @@
 //! the control session (DESIGN.md §6.2); obsolete queries still unsent at
 //! the normal end do not fail it, also inside a compressed block. After
 //! HELLO, the data frames of `serve` through END form one zstd frame, and
-//! DONE follows it; after the protocol version, each direction of the
-//! control session is one zstd stream that no frame ends.
+//! DONE follows it; after the features, each direction of the control
+//! session is one zstd stream that no frame ends.
 
 mod common;
 
@@ -21,8 +21,9 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::time::Duration;
 
 use common::{
-    ANSWER, CACHE_RESULT, DONE, END, END_ACK, HASHLIST, HELLO, INPUT, INPUT_END, INPUT_STOP, LIT,
-    PROTOCOL_VERSION, QUERY, REF, frame, proc_state, recv_frame, try_recv_frame, version,
+    ANSWER, CACHE_RESULT, DONE, END, END_ACK, FEATURES, HASHLIST, HELLO, INPUT, INPUT_END,
+    INPUT_STOP, LIT, PROTOCOL_VERSION, QUERY, REF, frame, proc_state, recv_frame, try_recv_frame,
+    version_and_features,
 };
 use rustix::event::{PollFd, PollFlags, poll};
 use rustix::fs::{CWD, Mode, mkfifoat};
@@ -277,9 +278,9 @@ fn frames_through_end(reader: &mut impl Read) -> Vec<(u8, Vec<u8>)> {
     }
 }
 
-/// This side of the control session after both versions, as the
-/// receiver's: each direction as plain frames at level 0, else as one zstd
-/// stream, which no frame ends (DESIGN.md §6.2).
+/// This side of the control session after both versions and features, as
+/// the receiver's: each direction as plain frames at level 0, else as one
+/// zstd stream, which no frame ends (DESIGN.md §6.2).
 struct Control {
     queries: Box<dyn Read>,
     answers: Box<dyn Write>,
@@ -357,6 +358,10 @@ struct Serve {
     data_in: Option<ChildStdin>,
     data_out: ChildStdout,
     home: TempDir,
+    /// The features that this side sends on both sessions, as the
+    /// receiver: `FEATURES`, unless a test sets bits that `serve` does not
+    /// know.
+    features: u64,
 }
 
 impl Drop for Serve {
@@ -390,6 +395,7 @@ impl Serve {
             data_out: child.stdout.take().unwrap(),
             child,
             home,
+            features: FEATURES,
         }
     }
 
@@ -407,18 +413,26 @@ impl Serve {
         self.send_raw(&frame(kind, payload));
     }
 
-    fn recv_version(&mut self) -> [u8; 4] {
-        let mut version = [0u8; 4];
-        self.data_out.read_exact(&mut version).unwrap();
-        version
+    /// Send this side's version and features on the data session. The
+    /// features are `self.features`, so that a test can send bits that
+    /// `serve` does not know.
+    fn send_version_and_features(&mut self) {
+        self.send_raw(&version_and_features(self.features));
+    }
+
+    fn recv_version_and_features(&mut self) -> [u8; 12] {
+        let mut bytes = [0u8; 12];
+        self.data_out.read_exact(&mut bytes).unwrap();
+        bytes
     }
 
     fn recv(&mut self) -> (u8, Vec<u8>) {
         recv_frame(&mut self.data_out)
     }
 
-    /// The versions, then the data HELLOs: the receiver's, for the empty
-    /// list and 4 KiB blocks, then the sender's reply.
+    /// The versions and the features, then the data HELLOs: the
+    /// receiver's, for the empty list and 4 KiB blocks, then the sender's
+    /// reply.
     fn hello(&mut self, command: &[&str]) {
         self.hello_with(4096, &empty_list(), command, 0);
     }
@@ -427,37 +441,54 @@ impl Serve {
         self.send_hello(&hello_payload(block_size, list, command, level, 2 << 30));
     }
 
-    /// The versions and the data HELLOs, as `hello` exchanges them, with
-    /// a sender input spool that holds at most `input_limit` bytes.
+    /// The versions, the features, and the data HELLOs, as `hello`
+    /// exchanges them, with a sender input spool that holds at most
+    /// `input_limit` bytes.
     fn hello_with_input_limit(&mut self, command: &[&str], input_limit: u64) {
         self.send_hello(&hello_payload(4096, &empty_list(), command, 0, input_limit));
     }
 
     fn send_hello(&mut self, payload: &[u8]) {
-        self.send_raw(&version());
+        self.send_version_and_features();
         self.send(HELLO, payload);
-        assert_eq!(self.recv_version(), version());
+        assert_eq!(
+            self.recv_version_and_features(),
+            version_and_features(FEATURES)
+        );
         assert_eq!(self.recv().0, HELLO);
     }
 
-    /// Connect as `attach` does, through the socket directory's
-    /// descriptor: a temporary path can exceed the `sun_path` limit.
-    /// `serve` listens before it sends its version.
+    /// Open the control session as the receiver does: connect as
+    /// `hashsync attach` does, then send this side's version and features
+    /// at once (DESIGN.md §6.2). The features are `self.features`, as on
+    /// the data session.
     fn attach(&self) -> UnixStream {
+        let mut socket = self.attach_without_version();
+        socket
+            .write_all(&version_and_features(self.features))
+            .unwrap();
+        socket
+    }
+
+    /// Connect as `hashsync attach` does, through the socket directory's
+    /// descriptor: a temporary path can exceed the `sun_path` limit.
+    /// `serve` listens before it sends its version. Send nothing: some
+    /// tests keep the control session open without the receiver's
+    /// version.
+    fn attach_without_version(&self) -> UnixStream {
         let dir = std::fs::File::open(self.socket().parent().unwrap()).unwrap();
         let address = format!("/proc/self/fd/{}/{TOKEN}.sock", dir.as_raw_fd());
         UnixStream::connect(address).unwrap()
     }
 
-    /// Attach, send `list`, and exchange the versions of the control
-    /// session, whose later frames use compression at `level`.
+    /// Attach, send `list`, and exchange the versions and the features of
+    /// the control session, whose later frames use compression at `level`.
     fn control_session(&mut self, list: &[u8], level: i32) -> Control {
         let mut socket = self.attach();
-        socket.write_all(&version()).unwrap();
         self.send_list(list);
-        let mut theirs = [0u8; 4];
+        let mut theirs = [0u8; 12];
         socket.read_exact(&mut theirs).unwrap();
-        assert_eq!(theirs, version());
+        assert_eq!(theirs, version_and_features(FEATURES));
         Control::new(&socket, level)
     }
 
@@ -580,11 +611,15 @@ impl Serve {
 }
 
 #[test]
-fn a_different_protocol_version_is_fatal_before_any_frame() {
-    // `serve` sends its version without waiting for the receiver's and
-    // checks the receiver's before any frame (DESIGN.md §6.2).
+fn a_different_protocol_version_is_fatal_before_the_features() {
+    // `serve` sends its version and its features without waiting for the
+    // receiver's, and it checks the receiver's version before anything
+    // else: this receiver sends no features (DESIGN.md §6.2).
     let mut serve = Serve::start();
-    assert_eq!(serve.recv_version(), version());
+    assert_eq!(
+        serve.recv_version_and_features(),
+        version_and_features(FEATURES)
+    );
     let other = PROTOCOL_VERSION + 1;
     serve.send_raw(&other.to_le_bytes());
     serve.expect_death(&format!(
@@ -595,6 +630,29 @@ fn a_different_protocol_version_is_fatal_before_any_frame() {
 }
 
 #[test]
+fn feature_bits_that_serve_does_not_know_are_ignored() {
+    // A later receiver can send feature bits that this `serve` does not
+    // know, on both sessions. `serve` ignores them, sends its own
+    // features, and the run goes on as with none (DESIGN.md §6.2).
+    let mut serve = Serve::start();
+    serve.features = u64::MAX;
+    serve.hello(&["printf", "%s", "output"]);
+    let mut control = serve.control_session(&empty_list(), 0);
+    let frames = serve.recv_through_end(0);
+    control.input_stop();
+    serve.end_ack();
+    assert_eq!(
+        frames,
+        [
+            (CACHE_RESULT, Vec::new()),
+            (LIT, b"output".to_vec()),
+            (END, vec![0; 8])
+        ]
+    );
+    serve.expect_success();
+}
+
+#[test]
 fn an_unknown_strong_hash_is_rejected_before_the_target() {
     // The target's length depends on the strong hash, so `serve` rejects
     // an unknown one with `die` before it reads the target, as it would
@@ -602,7 +660,7 @@ fn an_unknown_strong_hash_is_rejected_before_the_target() {
     // payload ends after the algorithm's name: a read of any later field
     // would panic on truncation instead.
     let mut serve = Serve::start();
-    serve.send_raw(&version());
+    serve.send_version_and_features();
     serve.send(HELLO, &hello_prefix(4096, b"future-hash"));
     serve.expect_death("incompatible receiver: strong hash future-hash");
 }
@@ -613,7 +671,7 @@ fn an_unsupported_compression_level_is_rejected() {
     // run before command startup if it does not support them
     // (DESIGN.md §6.2).
     let mut serve = Serve::start();
-    serve.send_raw(&version());
+    serve.send_version_and_features();
     serve.send(
         HELLO,
         &hello_payload(4096, &empty_list(), &["true"], 20, 2 << 30),
@@ -634,11 +692,11 @@ fn control_loss_before_the_list_is_fatal() {
     let mut serve = Serve::start();
     serve.hello(&["true"]);
     let mut control = serve.attach();
-    control.write_all(&version()).unwrap();
-    // Read `serve`'s version, so that closing sends EOF, not a reset.
-    let mut theirs = [0u8; 4];
+    // Read `serve`'s version and features, so that closing sends EOF, not
+    // a reset.
+    let mut theirs = [0u8; 12];
     control.read_exact(&mut theirs).unwrap();
-    assert_eq!(theirs, version());
+    assert_eq!(theirs, version_and_features(FEATURES));
     drop(control);
     serve.expect_death("the control session closed unexpectedly");
 }
@@ -650,7 +708,7 @@ fn receiver_loss_while_serve_waits_for_the_control_version_is_fatal() {
     // `serve` waits for the control session's version.
     let mut serve = Serve::start();
     serve.hello(&["true"]);
-    let _control = serve.attach();
+    let _control = serve.attach_without_version();
     serve.send_empty_list();
     serve.wait_for_published_list();
     serve.lose_data_session();
@@ -668,7 +726,7 @@ fn receiver_loss_while_the_input_waits_at_the_spool_limit_is_fatal() {
     // without its version, so only the data session shows the loss.
     let mut serve = Serve::start();
     serve.hello_with_input_limit(&["true"], 0);
-    let _control = serve.attach();
+    let _control = serve.attach_without_version();
     serve.send_empty_list();
     serve.recv_result();
     serve.send(INPUT, b"waits");
@@ -691,8 +749,7 @@ fn receiver_loss_after_end_ack_is_fatal_while_stderr_drains() {
         std::process::id()
     );
     serve.hello(&["sh", "-c", &script]);
-    let mut control = serve.attach();
-    control.write_all(&version()).unwrap();
+    let _control = serve.attach();
     serve.send_empty_list();
     serve.recv_result();
     let mut output = Vec::new();
@@ -880,8 +937,7 @@ fn compressed_frames_form_one_zstd_frame_that_ends_with_end() {
     // nothing follows DONE (DESIGN.md §6.2).
     let mut serve = Serve::start();
     serve.hello_with(4096, &empty_list(), &["printf", "%s", "compressed"], 3);
-    let mut control = serve.attach();
-    control.write_all(&version()).unwrap();
+    let _control = serve.attach();
     serve.send_empty_list();
     let Serve {
         data_in, data_out, ..
@@ -919,8 +975,7 @@ fn the_input_reaches_the_command() {
     for level in [0, 3] {
         let mut serve = Serve::start();
         serve.hello_with(4096, &empty_list(), &["cat"], level);
-        let mut control = serve.attach();
-        control.write_all(&version()).unwrap();
+        let _control = serve.attach();
         serve.send_empty_list();
         let stream = match level {
             0 => input.clone(),
@@ -1063,8 +1118,7 @@ fn end_does_not_wait_for_a_descendant_that_holds_the_command_stdin() {
         go.display()
     );
     serve.hello(&["sh", "-c", &script]);
-    let mut control = serve.attach();
-    control.write_all(&version()).unwrap();
+    let _control = serve.attach();
     serve.send_empty_list();
     serve.recv_result();
     // 4 MiB, more than a pipe holds by default: the sender's input spool
@@ -1107,17 +1161,17 @@ fn stdin_eof_after_done_is_the_normal_end() {
     let mut serve = Serve::start();
     serve.hello(&["printf", "%s", "output"]);
     let mut control = serve.attach();
-    control.write_all(&version()).unwrap();
     serve.send_empty_list();
     serve.recv_result();
     assert_eq!(serve.recv(), (LIT, b"output".to_vec()));
     assert_eq!(serve.recv().0, END);
-    // After the version, the INPUT_STOP of the command's exit, which comes
-    // before END, and before the closure of the session that END_ACK
-    // allows (DESIGN.md §6.6).
-    let mut stopped = vec![0; 9];
+    // After the version and the features, the INPUT_STOP of the command's
+    // exit, which comes before END, and before the closure of the session
+    // that END_ACK allows (DESIGN.md §6.6).
+    let expected = [&version_and_features(FEATURES)[..], &frame(INPUT_STOP, b"")].concat();
+    let mut stopped = vec![0; expected.len()];
     control.read_exact(&mut stopped).unwrap();
-    assert_eq!(stopped, [&version()[..], &frame(INPUT_STOP, b"")].concat());
+    assert_eq!(stopped, expected);
     serve.send(END_ACK, b"");
     assert_eq!(serve.recv(), (DONE, Vec::new()));
     let mut received = Vec::new();

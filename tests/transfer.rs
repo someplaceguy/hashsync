@@ -26,8 +26,8 @@ use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use std::time::Duration;
 
 use common::{
-    ANSWER, BLOCK, CACHE_RESULT, END, Env, HELLO, INPUT_STOP, KillOnDrop, LIT, QUERY, frame,
-    proc_state, random, tiled, toml_literal, try_recv_frame, version,
+    ANSWER, BLOCK, CACHE_RESULT, DONE, END, Env, FEATURES, HELLO, INPUT_STOP, KillOnDrop, LIT,
+    QUERY, frame, proc_state, random, tiled, toml_literal, try_recv_frame, version_and_features,
 };
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::fs::{CWD, Mode, OFlags, inotify, mkfifoat};
@@ -776,21 +776,23 @@ fn the_summary_counts_both_sessions() {
     let (output_bytes, wire, hash_list) = (counts[0], counts[4], counts[5]);
     assert_eq!(counts[2], blocks.len(), "every block is a reference");
 
-    // The receiver reads the sender's control version, one QUERY per
-    // block: a 5-byte frame header, the offset, and the full digest, and
-    // the INPUT_STOP of the command's exit, a header alone. The sender
-    // does not wait for its control writer at the end, so the closure of
-    // the session can cut INPUT_STOP off (DESIGN.md §6.6 and §6.9). The
-    // receiver writes its two versions, the hash list, and one ANSWER per
-    // block: a header, the offset, and the flag.
+    // The receiver reads the sender's control version and features, one
+    // QUERY per block: a 5-byte frame header, the offset, and the full
+    // digest, and the INPUT_STOP of the command's exit, a header alone.
+    // The sender does not wait for its control writer at the end, so the
+    // closure of the session can cut INPUT_STOP off (DESIGN.md §6.6 and
+    // §6.9). The receiver writes its versions and features on both
+    // sessions, the hash list, and one ANSWER per block: a header, the
+    // offset, and the flag.
     let traffic = traffic(&output);
-    let queries = wire + 4 + 64 * (5 + 8 + 32);
+    let start = version_and_features(FEATURES).len();
+    let queries = wire + start + 64 * (5 + 8 + 32);
     assert!(
         [queries, queries + 5].contains(&traffic.received),
         "received {} bytes",
         traffic.received
     );
-    assert!(traffic.sent > hash_list + 2 * 4 + 64 * (5 + 8 + 1));
+    assert!(traffic.sent > hash_list + 2 * start + 64 * (5 + 8 + 1));
 
     // The speedup is the output over the traffic. The rate is the
     // traffic over the elapsed time. The line rounds the time to a tenth
@@ -1623,56 +1625,16 @@ fn bootstrap_quoting_survives_a_hostile_sender_command_path() {
     assert_eq!(output.stdout, b"quoted-ok");
 }
 
-#[test]
-fn a_sender_with_another_protocol_version_is_rejected() {
-    // A fake sender that sends only its version, 0xFFFFFFFF, on both
-    // sessions: the receiver ends the run before any frame
-    // (DESIGN.md §6.2).
-    let transfer = Transfer::new("");
-    let sender = transfer.env.path("other-version");
-    std::fs::write(
-        &sender,
-        "#!/bin/sh\nprintf '\\377\\377\\377\\377'\nexec cat >/dev/null\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&sender, std::fs::Permissions::from_mode(0o755)).unwrap();
-    transfer.reconfigure(sender.as_os_str().as_bytes(), "");
-    let command = args(&["true"]);
-    let output = transfer.run(&[], &refs(&command));
-    assert_eq!(output.status.code(), Some(1));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("speaks protocol version 4294967295, this hashsync"),
-        "version mismatch:\n{stderr}"
-    );
-}
-
-#[test]
-fn a_data_session_that_ends_before_done_fails_the_run() {
-    // A fake sender sends its version, HELLO, CACHE_RESULT, output, and
-    // END, reads what the receiver sends, END_ACK included, and ends the
-    // data session without DONE, as a sender that fails after END_ACK
-    // does. The receiver wrote the output, so it read END; without
-    // compression, only DONE can then fail. The run fails although the
-    // output is complete (DESIGN.md §6.9). The fake control session sends
-    // its version and stays open until its stdin ends.
-    let transfer = Transfer::new("");
-    // HELLO: an account ID and no base. END: status 0 and no error text.
-    let mut hello = vec![0x11; 16];
-    hello.push(0);
-    let frames = [
-        version().to_vec(),
-        frame(HELLO, &hello),
-        frame(CACHE_RESULT, b""),
-        frame(LIT, b"output"),
-        frame(END, &[0; 8]),
-    ]
-    .concat();
-    let data = transfer.env.path("sender-frames");
-    std::fs::write(&data, frames).unwrap();
-    let control = transfer.env.path("sender-version");
-    std::fs::write(&control, version()).unwrap();
-    let sender = transfer.env.path("ends-before-done");
+/// A fake sender that ignores what the receiver sends. On the data
+/// session, it sends `data`, then reads its stdin to EOF. On the control
+/// session, it sends `control`, then keeps its stdout open until its stdin
+/// ends. Returns the path of the script, for `sender_command`.
+fn fake_sender(transfer: &Transfer, name: &str, data: &[u8], control: &[u8]) -> PathBuf {
+    let data_path = transfer.env.path(format!("{name}.data"));
+    std::fs::write(&data_path, data).unwrap();
+    let control_path = transfer.env.path(format!("{name}.control"));
+    std::fs::write(&control_path, control).unwrap();
+    let sender = transfer.env.path(name);
     std::fs::write(
         &sender,
         format!(
@@ -1684,13 +1646,64 @@ fi
 cat '{}'
 exec cat 3>&1 >/dev/null
 "#,
-            data.display(),
-            control.display(),
+            data_path.display(),
+            control_path.display(),
         ),
     )
     .unwrap();
     std::fs::set_permissions(&sender, std::fs::Permissions::from_mode(0o755)).unwrap();
-    // Without compression, END needs no zstd frame.
+    sender
+}
+
+#[test]
+fn a_sender_with_another_protocol_version_is_rejected() {
+    // A fake sender that sends only its version, 0xFFFFFFFF, on both
+    // sessions, without features: the receiver checks the version before
+    // anything else and ends the run (DESIGN.md §6.2).
+    let transfer = Transfer::new("");
+    let other = [0xff; 4];
+    let sender = fake_sender(&transfer, "other-version", &other, &other);
+    transfer.reconfigure(sender.as_os_str().as_bytes(), "");
+    let command = args(&["true"]);
+    let output = transfer.run(&[], &refs(&command));
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("speaks protocol version 4294967295, this hashsync"),
+        "version mismatch:\n{stderr}"
+    );
+}
+
+/// The data frames of a fake sender, from HELLO through END: an account ID
+/// and no base in HELLO, then CACHE_RESULT, `output` in one LIT, and END
+/// with status 0 and no error text. They are plain frames, so a run that
+/// gets them needs `compression_level = 0`: with compression, the frames
+/// after HELLO would form a zstd frame.
+fn fake_frames(output: &[u8]) -> Vec<u8> {
+    let mut hello = vec![0x11; 16];
+    hello.push(0);
+    [
+        frame(HELLO, &hello),
+        frame(CACHE_RESULT, b""),
+        frame(LIT, output),
+        frame(END, &[0; 8]),
+    ]
+    .concat()
+}
+
+#[test]
+fn a_data_session_that_ends_before_done_fails_the_run() {
+    // A fake sender sends its version and features, HELLO, CACHE_RESULT,
+    // output, and END, reads what the receiver sends, END_ACK included,
+    // and ends the data session without DONE, as a sender that fails after
+    // END_ACK does. The receiver wrote the output, so it read END; without
+    // compression, only DONE can then fail. The run fails although the
+    // output is complete (DESIGN.md §6.9). The fake control session sends
+    // its version and features and stays open until its stdin ends.
+    let transfer = Transfer::new("");
+    let start = version_and_features(FEATURES);
+    let data = [&start[..], &fake_frames(b"output")].concat();
+    let sender = fake_sender(&transfer, "ends-before-done", &data, &start);
     transfer.reconfigure(sender.as_os_str().as_bytes(), "compression_level = 0\n");
     let output = transfer.run(&[], &refs(&args(&["true"])));
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1700,6 +1713,24 @@ exec cat 3>&1 >/dev/null
         stderr.contains("the data session ended unexpectedly"),
         "stderr:\n{stderr}"
     );
+}
+
+#[test]
+fn feature_bits_that_the_receiver_does_not_know_are_ignored() {
+    // A later sender can send feature bits that this receiver does not
+    // know, on both sessions. The receiver ignores them, and the run ends
+    // as with none (DESIGN.md §6.2). The fake sender sends DONE without
+    // waiting for END_ACK, which the receiver cannot tell from a sender
+    // that waits.
+    let transfer = Transfer::new("");
+    let start = version_and_features(u64::MAX);
+    let data = [&start[..], &fake_frames(b"output"), &frame(DONE, b"")].concat();
+    let sender = fake_sender(&transfer, "unknown-features", &data, &start);
+    transfer.reconfigure(sender.as_os_str().as_bytes(), "compression_level = 0\n");
+    let output = transfer.run(&[], &refs(&args(&["true"])));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "stderr:\n{stderr}");
+    assert_eq!(output.stdout, b"output");
 }
 
 fn signal(pid: u32, signal: Signal) {
@@ -1988,10 +2019,10 @@ exit $status"#,
 
 #[test]
 fn both_directions_of_the_control_session_are_compressed() {
-    // After the protocol version, the queries and the INPUT_STOP of the
-    // command's exit form one zstd stream, and the answers another. No
-    // frame ends either stream: the closure of the session does
-    // (DESIGN.md §6.2). `tee` copies both directions of the control
+    // After the version and the features, the queries and the INPUT_STOP
+    // of the command's exit form one zstd stream, and the answers
+    // another. No frame ends either stream: the closure of the session
+    // does (DESIGN.md §6.2). `tee` copies both directions of the control
     // session. Every block of the output is queried once, in order, and
     // answered yes. INPUT_STOP can come between any two queries, and as
     // the sender does not wait for its control writer at the end, the
@@ -2021,8 +2052,9 @@ exec "$ssh" "$@""#,
     // comes inside the zstd frame.
     let decode = |direction: &str| {
         let stream = std::fs::read(format!("{}.{direction}", captured.display())).unwrap();
-        assert_eq!(stream[..4], version(), "{direction}");
-        let mut stream = zstd::stream::read::Decoder::new(&stream[4..]).unwrap();
+        let start = version_and_features(FEATURES);
+        assert_eq!(stream[..start.len()], start, "{direction}");
+        let mut stream = zstd::stream::read::Decoder::new(&stream[start.len()..]).unwrap();
         let mut frames = Vec::new();
         loop {
             match try_recv_frame(&mut stream) {

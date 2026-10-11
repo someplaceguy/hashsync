@@ -1,9 +1,9 @@
-//! The transfer protocol's version exchange, frames, and payload layouts
-//! (DESIGN.md §6.2).
+//! The transfer protocol's version exchange, features, frames, and payload
+//! layouts (DESIGN.md §6.2).
 //!
 //! Both roles share these definitions. The version exchange never
 //! changes; DESIGN.md §11 says which other changes require a protocol
-//! version bump.
+//! version bump or a new feature.
 //!
 //! Readers grow their buffers only as bytes arrive, so no length or count
 //! needs a bound beyond its field: a corrupt value costs only the bytes
@@ -12,8 +12,8 @@
 //! After its HELLO, the sender's data-session frames through END share one
 //! zstd stream unless compression is disabled: `Compressor` writes it and
 //! `Decompressor` reads it. DONE follows the stream, outside it. After the
-//! protocol version, each direction of the control session is one zstd
-//! stream too, which the closure of the session ends. The frames of the
+//! features, each direction of the control session is one zstd stream too,
+//! which the closure of the session ends. The frames of the
 //! receiver-to-sender direction of the data session are not compressed:
 //! the hash list is already as small as zstd can make it, and the sender
 //! must find END_ACK after input that it discards without decoding. The
@@ -40,6 +40,15 @@ use crate::sys::{ZstdCCtx, ZstdDCtx};
 /// little-endian `u32`.
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// The optional features of the protocol that this build supports, one
+/// bit each. Each side sends them as a little-endian `u64` directly after
+/// its protocol version. The field exists so that a later build can add a
+/// feature and still work with this one: a side uses a feature only when
+/// both sides have its bit, and it ignores the bits that it does not know.
+/// This build supports no features: they come only after the first
+/// release (DESIGN.md §6.2 and §11).
+pub const FEATURES: u64 = 0;
+
 /// Frame types. `type u8, length u32, payload`, integers little endian.
 pub mod frame {
     // The full frame space is defined here (DESIGN.md §6.2); later
@@ -63,19 +72,6 @@ pub mod frame {
     pub const INPUT: u8 = 15;
     pub const INPUT_END: u8 = 16;
     pub const INPUT_STOP: u8 = 17;
-}
-
-/// Require the peer's protocol version, read before any frame, to equal
-/// this side's; another version can change everything that follows.
-/// `who` names the peer for the failure message.
-pub fn check_version(version: u32, who: &str) {
-    if version != PROTOCOL_VERSION {
-        die(format!(
-            "the {who} speaks protocol version {version}, \
-             this hashsync {} speaks {PROTOCOL_VERSION}",
-            env!("CARGO_PKG_VERSION")
-        ));
-    }
 }
 
 /// HELLO, receiver to sender. Its block size and hashes are the run's:
@@ -514,14 +510,31 @@ impl<R: Read> FrameReader<R> {
         self.reader
     }
 
-    /// The peer's protocol version, which precedes its first frame;
-    /// `None` at a clean EOF before it. A truncated version is
-    /// `UnexpectedEof`.
-    pub fn version(&mut self) -> std::io::Result<Option<u32>> {
-        let mut bytes = [0u8; 4];
-        Ok(self
-            .read_whole(&mut bytes)?
-            .then(|| u32::from_le_bytes(bytes)))
+    /// What the peer sends before its first frame: its protocol version,
+    /// then its features (DESIGN.md §6.2). This function exists so that
+    /// every session checks the version before it reads anything more: a
+    /// peer with another protocol version can send anything after its
+    /// version, or nothing. A different version ends the run with `die`,
+    /// and `who` names the peer in the message. This build supports no
+    /// features, so the peer's bits enable none, and this function ignores
+    /// them. `false` at a clean EOF before the version; EOF after its
+    /// first byte is `UnexpectedEof`.
+    pub fn read_version_and_features(&mut self, who: &str) -> std::io::Result<bool> {
+        let mut version = [0u8; 4];
+        if !self.read_whole(&mut version)? {
+            return Ok(false);
+        }
+        let version = u32::from_le_bytes(version);
+        if version != PROTOCOL_VERSION {
+            die(format!(
+                "the {who} speaks protocol version {version}, \
+                 this hashsync {} speaks {PROTOCOL_VERSION}",
+                env!("CARGO_PKG_VERSION")
+            ));
+        }
+        let mut features = [0u8; 8];
+        self.reader.read_exact(&mut features)?;
+        Ok(true)
     }
 
     /// The next frame; `None` at a clean EOF between frames. EOF inside a
@@ -613,10 +626,13 @@ impl<W: Write> FrameWriter<W> {
         self.writer
     }
 
-    /// This side's protocol version: the session's first bytes, sent
-    /// without waiting for the peer's.
-    pub fn send_version(&mut self) -> std::io::Result<()> {
-        self.writer.write_all(&PROTOCOL_VERSION.to_le_bytes())
+    /// This side's protocol version and then its features: the session's
+    /// first bytes, sent without waiting for the peer's (DESIGN.md §6.2).
+    pub fn send_version_and_features(&mut self) -> std::io::Result<()> {
+        let mut bytes = [0u8; 12];
+        bytes[..4].copy_from_slice(&PROTOCOL_VERSION.to_le_bytes());
+        bytes[4..].copy_from_slice(&FEATURES.to_le_bytes());
+        self.writer.write_all(&bytes)
     }
 
     /// Write one frame: its header and its payload in one vectored write
@@ -701,8 +717,8 @@ const LONG_WINDOW_LOG: u32 = 27;
 /// frame that it must answer. The sender's data session begins the stream
 /// after its HELLO, and `finish` ends it after END. The zstd frame has a
 /// checksum: the trailer that the receiver checks (DESIGN.md §6.9). Each
-/// direction of the control session begins its stream after the protocol
-/// version, and no frame ends it: the closure of the session ends it.
+/// direction of the control session begins its stream after the features,
+/// and no frame ends it: the closure of the session ends it.
 ///
 /// Transport failures are `io::Error`s for the caller's `die`. A failure of
 /// zstd itself panics.
@@ -1022,19 +1038,30 @@ mod tests {
     }
 
     #[test]
-    fn the_version_precedes_the_first_frame() {
+    fn the_version_and_the_features_precede_the_first_frame() {
         let mut out = Vec::new();
         let mut writer = FrameWriter::new(&mut out);
-        writer.send_version().unwrap();
+        writer.send_version_and_features().unwrap();
         writer.send(frame::HELLO, b"x").unwrap();
         assert_eq!(out[..4], PROTOCOL_VERSION.to_le_bytes());
+        assert_eq!(out[4..12], FEATURES.to_le_bytes());
         let mut reader = FrameReader::new(&out[..]);
-        assert_eq!(reader.version().unwrap(), Some(PROTOCOL_VERSION));
+        assert!(reader.read_version_and_features("peer").unwrap());
         assert_eq!(reader.next().unwrap().unwrap().kind, frame::HELLO);
 
-        assert_eq!(FrameReader::new(&out[..0]).version().unwrap(), None);
-        for cut in 1..4 {
-            let error = FrameReader::new(&out[..cut]).version().unwrap_err();
+        // A later peer can send bits that this build does not know.
+        let mut unknown = out.clone();
+        unknown[4..12].copy_from_slice(&u64::MAX.to_le_bytes());
+        let mut reader = FrameReader::new(&unknown[..]);
+        assert!(reader.read_version_and_features("peer").unwrap());
+        assert_eq!(reader.next().unwrap().unwrap().kind, frame::HELLO);
+
+        let mut empty = FrameReader::new(&out[..0]);
+        assert!(!empty.read_version_and_features("peer").unwrap());
+        for cut in 1..12 {
+            let error = FrameReader::new(&out[..cut])
+                .read_version_and_features("peer")
+                .unwrap_err();
             assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
         }
     }

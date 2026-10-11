@@ -6,27 +6,28 @@
 //! turns the command's stdout into literals, runs, and references. After
 //! its HELLO, this side's data frames share one zstd stream unless
 //! compression is disabled, and so do the queries and the answers on the
-//! control session after the protocol version (DESIGN.md §6.2).
+//! control session after the features (DESIGN.md §6.2).
 //!
 //! Each incoming direction has one owner for the whole run, so session
 //! loss is fatal at any moment — during rendezvous, setup, startup
 //! failure, and transfer alike (DESIGN.md §6.9). The data reader owns
-//! stdin and walks the receiver's fixed sequence: the protocol version,
-//! HELLO, HASHLIST and the list bytes, the input, END_ACK, closure. From
-//! acceptance, the control reader owns the incoming direction of the
-//! control socket: the protocol version, then answers. The control writer
-//! owns the outgoing one: the protocol version, then queries, and
-//! INPUT_STOP. The main thread writes the setup frames, then gives the data
-//! session to the data writer and runs the scanner (DESIGN.md §6.8): it
-//! takes command output from the output reader and answers from the
-//! control reader, lends long stretches of windows to the probe threads,
-//! and queues queries for the control writer and frames for the data
-//! writer. The command's stdout goes through a spool, so the command waits
-//! for the scanner only when `sender_output_spool_limit` bytes wait for it
-//! (DESIGN.md §6.5). The receiver's stdin arrives in INPUT frames, which
-//! the data reader appends to the input spool, and the stdin writer
-//! decompresses that spool into the command's stdin (DESIGN.md §6.6).
-//! Command success and startup failure share one completion path.
+//! stdin and walks the receiver's fixed sequence: the protocol version and
+//! the features, HELLO, HASHLIST and the list bytes, the input, END_ACK,
+//! closure. From acceptance, the control reader owns the incoming
+//! direction of the control socket: the protocol version and the features,
+//! then answers. The control writer owns the outgoing one: the protocol
+//! version and the features, then queries, and INPUT_STOP. The main
+//! thread writes the setup frames, then gives the data session to the data
+//! writer and runs the scanner (DESIGN.md §6.8): it takes command output
+//! from the output reader and answers from the control reader, lends long
+//! stretches of windows to the probe threads, and queues queries for the
+//! control writer and frames for the data writer. The command's stdout
+//! goes through a spool, so the command waits for the scanner only when
+//! `sender_output_spool_limit` bytes wait for it (DESIGN.md §6.5). The
+//! receiver's stdin arrives in INPUT frames, which the data reader appends
+//! to the input spool, and the stdin writer decompresses that spool into
+//! the command's stdin (DESIGN.md §6.6). Command success and startup
+//! failure share one completion path.
 //!
 //! The normal end joins every thread (DESIGN.md §6.9). After the cleanup,
 //! DONE tells the receiver that this side needs neither session any more,
@@ -151,9 +152,12 @@ pub fn run(token: &str) -> ! {
     };
     let mut data_out = FrameWriter::new(BufWriter::with_capacity(WRITE_BUFFER, fsops::stdout()));
 
-    // This side's protocol version goes first, without waiting for the
-    // receiver's, which the data reader checks (DESIGN.md §6.2).
-    if let Err(e) = data_out.send_version().and_then(|()| data_out.flush()) {
+    // This side's protocol version and features go first, without waiting
+    // for the receiver's, which the data reader reads (DESIGN.md §6.2).
+    if let Err(e) = data_out
+        .send_version_and_features()
+        .and_then(|()| data_out.flush())
+    {
         die(format!("data session: {e}"));
     }
 
@@ -202,12 +206,12 @@ pub fn run(token: &str) -> ! {
     ));
 
     // The control session: accept `attach`. Each direction has one thread,
-    // from the protocol version on, and both sides send their version at
-    // once (DESIGN.md §6.2). The control writer sends the scanner's
-    // queries, and INPUT_STOP; the control reader reports readiness once
-    // the receiver's version matched, then forwards answers. After the
-    // version, each direction is one zstd stream at the data session's
-    // level.
+    // from the protocol version on, and both sides send their version and
+    // features at once (DESIGN.md §6.2). The control writer sends the
+    // scanner's queries, and INPUT_STOP; the control reader reports
+    // readiness once the receiver's version matched and its features
+    // arrived, then forwards answers. After the features, each direction
+    // is one zstd stream at the data session's level.
     let control = listener.accept();
     let control_writer = {
         let progress = Arc::clone(&progress);
@@ -566,13 +570,14 @@ fn write_output(
 }
 
 /// The owner of the control session's outgoing direction: this side's
-/// protocol version, sent at once, without waiting for the receiver's,
-/// then the frames of `queue` in order, queries and INPUT_STOP, one zstd
-/// stream at `level`, 0 for none, flushed whenever the queue runs empty,
-/// until the queue is closed and empty (DESIGN.md §6.2). Obsolete queries
-/// do not delay completion (DESIGN.md §6.3), so normal cleanup can close
-/// the socket while this thread still has some to send. In Completing, a
-/// failed write is expected closure, not a failure (DESIGN.md §6.9).
+/// protocol version and features, sent at once, without waiting for the
+/// receiver's, then the frames of `queue` in order, queries and
+/// INPUT_STOP, one zstd stream at `level`, 0 for none, flushed whenever
+/// the queue runs empty, until the queue is closed and empty (DESIGN.md
+/// §6.2). Obsolete queries do not delay completion (DESIGN.md §6.3), so
+/// normal cleanup can close the socket while this thread still has some to
+/// send. In Completing, a failed write is expected closure, not a failure
+/// (DESIGN.md §6.9).
 fn write_control(
     stream: UnixStream,
     level: i32,
@@ -581,7 +586,7 @@ fn write_control(
 ) {
     let mut control_out = FrameWriter::new(BufWriter::new(stream));
     let mut result = control_out
-        .send_version()
+        .send_version_and_features()
         .and_then(|()| control_out.flush());
     let mut control_out = FrameWriter::new(Compressor::control(control_out.into_inner(), level));
     while result.is_ok() {
@@ -602,12 +607,12 @@ fn write_control(
 }
 
 /// The single owner of the data session's incoming direction, for the
-/// whole run: the protocol version, HELLO, the list, the input, END_ACK,
-/// then closure. EOF before DONE is the receiver's disappearance and is
-/// fatal (DESIGN.md §6.9). The receiver closes the session after DONE, so
-/// EOF then is the normal end of this thread, and the main thread joins
-/// it. The payloads of INPUT frames go to the writer of the input spool,
-/// from `input_rx` (DESIGN.md §6.6).
+/// whole run: the protocol version and the features, HELLO, the list, the
+/// input, END_ACK, then closure. EOF before DONE is the receiver's
+/// disappearance and is fatal (DESIGN.md §6.9). The receiver closes the
+/// session after DONE, so EOF then is the normal end of this thread, and
+/// the main thread joins it. The payloads of INPUT frames go to the writer
+/// of the input spool, from `input_rx` (DESIGN.md §6.6).
 fn data_reader<R: Read>(
     mut data_in: FrameReader<R>,
     hello_tx: Sender<ReceiverHello>,
@@ -616,9 +621,9 @@ fn data_reader<R: Read>(
     ack_tx: Sender<()>,
     progress: &Progress,
 ) {
-    match data_in.version() {
-        Ok(Some(version)) => protocol::check_version(version, "receiver"),
-        Ok(None) => die("the receiver disappeared"),
+    match data_in.read_version_and_features("receiver") {
+        Ok(true) => {}
+        Ok(false) => die("the receiver disappeared"),
         Err(e) => die_data(&e),
     }
     let payload = data_in
@@ -707,10 +712,10 @@ fn data_reader<R: Read>(
 }
 
 /// The owner of the control session's incoming direction: the protocol
-/// version, whose check gates command startup, then answers for the
-/// scanner until closure, which is fatal before the normal cleanup
-/// (DESIGN.md §6.9). The answers are one zstd stream when `compressed`
-/// (DESIGN.md §6.2).
+/// version, whose check gates command startup, and the features, then
+/// answers for the scanner until closure, which is fatal before the normal
+/// cleanup (DESIGN.md §6.9). The answers are one zstd stream when
+/// `compressed` (DESIGN.md §6.2).
 fn read_answers(
     stream: UnixStream,
     compressed: bool,
@@ -719,9 +724,9 @@ fn read_answers(
     progress: &Progress,
 ) {
     let mut control_in = FrameReader::new(BufReader::new(stream));
-    match control_in.version() {
-        Ok(Some(version)) => protocol::check_version(version, "receiver's control session"),
-        Ok(None) => die("the control session closed before the protocol version"),
+    match control_in.read_version_and_features("receiver's control session") {
+        Ok(true) => {}
+        Ok(false) => die("the control session closed before the protocol version"),
         Err(e) => die(format!("control session: {e}")),
     }
     let _ = ready_tx.send(());
@@ -961,7 +966,7 @@ mod tests {
             length: list.len() as u64,
         };
         let mut session = FrameWriter::new(Vec::new());
-        session.send_version().unwrap();
+        session.send_version_and_features().unwrap();
         session.send(frame::HELLO, &hello.encode()).unwrap();
         session.send(frame::HASHLIST, &header.encode()).unwrap();
         session.send_bytes(&list).unwrap();

@@ -820,16 +820,24 @@ finishes only after command stderr reaches EOF and all copied bytes have
 been written and flushed to SSH; successful sender exit requires that
 (section 6.9).
 
-### 6.2 Protocol version and frames
+### 6.2 Protocol version, features, and frames
 
 Each side sends `protocol_version u32`, little endian, as the first bytes of
 each session. It does not wait for the peer's version before it sends its
-own. It reads the peer's version before it reads any frame, and it ends the
-run with `die` if the versions are different; the message names both
-versions. The sender starts the command only after it has checked the
-receiver's version on both sessions. The remote commands of section 6.1 and
-this version exchange never change. Everything after the exchange belongs to
-one protocol version (section 11).
+own. It reads the peer's version before anything else, and it ends the run
+with `die` if the versions are different; the message names both versions.
+The sender starts the command only after it has checked the receiver's
+version on both sessions. The remote commands of section 6.1 and this
+version exchange never change. Everything after the exchange belongs to one
+protocol version (section 11).
+
+Directly after its version, each side sends `features u64`, little endian,
+also without waiting for the peer's. It has one bit for each optional
+feature of the protocol that the side supports. A side uses a feature only
+when both sides have its bit, and it ignores the bits that it does not
+know. When a run needs a feature that the peer does not have, for example
+for an option that the user gave, the side that needs it ends the run with
+`die`. No features exist yet, so both sides send 0.
 
 Every frame is `type u8, length u32, payload`. Integers are little endian.
 Strings and byte strings have a `u32` byte length; lists have a `u32` item
@@ -906,12 +914,13 @@ startup if it does not support them. It checks the strong hash before it
 reads the target, whose length depends on it. Its HELLO does not repeat
 them.
 
-The data handshake is the version exchange, receiver HELLO, sender HELLO,
-durable receiver publication, then HASHLIST/HASHDELTA/HASHKEEP and its data.
-The sender replies with CACHE_RESULT, possibly after one HASHFULL fallback.
-The receiver handles the result and cache cleanup before entering its output
-loop. Its remaining data-session frames are the input, in INPUT frames and
-INPUT_END, until the stop of the input, and then END_ACK.
+The data handshake is the version exchange, the features, receiver HELLO,
+sender HELLO, durable receiver publication, then
+HASHLIST/HASHDELTA/HASHKEEP and its data. The sender replies with
+CACHE_RESULT, possibly after one HASHFULL fallback. The receiver handles the
+result and cache cleanup before entering its output loop. Its remaining
+data-session frames are the input, in INPUT frames and INPUT_END, until the
+stop of the input, and then END_ACK.
 
 After HELLO, all sender-to-receiver data-session frames through END share one
 zstd stream, unless compression is disabled. This includes HASHFULL and
@@ -924,8 +933,8 @@ the transport buffer until more output fills them or the stream ends. No
 wait depends on them: queries and answers use the control session.
 Compression settings are in section 7.
 
-After the protocol version, each direction of the control session is also
-one zstd stream at the same level, unless compression is disabled. The
+After the features, each direction of the control session is also one
+zstd stream at the same level, unless compression is disabled. The
 frames are small, so the stream uses no long-distance matching and no
 worker threads. A control writer flushes its stream each time its queue
 becomes empty, because the scanner waits for answers, and the receiver
@@ -1516,16 +1525,17 @@ joins the stderr relay, so such a descendant delays DONE but not END
   END; a startup failure returns status 127 and error text.
 - External failures end the run without a core dump (section 6.9).
   Receiver SIGINT/SIGTERM give status `128 + signal` (section 6.8). These
-  end the run with `die`: different protocol versions and unsupported
-  HELLO parameters, before command startup; truncated streams; broken
-  sessions or receiver stdout; stderr relay read, write, or flush
-  failures; failed reads of the receiver's stdin, and failed writes to the
-  command's stdin other than `EPIPE` (section 6.6); configuration errors,
-  including conflicting immutable-copy policies and duplicate or nested
-  root paths; repeated directory identities detected during expansion or
-  traversal; failures of the tmp_data directory setup, segment creation,
-  segment I/O, or pin verification, because a yes answer cannot be
-  retracted; and cache operation failures (section 5.6).
+  end the run with `die`: different protocol versions, features that the
+  run needs and the peer does not have, and unsupported HELLO parameters,
+  before command startup; truncated streams; broken sessions or receiver
+  stdout; stderr relay read, write, or flush failures; failed reads of the
+  receiver's stdin, and failed writes to the command's stdin other than
+  `EPIPE` (section 6.6); configuration errors, including conflicting
+  immutable-copy policies and duplicate or nested root paths; repeated
+  directory identities detected during expansion or traversal; failures of
+  the tmp_data directory setup, segment creation, segment I/O, or pin
+  verification, because a yes answer cannot be retracted; and cache
+  operation failures (section 5.6).
 - Bugs panic and abort: invalid frames, a compressed stream that ends
   before END or on the control session, invalid compressed input, an
   input stream that does not end with its zstd frame, unexpected answers,
@@ -1552,7 +1562,7 @@ give `128 + signal`.
 | Role | Responsibilities |
 |---|---|
 | Sender main | Handshake and command startup, then obtain the command's exit status without reaping, wait for the completion conditions of section 6.9, and send DONE. |
-| Sender data reader | Read the data session for the whole run: the protocol version, HELLO, the list, the input, END_ACK, and EOF. EOF before DONE means that the receiver disappeared. Append the input to the input spool (section 6.6). |
+| Sender data reader | Read the data session for the whole run: the protocol version, the features, HELLO, the list, the input, END_ACK, and EOF. EOF before DONE means that the receiver disappeared. Append the input to the input spool (section 6.6). |
 | Sender spool thread | Copy command stdout into its spool until EOF (section 6.5). |
 | Sender output reader | Fill lookahead from the spool of command stdout until its EOF, then close the spool. |
 | Sender stderr relay | Copy command stderr to sender stderr through EOF and flush (section 6.1). |
@@ -1898,7 +1908,7 @@ separate pure-Rust build.
 | System calls | `rustix`; `libc` and `linux-raw-sys` for missing wrappers/constants |
 | Thread pools and channels | `rayon` for indexing, the hash-list sort, and sender probes, `crossbeam-channel`; blocking standard threads for transfer |
 | Compression | `zstd-sys` binding libzstd with worker-thread support |
-| Memory allocation | `mimalloc` for Rust code, RocksDB, and libzstd, with the `mimalloc` feature (on by default): the global allocator, replacements of the C++ allocation functions from mimalloc's `mimalloc-new-delete.h`, and libzstd's allocator interface; never its `override`, so other C code keeps libc `malloc` |
+| Memory allocation | `mimalloc` for Rust code, RocksDB, and libzstd, with the `mimalloc` Cargo feature (on by default): the global allocator, replacements of the C++ allocation functions from mimalloc's `mimalloc-new-delete.h`, and libzstd's allocator interface; never its `override`, so other C code keeps libc `malloc` |
 | Unlinked segment files | `O_TMPFILE` through `rustix` |
 | Configuration and CLI | `serde`, `toml`, `clap`; `gix-glob` for byte patterns and paths |
 | Maps and caches | Standard maps with a fast hasher; `lru` for bounded caches |
@@ -2123,11 +2133,12 @@ decision history, including fuller measurements, is in version control.
 - One crate, one binary, committed `Cargo.lock`. All profiles use
   `panic = "abort"`; install cleanup hooks before starting threads.
 - Isolate unsafe syscall wrappers and SIMD code; deny unsafe code elsewhere.
-- Share protocol definitions between both roles. The protocol version is 1
-  until the first release. After that, any change that a peer can observe
-  after the version exchange requires a protocol version bump, for example a
-  change to frame layouts, frame order or meaning, the list encoding, or the
-  frames that the zstd streams carry. New weak and strong hashes are the
+- Share protocol definitions between both roles. Until the first release,
+  the protocol version stays 1, and no change adds a feature. After that,
+  any change that a peer can observe after the version exchange requires a
+  protocol version bump or a new feature (section 6.2), for example a
+  change to frame layouts, frame order or meaning, the list encoding, or
+  the frames that the zstd streams carry. New weak and strong hashes are the
   exception: HELLO names both, and a sender that does not support them
   ends the run before command startup (section 6.2).
 - Run `cargo fmt`, `cargo clippy --all-targets`, and `cargo test` for
@@ -2172,7 +2183,8 @@ decision history, including fuller measurements, is in version control.
     and non-UTF-8 values;
   - SSH option precedence; bootstrap quoting of executable paths with
     whitespace, quotes, shell metacharacters, and non-UTF-8 bytes; a
-    different protocol version on either side, detected before any frame;
+    different protocol version on either side, detected before the
+    features; feature bits that a side does not know, on either side;
   - crash recovery, process exclusion, and reads of later commits; cache
     races, fatal cache I/O failures, and invalid cached lists;
   - completion without truncation or premature exit; complete stderr

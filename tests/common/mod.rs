@@ -532,9 +532,11 @@ pub fn namespaces_available() -> bool {
         .is_ok_and(|status| status.success())
 }
 
-// The protocol version and the frame types of DESIGN.md §6.2, spelled out
-// because the tests reach only the binary.
+// The protocol version, the features, and the frame types of DESIGN.md
+// §6.2, spelled out because the tests reach only the binary.
 pub const PROTOCOL_VERSION: u32 = 1;
+/// The features that hashsync sends: it supports none yet.
+pub const FEATURES: u64 = 0;
 pub const HELLO: u8 = 1;
 pub const HASHLIST: u8 = 2;
 pub const CACHE_RESULT: u8 = 6;
@@ -549,9 +551,14 @@ pub const INPUT: u8 = 15;
 pub const INPUT_END: u8 = 16;
 pub const INPUT_STOP: u8 = 17;
 
-/// The first bytes of each session, in both directions.
-pub fn version() -> [u8; 4] {
-    PROTOCOL_VERSION.to_le_bytes()
+/// The first bytes of each session, in both directions: the protocol
+/// version, then `features`. hashsync sends `FEATURES`, but a later peer
+/// can send bits that hashsync does not know.
+pub fn version_and_features(features: u64) -> [u8; 12] {
+    let mut bytes = [0; 12];
+    bytes[..4].copy_from_slice(&PROTOCOL_VERSION.to_le_bytes());
+    bytes[4..].copy_from_slice(&features.to_le_bytes());
+    bytes
 }
 
 /// A frame: the type, the length of the payload as a little-endian `u32`,
