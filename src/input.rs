@@ -12,13 +12,19 @@
 //!
 //! The input stream is one zstd frame at the level and long-distance
 //! matching of the data stream, or the bytes of stdin themselves when
-//! compression is disabled. The command can wait for its input before it
-//! writes output, so the stdin reader flushes the stream before each wait
-//! for stdin, and the EOF of stdin ends the stream. It compresses on its
-//! own thread: with worker threads, each flush would end a zstd job, which
-//! costs much more than the end of a block. The pieces of the stream travel
-//! in frames that are not compressed, so each role can stop the input after
-//! any frame.
+//! compression is disabled. On its way to the input spool, it passes a
+//! buffer, which goes on when the next bytes do not fit in it, or at a
+//! flush. In eager delivery (DESIGN.md §6.2), the command can wait for its
+//! input before it writes output, so the stdin reader flushes the stream at
+//! each idle point of stdin, once the input writer has sent every byte of
+//! the input spool: until then, the bytes could not leave sooner, and the
+//! flush would only cost compression (`Sent`). In batch delivery, it
+//! flushes nothing. In both, it compresses on worker threads, as the
+//! sender's data stream does: a producer that never pauses waits for one
+//! compressing thread otherwise. In eager delivery, each flush then ends a
+//! zstd job, which costs more bytes than the end of a block. The EOF of
+//! stdin ends the stream. The pieces of the stream travel in frames that
+//! are not compressed, so each role can stop the input after any frame.
 //!
 //! Each role stops its input once, when the input has no use any more
 //! (`InputStop`). The sender stops it when no process reads the command's
@@ -33,26 +39,35 @@
 //! of the session. So until the stop, the session watcher sees it instead,
 //! and ends the run.
 
-use std::io::{ErrorKind, IsTerminal, PipeReader, PipeWriter, Read, Write};
-use std::os::fd::AsFd;
+use std::io::{BufWriter, ErrorKind, IsTerminal, PipeReader, PipeWriter, Read, Write};
+use std::os::fd::{AsFd, OwnedFd};
+use std::sync::atomic::{AtomicU64, Ordering::Acquire, Ordering::Release};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use crossbeam_channel::Sender;
-use rustix::event::{PollFd, PollFlags};
+use rustix::event::{EventfdFlags, PollFd, PollFlags};
 use rustix::fs::OFlags;
 use rustix::io::{Errno, retry_on_intr};
 use rustix::process::Pid;
 
+use crate::config::thread_count;
 use crate::die::{self, die};
 use crate::fsops::{any_ready, poll_fds};
-use crate::protocol::{Compressor, FrameWriter, SenderControl, flush_data, frame, send_data};
+use crate::protocol::{
+    Compressor, Delivery, FrameWriter, SenderControl, flush_data, frame, send_data,
+};
 use crate::segments::Directory;
 use crate::spool::{Spool, SpoolWriter, Stopper};
 use crate::sys::{self, ZstdDCtx};
 
-/// The most bytes of one read of stdin, and of one INPUT frame.
+/// The most bytes of one read of stdin, of the buffer of the input stream,
+/// and of one INPUT frame.
 const CHUNK: usize = 256 << 10;
+
+/// The input stream on the receiver: the stream through its buffer, into
+/// the input spool.
+type InputStream = Compressor<BufWriter<SpoolWriter>>;
 
 /// The stop of the input of one role (DESIGN.md §6.6). The threads that
 /// can stop the input share it, and only the first stop does something:
@@ -112,6 +127,64 @@ impl InputStop {
     }
 }
 
+/// The bytes of the input spool that the receiver's input writer has sent
+/// (DESIGN.md §6.6). This type exists so that in eager delivery, the stdin
+/// reader flushes the input stream at an idle point of stdin only when the
+/// input writer has sent every byte of the spool, and so can send the
+/// flushed bytes at once. While the input writer is busy, as on a slow
+/// link, the flush would only cost compression, and the stdin reader waits
+/// for the input writer instead.
+struct Sent {
+    bytes: AtomicU64,
+    /// An eventfd that the input writer signals after each INPUT frame, so
+    /// that the stdin reader can wait for it.
+    wake: OwnedFd,
+}
+
+impl Sent {
+    fn new() -> Self {
+        let flags = EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK;
+        let wake = rustix::event::eventfd(0, flags)
+            .unwrap_or_else(|e| die(format!("cannot create the eventfd of the input: {e}")));
+        Sent {
+            bytes: AtomicU64::new(0),
+            wake,
+        }
+    }
+
+    /// The input writer has sent `n` more bytes: wake the stdin reader.
+    fn add(&self, n: u64) {
+        self.bytes.fetch_add(n, Release);
+        match retry_on_intr(|| rustix::io::write(&self.wake, &1u64.to_ne_bytes())) {
+            // A counter at its maximum wakes the stdin reader already.
+            Ok(_) | Err(Errno::AGAIN) => {}
+            Err(e) => panic!("cannot write to the eventfd of the input: {e}"),
+        }
+    }
+
+    /// True when the input writer has sent every byte that `writer`, the
+    /// writer of the input spool, has appended. A look at an idle input
+    /// writer, the common case, costs no system call, and leaves the
+    /// wake-ups as they are. A look at a busy one takes them, because the
+    /// stdin reader will then wait for the next one, and the old ones have
+    /// no use any more. Then it looks again, so that it does not miss a
+    /// frame sent between the two looks, and a frame sent after them wakes
+    /// the wait.
+    fn all_of(&self, writer: &SpoolWriter) -> bool {
+        // Only the stdin reader appends to the spool, so one look at
+        // `written` serves both looks.
+        let written = writer.written();
+        if self.bytes.load(Acquire) == written {
+            return true;
+        }
+        match retry_on_intr(|| rustix::io::read(&self.wake, &mut [0u8; 8])) {
+            Ok(_) | Err(Errno::AGAIN) => {}
+            Err(e) => panic!("cannot read the eventfd of the input: {e}"),
+        }
+        self.bytes.load(Acquire) == written
+    }
+}
+
 /// A new stop pipe (DESIGN.md §6.6): its read end for the thread that polls
 /// it, and its write end for the stop.
 fn stop_pipe() -> (PipeReader, PipeWriter) {
@@ -151,17 +224,21 @@ impl ReceiverInput {
         self.stop.clone()
     }
 
-    /// Start to send `stdin` to the command, after CACHE_RESULT: the stdin
-    /// reader compresses it at zstd `level`, with long-distance matching
-    /// when `long`, into the input spool, and the input writer sends the
-    /// spool in INPUT frames on `session`, the outgoing direction of the
-    /// data session. When INPUT_STOP came first, both threads end at once.
+    /// Start to send `stdin` to the command, after CACHE_RESULT, in
+    /// `delivery`: the stdin reader compresses it at zstd `level`, with
+    /// long-distance matching when `long`, into the input spool, and the
+    /// input writer sends the spool in INPUT frames on `session`, the
+    /// outgoing direction of the data session. The stdin reader compresses
+    /// on `threads` worker threads, 0 for half the cores. When INPUT_STOP
+    /// came first, both threads end at once.
     pub fn start<W: Write + Send + 'static>(
         self,
         stdin: impl AsFd + Send + 'static,
         session: FrameWriter<W>,
+        delivery: Delivery,
         level: i32,
         long: bool,
+        threads: u32,
     ) -> RunningInput<W> {
         let ReceiverInput {
             stop,
@@ -169,15 +246,19 @@ impl ReceiverInput {
             spool,
             stopped,
         } = self;
-        // No worker threads: the stream flushes often (`read_stdin`).
-        let input = Compressor::new(writer, level, long, 0);
-        let stdin_reader = std::thread::Builder::new()
-            .name("stdin-reader".into())
-            .spawn(move || read_stdin(stdin, &stopped, input))
-            .expect("cannot start the stdin reader");
+        let buffer = BufWriter::with_capacity(CHUNK, writer);
+        let input = Compressor::new(buffer, level, long, thread_count(threads));
+        let sent = Arc::new(Sent::new());
+        let stdin_reader = {
+            let sent = Arc::clone(&sent);
+            std::thread::Builder::new()
+                .name("stdin-reader".into())
+                .spawn(move || read_stdin(stdin, &stopped, input, delivery, &sent))
+                .expect("cannot start the stdin reader")
+        };
         let input_writer = std::thread::Builder::new()
             .name("input-writer".into())
-            .spawn(move || write_input(spool, session))
+            .spawn(move || write_input(spool, session, &sent))
             .expect("cannot start the input writer");
         RunningInput {
             stop,
@@ -210,19 +291,29 @@ impl<W: Write> RunningInput<W> {
 
 /// The stdin reader (DESIGN.md §6.6, steps I1 to I3): read stdin, and
 /// append its bytes to the input stream, until the EOF of stdin, which
-/// ends the stream: its zstd frame, and then the input spool. Before each
-/// wait for stdin, flush the stream, because the command can wait for the
-/// bytes that the stream holds. The stop ends this function at once. A
-/// failed read ends the run.
+/// ends the stream: its zstd frame, and then the input spool. In eager
+/// `delivery`, flush the stream at each idle point of stdin, because the
+/// command can wait for the bytes that the stream holds, once the input
+/// writer has sent every byte of the input spool (`sent`). The stop ends
+/// this function, but zstd cannot cancel a job: at a level other than 0,
+/// the function returns only once the worker threads have compressed the
+/// jobs that zstd holds (DESIGN.md §6.6). A failed read ends the run.
 ///
 /// As ssh does, a stdin that is not a terminal is non-blocking while this
 /// function reads it, so that no read waits: when another process takes
 /// the bytes that `poll` reported, the read fails with `EAGAIN`, and the
-/// next wait follows a flush, and the stop can end it. A terminal stays as
-/// it is, because the shell of the user shares it. Other processes can
-/// share stdin, so its flags go back to what they were when this function
-/// stops to read it, and at every end of the process, also a fatal one.
-fn read_stdin(stdin: impl AsFd, stopped: &PipeReader, mut input: Compressor<SpoolWriter>) {
+/// stop can end the next wait, which in eager delivery follows a flush, or
+/// waits for the input writer. A terminal stays as it is, because the
+/// shell of the user shares it. Other processes can share stdin, so its
+/// flags go back to what they were when this function stops to read it,
+/// and at every end of the process, also a fatal one.
+fn read_stdin(
+    stdin: impl AsFd,
+    stopped: &PipeReader,
+    mut input: InputStream,
+    delivery: Delivery,
+    sent: &Sent,
+) {
     let non_blocking = if stdin.as_fd().is_terminal() {
         None
     } else {
@@ -232,16 +323,11 @@ fn read_stdin(stdin: impl AsFd, stopped: &PipeReader, mut input: Compressor<Spoo
     let mut fds = [
         PollFd::new(&stdin, PollFlags::IN),
         PollFd::new(stopped, PollFlags::IN),
+        PollFd::new(&sent.wake, PollFlags::IN),
     ];
     let eof = loop {
-        // I1. When a look shows that neither stdin nor the stop is ready,
-        // flush, and only then wait, without a timeout (DESIGN.md §3). So
-        // every wait follows a flush, also when another process that
-        // shares stdin took the bytes that an earlier look reported.
-        if !any_ready(&mut fds) {
-            input.flush().expect("a spool write failed");
-            poll_fds(&mut fds);
-        }
+        // I1.
+        wait_for_stdin(&mut fds, delivery, &mut input, sent);
         if !fds[1].revents().is_empty() {
             break false;
         }
@@ -249,8 +335,8 @@ fn read_stdin(stdin: impl AsFd, stopped: &PipeReader, mut input: Compressor<Spoo
         let n = match retry_on_intr(|| rustix::io::read(&stdin, &mut buf[..])) {
             Ok(n) => n,
             // Another process that shares stdin took the bytes that `poll`
-            // reported. Look again: so the flush comes before the next
-            // wait, and the stop can end that wait.
+            // reported. Look again: so in eager delivery, the flush comes
+            // before the next wait, and the stop can end that wait.
             Err(Errno::AGAIN) => continue,
             Err(e) => die(format!("cannot read stdin: {e}")),
         };
@@ -268,19 +354,60 @@ fn read_stdin(stdin: impl AsFd, stopped: &PipeReader, mut input: Compressor<Spoo
     // limit.
     drop(non_blocking);
     if eof {
-        // The end of the zstd frame, then the drop of the spool's writer,
-        // which ends the input spool.
-        let writer = input.finish().expect("a spool write failed");
-        drop(writer);
+        // The end of the zstd frame, which empties the buffer into the
+        // input spool, then the drop of the spool's writer, which ends the
+        // input spool.
+        let buffer = input.finish().expect("a spool write failed");
+        drop(buffer);
+    }
+}
+
+/// Wait until stdin or the stop pipe is ready: `fds[0]` and `fds[1]`
+/// (DESIGN.md §6.6, step I1). In eager `delivery`, look first without a
+/// wait: when neither is ready, an idle point waits, also when another
+/// process that shares stdin took the bytes that an earlier look reported.
+/// Then flush the stream once the input writer has sent every byte of the
+/// input spool, and until then, wake up after each frame that it sends,
+/// which `fds[2]` tells, to look again. The idle point lasts only this
+/// wait: bytes of stdin that come first join the stream, and the next idle
+/// point decides again. In batch delivery, just wait. No timeout
+/// (DESIGN.md §3).
+fn wait_for_stdin(
+    fds: &mut [PollFd<'_>; 3],
+    delivery: Delivery,
+    input: &mut InputStream,
+    sent: &Sent,
+) {
+    // In eager delivery, an idle point waits unless the look finds stdin
+    // or the stop ready.
+    let mut waits = delivery == Delivery::Eager;
+    if waits && any_ready(&mut fds[..2]) {
+        return;
+    }
+    loop {
+        if waits && sent.all_of(input.transport().get_ref()) {
+            input.flush().expect("a spool write failed");
+            waits = false;
+        }
+        let watched = if waits { 3 } else { 2 };
+        poll_fds(&mut fds[..watched]);
+        if fds[..2].iter().any(|fd| !fd.revents().is_empty()) {
+            return;
+        }
     }
 }
 
 /// The input writer (DESIGN.md §6.6, steps S1 and S2): send the bytes of
 /// the input spool in INPUT frames on `session`, each at once, and
 /// INPUT_END at the end of the input. The stop ends it without INPUT_END.
-/// A failure to send is the loss of the session before END_ACK, which
-/// ends the run (DESIGN.md §6.9). Returns the session.
-fn write_input<W: Write>(mut input: Spool, mut session: FrameWriter<W>) -> FrameWriter<W> {
+/// After each frame, `sent` counts its bytes for the stdin reader. A
+/// failure to send is the loss of the session before END_ACK, which ends
+/// the run (DESIGN.md §6.9). Returns the session.
+fn write_input<W: Write>(
+    mut input: Spool,
+    mut session: FrameWriter<W>,
+    sent: &Sent,
+) -> FrameWriter<W> {
     let mut buf = vec![0u8; CHUNK];
     loop {
         // A spool read never fails: the spool itself ends the run when it
@@ -295,6 +422,7 @@ fn write_input<W: Write>(mut input: Spool, mut session: FrameWriter<W>) -> Frame
         }
         send_data(&mut session, frame::INPUT, &buf[..n]);
         flush_data(&mut session);
+        sent.add(n as u64);
     }
 }
 
@@ -547,6 +675,7 @@ mod tests {
     use super::*;
     use crate::protocol::FrameReader;
     use crate::scanner::tests::noise;
+    use crate::spool::Taken;
 
     /// A tmp_data directory, which lives as long as the returned guard.
     fn tmp_data() -> (Arc<Directory>, tempfile::TempDir) {
@@ -583,10 +712,10 @@ mod tests {
         // frames on a second pipe. The sender's side gets their payloads,
         // as its data reader does, and writes the input to the stdin of
         // `cat`, the command. The command reads exactly the input, then
-        // EOF: with compression and without, also for an empty input. Both
-        // spools hold at most about 1 MiB, less than the input. The exit of
-        // the command stops the input, which queues INPUT_STOP for the
-        // control writer, once.
+        // EOF: with compression and without, in both deliveries, also for
+        // an empty input. Both spools hold at most about 1 MiB, less than
+        // the input. The exit of the command stops the input, which queues
+        // INPUT_STOP for the control writer, once.
         let (dir, _tempdir) = tmp_data();
         let inputs = [
             [noise(3 << 20, 1), b"text ".repeat(200_000)].concat(),
@@ -594,52 +723,73 @@ mod tests {
         ];
         for input in inputs {
             for level in [0, 3] {
-                let (stdin, mut producer) = std::io::pipe().unwrap();
-                let (session_in, session_out) = std::io::pipe().unwrap();
-                let receiver = ReceiverInput::new(Arc::clone(&dir), 1 << 20).start(
-                    stdin,
-                    FrameWriter::new(session_out),
-                    level,
-                    false,
-                );
-                let (control_tx, control_rx) = unbounded();
-                let (writer, mut sender) = SenderInput::new(
-                    Arc::clone(&dir),
-                    1 << 20,
-                    level != 0,
-                    quiet_session(),
-                    control_tx,
-                );
-                let mut cat = Command::new("cat")
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .spawn()
-                    .unwrap();
-                sender.start(cat.stdin.take().unwrap(), Pid::from_child(&cat));
-                let mut output = cat.stdout.take().unwrap();
-                let command = std::thread::spawn(move || {
-                    let mut read = Vec::new();
-                    output.read_to_end(&mut read).unwrap();
-                    read
-                });
-                let produced = {
-                    let input = input.clone();
-                    std::thread::spawn(move || producer.write_all(&input).unwrap())
-                };
-                deliver(&mut FrameReader::new(session_in), writer);
-                produced.join().unwrap();
-                let read = command.join().unwrap();
-                assert!(read == input, "level {level}: the input differs");
-                drop(receiver.stop());
-                sender.stop().join();
-                // The exit watcher has returned, so this wait can reap.
-                assert!(cat.wait().unwrap().success());
-                assert!(matches!(
-                    control_rx.try_iter().collect::<Vec<_>>()[..],
-                    [SenderControl::InputStop]
-                ));
+                for delivery in [Delivery::Eager, Delivery::Batch] {
+                    let read = through_both_roles(&dir, &input, level, delivery);
+                    assert!(
+                        read == input,
+                        "level {level}, {delivery:?}: the input differs"
+                    );
+                }
             }
         }
+    }
+
+    /// Send `input` through the receiver's and the sender's sides of the
+    /// input to `cat`, at zstd `level`, in `delivery`, with two worker
+    /// threads. Returns what `cat` wrote. The exit of `cat` stops the input,
+    /// which must queue INPUT_STOP once.
+    fn through_both_roles(
+        dir: &Arc<Directory>,
+        input: &[u8],
+        level: i32,
+        delivery: Delivery,
+    ) -> Vec<u8> {
+        let (stdin, mut producer) = std::io::pipe().unwrap();
+        let (session_in, session_out) = std::io::pipe().unwrap();
+        let receiver = ReceiverInput::new(Arc::clone(dir), 1 << 20).start(
+            stdin,
+            FrameWriter::new(session_out),
+            delivery,
+            level,
+            false,
+            2,
+        );
+        let (control_tx, control_rx) = unbounded();
+        let (writer, mut sender) = SenderInput::new(
+            Arc::clone(dir),
+            1 << 20,
+            level != 0,
+            quiet_session(),
+            control_tx,
+        );
+        let mut cat = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        sender.start(cat.stdin.take().unwrap(), Pid::from_child(&cat));
+        let mut output = cat.stdout.take().unwrap();
+        let command = std::thread::spawn(move || {
+            let mut read = Vec::new();
+            output.read_to_end(&mut read).unwrap();
+            read
+        });
+        let produced = {
+            let input = input.to_vec();
+            std::thread::spawn(move || producer.write_all(&input).unwrap())
+        };
+        deliver(&mut FrameReader::new(session_in), writer);
+        produced.join().unwrap();
+        let read = command.join().unwrap();
+        drop(receiver.stop());
+        sender.stop().join();
+        // The exit watcher has returned, so this wait can reap.
+        assert!(cat.wait().unwrap().success());
+        assert!(matches!(
+            control_rx.try_iter().collect::<Vec<_>>()[..],
+            [SenderControl::InputStop]
+        ));
+        read
     }
 
     #[test]
@@ -650,8 +800,14 @@ mod tests {
         let (dir, _tempdir) = tmp_data();
         let (stdin, mut producer) = std::io::pipe().unwrap();
         let (session_in, session_out) = std::io::pipe().unwrap();
-        let receiver =
-            ReceiverInput::new(dir, u64::MAX).start(stdin, FrameWriter::new(session_out), 0, false);
+        let receiver = ReceiverInput::new(dir, u64::MAX).start(
+            stdin,
+            FrameWriter::new(session_out),
+            Delivery::Eager,
+            0,
+            false,
+            0,
+        );
         producer.write_all(b"partial").unwrap();
         let mut session = FrameReader::new(session_in);
         let received = session.next().unwrap().unwrap();
@@ -677,7 +833,14 @@ mod tests {
         let (session_in, session_out) = std::io::pipe().unwrap();
         let input = ReceiverInput::new(dir, u64::MAX);
         input.stopper().stop();
-        let running = input.start(stdin, FrameWriter::new(session_out), 3, false);
+        let running = input.start(
+            stdin,
+            FrameWriter::new(session_out),
+            Delivery::Eager,
+            3,
+            false,
+            0,
+        );
         // Ends when both threads have ended; no timeout.
         while !(running.stdin_reader.is_finished() && running.input_writer.is_finished()) {
             std::thread::yield_now();
@@ -699,8 +862,14 @@ mod tests {
         let (dir, _tempdir) = tmp_data();
         let (stdin, mut producer) = std::io::pipe().unwrap();
         let (session_in, session_out) = std::io::pipe().unwrap();
-        let receiver =
-            ReceiverInput::new(dir, u64::MAX).start(stdin, FrameWriter::new(session_out), 3, false);
+        let receiver = ReceiverInput::new(dir, u64::MAX).start(
+            stdin,
+            FrameWriter::new(session_out),
+            Delivery::Eager,
+            3,
+            false,
+            0,
+        );
         producer.write_all(b"partial").unwrap();
         let mut session = FrameReader::new(session_in);
         let mut decoder = Decoder::new();
@@ -716,6 +885,197 @@ mod tests {
         assert_eq!(decoded, b"partial");
         assert!(!decoder.ended, "the zstd frame ended before EOF");
         drop(receiver.stop());
+    }
+
+    /// The system call in which the thread `tid` of this process sleeps,
+    /// with its six arguments, once it sleeps in one; no deadline. While
+    /// the thread runs, its `syscall` file says `running`, and while it
+    /// sleeps outside a system call, the number is -1. A process can always
+    /// read the `syscall` files of its own threads.
+    fn sleeping_syscall(tid: rustix::thread::Pid) -> (u64, Vec<u64>) {
+        let path = format!("/proc/self/task/{}/syscall", tid.as_raw_nonzero());
+        loop {
+            let syscall = std::fs::read_to_string(&path).unwrap();
+            let mut fields = syscall.split_whitespace();
+            if let Some(Ok(nr)) = fields.next().map(str::parse::<u64>) {
+                let args = fields
+                    .take(6)
+                    .map(|arg| u64::from_str_radix(arg.trim_start_matches("0x"), 16).unwrap())
+                    .collect();
+                return (nr, args);
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    /// The system call in which `poll_fds` sleeps, `ppoll` or `poll`, by
+    /// its number on this architecture. A new thread waits for a pipe that
+    /// nothing writes. It tells its ID before the wait, so the wait is the
+    /// only call that it can then sleep in. The drop of the write end ends
+    /// the wait.
+    fn poll_syscall() -> u64 {
+        let (reader, writer) = std::io::pipe().unwrap();
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let waits = std::thread::spawn(move || {
+            tid_tx.send(rustix::thread::gettid()).unwrap();
+            poll_fds(&mut [PollFd::new(&reader, PollFlags::IN)]);
+        });
+        let (nr, _) = sleeping_syscall(tid_rx.recv().unwrap());
+        drop(writer);
+        waits.join().unwrap();
+        nr
+    }
+
+    #[test]
+    fn an_idle_point_of_stdin_waits_for_a_busy_input_writer() {
+        // In eager delivery, the stdin reader flushes the stream at an idle
+        // point of stdin only when the input writer has sent every byte of
+        // the input spool (DESIGN.md §6.6). Here this test is the input
+        // writer: it takes the first flush, and tells that it sent it only
+        // later. Meanwhile, the next bytes of stdin wait in the stream:
+        // after its read of them, the stdin reader sleeps in a poll of three
+        // descriptors, stdin, the stop pipe, and the wake-up, without a
+        // flush. A stdin reader that flushes at once sleeps in a poll of two
+        // descriptors, which fails the test. Once the test tells that it
+        // sent the first bytes, the stdin reader flushes the next ones,
+        // without more stdin; a stdin reader that does not wake up then
+        // hangs the test.
+        let poll = poll_syscall();
+        let (dir, _tempdir) = tmp_data();
+        let (writer, mut spool) = Spool::pipe(dir, u64::MAX);
+        let (stopped, pipe) = stop_pipe();
+        let sent = Arc::new(Sent::new());
+        let (stdin, mut producer) = std::io::pipe().unwrap();
+        let unread = stdin.try_clone().unwrap();
+        let input = Compressor::new(BufWriter::with_capacity(CHUNK, writer), 0, false, 0);
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let reader = {
+            let sent = Arc::clone(&sent);
+            std::thread::spawn(move || {
+                tid_tx.send(rustix::thread::gettid()).unwrap();
+                read_stdin(stdin, &stopped, input, Delivery::Eager, &sent);
+            })
+        };
+        let tid = tid_rx.recv().unwrap();
+        let mut buf = [0u8; 64];
+        producer.write_all(b"first").unwrap();
+        // The input writer has nothing to send: the flush comes at once.
+        assert_eq!(spool.take_next(&mut buf), Taken::Bytes(5));
+        producer.write_all(b"second").unwrap();
+        let takes = std::thread::spawn(move || {
+            let mut buf = [0u8; 64];
+            let taken = spool.take_next(&mut buf);
+            (taken, buf)
+        });
+        // The stdin reader is the only reader of the pipe, so once the pipe
+        // is empty, it has read "second", and its next sleep in a poll is
+        // the wait that follows that read. No deadline.
+        while rustix::io::ioctl_fionread(&unread).unwrap() > 0 {
+            std::thread::yield_now();
+        }
+        let args = loop {
+            match sleeping_syscall(tid) {
+                (nr, args) if nr == poll => break args,
+                _ => std::thread::yield_now(),
+            }
+        };
+        assert_eq!(args[1], 3, "no wait for the busy input writer");
+        assert!(
+            !takes.is_finished(),
+            "a flush while the input writer was busy"
+        );
+        sent.add(5);
+        let (taken, buf) = takes.join().unwrap();
+        assert_eq!(taken, Taken::Bytes(6));
+        assert_eq!(buf[..6], *b"second");
+        // The stop ends the stdin reader.
+        drop(pipe);
+        reader.join().unwrap();
+        drop(producer);
+    }
+
+    /// The payloads of the INPUT frames of the input `pieces`, which a
+    /// producer writes to the stdin of a receiver's side in batch delivery
+    /// at zstd `level`, with two worker threads. The producer waits after
+    /// each piece until the stdin reader has read it, so stdin waits after
+    /// each piece. Before the EOF of stdin, it also waits until
+    /// `before_eof` bytes have reached the session. The frames end with
+    /// INPUT_END.
+    fn batch_frames(pieces: &[Vec<u8>], level: i32, before_eof: usize) -> Vec<Vec<u8>> {
+        let (dir, _tempdir) = tmp_data();
+        let (stdin, mut producer) = std::io::pipe().unwrap();
+        let unread = stdin.try_clone().unwrap();
+        let (session_in, session_out) = std::io::pipe().unwrap();
+        let receiver = ReceiverInput::new(dir, u64::MAX).start(
+            stdin,
+            FrameWriter::new(session_out),
+            Delivery::Batch,
+            level,
+            false,
+            2,
+        );
+        let mut session = FrameReader::new(session_in);
+        let received = std::sync::atomic::AtomicUsize::new(0);
+        let frames = std::thread::scope(|scope| {
+            let frames = scope.spawn(|| {
+                let mut frames = Vec::new();
+                loop {
+                    let next = session.next().unwrap().expect("EOF before INPUT_END");
+                    match next.kind {
+                        frame::INPUT => {
+                            received.fetch_add(next.payload.len(), Release);
+                            frames.push(next.payload.to_vec());
+                        }
+                        frame::INPUT_END => return frames,
+                        kind => panic!("unexpected frame type {kind}"),
+                    }
+                }
+            });
+            for piece in pieces {
+                producer.write_all(piece).unwrap();
+                // The stdin reader is the only reader of the pipe; no
+                // deadline.
+                while rustix::io::ioctl_fionread(&unread).unwrap() > 0 {
+                    std::thread::yield_now();
+                }
+            }
+            // No deadline: a stdin reader that keeps a full buffer until EOF
+            // hangs the test here.
+            while received.load(Acquire) < before_eof {
+                std::thread::yield_now();
+            }
+            drop(producer);
+            frames.join().unwrap()
+        });
+        drop(receiver.stop());
+        frames
+    }
+
+    #[test]
+    fn batch_delivery_sends_the_input_only_from_a_full_buffer_and_at_its_end() {
+        // In batch delivery, the stdin reader does not flush when stdin
+        // waits, so ten small pieces reach the session only at the EOF of
+        // stdin, in one INPUT frame: the buffer of 256 KiB does not fill.
+        // With compression, they form one zstd frame, which ends there
+        // (DESIGN.md §6.6).
+        let pieces: Vec<Vec<u8>> = (0..10).map(|i| noise(1000, 40 + i)).collect();
+        let input = pieces.concat();
+        let frames = batch_frames(&pieces, 0, 0);
+        assert_eq!(frames, std::slice::from_ref(&input));
+        let frames = batch_frames(&pieces, 3, 0);
+        assert_eq!(frames.len(), 1);
+        let mut decoder = Decoder::new();
+        let mut decoded = Vec::new();
+        decoder.decode(&frames[0], &mut decoded, || false).unwrap();
+        assert!(decoder.ended, "the zstd frame did not end");
+        assert!(decoded == input, "the input differs");
+
+        // 600 pieces fill the buffer twice, less the piece that did not fit:
+        // those two buffers reach the session before EOF, and the rest at
+        // EOF.
+        let pieces: Vec<Vec<u8>> = (0..600).map(|i| noise(1000, 100 + i)).collect();
+        let frames = batch_frames(&pieces, 0, 2 * 262_000);
+        assert!(frames.concat() == pieces.concat(), "the input differs");
     }
 
     /// The sender's input spool with `stream`, and the end of the input.

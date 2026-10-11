@@ -32,7 +32,10 @@ session with zstd. The command's stdout and the data session go through
 spools, so that a slow stage of the transfer does not stop the others.
 With `--stdin`, the receiver's stdin goes to the command's stdin,
 compressed as the data stream is, through an input spool on each side
-(DESIGN.md §6.6).
+(DESIGN.md §6.6). The output and the input reach their destinations at
+each idle point of their sources, once the link can carry them, unless
+`--batch-stdout` or `--batch-stdin` asks for batch delivery (DESIGN.md
+§6.2).
 Step 6 is the next milestone.
 
 ## 1. Build and inspect a local index
@@ -164,8 +167,9 @@ Design coverage: §§3, 4.5, 5.1–5.3, 5.5, 6.2–6.9, 7–8.
   boundaries and the end-of-stream behavior specified in the design.
 - Support zstd compression with the configured level and thread count,
   including the option to disable compression.
-- Favor bandwidth over output latency: flush the compression stream only
-  before the sender waits for a reply, and finish it after END. Keep query
+- Flush the compression stream before the sender waits for a reply and,
+  in eager delivery, after each idle point of command stdout once the data
+  writer has nothing left to write; finish it after END. Keep query
   progress independent of compression and output backpressure.
 - Compress both directions of the control session at the same level, and
   flush each one whenever its writer's queue becomes empty.

@@ -47,8 +47,17 @@ asynchronous runtime or event loop.
 - **Spool**: a pipe whose bytes wait in segments, so that the producer of
   the bytes waits for their consumer only at the limit of the spool.
 - **Input**: the bytes that the command reads as its stdin: the receiver's
-  stdin when the run has `--stdin`, else none. The **input stream** carries
-  them from the receiver to the sender, compressed (section 6.6).
+  stdin when the run has `--stdin` or `--batch-stdin`, else none. The
+  **input stream** carries them from the receiver to the sender,
+  compressed (section 6.6).
+- **Idle point**: a moment when the source of the output, command stdout,
+  or the source of the input, the stdin that the stdin reader reads, has no
+  byte ready.
+- **Delivery**: when the bytes of the output, or of the input, go on from
+  the buffers on their way. **Eager** delivery, the default, sends them on
+  at each idle point of their source, once the writer of their session is
+  idle, and when a buffer is full; **batch** delivery only when a buffer
+  is full and at the end of the stream (section 6.2).
 
 ## 3. One run, step by step
 
@@ -68,7 +77,10 @@ asynchronous runtime or event loop.
    bytes wait in the spool. The scanner sends literals for misses, runs for
    repeated bytes, and queries for possible block matches. From the
    acknowledgement on, the receiver sends the input to the command's
-   stdin, until the sender stops the input (section 6.6).
+   stdin, until the sender stops the input (section 6.6). In eager
+   delivery, the bytes of the output and of the input reach their
+   destinations at each idle point of their sources, once the link can
+   carry them (section 6.2).
 5. The receiver reads and verifies candidates, and writes each verified
    block to a pin before it answers yes. The sender emits references for
    yes answers and rescans rejected windows from the next byte. Output is
@@ -865,7 +877,8 @@ Payloads:
   `compression_level i32`, `compression_long u8`, `compression_threads u32`,
   `probe_threads u32`, `lookahead u64`, `negative_cache u64` (bytes),
   `sender_output_spool_limit u64` and `sender_input_spool_limit u64` (bytes;
-  `2^64 − 1` for `unlimited`), and `command`, a list of argv byte strings.
+  `2^64 − 1` for `unlimited`), `output_delivery u8` (0 for eager, 1 for
+  batch), and `command`, a list of argv byte strings.
 - HELLO, sender to receiver: `account_id [u8; 16]` and an optional
   `base [u8; S]`.
 - HASHLIST: `length u64`. That many encoded bytes of the target follow the
@@ -924,14 +937,37 @@ stop of the input, and then END_ACK.
 
 After HELLO, all sender-to-receiver data-session frames through END share one
 zstd stream, unless compression is disabled. This includes HASHFULL and
-CACHE_RESULT. DONE follows the stream, outside it. Output latency does not
-matter, only bandwidth. So the sender flushes the stream only before it
-waits for a reply, after HASHFULL, and after CACHE_RESULT, which the input
-waits for: the command can wait for its input before it writes output. It
-finishes the stream after END. Other frames can stay in the compressor and
-the transport buffer until more output fills them or the stream ends. No
-wait depends on them: queries and answers use the control session.
-Compression settings are in section 7.
+CACHE_RESULT. DONE follows the stream, outside it. The sender flushes the
+stream before it waits for a reply, after HASHFULL, and after
+CACHE_RESULT, which the input waits for: the command can wait for its
+input before it writes output. In eager delivery of the output, the data
+writer also flushes the stream after each idle point of command stdout,
+once it has written the frames of the bytes before the idle point and
+has nothing left to write (section 6.3): before that, the bytes could not
+leave sooner, and the flush would only cost compression. It finishes the
+stream after END.
+Other frames can stay in the compressor and the transport buffer until
+more output fills them or the stream ends. No wait of `hashsync` depends
+on them: queries and answers use the control session. Compression
+settings are in section 7.
+
+**Delivery.** The run gives the output and the input each a delivery
+(section 8). Eager delivery, the default, works as SSH does: a command
+that waits for its next input before it writes more output, and a
+consumer of the output that writes the next input only after it has read
+that output, such as the two ends of `rsync -e`, never wait for bytes that
+a buffer of `hashsync` holds. It sends the bytes of an idle point on only
+when they can leave at once: when the writer of their session has nothing
+left to write. On a slow link, that writer is busy, so the bytes wait,
+and the bytes that follow join them: the output keeps its matches, and the
+streams compress better. So the link decides how much eager delivery
+costs. Batch delivery keeps the bytes until a buffer is full or the
+stream ends: it costs fewer bytes and less CPU also on a fast link, and
+keeps the matches that eager delivery loses at idle points there (section
+10). The receiver's HELLO names the delivery of the output, whose idle
+points are those of command stdout (sections 6.3 and 6.5). The receiver
+applies the delivery of the input alone, at the idle points of its stdin
+(section 6.6).
 
 After the features, each direction of the control session is also one
 zstd stream at the same level, unless compression is disabled. The
@@ -967,6 +1003,15 @@ for the scanner. Let `B = block_size`.
   (section 6.5), pauses when the buffer is full. Scanning starts a step
   only while `p - e < lookahead`; a full-window step may advance `p` by
   `B`.
+- `f`: in eager delivery of the output (section 6.2), the end of the
+  bytes before the last idle point of command stdout, initially zero, with
+  `f <= r`. The output reader passes each idle point that the spool
+  reports after the bytes before it, and the scanner then sets `f = r`.
+  The bytes before `f` leave without waiting for more output, once they
+  can leave at once.
+- The data writer is **idle** when it waits for frames, after it has
+  written every frame that the scanner queued, and made the flush that an
+  idle point asked for. It tells the scanner when it becomes idle.
 - **Records** describe scanned output that is not emitted yet. Ordered
   records cover exactly `[e, p)`, without gaps or overlaps:
   `Literal { offset, length }`, `Run { offset, length, byte }`,
@@ -1017,6 +1062,13 @@ match; the remainder is literal. If that Run was already emitted, its short
 continuation is literal. Earlier unresolved queries can still force this
 tail to be scanned again.
 
+Before EOF, when `p < f` and fewer than `B` bytes follow `p`, the bytes
+from `p` to `f` become such a tail, so that they leave at once, when two
+conditions hold: every record before them has left, except a last Literal
+shorter than `B`, and the data writer is idle. Until then, they wait for
+more output, as the bytes from `f` on do. While the data writer is busy,
+as on a slow link, output that arrives meanwhile can fill their windows.
+
 **Probe threads.**
 
 A weak-table probe depends only on the bytes of its window. When the
@@ -1065,7 +1117,11 @@ Emit from the front until blocked by a Query or a full data queue:
 - Run becomes RLE for its known length and advances `e` by that length.
   A new Run starts at `B` bytes and need not wait to grow.
 - Literal emits up to `B` bytes per LIT. Emit a short Literal when another
-  record follows or at EOF; otherwise let it grow.
+  record follows, at EOF, or, once `p >= f`, for its bytes before `f`;
+  otherwise let it grow.
+- After a change of `f`, once `e >= f`, queue a flush of the data stream
+  for the data writer, behind the frames before `f`. The data writer makes
+  it once it has nothing left to write (section 6.2).
 
 Advance `e` only after the data writer accepts the frame. LIT owns a copy
 before those buffer bytes are released. Remove emitted record portions and
@@ -1077,15 +1133,19 @@ queue and remain ordered even when offsets go backwards. Discarded records
 can leave obsolete requests; lookahead is not a bound on all outstanding
 queries or receiver pins.
 
-When progress requires command output, answers, or data-queue space, wait on
-notifications for those events, continuing to prioritize answers.
+When progress requires command output, answers, data-queue space, or, while
+a tail before `f` waits, an idle data writer, wait on notifications for
+those events, continuing to prioritize answers.
 Backpressure propagates from the data writer through the lookahead buffer
 to the spool of command stdout (section 6.5).
 
 Finish only after stdout EOF, `p = r`, and no Query records remain. Drain all
-records so `e = p = r`. END can be queued once the command's exit status is
-also available (section 6.9). Flush queued data before waiting for further
-completion conditions. Obsolete unanswered requests do not delay completion.
+records so `e = p = r`, and queue the flush of the last idle point, which
+can come after the last frame: END can come much later than stdout EOF,
+and the bytes before that idle point must not wait for it. END can be
+queued once the command's exit status is also available (section 6.9).
+Flush queued data before waiting for further completion conditions.
+Obsolete unanswered requests do not delay completion.
 
 ### 6.4 The receiver's answering and reconstruction
 
@@ -1327,6 +1387,11 @@ Data structures:
 - **Stopped**: a role stopped the spool, before or after its end, because
   its bytes have no use any more. Only the input spools stop
   (section 6.6).
+- **Idle point**: the thread of the spool of command stdout, in eager
+  delivery of the output (section 6.2), marks one when its source has no
+  byte ready. The end of the source is the last idle point. The next
+  append removes it, so the reader reports an idle point only when no byte
+  follows it.
 
 The writer:
 
@@ -1334,21 +1399,29 @@ The writer:
   the spool is stopped. The reader wakes the writer when it takes bytes.
   With a limit of 0, the writer takes bytes from its source when no byte
   waits.
-- **W2.** Take the next bytes from the source. At the end of the source,
-  mark the end, wake the reader, and stop. A thread of a spool reads its
-  source; a read error ends the run with `die`.
+- **W2.** Take the next bytes from the source. For command stdout in
+  eager delivery, when the source has no byte ready, first mark an idle
+  point and wake the reader under the lock, then wait for the source. Do
+  this also at the end of the source, unless the last read found no byte
+  ready: the bytes before the end must not wait for the end of the
+  command, which can come much later. At the end of the source, mark the
+  end, wake the reader, and stop. A thread of a spool reads its source; a
+  read error ends the run with `die`.
 - **W3.** Append the bytes, one extent at a time. If there is no extent,
   or the last extent is full, allocate an extent (steps A1 to A3) under
   the lock. Write the bytes that fit in the last extent with `pwrite`
-  outside the lock. Then add them to written under the lock, and wake the
-  reader. Repeat until all bytes are appended, then go to step W1. When
-  the spool is stopped, discard the bytes that are not appended.
+  outside the lock. Then add them to written under the lock, remove the
+  idle point, if one is marked, and wake the reader. Repeat until all
+  bytes are appended, then go to step W1. When the spool is stopped,
+  discard the bytes that are not appended.
 
 The reader:
 
-- **T1.** Under the lock, wait until bytes wait, the end is marked, or the
-  spool is stopped. If it is stopped, report EOF. If no byte waits and the
-  end is marked, release the remaining extent, if one remains (steps R1 to
+- **T1.** Under the lock, wait until bytes wait, the end or an idle point
+  is marked, or the spool is stopped. If it is stopped, report EOF. If no
+  byte waits and an idle point is marked, remove it, and report the idle
+  point, also when the end follows it. Else, if no byte waits and the end
+  is marked, release the remaining extent, if one remains (steps R1 to
   R3), and report EOF. That extent is the last one, which is not full, so
   step T3 did not release it.
 - **T2.** Read the waiting bytes of the first extent with `pread`, outside
@@ -1387,12 +1460,16 @@ both input spools hold their limits.
 
 The input stream is one zstd frame at the level and long-distance matching
 of the data stream, or the input itself when compression is disabled. The
-input spools hold the input stream, and their limits count its bytes. The
-command can wait for its input before it writes output, so the stdin
-reader flushes the stream before each wait for stdin, and the EOF of stdin
-ends the zstd frame. The stdin reader compresses on its own thread,
-without worker threads: with them, each flush would end a zstd job, which
-costs much more than the end of a block (section 10). The frames that
+input spools hold the input stream, and their limits count its bytes. On
+its way to the input spool, the stream passes a buffer of 256 KiB, which
+goes on when the next bytes do not fit in it, or at a flush. In eager
+delivery (section 6.2), the stdin reader flushes the stream at each idle
+point of stdin, once the input writer is idle: the command can wait for
+its input before it writes output. In batch delivery, it flushes
+nothing. In both, it compresses with `compression_threads` worker threads
+(section 7), as the sender's data stream does; in eager delivery, each
+flush then ends a zstd job, which costs more bytes than the end of a
+block (section 10). The EOF of stdin ends the zstd frame. The frames that
 carry the stream are not compressed (section 6.2): a role can stop the
 input after any frame, and the zstd frame then stays incomplete.
 
@@ -1403,6 +1480,12 @@ Data structures:
   `sender_input_spool_limit` from HELLO. The receiver's exists before the
   sessions start, so that INPUT_STOP can stop it at any time; the
   sender's exists from the sender's HELLO, before the command starts.
+- **Sent**: the bytes of the receiver's input spool that the input writer
+  has sent. The input writer is **idle** when it has sent every byte that
+  the stdin reader appended to the input spool.
+- **Wake-up**: an eventfd of the receiver, which the input writer signals
+  after each INPUT frame, so that the stdin reader can wait for an idle
+  input writer.
 - **Stop pipe**: a pipe of each role. At the stop of the input, the role
   closes its write end, and the EOF that follows ends a wait of `poll`:
   that of the receiver's stdin reader for stdin, and that of the sender's
@@ -1411,32 +1494,38 @@ Data structures:
   once; a later stop does nothing.
 
 The receiver's **stdin reader**, from CACHE_RESULT, reads stdin when the
-run has `--stdin`, else `/dev/null` (section 8). As `ssh` does, it makes a
-stdin that is not a terminal non-blocking while it reads it, unless it is
-non-blocking already, so that no read waits. A terminal stays as it is,
-because the shell of the user shares it. Other processes can share stdin
-too, so the stdin reader restores the flags of stdin at the EOF of stdin
-and at the stop of the input, and every end of the process restores them,
-also a fatal one (section 6.9).
+run has `--stdin` or `--batch-stdin`, else `/dev/null` (section 8). As
+`ssh` does, it makes a stdin that is not a terminal non-blocking while it
+reads it, unless it is non-blocking already, so that no read waits. A
+terminal stays as it is, because the shell of the user shares it. Other
+processes can share stdin too, so the stdin reader restores the flags of
+stdin at the EOF of stdin and at the stop of the input, and every end of
+the process restores them, also a fatal one (section 6.9).
 
-- **I1.** If neither stdin nor the stop pipe is ready, which `poll` shows
-  without a wait, flush the stream, append the output of the flush to the
-  input spool, and wait until one of them is ready. At the EOF of the
-  stop pipe, end. So every wait for stdin follows a flush, also when
-  another process that shares stdin took the bytes that `poll` reported.
+- **I1.** In eager delivery, if neither stdin nor the stop pipe is ready,
+  which `poll` shows without a wait, an idle point waits. While one waits
+  and the input writer is idle, flush the stream, and append the buffer to
+  the input spool: the idle point waits no more. Wait until stdin or the
+  stop pipe is ready, or, while an idle point waits, until the wake-up is
+  signaled; after the wake-up alone, do this step again. At the EOF of the
+  stop pipe, end. So in eager delivery, every wait for stdin follows a
+  flush, or waits for the input writer, also when another process that
+  shares stdin took the bytes that `poll` reported.
 - **I2.** Read stdin. If the read finds no bytes, because another process
   that shares stdin took them first (`EAGAIN`, section 3), go to step I1.
-  At the EOF of stdin, end the zstd frame, append its last bytes to the
-  input spool, mark the end of the spool, and end. A read error ends the
-  run with `die`.
-- **I3.** Compress the bytes, and append the output to the input spool,
-  which waits while the spool holds its limit (section 6.5, steps W1 and
-  W3). Go to step I1.
+  At the EOF of stdin, end the zstd frame, append the buffer to the input
+  spool, mark the end of the spool, and end. A read error ends the run
+  with `die`.
+- **I3.** Compress the bytes into the buffer. When the next bytes do not
+  fit in the buffer, the buffer goes to the input spool first, which waits
+  while the spool holds its limit (section 6.5, steps W1 and W3). An idle
+  point that waits gives way to the next one. Go to step I1.
 
 The receiver's **input writer**, from CACHE_RESULT:
 
 - **S1.** Take the next bytes of the input spool, at most 256 KiB, and
-  send them in one INPUT frame. Go to step S1.
+  send them in one INPUT frame. Add them to sent, and signal the wake-up.
+  Go to step S1.
 - **S2.** At the end of the spool, send INPUT_END, and end. At the EOF of
   a stopped spool, end without INPUT_END.
 
@@ -1500,21 +1589,27 @@ what the link carries in one round trip. INPUT_STOP travels on the
 control session, so it does not wait behind the output that the receiver
 must write before it reads END (section 10). As with SSH, the input that
 the receiver has read and not sent is lost, a command that neither reads
-nor closes its stdin makes a run with `--stdin` send up to the sender's
-limit of input for nothing, and a run with `--stdin` in the background of
-an interactive shell stops at its first read of the terminal.
+nor closes its stdin makes a run with `--stdin` or `--batch-stdin` send
+up to the sender's limit of input for nothing, and such a run in the
+background of an interactive shell stops at its first read of the
+terminal.
 
-Two waits can delay the end. When another program that reads the same
+Three waits can delay the end. When another program that reads the same
 terminal, such as a pager in the same pipeline, takes the bytes that
 `poll` reported, the stdin reader's read of the terminal waits for its
 next bytes or its EOF, and so does the receiver's join of the stdin
 reader at END, as `ssh` waits in its read; until then, the stream holds
-the input compressed after the last flush. And a descendant of the
-command that holds the command's stdin without reading it keeps the stdin
-writer in a write, which otherwise fails with `EPIPE` at once after the
+the input compressed after the last flush. A descendant of the command
+that holds the command's stdin without reading it keeps the stdin writer
+in a write, which otherwise fails with `EPIPE` at once after the
 command's exit. The sender joins the stdin writer after END_ACK, as it
 joins the stderr relay, so such a descendant delays DONE but not END
-(section 6.9).
+(section 6.9). And zstd cannot cancel a job of its worker threads: after
+a stop before the EOF of stdin, the stdin reader ends only once they have
+compressed the jobs that zstd holds, about one for each worker thread,
+and the receiver's join of the stdin reader at END waits until then. For
+a producer that never pauses, with 12 worker threads, this took less
+than 0.1 s at level 9, 2.4 s at level 15, and about a minute at level 19.
 
 ### 6.7 Failures and trust
 
@@ -1563,20 +1658,20 @@ give `128 + signal`.
 |---|---|
 | Sender main | Handshake and command startup, then obtain the command's exit status without reaping, wait for the completion conditions of section 6.9, and send DONE. |
 | Sender data reader | Read the data session for the whole run: the protocol version, the features, HELLO, the list, the input, END_ACK, and EOF. EOF before DONE means that the receiver disappeared. Append the input to the input spool (section 6.6). |
-| Sender spool thread | Copy command stdout into its spool until EOF (section 6.5). |
-| Sender output reader | Fill lookahead from the spool of command stdout until its EOF, then close the spool. |
+| Sender spool thread | Copy command stdout into its spool until EOF, and in eager delivery mark its idle points (section 6.5). |
+| Sender output reader | Fill lookahead from the spool of command stdout, and pass its idle points to the scanner, until its EOF; then close the spool. |
 | Sender stderr relay | Copy command stderr to sender stderr through EOF and flush (section 6.1). |
 | Sender session watcher | Until the stop of the input, end the run at the hangup of the data session (section 6.6). |
 | Sender stdin writer | Decompress the input spool into the command's stdin (section 6.6). |
 | Sender exit watcher | Stop the input when the command exits (section 6.6). |
 | Sender scanner | Own records and query states; queue queries and output (section 6.3). |
 | Sender probe threads | Probe the parts of long stretches of windows for the scanner (section 6.3). |
-| Sender data writer | Drain output in order, compress, and finish and flush the stream after END. |
+| Sender data writer | Drain output in order and compress; make the flush that the scanner queues once nothing is left to write, then tell the scanner that it is idle; finish and flush the stream after END. |
 | Sender control reader/writer | Receive answers, and send queries and INPUT_STOP promptly, independently of data output. |
 | Receiver main | Start SSH sessions, reconstruct stdout from the spool of the data session, validate completion, send END_ACK, and close both session stdin pipes after DONE (section 6.9). |
 | Receiver spool thread | Copy data-session stdout into its spool until EOF (section 6.5). |
 | Receiver stdin reader | Compress stdin into the input spool (section 6.6). |
-| Receiver input writer | Send the input spool in INPUT frames (section 6.6). |
+| Receiver input writer | Send the input spool in INPUT frames, and signal each one to the stdin reader (section 6.6). |
 | Receiver control reader/writer | Dispatch queries to lookup workers, stop the input at INPUT_STOP, and send answers promptly. |
 | Receiver lookup workers | Answer queries out of order (section 6.4). |
 | Receiver signal thread | Handle SIGINT/SIGTERM with status `128 + signal`. |
@@ -1770,7 +1865,7 @@ negative_cache = "128MiB"
 probe_threads  = 0         # 0 = half the sender's cores, at least one
 compression_level   = 9    # zstd 1–19; 0 disables
 compression_long    = true # zstd long-distance matching, 128 MiB window
-compression_threads = 0    # 0 = half the sender's cores, at least one
+compression_threads = 0    # data and input streams; 0 = half the cores, at least one
 ssh            = "ssh"     # shell-split command; appends -o Compression=no
 sender_command = "hashsync"
 sender_cache   = true
@@ -1848,12 +1943,16 @@ exclude = ['*.tmp', 'literal\x2Aname', 'back\\slash']
 
 - `hashsync update [--rebuild] [-j N]`: update or rebuild the index;
   `-j` overrides the configured thread count.
-- `hashsync run [--stdin] [--no-update] [--ssh CMD] [USER@]HOST -- COMMAND
-  ARGS...`: run the remote command, reproduce stdout, and return its
-  status. The command reads EOF from its stdin at once, as with `ssh -n`:
-  the run reads `/dev/null` in place of its stdin, and nothing from its
-  stdin. `--stdin` gives the command this process's stdin instead: as `ssh`
-  does, the run then reads its stdin while the command runs (section 6.6).
+- `hashsync run [--stdin] [--batch-stdin] [--batch-stdout] [--no-update]
+  [--ssh CMD] [USER@]HOST -- COMMAND ARGS...`: run the remote command,
+  reproduce stdout, and return its status. The command reads EOF from its
+  stdin at once, as with `ssh -n`: the run reads `/dev/null` in place of
+  its stdin, and nothing from its stdin. `--stdin` gives the command this
+  process's stdin instead: as `ssh` does, the run then reads its stdin
+  while the command runs (section 6.6). The output and the input have
+  eager delivery (section 6.2). `--batch-stdout` gives the output batch
+  delivery, and `--batch-stdin` gives the input batch delivery, and also
+  gives the command this process's stdin, as `--stdin` does.
   `--no-update` skips the index update, takes read-only index access
   (section 4.4), and still resolves current roots (section 4.2). After a
   successful transfer, also when the command fails, print a summary of two
@@ -2059,20 +2158,48 @@ decision history, including fuller measurements, is in version control.
   all dirty data to the server before they send a truncation
   (`nfs_setattr`, Linux 6.18), and on local filesystems, the close of an
   unlinked file already discards its pages.
-- **Flushing the compression stream when the scanner waits:** each flush
-  ends a zstd block or job early. With a command paced at 2 MB/s, level 9
-  sent 5.7% more bytes and used 53% more compression CPU, and output
-  latency does not matter. The input stream, which the command can wait
-  for, flushes instead (section 6.6).
-- **Worker threads for the input stream:** each flush, which the stdin
-  reader makes whenever stdin has no byte ready, then ends a zstd job. For
-  C++ source code paced at 2 MB/s in writes of 4 KiB, 12 worker threads
-  sent 49% more bytes than without flushes, and no worker threads 7.7%.
-  The flushes also come between the writes of a fast producer, whose pipe
-  the stdin reader empties sooner than the producer fills it: for 64 MiB
-  written as fast as possible, the stream took 2.3 s without worker
-  threads and 2.9 s with 12. Worker threads were faster only when nothing
-  flushed the stream (0.6 s).
+- **Batch delivery only:** the scanner keeps the last `B − 1` bytes and a
+  short last literal until EOF, and the data stream keeps frames until
+  END, so a command that writes its next output only after the consumer
+  has answered the last, such as the remote end of `rsync -e`, waits
+  forever. Eager delivery costs bytes and CPU instead, where the link has
+  room for them: each flush ends a zstd block or job early, and a block or
+  a run whose window spans an idle point becomes literal. For a 72 MB
+  text tar without matches, at level 9, paced at 2 MB/s and 20 MB/s,
+  eager delivery sent 4.0% and 1.0% more bytes than batch delivery, with
+  40% and 5% more sender CPU; over a link of 200 KB/s, 0.4% more. For a
+  tar of 631 MB of indexed files at 16 KiB blocks, paced at 20 MB/s and
+  100 MB/s, it made 300 and 52 blocks literal, and sent 3.04 MB and
+  1.55 MB against 1.22 MB. Over links of 200 KB/s and 50 KB/s, it made
+  312 and 106 blocks literal, and ended after 31 s and 36 s, where batch
+  delivery took 32 s and 49 s: batch delivery sends its last buffers only
+  at the end.
+- **Sending the bytes of every idle point at once:** the first eager
+  design recorded the tail and flushed at each idle point that the
+  scanner saw. The scanner scans up to `lookahead` ahead of emission, so
+  it still saw idle points while the data queue was full behind a slow
+  link, and the literal tails then waited in the queue. For the tar of
+  indexed files above, it made 2,281 and 1,515 blocks literal over links
+  of 200 KB/s and 50 KB/s, and took 63 s and 180 s; on a local link, 1,753
+  blocks at 20 MB/s. For the input, the stdin reader flushed while the
+  input writer waited on a link of 200 KB/s, and sent 0.2–0.3% more bytes.
+- **No worker threads for the data stream in eager delivery:** each flush
+  then ends only a zstd block. For the paced text above, eager delivery
+  then sent 0.4–0.6% fewer bytes than batch delivery with worker threads,
+  at about the same CPU. But a command that is faster than the scanner
+  gives no idle points, and its output compressed 2.0–3.7 times slower:
+  the unpaced text took 3.0–3.8 s instead of 1.0–1.5 s.
+- **No worker threads for the input stream in eager delivery:** each
+  flush would then end only a zstd block. For 72 MB of text paced at
+  2 MB/s, eager delivery with 12 worker threads sent 5.4% more bytes than
+  without them, and 8.3% more in writes of 4 KiB, with about 50% more CPU;
+  over an input link of 200 KB/s, which holds most flushes back, 0.6%
+  more. But without worker threads, a producer that never pauses waits for
+  one compressing thread: 72 MB of text took 2.3–3.0 s instead of
+  1.2–1.7 s, and 631 MB of binaries 21.9–22.8 s instead of 8.4–9.9 s.
+  Batch delivery, which flushes nothing, took 0.9–1.1 s and 3.4–3.5 s: in
+  eager delivery, the stdin reader empties the pipe sooner than the
+  producer fills it, so idle points still end zstd jobs.
 - **One zstd stream for the frames from the receiver to the sender:**
   END_ACK would follow all the compressed input, so at END, the receiver
   would send its whole input spool for a command that has exited, and the
@@ -2158,10 +2285,20 @@ decision history, including fuller measurements, is in version control.
     closes all segments and wakes both ends, a consumer of stdout that
     reads nothing, and a producer that waits when both spools of its
     stream are full;
-  - the input: with and without compression and `--stdin`; flushes when
-    stdin waits; a run that ends with its command while stdin stays open;
-    a command that reads a part of its input, closes its stdin, or exits
-    while a descendant holds stdout or reads its stdin;
+  - delivery: in eager delivery, idle points that the reader of a spool
+    reports only when no byte follows them, the end of command stdout as
+    the last one, also when the end follows at once, the tail and the
+    short literal before an idle point, one flush after their frames, also
+    when the data queue is full at the last frame, a tail and flushes that
+    wait while the data writer or the input writer is busy and leave once
+    it is idle, a block that spans an idle point while the data session is
+    full, and a command and a consumer that answer each other through both
+    sessions, also after the command closed its stdout; in batch delivery,
+    a full buffer and the end of the stream as the only flushes;
+  - the input: with and without compression, `--stdin`, and
+    `--batch-stdin`; a run that ends with its command while stdin stays
+    open; a command that reads a part of its input, closes its stdin, or
+    exits while a descendant holds stdout or reads its stdin;
     INPUT_STOP before CACHE_RESULT; END that does not wait for a
     descendant that holds the command's stdin; the loss of the data
     session while the data reader waits at its limit; a stop inside the

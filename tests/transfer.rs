@@ -43,6 +43,25 @@ const HOST: &str = "testhost";
 /// counts exactly.
 const EXACT: &str = "--no-human-readable";
 
+/// Batch delivery of the output, for the tests that count references and
+/// runs exactly. In eager delivery, a block or a run whose window spans an
+/// idle point of the command's stdout becomes literal, and the idle points
+/// depend on timing (DESIGN.md §6.3).
+const BATCH: &str = "--batch-stdout";
+
+/// The bytes of noise that fill the data session in the tests of a busy
+/// data writer: the consumer reads none of the receiver's stdout, the
+/// receiver's spool holds at most 64 KiB, and compression is disabled, as
+/// on a slow link. The noise must be more than all the buffers after the
+/// sender's data writer, so that the data writer stays busy: its write
+/// buffer of 256 KiB, the receiver's spool, which holds its limit and one
+/// read of 256 KiB, the receiver's read buffer of 256 KiB, and two pipes.
+/// That is 0.9 MiB, or 2.8 MiB where a pipe holds 1 MiB (pages of 64 KiB).
+/// It must also be less than those buffers and the data queue of 4 MiB
+/// together, so that every frame of the noise leaves the scanner, and only
+/// the busy data writer keeps a tail that follows the noise.
+const SESSION_NOISE: usize = 4 << 20;
+
 struct Transfer {
     env: Env,
 }
@@ -382,7 +401,7 @@ fn indexed_blocks_become_references_at_any_offset() {
         "printf abc; cat '{0}'; printf defg; cat '{0}'",
         transfer.env.path("tree/blocks").display()
     );
-    let output = transfer.run_ok(&refs(&args(&["sh", "-c", &script])));
+    let output = succeeded(transfer.run(&[BATCH], &refs(&args(&["sh", "-c", &script]))));
     let expected = [&b"abc"[..], &blocks, b"defg", &blocks].concat();
     assert_eq!(output.stdout, expected);
     assert_eq!(summary(&output), [expected.len(), 7, 2 * blocks.len(), 0]);
@@ -413,12 +432,12 @@ fn stale_and_unreadable_candidates_are_misses() {
     let mut changed = original.clone();
     changed[3 * BLOCK + 100] ^= 1;
     std::fs::write(transfer.env.path("tree/file"), &changed).unwrap();
-    let output = succeeded(transfer.run(&["--no-update"], &refs(&command)));
+    let output = succeeded(transfer.run(&["--no-update", BATCH], &refs(&command)));
     assert_eq!(output.stdout, original);
     assert_eq!(summary(&output), [8 * BLOCK, BLOCK, 7 * BLOCK, 0]);
 
     transfer.env.chmod("tree/file", 0o000);
-    let output = succeeded(transfer.run(&["--no-update"], &refs(&command)));
+    let output = succeeded(transfer.run(&["--no-update", BATCH], &refs(&command)));
     transfer.env.chmod("tree/file", 0o644);
     assert_eq!(output.stdout, original);
     assert_eq!(summary(&output), [8 * BLOCK, 8 * BLOCK, 0, 0]);
@@ -488,7 +507,7 @@ fn the_receiver_keeps_its_temporary_data_in_the_configured_directory() {
     let blocks = tiled(8, 16);
     transfer.env.write("tree/blocks", &blocks);
     let command = args(&["cat", transfer.env.path("tree/blocks").to_str().unwrap()]);
-    let output = transfer.run_ok(&refs(&command));
+    let output = succeeded(transfer.run(&[BATCH], &refs(&command)));
     assert_eq!(output.stdout, blocks);
     assert_eq!(summary(&output), [8 * BLOCK, 0, 8 * BLOCK, 0]);
     assert_eq!(mode(&tmp_data), 0o700);
@@ -670,7 +689,7 @@ fn a_slow_consumer_and_a_one_window_lookahead_keep_the_output_exact() {
         transfer.env.path("tree/big").display()
     );
     let mut receiver = transfer
-        .invocation(&[EXACT], &refs(&args(&["sh", "-c", &script])))
+        .invocation(&[EXACT, BATCH], &refs(&args(&["sh", "-c", &script])))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -708,7 +727,7 @@ fn runs_and_compression_shrink_the_wire() {
             transfer.env.path("text").display(),
             transfer.env.path("noise").display()
         );
-        let output = transfer.run_ok(&refs(&args(&["sh", "-c", &script])));
+        let output = succeeded(transfer.run(&[BATCH], &refs(&args(&["sh", "-c", &script]))));
         let expected = [&vec![0; ZEROS][..], text.as_bytes(), &noise].concat();
         assert!(output.stdout == expected, "the output differs");
         let literal = text.len() + noise.len();
@@ -728,9 +747,9 @@ fn runs_and_compression_shrink_the_wire() {
 #[test]
 fn a_command_that_pauses_transfers_exactly() {
     // The command stops for a while, with queries for its indexed blocks in
-    // flight. Its frames can wait in the compressor meanwhile: the sender
-    // does not flush the stream for the receiver's sake, and no wait
-    // depends on those frames (DESIGN.md §6.2).
+    // flight. In batch delivery, its frames can wait in the compressor
+    // meanwhile: the sender does not flush the stream for the receiver's
+    // sake, and no wait depends on those frames (DESIGN.md §6.2).
     let transfer = Transfer::new("");
     let blocks = tiled(16, 25);
     transfer.env.write("tree/blocks", &blocks);
@@ -738,7 +757,7 @@ fn a_command_that_pauses_transfers_exactly() {
         "cat '{0}'; sleep 0.5; cat '{0}'",
         transfer.env.path("tree/blocks").display()
     );
-    let output = transfer.run_ok(&refs(&args(&["sh", "-c", &script])));
+    let output = succeeded(transfer.run(&[BATCH], &refs(&args(&["sh", "-c", &script]))));
     assert_eq!(output.stdout, blocks.repeat(2));
     assert_eq!(summary(&output), [2 * blocks.len(), 0, 2 * blocks.len(), 0]);
 }
@@ -770,7 +789,7 @@ fn the_summary_counts_both_sessions() {
     let blocks = tiled(64, 7);
     transfer.env.write("tree/blocks", &blocks);
     let command = args(&["cat", transfer.env.path("tree/blocks").to_str().unwrap()]);
-    let output = transfer.run_ok(&refs(&command));
+    let output = succeeded(transfer.run(&[BATCH], &refs(&command)));
     assert_eq!(output.stdout, blocks);
     let counts = summary_counts(&output);
     let (output_bytes, wire, hash_list) = (counts[0], counts[4], counts[5]);
@@ -1163,10 +1182,11 @@ fn the_receiver_stops_reading_the_data_session_at_its_spool_limit() {
 #[test]
 fn stdin_reaches_the_command() {
     // Through `cat`, the receiver's stdin becomes the output, byte for
-    // byte, and the command reads EOF after it, so `echo` follows. The
-    // input stream is compressed as the data stream is: the text takes a
-    // small part of its size on the wire, and the noise its full size
-    // (DESIGN.md §6.6).
+    // byte, and the command reads EOF after it, so `echo` follows: in
+    // eager delivery with `--stdin`, and in batch delivery with
+    // `--batch-stdin`, which needs no `--stdin`. The input stream is
+    // compressed as the data stream is: the text takes a small part of its
+    // size on the wire, and the noise its full size (DESIGN.md §6.6).
     let text = "hashsync sends its stdin to the command\n".repeat(100_000);
     let noise = random(2 << 20, 31);
     let input = [text.as_bytes(), &noise].concat();
@@ -1175,23 +1195,259 @@ fn stdin_reaches_the_command() {
         let path = transfer.env.path("input");
         std::fs::write(&path, &input).unwrap();
         let command = args(&["sh", "-c", "cat; echo end"]);
-        let output = transfer
-            .invocation(&[EXACT, "--stdin"], &refs(&command))
-            .stdin(File::open(&path).unwrap())
-            .output()
-            .unwrap();
-        let output = succeeded(output);
-        assert!(
-            output.stdout == [&input[..], b"end\n"].concat(),
-            "the output differs"
-        );
-        let sent = traffic(&output).sent;
-        if compressed {
-            assert!(sent < noise.len() + (64 << 10), "{sent} bytes sent");
-        } else {
-            assert!(sent > input.len(), "{sent} bytes sent");
+        for flag in ["--stdin", "--batch-stdin"] {
+            let output = transfer
+                .invocation(&[EXACT, flag], &refs(&command))
+                .stdin(File::open(&path).unwrap())
+                .output()
+                .unwrap();
+            let output = succeeded(output);
+            assert!(
+                output.stdout == [&input[..], b"end\n"].concat(),
+                "{flag}: the output differs"
+            );
+            let sent = traffic(&output).sent;
+            if compressed {
+                assert!(sent < noise.len() + (64 << 10), "{flag}: {sent} bytes sent");
+            } else {
+                assert!(sent > input.len(), "{flag}: {sent} bytes sent");
+            }
         }
     }
+}
+
+#[test]
+fn a_command_and_a_consumer_answer_each_other() {
+    // As the two ends of `rsync -e` do, the command answers each line of
+    // its input with a line of output, and the consumer writes its next
+    // line only after it has read the answer. In eager delivery, the input
+    // and the output reach their destinations at each idle point of their
+    // sources, so neither end waits for bytes that a buffer of hashsync
+    // holds (DESIGN.md §6.2). With compression and without; a build that
+    // keeps such bytes hangs the test.
+    for config in ["", "compression_level = 0\n"] {
+        let transfer = Transfer::new(config);
+        let script = "while read -r line; do echo \"got $line\"; done";
+        let (stdin, mut producer) = std::io::pipe().unwrap();
+        let receiver = transfer
+            .invocation(&[EXACT, "--stdin"], &refs(&args(&["sh", "-c", script])))
+            .stdin(stdin)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut receiver = KillOnDrop(receiver);
+        {
+            let mut answers = BufReader::new(receiver.0.stdout.as_mut().unwrap());
+            for line in ["one", "two", "three"] {
+                producer.write_all(format!("{line}\n").as_bytes()).unwrap();
+                let mut answer = String::new();
+                answers.read_line(&mut answer).unwrap();
+                assert_eq!(answer, format!("got {line}\n"), "{config:?}");
+            }
+            assert!(answers.buffer().is_empty(), "output after the answers");
+        }
+        // The EOF of stdin ends the command, and so the run.
+        drop(producer);
+        let output = succeeded(output_of(receiver));
+        assert!(output.stdout.is_empty(), "output after the answers");
+    }
+}
+
+#[test]
+fn eager_delivery_sends_the_output_before_its_eof_at_once() {
+    // The command writes a question, closes its stdout, and waits for the
+    // answer on its stdin, which the consumer writes only after it has read
+    // the question. The EOF of command stdout is its last idle point, so
+    // the question does not wait for END, which waits for the exit of the
+    // command (DESIGN.md §6.3 and §6.5). With compression and without; a
+    // build that keeps the question until END hangs the test.
+    for config in ["", "compression_level = 0\n"] {
+        let transfer = Transfer::new(config);
+        let script = "printf question; exec >&-; read -r answer; test \"$answer\" = yes";
+        let (stdin, mut producer) = std::io::pipe().unwrap();
+        let receiver = transfer
+            .invocation(&[EXACT, "--stdin"], &refs(&args(&["sh", "-c", script])))
+            .stdin(stdin)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut receiver = KillOnDrop(receiver);
+        let mut question = [0u8; 8];
+        let stdout = receiver.0.stdout.as_mut().unwrap();
+        stdout.read_exact(&mut question).unwrap();
+        assert_eq!(&question, b"question", "{config:?}");
+        producer.write_all(b"yes\n").unwrap();
+        drop(producer);
+        let output = succeeded(output_of(receiver));
+        assert!(output.stdout.is_empty(), "output after the question");
+    }
+}
+
+#[test]
+fn eager_delivery_sends_the_bytes_before_a_pause_at_once() {
+    // The command writes the first 100 bytes of an indexed file of two
+    // blocks, and waits until this test has read them from the receiver's
+    // stdout, then writes the rest. In eager delivery, those 100 bytes
+    // leave at the idle point that the wait makes. The window of the first
+    // block spans the idle point, so that block is literal, and only the
+    // second one becomes a reference (DESIGN.md §6.3). A build that keeps
+    // the bytes hangs the test.
+    let transfer = Transfer::new("");
+    let blocks = tiled(2, 36);
+    transfer.env.write("tree/blocks", &blocks);
+    transfer.env.write("head", &blocks[..100]);
+    transfer.env.write("rest", &blocks[100..]);
+    let go = transfer.env.path("go");
+    mkfifoat(CWD, &go, Mode::RUSR | Mode::WUSR).unwrap();
+    // `cat` writes each file in one call, so the rest has no idle point.
+    let script = format!(
+        "cat '{}'; read go <'{}'; cat '{}'",
+        transfer.env.path("head").display(),
+        go.display(),
+        transfer.env.path("rest").display()
+    );
+    let receiver = transfer
+        .invocation(&[EXACT], &refs(&args(&["sh", "-c", &script])))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut receiver = KillOnDrop(receiver);
+    let mut first = vec![0u8; 100];
+    let stdout = receiver.0.stdout.as_mut().unwrap();
+    stdout.read_exact(&mut first).unwrap();
+    assert_eq!(first, blocks[..100]);
+    std::fs::write(&go, b"go\n").unwrap();
+    let output = succeeded(output_of(receiver));
+    assert!(output.stdout == blocks[100..], "the output differs");
+    assert_eq!(summary(&output), [blocks.len(), BLOCK, BLOCK, 0]);
+}
+
+#[test]
+fn eager_delivery_keeps_a_block_that_spans_a_pause_while_the_session_is_full() {
+    // As in the test above, but the receiver reads none of its stdout
+    // until the command has ended, and its spool holds at most 64 KiB, so
+    // noise first fills the data session, as a slow link does (DESIGN.md
+    // §6.5, `SESSION_NOISE`). The sender's data writer then waits on the
+    // session, so the tail before the idle point waits for it too, and the
+    // rest of the file fills the window of the first block: both blocks
+    // become references (DESIGN.md §6.3). The pause makes the idle point,
+    // but its length decides nothing for a correct build: the session
+    // stays full until the command has ended.
+    let transfer =
+        Transfer::new("receiver_output_spool_limit = \"64KiB\"\ncompression_level = 0\n");
+    let blocks = tiled(2, 38);
+    let noise = random(SESSION_NOISE, 39);
+    transfer.env.write("tree/blocks", &blocks);
+    transfer.env.write("noise", &noise);
+    transfer.env.write("head", &blocks[..100]);
+    transfer.env.write("rest", &blocks[100..]);
+    let ended = transfer.env.path("ended");
+    mkfifoat(CWD, &ended, Mode::RUSR | Mode::WUSR).unwrap();
+    let path = |name: &str| transfer.env.path(name).display().to_string();
+    let script = format!(
+        "cat '{}' '{}'; sleep 0.3; cat '{}'; echo ended >'{}'",
+        path("noise"),
+        path("head"),
+        path("rest"),
+        ended.display()
+    );
+    let receiver = transfer
+        .invocation(&[EXACT], &refs(&args(&["sh", "-c", &script])))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let receiver = KillOnDrop(receiver);
+    // The open waits for the command to open the FIFO, after its output.
+    let mut message = String::new();
+    File::open(&ended)
+        .unwrap()
+        .read_to_string(&mut message)
+        .unwrap();
+    assert_eq!(message, "ended\n");
+    let output = succeeded(output_of(receiver));
+    assert!(
+        output.stdout == [&noise[..], &blocks].concat(),
+        "the output differs"
+    );
+    let expected = [noise.len() + blocks.len(), noise.len(), blocks.len(), 0];
+    assert_eq!(summary(&output), expected);
+}
+
+#[test]
+fn a_tail_that_waits_for_a_busy_data_writer_leaves_once_the_writer_is_idle() {
+    // The command fills the data session with noise while the receiver
+    // reads none of its stdout, and its spool holds at most 64 KiB
+    // (`SESSION_NOISE`). Then the command writes fewer bytes than a window,
+    // and waits until this test has read them. The idle point after those
+    // bytes comes while the data writer waits on the full session, so their
+    // tail waits for it. Once this test reads stdout, the data writer
+    // writes the rest and becomes idle, which wakes the scanner: the bytes
+    // leave, although no more output comes (DESIGN.md §6.3). A sender that
+    // is not woken then hangs the test.
+    let transfer =
+        Transfer::new("receiver_output_spool_limit = \"64KiB\"\ncompression_level = 0\n");
+    let noise = random(SESSION_NOISE, 40);
+    transfer.env.write("noise", &noise);
+    let (written, go) = (transfer.env.path("written"), transfer.env.path("go"));
+    for fifo in [&written, &go] {
+        mkfifoat(CWD, fifo, Mode::RUSR | Mode::WUSR).unwrap();
+    }
+    let script = format!(
+        "cat '{}'; printf partial; echo written >'{}'; read go <'{}'",
+        transfer.env.path("noise").display(),
+        written.display(),
+        go.display()
+    );
+    let receiver = transfer
+        .invocation(&[EXACT], &refs(&args(&["sh", "-c", &script])))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut receiver = KillOnDrop(receiver);
+    // The open waits for the command to open the FIFO, after its output.
+    let mut message = String::new();
+    File::open(&written)
+        .unwrap()
+        .read_to_string(&mut message)
+        .unwrap();
+    assert_eq!(message, "written\n");
+    let mut received = vec![0u8; noise.len() + 7];
+    let stdout = receiver.0.stdout.as_mut().unwrap();
+    stdout.read_exact(&mut received).unwrap();
+    assert!(
+        received == [&noise[..], b"partial"].concat(),
+        "the output differs"
+    );
+    std::fs::write(&go, b"go\n").unwrap();
+    let output = succeeded(output_of(receiver));
+    assert!(output.stdout.is_empty(), "output after the bytes");
+}
+
+#[test]
+fn batch_delivery_keeps_a_block_that_spans_a_pause() {
+    // The same command as above, with `--batch-stdout`, and a pause of its
+    // own: no idle point sends the first 100 bytes on, so both blocks
+    // become references (DESIGN.md §6.3). The length of the pause decides
+    // nothing for a correct build; a slow machine can only make the test
+    // miss a build that flushes at idle points.
+    let transfer = Transfer::new("");
+    let blocks = tiled(2, 37);
+    transfer.env.write("tree/blocks", &blocks);
+    transfer.env.write("head", &blocks[..100]);
+    transfer.env.write("rest", &blocks[100..]);
+    let script = format!(
+        "cat '{}'; sleep 0.3; cat '{}'",
+        transfer.env.path("head").display(),
+        transfer.env.path("rest").display()
+    );
+    let output = succeeded(transfer.run(&[BATCH], &refs(&args(&["sh", "-c", &script]))));
+    assert_eq!(output.stdout, blocks);
+    assert_eq!(summary(&output), [blocks.len(), 0, blocks.len(), 0]);
 }
 
 #[test]
@@ -1324,9 +1580,9 @@ fn a_terminal_stdin_stays_blocking() {
     // pseudo-terminal, which holds a typed line before the run starts.
     // Only the stdin reader reads the terminal, so once the line is gone,
     // the stdin reader has read it, and the flags of the terminal must
-    // still be as they were. The output of `cat`, the command, cannot show
-    // that sooner: for so short an output, the sender flushes its data
-    // stream only at END (DESIGN.md §6.2). Ctrl-D then ends the input.
+    // still be as they were. The output of `cat`, the command, would show
+    // that only later, after the line has crossed both sessions. Ctrl-D
+    // then ends the input.
     let master = match openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC) {
         Ok(master) => master,
         Err(e) => {
@@ -1830,11 +2086,9 @@ fn a_termination_signal_decides_the_status_even_after_the_sessions_break() {
     // and let the receiver continue with both events already present.
     let transfer = Transfer::new("");
     // The command opens a FIFO that the test holds open, and reports on
-    // stderr that it runs: the sender relays stderr at once, but a line on
-    // stdout, shorter than a block, would stay in the sender's scanner
-    // until more output or EOF (DESIGN.md §6.3). Then it reads the FIFO
-    // until EOF, so it runs until the test ends, also after the killed
-    // sessions orphan it.
+    // stderr that it runs, which the sender relays at once (DESIGN.md
+    // §6.1). Then it reads the FIFO until EOF, so it runs until the test
+    // ends, also after the killed sessions orphan it.
     let fifo = transfer.env.path("hold");
     let _hold = held_fifo(&fifo);
     let running = "the command runs";
@@ -1917,7 +2171,7 @@ fn the_receiver_closes_stdin_before_either_stdout_ends() {
     transfer.env.write("tree/blocks", &blocks);
     wrap_ssh(&transfer, "\"$ssh\" \"$@\"\nexit $?");
     let command = args(&["cat", transfer.env.path("tree/blocks").to_str().unwrap()]);
-    let output = transfer.run_ok(&refs(&command));
+    let output = succeeded(transfer.run(&[BATCH], &refs(&command)));
     assert_eq!(output.stdout, blocks);
     assert_eq!(summary(&output), [blocks.len(), 0, blocks.len(), 0]);
 }
@@ -1950,9 +2204,9 @@ exit $status"#,
     let cat = args(&["cat", transfer.env.path("tree/blocks").to_str().unwrap()]);
     let missing = args(&["/nonexistent-hashsync-test-command"]);
     for (flags, command, status) in [
-        (&[][..], &cat, 0),
-        (&["--no-update"][..], &cat, 0),
-        (&[][..], &missing, 127),
+        (&[BATCH][..], &cat, 0),
+        (&["--no-update", BATCH][..], &cat, 0),
+        (&[BATCH][..], &missing, 127),
     ] {
         let _ = std::fs::remove_file(&marker);
         let output = transfer.run(flags, &refs(command));
@@ -2004,7 +2258,7 @@ exit $status"#,
         ),
     );
     let command = args(&["cat", transfer.env.path("tree/blocks").to_str().unwrap()]);
-    let output = succeeded(transfer.run(&["--no-update"], &refs(&command)));
+    let output = succeeded(transfer.run(&["--no-update", BATCH], &refs(&command)));
     assert_eq!(output.stdout, blocks);
     assert_eq!(summary(&output), [blocks.len(), BLOCK, 31 * BLOCK, 0]);
     let read = |session: &str| std::fs::read(format!("{}.{session}", captured.display())).unwrap();
@@ -2043,7 +2297,7 @@ exec "$ssh" "$@""#,
         ),
     );
     let command = args(&["cat", transfer.env.path("tree/blocks").to_str().unwrap()]);
-    let output = transfer.run_ok(&refs(&command));
+    let output = succeeded(transfer.run(&[BATCH], &refs(&command)));
     assert_eq!(output.stdout, blocks);
     assert_eq!(summary(&output), [blocks.len(), 0, blocks.len(), 0]);
 

@@ -102,14 +102,15 @@ fn hello_prefix(block_size: u32, strong: &[u8]) -> Vec<u8> {
 }
 
 /// The receiver's HELLO payload for `list`, with BLAKE3 as its strong
-/// hash, zstd compression at `level`, 0 for none, and a sender input spool
-/// that holds at most `input_limit` bytes.
+/// hash, zstd compression at `level`, 0 for none, a sender input spool that
+/// holds at most `input_limit` bytes, and the output in `delivery`.
 fn hello_payload(
     block_size: u32,
     list: &[u8],
     command: &[&str],
     level: i32,
     input_limit: u64,
+    delivery: Delivery,
 ) -> Vec<u8> {
     let mut hello = hello_prefix(block_size, b"blake3");
     hello.extend_from_slice(blake3::hash(list).as_bytes()); // target
@@ -125,6 +126,7 @@ fn hello_payload(
     hello.extend_from_slice(&(128u64 << 20).to_le_bytes()); // negative cache
     hello.extend_from_slice(&(2u64 << 30).to_le_bytes()); // sender output spool limit
     hello.extend_from_slice(&input_limit.to_le_bytes()); // sender input spool limit
+    hello.push(delivery as u8); // output delivery
     hello.extend_from_slice(&(command.len() as u32).to_le_bytes());
     for arg in command {
         string(&mut hello, arg.as_bytes());
@@ -353,6 +355,13 @@ impl Control {
     }
 }
 
+/// The delivery of the output, as HELLO encodes it (DESIGN.md §6.2).
+#[derive(Clone, Copy, Debug)]
+enum Delivery {
+    Eager = 0,
+    Batch = 1,
+}
+
 struct Serve {
     child: Child,
     data_in: Option<ChildStdin>,
@@ -362,6 +371,9 @@ struct Serve {
     /// receiver: `FEATURES`, unless a test sets bits that `serve` does not
     /// know.
     features: u64,
+    /// The delivery of the output that HELLO asks for: eager, the default,
+    /// unless a test needs batch delivery.
+    delivery: Delivery,
 }
 
 impl Drop for Serve {
@@ -396,6 +408,7 @@ impl Serve {
             child,
             home,
             features: FEATURES,
+            delivery: Delivery::Eager,
         }
     }
 
@@ -438,14 +451,30 @@ impl Serve {
     }
 
     fn hello_with(&mut self, block_size: u32, list: &[u8], command: &[&str], level: i32) {
-        self.send_hello(&hello_payload(block_size, list, command, level, 2 << 30));
+        let delivery = self.delivery;
+        self.send_hello(&hello_payload(
+            block_size,
+            list,
+            command,
+            level,
+            2 << 30,
+            delivery,
+        ));
     }
 
     /// The versions, the features, and the data HELLOs, as `hello`
     /// exchanges them, with a sender input spool that holds at most
     /// `input_limit` bytes.
     fn hello_with_input_limit(&mut self, command: &[&str], input_limit: u64) {
-        self.send_hello(&hello_payload(4096, &empty_list(), command, 0, input_limit));
+        let delivery = self.delivery;
+        self.send_hello(&hello_payload(
+            4096,
+            &empty_list(),
+            command,
+            0,
+            input_limit,
+            delivery,
+        ));
     }
 
     fn send_hello(&mut self, payload: &[u8]) {
@@ -674,7 +703,7 @@ fn an_unsupported_compression_level_is_rejected() {
     serve.send_version_and_features();
     serve.send(
         HELLO,
-        &hello_payload(4096, &empty_list(), &["true"], 20, 2 << 30),
+        &hello_payload(4096, &empty_list(), &["true"], 20, 2 << 30, Delivery::Eager),
     );
     serve.expect_death("incompatible receiver: compression level 20");
 }
@@ -882,6 +911,9 @@ fn obsolete_queries_in_flight(level: i32) {
     }
     let file = serve.home.path().join("output");
     std::fs::write(&file, &data).unwrap();
+    // In eager delivery, an idle point of the output of `cat` could make a
+    // window of a chain literal, and change the queries (DESIGN.md §6.3).
+    serve.delivery = Delivery::Batch;
     serve.hello_with(B as u32, &list, &["cat", file.to_str().unwrap()], level);
     let mut control = serve.control_session(&list, level);
     assert_eq!(control.query().0, 0);
@@ -961,6 +993,91 @@ fn compressed_frames_form_one_zstd_frame_that_ends_with_end() {
     transport.read_to_end(&mut rest).unwrap();
     assert!(rest.is_empty(), "bytes after DONE");
     serve.expect_success();
+}
+
+#[test]
+fn eager_delivery_sends_the_output_while_the_command_waits() {
+    // The command writes fewer bytes than a window, and waits until this
+    // test has read them, then writes more. In eager delivery, the idle
+    // point of the command's stdout makes the scanner emit the bytes before
+    // it, and the data writer flush the stream behind their frame: the
+    // bytes arrive while the command still waits, with compression and
+    // without (DESIGN.md §6.2 and §6.3). A `serve` that does not flush there
+    // hangs this test.
+    for level in [0, 3] {
+        let mut serve = Serve::start();
+        let go = serve.home.path().join("go");
+        mkfifoat(CWD, &go, Mode::RUSR | Mode::WUSR).unwrap();
+        let script = format!("printf partial; read go <'{}'; printf more", go.display());
+        serve.hello_with(4096, &empty_list(), &["sh", "-c", &script], level);
+        let _control = serve.attach();
+        serve.send_empty_list();
+        let Serve {
+            data_in, data_out, ..
+        } = &mut serve;
+        let mut transport = BufReader::new(data_out);
+        {
+            let mut stream: Box<dyn Read> = match level {
+                0 => Box::new(&mut transport),
+                _ => Box::new(
+                    zstd::stream::read::Decoder::with_buffer(&mut transport)
+                        .unwrap()
+                        .single_frame(),
+                ),
+            };
+            assert_eq!(recv_frame(&mut stream), (CACHE_RESULT, Vec::new()));
+            assert_eq!(recv_frame(&mut stream), (LIT, b"partial".to_vec()));
+            std::fs::write(&go, b"go\n").unwrap();
+            assert_eq!(recv_frame(&mut stream), (LIT, b"more".to_vec()));
+            // Status 0, without error text.
+            assert_eq!(recv_frame(&mut stream), (END, vec![0; 8]));
+            if level != 0 {
+                assert_eq!(stream.read(&mut [0]).unwrap(), 0, "the frame goes on");
+            }
+        }
+        data_in
+            .as_mut()
+            .unwrap()
+            .write_all(&frame(END_ACK, b""))
+            .unwrap();
+        assert_eq!(recv_frame(&mut transport), (DONE, Vec::new()));
+        serve.expect_success();
+    }
+}
+
+#[test]
+fn batch_delivery_keeps_the_output_while_the_command_waits() {
+    // The command writes fewer bytes than a window, and waits until this
+    // test lets it go on. In batch delivery, `serve` keeps those bytes, a
+    // short last literal, even once all its threads sleep: they leave with
+    // the bytes that follow, in one LIT, at EOF (DESIGN.md §6.3).
+    for level in [0, 3] {
+        let mut serve = Serve::start();
+        let go = serve.home.path().join("go");
+        mkfifoat(CWD, &go, Mode::RUSR | Mode::WUSR).unwrap();
+        let script = format!("printf partial; read go <'{}'; printf more", go.display());
+        serve.delivery = Delivery::Batch;
+        serve.hello_with(4096, &empty_list(), &["sh", "-c", &script], level);
+        let _control = serve.attach();
+        serve.send_empty_list();
+        // The open waits for the command to open the FIFO, after it wrote
+        // its first bytes. Then `serve` has nothing more to do until the
+        // command goes on.
+        let mut fifo = std::fs::File::options().write(true).open(&go).unwrap();
+        wait_until_asleep(serve.child.id());
+        fifo.write_all(b"go\n").unwrap();
+        drop(fifo);
+        let frames = serve.frames_through_done(level);
+        assert_eq!(
+            frames,
+            [
+                (CACHE_RESULT, Vec::new()),
+                (LIT, b"partialmore".to_vec()),
+                (END, vec![0; 8])
+            ]
+        );
+        serve.expect_success();
+    }
 }
 
 #[test]

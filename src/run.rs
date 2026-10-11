@@ -1,5 +1,6 @@
-//! `hashsync run [--stdin] [--no-update] [--ssh CMD] [USER@]HOST --
-//! COMMAND ...` (DESIGN.md §3, §5.6, §6, §8): the receiver.
+//! `hashsync run [--stdin] [--batch-stdin] [--batch-stdout] [--no-update]
+//! [--ssh CMD] [USER@]HOST -- COMMAND ...` (DESIGN.md §3, §5.6, §6, §8):
+//! the receiver.
 //!
 //! The run updates the index (or opens it read-only), exports and
 //! publishes the hash list, prepares the pins and the lookup workers,
@@ -11,9 +12,12 @@
 //! `receiver_output_spool_limit` bytes wait in the spool (DESIGN.md §6.5).
 //! Queries and answers have compression streams of their own (DESIGN.md
 //! §6.2). Meanwhile, the input goes to the command's stdin, in INPUT
-//! frames on the data session, until END: with `--stdin`, the receiver's
-//! stdin, and else no bytes (DESIGN.md §6.6). It returns the command's
-//! status once both sessions exited successfully, after a summary.
+//! frames on the data session, until END: with `--stdin` or
+//! `--batch-stdin`, the receiver's stdin, and else no bytes (DESIGN.md
+//! §6.6). The output and the input each have a delivery: eager, which sends
+//! their bytes on at each idle point of their source, or batch (DESIGN.md
+//! §6.2). It returns the command's status once both sessions exited
+//! successfully, after a summary.
 //!
 //! The end is orderly (DESIGN.md §6.9). After END_ACK, DONE tells the
 //! receiver that the sender needs neither session any more. The main
@@ -47,8 +51,8 @@ use crate::input::{InputStop, ReceiverInput};
 use crate::lookup;
 use crate::pins::Pins;
 use crate::protocol::{
-    self, Answer, Compressor, Decompressor, End, FrameReader, FrameWriter, HashList, Query,
-    ReceiverHello, Rle, SenderHello, flush_data, frame, send_data,
+    self, Answer, Compressor, Decompressor, Delivery, End, FrameReader, FrameWriter, HashList,
+    Query, ReceiverHello, Rle, SenderHello, flush_data, frame, send_data,
 };
 use crate::rendezvous;
 use crate::roots::{self, Location};
@@ -71,10 +75,14 @@ static SENT: AtomicU64 = AtomicU64::new(0);
 static DATA_RECEIVED: AtomicU64 = AtomicU64::new(0);
 static CONTROL_RECEIVED: AtomicU64 = AtomicU64::new(0);
 
+/// `input_delivery` is the delivery of this process's stdin to the
+/// command, or `None` for no input, and `output_delivery` the delivery of
+/// the command's stdout (DESIGN.md §6.2 and §8).
 pub fn run(
     config: &Config,
     no_update: bool,
-    send_stdin: bool,
+    input_delivery: Option<Delivery>,
+    output_delivery: Delivery,
     cli_ssh: Option<&OsStr>,
     host: &OsStr,
     command: &[std::ffi::OsString],
@@ -196,6 +204,7 @@ pub fn run(
         negative_cache: config.negative_cache,
         sender_output_spool_limit: config.sender_output_spool_limit,
         sender_input_spool_limit: config.sender_input_spool_limit,
+        output_delivery,
         command: command.iter().map(|arg| arg.as_bytes().to_vec()).collect(),
     };
     // HELLO follows the version and the features at once. It does not
@@ -249,24 +258,26 @@ pub fn run(
     // The list exchange is complete: from here on until END, the input
     // writer owns the outgoing direction of the data session, and sends
     // the input to the command, at the level of the data stream, until the
-    // stop of the input (DESIGN.md §6.6). With `--stdin`, the stdin reader
-    // reads this process's stdin. Without it, the stdin reader reads
-    // `/dev/null` in its place, as `ssh -n` does: the command reads EOF at
-    // once, and this process reads nothing from its own stdin (DESIGN.md
-    // §8).
-    let stdin: Box<dyn AsFd + Send> = if send_stdin {
-        Box::new(rustix::stdio::stdin())
-    } else {
-        match File::open("/dev/null") {
-            Ok(null) => Box::new(null),
+    // stop of the input (DESIGN.md §6.6). With `--stdin` or `--batch-stdin`,
+    // the stdin reader reads this process's stdin. Without them, the stdin
+    // reader reads `/dev/null` in its place, as `ssh -n` does: the command
+    // reads EOF at once, and this process reads nothing from its own stdin
+    // (DESIGN.md §8). `/dev/null` ends at once, so its delivery changes
+    // nothing.
+    let (stdin, delivery): (Box<dyn AsFd + Send>, _) = match input_delivery {
+        Some(delivery) => (Box::new(rustix::stdio::stdin()), delivery),
+        None => match File::open("/dev/null") {
+            Ok(null) => (Box::new(null), Delivery::Eager),
             Err(e) => die(format!("cannot open /dev/null: {e}")),
-        }
+        },
     };
     let input = input.start(
         stdin,
         data_out,
+        delivery,
         config.compression_level,
         config.compression_long,
+        config.compression_threads,
     );
 
     let mut stdout = fsops::stdout();

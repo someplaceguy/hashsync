@@ -8,7 +8,7 @@
 //! Every wrapper retries a call that a signal interrupts, so callers never
 //! see `EINTR`.
 
-use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::path::Path;
 
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
@@ -195,6 +195,64 @@ impl std::io::Write for FdWriter {
 
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+/// A pipe that only this process reads, as the source of a spool that marks
+/// its idle points (DESIGN.md §6.5): the command's stdout in eager delivery
+/// of the output. The pipe is non-blocking, so a read that finds no byte
+/// fails with `EAGAIN`. Then the read fails once with `WouldBlock`, which
+/// tells the idle point, and the next read waits for a byte or EOF. EOF is
+/// the last idle point: a read that finds EOF also fails once with
+/// `WouldBlock`, unless the read before it told an idle point, so that the
+/// bytes before EOF do not wait for the end of the command, which can come
+/// much later. This type exists so that the idle points cost no system call
+/// for a read that finds bytes, and only two more calls at each idle point.
+pub struct IdlePointReader<F: AsFd> {
+    fd: F,
+    /// The last read failed with `WouldBlock`.
+    told: bool,
+}
+
+impl<F: AsFd> IdlePointReader<F> {
+    /// Make `fd` non-blocking. Only the read end changes: the writer of
+    /// the pipe has an open file description of its own.
+    pub fn new(fd: F) -> Self {
+        let flags = rustix::fs::fcntl_getfl(&fd).expect("fcntl F_GETFL on a pipe failed");
+        rustix::fs::fcntl_setfl(&fd, flags | OFlags::NONBLOCK)
+            .expect("fcntl F_SETFL on a pipe failed");
+        IdlePointReader { fd, told: false }
+    }
+}
+
+impl<F: AsFd> std::io::Read for IdlePointReader<F> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        // A read into an empty buffer also returns 0, which is not EOF, so
+        // it must not tell an idle point.
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            // After the read that told the idle point, wait for a byte or
+            // EOF; no timeout (DESIGN.md §3).
+            if self.told {
+                wait_until_ready(self.fd.as_fd(), PollFlags::IN);
+            }
+            match retry_on_intr(|| rustix::io::read(&self.fd, &mut *buf)) {
+                // Only a spurious wakeup can leave no byte after the wait.
+                Err(Errno::AGAIN) if self.told => {}
+                // No byte is ready, or EOF comes without an idle point
+                // before it.
+                Err(Errno::AGAIN) | Ok(0) if !self.told => {
+                    self.told = true;
+                    return Err(std::io::ErrorKind::WouldBlock.into());
+                }
+                result => {
+                    self.told = false;
+                    return Ok(result?);
+                }
+            }
+        }
     }
 }
 
@@ -417,6 +475,44 @@ mod tests {
             unblock_when_asleep(read, fill)
         };
         assert_eq!(read, Ok(b"y".to_vec()));
+    }
+
+    #[test]
+    fn idle_points_are_told_once_and_eof_is_the_last_one() {
+        // A read that finds no byte fails once with `WouldBlock`, and the
+        // next read waits for a byte. EOF right after bytes is the last
+        // idle point: a read fails once with `WouldBlock` before EOF comes.
+        // EOF right after an idle point needs no second one (DESIGN.md
+        // §6.5).
+        use std::io::{Read, Write};
+
+        fn would_block(result: std::io::Result<usize>) -> bool {
+            result.is_err_and(|e| e.kind() == ErrorKind::WouldBlock)
+        }
+        let mut buf = [0u8; 8];
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        let mut idle = IdlePointReader::new(reader);
+        assert!(would_block(idle.read(&mut buf)), "no idle point");
+        let (mut idle, read) = unblock_when_asleep(
+            move || {
+                let mut buf = [0u8; 8];
+                let n = idle.read(&mut buf).unwrap();
+                (idle, buf[..n].to_vec())
+            },
+            || writer.write_all(b"ab").unwrap(),
+        );
+        assert_eq!(read, b"ab");
+        writer.write_all(b"cd").unwrap();
+        drop(writer);
+        assert!(matches!(idle.read(&mut buf), Ok(2)));
+        assert!(would_block(idle.read(&mut buf)), "no idle point before EOF");
+        assert!(matches!(idle.read(&mut buf), Ok(0)), "no EOF");
+
+        let (reader, writer) = std::io::pipe().unwrap();
+        let mut idle = IdlePointReader::new(reader);
+        assert!(would_block(idle.read(&mut buf)), "no idle point");
+        drop(writer);
+        assert!(matches!(idle.read(&mut buf), Ok(0)), "a second idle point");
     }
 
     #[test]

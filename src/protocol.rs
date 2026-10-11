@@ -74,6 +74,19 @@ pub mod frame {
     pub const INPUT_STOP: u8 = 17;
 }
 
+/// When the bytes of the output, or of the input, go on from the buffers
+/// on their way to their destination (DESIGN.md §6.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Delivery {
+    /// At each idle point of their source, when it has no byte ready, and
+    /// when a buffer is full: a command and a consumer that answer each
+    /// other never wait for bytes that a buffer holds.
+    Eager,
+    /// Only when a buffer is full and at the end of the stream, which costs
+    /// fewer bytes and less CPU when nothing waits for the bytes.
+    Batch,
+}
+
 /// HELLO, receiver to sender. Its block size and hashes are the run's:
 /// the sender uses them or ends the run. Every digest of the run,
 /// including the target's, uses `strong_hash` (DESIGN.md §6.2).
@@ -106,6 +119,8 @@ pub struct ReceiverHello {
     /// spool before the sender stops reading the data session; `u64::MAX`
     /// sets no limit (DESIGN.md §6.6).
     pub sender_input_spool_limit: u64,
+    /// The delivery of the command's output (DESIGN.md §6.2).
+    pub output_delivery: Delivery,
     /// The command's argv; argv[0] is found in PATH and run directly.
     pub command: Vec<Vec<u8>>,
 }
@@ -129,6 +144,10 @@ impl ReceiverHello {
         enc.u64(self.negative_cache);
         enc.u64(self.sender_output_spool_limit);
         enc.u64(self.sender_input_spool_limit);
+        enc.u8(match self.output_delivery {
+            Delivery::Eager => 0,
+            Delivery::Batch => 1,
+        });
         enc.u32(list_len(self.command.len()));
         for arg in &self.command {
             enc.bytes(arg);
@@ -167,6 +186,11 @@ impl ReceiverHello {
             negative_cache: dec.u64(),
             sender_output_spool_limit: dec.u64(),
             sender_input_spool_limit: dec.u64(),
+            output_delivery: match dec.u8() {
+                0 => Delivery::Eager,
+                1 => Delivery::Batch,
+                v => panic!("protocol error: invalid delivery {v} in HELLO frame"),
+            },
             command: dec.list(Dec::string_bytes),
         };
         dec.done();
@@ -610,9 +634,10 @@ pub fn drain_to_eof(mut reader: impl Read) -> std::io::Result<bool> {
 /// transport takes it whole (`send`). A writer that sends many small
 /// frames also wraps its transport in a `BufWriter`, which makes fewer
 /// calls. A control writer flushes before it waits (`next_from`). On the
-/// data session, the sender flushes its stream only before it waits for a
-/// reply, and the receiver sends each INPUT frame at once (DESIGN.md §6.2
-/// and §6.6).
+/// data session, the sender flushes its stream before it waits for a reply
+/// and, in eager delivery of the output, at the idle points of the
+/// command's stdout; the receiver sends each INPUT frame at once
+/// (DESIGN.md §6.2 and §6.6).
 pub struct FrameWriter<W: Write> {
     writer: W,
 }
@@ -772,6 +797,11 @@ impl<W: Write> Compressor<W> {
     /// the bytes that zstd still holds are lost.
     pub fn into_transport(self) -> W {
         self.transport
+    }
+
+    /// The transport, for a look at its state.
+    pub fn transport(&self) -> &W {
+        &self.transport
     }
 }
 
@@ -1134,6 +1164,7 @@ mod tests {
             negative_cache: 128 << 20,
             sender_output_spool_limit: 2 << 30,
             sender_input_spool_limit: 3 << 30,
+            output_delivery: Delivery::Batch,
             command: vec![b"printf".to_vec(), b"%s".to_vec(), b"\xff\xfe".to_vec()],
         }
     }
@@ -1184,7 +1215,26 @@ mod tests {
         assert_eq!(decoded.negative_cache, 128 << 20);
         assert_eq!(decoded.sender_output_spool_limit, 2 << 30);
         assert_eq!(decoded.sender_input_spool_limit, 3 << 30);
+        assert_eq!(decoded.output_delivery, Delivery::Batch);
         assert_eq!(decoded.command, hello.command);
+        let eager = ReceiverHello {
+            output_delivery: Delivery::Eager,
+            ..receiver_hello()
+        };
+        let decoded = ReceiverHello::decode(&eager.encode());
+        assert_eq!(decoded.output_delivery, Delivery::Eager);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid delivery 2 in HELLO")]
+    fn a_delivery_is_eager_or_batch() {
+        let mut payload = receiver_hello().encode();
+        // The delivery byte precedes the argument count and the three
+        // arguments, each with its length.
+        let at = payload.len() - 1 - (4 + 3 * 4 + 6 + 2 + 2);
+        assert_eq!(payload[at], 1, "the batch delivery");
+        payload[at] = 2;
+        ReceiverHello::decode(&payload);
     }
 
     #[test]

@@ -16,6 +16,14 @@
 //! closes happen outside it; the creation of a segment happens under it,
 //! once per segment, as for the pins.
 //!
+//! The source of the thread of a spool can tell when it has no byte ready:
+//! a read then fails with `WouldBlock`, and the next read waits. The
+//! command's stdout does that in eager delivery of the output, also right
+//! before its EOF (DESIGN.md §6.2). The thread then marks an idle point,
+//! which the reader reports (`take_next`) once it has taken every byte
+//! before it, unless more bytes arrive first, and before the end of the
+//! stream.
+//!
 //! At the normal end, after the reader has read EOF, `close` joins the
 //! thread of the spool and closes the spool's segments (DESIGN.md §6.9). A
 //! role can also stop a spool, from any thread, when its bytes have no use
@@ -26,7 +34,7 @@
 
 use std::collections::VecDeque;
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::FileExt;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
@@ -63,6 +71,18 @@ pub struct SpoolWriter {
 /// Stops a spool from any thread (`Stopper::stop`).
 pub struct Stopper(Arc<Shared>);
 
+/// What one `Spool::take_next` found.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Taken {
+    /// This many bytes, at the start of the buffer.
+    Bytes(usize),
+    /// An idle point: the reader has taken every byte, and the source had
+    /// no byte ready after the last one (DESIGN.md §6.5).
+    Idle,
+    /// The end of the stream, or a stop.
+    End,
+}
+
 /// What the writer and the reader share.
 struct Shared {
     /// The tmp_data directory, for new segments and failure messages.
@@ -93,6 +113,9 @@ struct State {
     /// A role stopped the spool: it has no extents and no open segments
     /// any more, and every later byte is discarded.
     stopped: bool,
+    /// An idle point: the source had no byte ready after the last append,
+    /// and the reader has not reported it yet. The next append removes it.
+    idle: bool,
     /// The reader waits for `appended`, or the writer for `taken`. A side
     /// signals the condition variable only when the other side waits.
     reader_waits: bool,
@@ -103,7 +126,9 @@ impl Spool {
     /// A spool in the tmp_data directory `dir`, that a new thread fills
     /// from `source` until EOF. The thread stops reading `source` while
     /// `limit` bytes, and at least one, wait for the reader; `u64::MAX` sets
-    /// no limit. `what` names the source in failure messages.
+    /// no limit. A read of `source` that fails with `WouldBlock` tells an
+    /// idle point, and the next read must wait for bytes or EOF. `what`
+    /// names the source in failure messages.
     pub fn start(
         what: &'static str,
         source: impl Read + Send + 'static,
@@ -142,6 +167,12 @@ impl Spool {
                     let n = match retry_interrupted(|| source.read(&mut buf)) {
                         Ok(0) => break,
                         Ok(n) => n,
+                        // The source has no byte ready, and its next read
+                        // waits (DESIGN.md §6.5, step W2).
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                            writer.shared.mark_idle();
+                            continue;
+                        }
                         Err(e) => die(format!("cannot read {what}: {e}")),
                     };
                     writer.write_all(&buf[..n]).expect("a spool write failed");
@@ -169,6 +200,7 @@ impl Spool {
                 read: 0,
                 ended: false,
                 stopped: false,
+                idle: false,
                 reader_waits: false,
                 writer_waits: false,
             }),
@@ -221,19 +253,28 @@ impl Spool {
     }
 }
 
-impl Read for Spool {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
+impl Spool {
+    /// Take the next bytes into `buf`, which must not be empty, or else
+    /// report an idle point, or the end of the stream (DESIGN.md §6.5,
+    /// steps T1 to T3). Waits without a timeout until one of them comes,
+    /// and never fails. After a stop, it reports the end at once.
+    pub fn take_next(&mut self, buf: &mut [u8]) -> Taken {
+        assert!(!buf.is_empty(), "a take into an empty buffer");
         let (file, offset, available) = {
             let mut state = self.shared.lock();
             loop {
                 if state.stopped {
-                    return Ok(0);
+                    return Taken::End;
                 }
                 if let Some(next) = state.next_bytes() {
                     break next;
+                }
+                // No byte follows the idle point: an append would have
+                // removed it. The end can follow it at once, as at the EOF
+                // of the command's stdout, and must not hide it.
+                if state.idle {
+                    state.idle = false;
+                    return Taken::Idle;
                 }
                 if state.ended {
                     // The reader took every byte, so only the last extent
@@ -244,10 +285,10 @@ impl Read for Spool {
                     let closed = state.release_rest();
                     drop(state);
                     drop(closed);
-                    return Ok(0);
+                    return Taken::End;
                 }
-                // Ends when the writer appends or ends the stream, or at a
-                // stop; no timeout (DESIGN.md §3).
+                // Ends when the writer appends, marks an idle point, or
+                // ends the stream, or at a stop; no timeout (DESIGN.md §3).
                 state.reader_waits = true;
                 state = self.shared.appended.wait(state).unwrap();
                 state.reader_waits = false;
@@ -261,7 +302,31 @@ impl Read for Spool {
         // is released. A stop during the read discards these bytes too.
         let (closed, stopped) = self.shared.took(n as u64);
         drop(closed);
-        Ok(if stopped { 0 } else { n })
+        if stopped { Taken::End } else { Taken::Bytes(n) }
+    }
+}
+
+/// The bytes of the spool, without its idle points: a read waits through
+/// them.
+impl Read for Spool {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            match self.take_next(buf) {
+                Taken::Bytes(n) => return Ok(n),
+                Taken::Idle => {}
+                Taken::End => return Ok(0),
+            }
+        }
+    }
+}
+
+impl SpoolWriter {
+    /// The bytes appended so far: the writer's `written` (DESIGN.md §6.5).
+    pub fn written(&self) -> u64 {
+        self.shared.lock().written
     }
 }
 
@@ -325,6 +390,16 @@ impl Shared {
         self.state.lock().unwrap()
     }
 
+    /// The source had no byte ready after the last append: mark an idle
+    /// point, and wake the reader (DESIGN.md §6.5, step W2).
+    fn mark_idle(&self) {
+        let mut state = self.lock();
+        state.idle = true;
+        if state.reader_waits {
+            self.appended.notify_one();
+        }
+    }
+
     /// Wait until fewer than `limit` bytes wait for the reader, or none,
     /// or until a stop. Ends when the reader takes bytes, or at the stop;
     /// no timeout (DESIGN.md §3).
@@ -365,6 +440,9 @@ impl Shared {
                 return;
             }
             state.written += n as u64;
+            // These bytes follow the idle point: it is not the end of the
+            // bytes any more.
+            state.idle = false;
             if state.reader_waits {
                 self.appended.notify_one();
             }
@@ -738,6 +816,100 @@ mod tests {
         drop((writer, spool));
         drop(setup.dir);
         assert_eq!(descriptors(&setup.path), (0, 0));
+    }
+
+    /// A source that gives what the test sends, one item per read: bytes,
+    /// or `None`, for no byte ready (`WouldBlock`). It gives EOF once the
+    /// test drops the sending end. A read waits for the next item.
+    struct Scripted(crossbeam_channel::Receiver<Option<Vec<u8>>>);
+
+    impl Read for Scripted {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.0.recv() {
+                Ok(Some(bytes)) => {
+                    buf[..bytes.len()].copy_from_slice(&bytes);
+                    Ok(bytes.len())
+                }
+                Ok(None) => Err(ErrorKind::WouldBlock.into()),
+                Err(_) => Ok(0),
+            }
+        }
+    }
+
+    #[test]
+    fn the_reader_reports_an_idle_point_only_when_no_byte_follows_it() {
+        // The source has no byte ready after "abc": the reader takes the
+        // bytes, then reports the idle point. Then the source gives "def",
+        // has no byte ready, and gives "gh" before the reader takes "def":
+        // the append of "gh" removes that idle point, so the reader takes
+        // all five bytes, and no idle point (DESIGN.md §6.5).
+        let setup = setup();
+        let (steps, script) = crossbeam_channel::unbounded();
+        let mut spool = Spool::start(
+            "the test source",
+            Scripted(script),
+            Arc::clone(&setup.dir),
+            u64::MAX,
+        );
+        let mut buf = [0u8; 16];
+        steps.send(Some(b"abc".to_vec())).unwrap();
+        steps.send(None).unwrap();
+        wait_until(&spool, |state| state.idle);
+        assert_eq!(spool.take_next(&mut buf), Taken::Bytes(3));
+        assert_eq!(buf[..3], *b"abc");
+        assert_eq!(spool.take_next(&mut buf), Taken::Idle);
+        steps.send(Some(b"def".to_vec())).unwrap();
+        steps.send(None).unwrap();
+        wait_until(&spool, |state| state.idle);
+        steps.send(Some(b"gh".to_vec())).unwrap();
+        wait_until(&spool, |state| state.written == 8);
+        assert!(!spool.shared.lock().idle, "an idle point before a byte");
+        assert_eq!(spool.take_next(&mut buf), Taken::Bytes(5));
+        assert_eq!(buf[..5], *b"defgh");
+
+        // A read waits through an idle point: here until the source gives
+        // "ij", which the test sends only once the read waits.
+        steps.send(None).unwrap();
+        wait_until(&spool, |state| state.idle);
+        let shared = Arc::clone(&spool.shared);
+        let sends = std::thread::spawn(move || {
+            while !shared.lock().reader_waits {
+                std::thread::yield_now();
+            }
+            steps.send(Some(b"ij".to_vec())).unwrap();
+            steps
+        });
+        assert_eq!(spool.read(&mut buf).unwrap(), 2);
+        assert_eq!(buf[..2], *b"ij");
+        drop(sends.join().unwrap());
+        assert_eq!(spool.take_next(&mut buf), Taken::End);
+        spool.close();
+    }
+
+    #[test]
+    fn an_idle_point_right_before_the_end_comes_first() {
+        // The source has no byte ready after "abc", then ends, all before
+        // the reader looks. The reader takes the bytes, then reports the
+        // idle point, and only then the end, which must not hide it: at the
+        // EOF of the command's stdout, the bytes before it would wait for
+        // the end of the command (DESIGN.md §6.5, step T1).
+        let setup = setup();
+        let (steps, script) = crossbeam_channel::unbounded();
+        let mut spool = Spool::start(
+            "the test source",
+            Scripted(script),
+            Arc::clone(&setup.dir),
+            u64::MAX,
+        );
+        steps.send(Some(b"abc".to_vec())).unwrap();
+        steps.send(None).unwrap();
+        drop(steps);
+        wait_until(&spool, |state| state.ended);
+        let mut buf = [0u8; 16];
+        assert_eq!(spool.take_next(&mut buf), Taken::Bytes(3));
+        assert_eq!(spool.take_next(&mut buf), Taken::Idle);
+        assert_eq!(spool.take_next(&mut buf), Taken::End);
+        spool.close();
     }
 
     #[test]

@@ -23,11 +23,16 @@
 //! stretches of windows to the probe threads, and queues queries for the
 //! control writer and frames for the data writer. The command's stdout
 //! goes through a spool, so the command waits for the scanner only when
-//! `sender_output_spool_limit` bytes wait for it (DESIGN.md §6.5). The
-//! receiver's stdin arrives in INPUT frames, which the data reader appends
-//! to the input spool, and the stdin writer decompresses that spool into
-//! the command's stdin (DESIGN.md §6.6). Command success and startup
-//! failure share one completion path.
+//! `sender_output_spool_limit` bytes wait for it (DESIGN.md §6.5). In eager
+//! delivery of the output, the spool also marks the idle points of the
+//! command's stdout, the last one at its EOF, which the output reader
+//! passes to the scanner: the bytes before each one then reach the receiver
+//! without waiting for more output, because the data writer flushes the
+//! stream behind their frames (DESIGN.md §6.2 and §6.3). The receiver's
+//! stdin arrives in INPUT frames, which the data reader appends to the
+//! input spool, and the stdin writer decompresses that spool into the
+//! command's stdin (DESIGN.md §6.6). Command success and startup failure
+//! share one completion path.
 //!
 //! The normal end joins every thread (DESIGN.md §6.9). After the cleanup,
 //! DONE tells the receiver that this side needs neither session any more,
@@ -47,30 +52,31 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering::SeqCst};
+use std::sync::{Arc, Mutex};
 
 use bstr::ByteSlice;
 use crossbeam_channel::{Receiver, Select, Sender, TryRecvError, bounded, unbounded};
 use rustix::process::Pid;
 
 use crate::cache::{self, ListStore, PublishedList};
-use crate::config;
+use crate::config::{self, thread_count};
 use crate::die::{self, die};
-use crate::fsops::{self, FdWriter, retry_interrupted};
+use crate::fsops::{self, IdlePointReader, retry_interrupted};
 use crate::hash;
 use crate::hashlist::{self, ListId};
 use crate::hashtable::HashTable;
 use crate::input::SenderInput;
 use crate::pool::Pool;
 use crate::protocol::{
-    self, Answer, COMPRESSION_LEVELS, Compressor, Decompressor, End, FrameReader, FrameWriter,
-    HashList, Query, ReceiverHello, Rle, SenderControl, SenderHello, flush_data, frame, send_data,
+    self, Answer, COMPRESSION_LEVELS, Compressor, Decompressor, Delivery, End, FrameReader,
+    FrameWriter, HashList, Query, ReceiverHello, Rle, SenderControl, SenderHello, flush_data,
+    frame, send_data,
 };
 use crate::rendezvous;
 use crate::scanner::{Frame, Scanner};
 use crate::segments::Directory;
-use crate::spool::{Spool, SpoolWriter};
+use crate::spool::{Spool, SpoolWriter, Taken};
 use crate::sys;
 
 /// The read size of the output reader.
@@ -83,13 +89,124 @@ const WRITE_BUFFER: usize = 256 << 10;
 /// holds at most `B` bytes.
 const QUEUED_BYTES: usize = 4 << 20;
 
-/// The data session after HELLO: frames through the compression stream.
-type DataWriter = FrameWriter<Compressor<BufWriter<FdWriter>>>;
-
 /// What the data writer sends, in order.
 enum Output {
     Scanned(Frame),
     End(End),
+}
+
+/// What the output reader passes to the scanner, in order: the bytes of
+/// the command's stdout, and its idle points (DESIGN.md §6.3).
+enum Stdout {
+    Bytes(Vec<u8>),
+    Idle,
+}
+
+/// A new data queue of `capacity` items, from the scanner's driver to the
+/// data writer.
+fn data_queue(capacity: usize) -> (DataQueue, DataItems) {
+    let (items_tx, items_rx) = bounded(capacity);
+    let (wakes_tx, wakes_rx) = bounded(1);
+    let idle_at = Arc::new(Mutex::new(0));
+    let queue = DataQueue {
+        items: items_tx,
+        queued: 0,
+        idle_at: Arc::clone(&idle_at),
+        wakes: wakes_rx,
+    };
+    let items = DataItems {
+        items: items_rx,
+        taken: 0,
+        idle_at,
+        wakes: wakes_tx,
+    };
+    (queue, items)
+}
+
+/// The driver's end of the data queue. It queues the scanner's frames for
+/// the data writer, and tells whether the writer is idle (DESIGN.md
+/// §6.3): the writer waits for items, with every queued item written, and
+/// the flush that an idle point asked for made. The tail before an idle
+/// point leaves only then, when it can leave at once.
+struct DataQueue {
+    items: Sender<Output>,
+    /// The items queued so far.
+    queued: u64,
+    /// The items that the writer had taken when it last became idle. A
+    /// lock, not an atomic, holds the count: see `writer_idle`.
+    idle_at: Arc<Mutex<u64>>,
+    /// A token each time the writer becomes idle, so that the driver can
+    /// wait for that.
+    wakes: Receiver<()>,
+}
+
+impl DataQueue {
+    fn is_full(&self) -> bool {
+        self.items.is_full()
+    }
+
+    /// Queue `frame`. The queue must have room: the driver is its only
+    /// producer, and found room.
+    fn queue(&mut self, frame: Frame) {
+        self.items
+            .try_send(Output::Scanned(frame))
+            .expect("the data queue refused a frame");
+        self.queued += 1;
+    }
+
+    /// True when the writer is idle. A token in `wakes` only makes the
+    /// driver look again: the count decides, so an old token does no harm.
+    ///
+    /// The look must not miss that the writer became idle, also when the
+    /// writer's token found an old token in the channel and nothing else
+    /// wakes the driver. The tokens are taken before the look, and the
+    /// lock puts the look either after the writer's last store, which it
+    /// then sees, or before it. In the second case, the writer's token, or
+    /// an older one that the take missed, is still in the channel, and
+    /// wakes the next wait. An atomic count gives no such order: a failed
+    /// `try_send` only reads the channel, so it does not order the store
+    /// before the look.
+    fn writer_idle(&self) -> bool {
+        while self.wakes.try_recv().is_ok() {}
+        *self.idle_at.lock().unwrap() == self.queued
+    }
+
+    /// END, after the scanner's last frame.
+    fn end(self, end: End) {
+        self.items
+            .send(Output::End(end))
+            .expect("the data writer ended before END");
+    }
+}
+
+/// The data writer's end of the data queue.
+struct DataItems {
+    items: Receiver<Output>,
+    /// The items taken so far.
+    taken: u64,
+    idle_at: Arc<Mutex<u64>>,
+    wakes: Sender<()>,
+}
+
+impl DataItems {
+    /// The next item, if one waits.
+    fn try_next(&mut self) -> Option<Output> {
+        let item = self.items.try_recv().ok()?;
+        self.taken += 1;
+        Some(item)
+    }
+
+    /// Tell the driver that the writer is idle: it has written every item
+    /// that it took, and made the flush that they asked for. Then wait for
+    /// the next item.
+    fn wait_next(&mut self) -> Output {
+        *self.idle_at.lock().unwrap() = self.taken;
+        // A full channel already holds a token for the driver.
+        let _ = self.wakes.try_send(());
+        let item = self.items.recv().expect("the scanner ended before END");
+        self.taken += 1;
+        item
+    }
 }
 
 /// How far the end of the run has come (DESIGN.md §6.9). The main thread
@@ -195,9 +312,9 @@ pub fn run(token: &str) -> ! {
     send_data(&mut data_out, frame::HELLO, &reply.encode());
     flush_data(&mut data_out);
     // After HELLO, this side's data frames share one zstd stream unless
-    // compression is disabled. Output latency does not matter, so the
-    // stream is flushed only before this side waits for a reply, and
-    // finished after END (DESIGN.md §6.2).
+    // compression is disabled. The stream is flushed before this side waits
+    // for a reply, and in eager delivery of the output at the idle points
+    // of the command's stdout, and finished after END (DESIGN.md §6.2).
     let mut data_out = FrameWriter::new(Compressor::new(
         data_out.into_inner(),
         hello.compression_level,
@@ -289,11 +406,10 @@ pub fn run(token: &str) -> ! {
 
     // From here on, the data writer owns the data session's outgoing
     // direction.
-    let queued = (QUEUED_BYTES / hello.block_size as usize).max(1);
-    let (output_tx, output_rx) = bounded(queued);
+    let (mut data, items) = data_queue((QUEUED_BYTES / hello.block_size as usize).max(1));
     let data_writer = std::thread::Builder::new()
         .name("data-writer".into())
-        .spawn(move || write_output(data_out, &output_rx))
+        .spawn(move || write_output(data_out, items))
         .expect("cannot start the data writer");
 
     // The scanner's probe threads (DESIGN.md §6.3) start before the
@@ -335,11 +451,17 @@ pub fn run(token: &str) -> ! {
                 // the scan needs the first, END the second (DESIGN.md
                 // §6.3). Stdout goes through a spool, so the command does
                 // not wait for the scanner until
-                // `sender_output_spool_limit` bytes wait in the spool.
+                // `sender_output_spool_limit` bytes wait in the spool. In
+                // eager delivery, the spool marks the idle points of
+                // stdout (DESIGN.md §6.5).
                 let command_stdout = child.stdout.take().unwrap();
+                let source: Box<dyn Read + Send> = match hello.output_delivery {
+                    Delivery::Eager => Box::new(IdlePointReader::new(command_stdout)),
+                    Delivery::Batch => Box::new(command_stdout),
+                };
                 let output = Spool::start(
                     "the command's output",
-                    command_stdout,
+                    source,
                     tmp_data,
                     hello.sender_output_spool_limit,
                 );
@@ -356,7 +478,7 @@ pub fn run(token: &str) -> ! {
                     hello.negative_cache,
                     probe_pool.as_deref(),
                 );
-                transfer(&mut scanner, &chunk_rx, &answer_rx, &output_tx, &control_tx);
+                transfer(&mut scanner, &chunk_rx, &answer_rx, &mut data, &control_tx);
                 // The scan ended after the output reader closed its queue,
                 // at the end of the spool, which it closed too.
                 output_reader.join().expect("the output reader panicked");
@@ -383,9 +505,7 @@ pub fn run(token: &str) -> ! {
     // finished stderr relay when command streams exist. Enter `EndSent`
     // first so an immediate acknowledgement is valid.
     progress.advance(Phase::EndSent);
-    output_tx
-        .send(Output::End(End { status, error }))
-        .expect("the data writer ended before END");
+    data.end(End { status, error });
     ack_rx
         .recv()
         .expect("the data reader ended without acknowledgement");
@@ -426,16 +546,6 @@ pub fn run(token: &str) -> ! {
     die::finish(0)
 }
 
-/// `requested` threads, or half the cores, at least one, for 0: the
-/// count of probe threads and of compression threads (DESIGN.md §7).
-fn thread_count(requested: u32) -> u32 {
-    match requested {
-        0 => std::thread::available_parallelism()
-            .map_or(1, |n| u32::try_from(n.get() / 2).unwrap_or(u32::MAX).max(1)),
-        n => n,
-    }
-}
-
 /// Start the threads that probe the scanner's long stretches of windows
 /// (DESIGN.md §6.3): `requested` threads, or half the cores for 0. One
 /// thread needs no pool: the scanner probes on its own thread.
@@ -446,15 +556,17 @@ fn start_probe_pool(requested: u32) -> Option<Pool> {
 
 /// Run the scanner until the command's output is emitted (DESIGN.md
 /// §6.3). Each round takes the waiting answers first, then command output
-/// while the scanner's buffer has room, then scans and queues ready frames
-/// while the data queue has room. A round that moves nothing waits for an
-/// answer, command output, or room in the data queue. The queries go to
-/// `control`, the queue of the control writer.
+/// and its idle points while the scanner's buffer has room, then scans,
+/// sends the tail before an idle point when the data writer is idle, and
+/// queues ready frames while the data queue has room. A round that moves
+/// nothing waits for an answer, command output, room in the data queue, or,
+/// while a tail waits, an idle data writer. The queries go to `control`,
+/// the queue of the control writer.
 fn transfer(
     scanner: &mut Scanner,
-    chunks: &Receiver<Vec<u8>>,
+    chunks: &Receiver<Stdout>,
     answers: &Receiver<Answer>,
-    output: &Sender<Output>,
+    data: &mut DataQueue,
     control: &Sender<SenderControl>,
 ) {
     let mut reading = true;
@@ -466,7 +578,8 @@ fn transfer(
         }
         while reading && scanner.has_room() {
             match chunks.try_recv() {
-                Ok(chunk) => scanner.push(&chunk),
+                Ok(Stdout::Bytes(chunk)) => scanner.push(&chunk),
+                Ok(Stdout::Idle) => scanner.idle(),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     scanner.end_input();
@@ -479,11 +592,19 @@ fn transfer(
             // The control writer ends only after the scanner.
             let _ = control.send(SenderControl::Query(Query { offset, strong }));
         });
+        // The tail before an idle point leaves only when it can leave at
+        // once. While the data writer is busy, as on a slow link, the tail
+        // waits, and output that arrives meanwhile can fill its windows
+        // (DESIGN.md §6.3).
+        if scanner.tail_waits() && data.writer_idle() {
+            scanner.send_tail();
+            progress = true;
+        }
         // This thread is the queue's only producer, so a queue with room
         // keeps it. Only a queue that is full before this attempt can hold
         // back a ready frame, so only then does the wait include room.
-        let full = output.is_full();
-        progress |= queue_frames(scanner, output);
+        let full = data.is_full();
+        progress |= queue_frames(scanner, data);
         if progress {
             continue;
         }
@@ -496,7 +617,10 @@ fn transfer(
             select.recv(chunks);
         }
         if full {
-            select.send(output);
+            select.send(&data.items);
+        }
+        if scanner.tail_waits() {
+            select.recv(&data.wakes);
         }
         select.ready();
     }
@@ -505,57 +629,72 @@ fn transfer(
 /// Queue the scanner's ready frames while the data queue has room. A frame
 /// leaves the scanner, which advances `e`, only when the queue can take it
 /// (DESIGN.md §6.3). True when a frame was queued.
-fn queue_frames(scanner: &mut Scanner, output: &Sender<Output>) -> bool {
+fn queue_frames(scanner: &mut Scanner, data: &mut DataQueue) -> bool {
     let mut queued = false;
-    while !output.is_full()
+    while !data.is_full()
         && let Some(frame) = scanner.next_frame()
     {
-        // The only producer found room.
-        output
-            .try_send(Output::Scanned(frame))
-            .expect("the data queue refused a frame");
+        data.queue(frame);
         queued = true;
     }
     queued
 }
 
 /// Read the command's output from its spool into chunks for the scanner,
-/// until the EOF of the spool. Then close the spool, which joins its
-/// thread (DESIGN.md §6.9), and return, which closes the queue. The
-/// bounded queue pauses reading while the scanner's buffer is full;
-/// meanwhile, the output waits in the spool (DESIGN.md §6.3).
-fn read_output(mut output: Spool, chunks: &Sender<Vec<u8>>) {
+/// with its idle points in order, until the EOF of the spool. Then close
+/// the spool, which joins its thread (DESIGN.md §6.9), and return, which
+/// closes the queue. The bounded queue pauses reading while the scanner's
+/// buffer is full; meanwhile, the output waits in the spool (DESIGN.md
+/// §6.3).
+fn read_output(mut output: Spool, chunks: &Sender<Stdout>) {
     let mut buf = vec![0u8; READ_CHUNK];
     loop {
-        // A spool read never fails: the spool itself ends the run when it
-        // cannot read the command's output or a segment.
-        let n = output.read(&mut buf).expect("a spool read failed");
-        if n == 0 {
-            break;
-        }
+        // A take never fails: the spool itself ends the run when it cannot
+        // read the command's output or a segment.
+        let next = match output.take_next(&mut buf) {
+            Taken::Bytes(n) => Stdout::Bytes(buf[..n].to_vec()),
+            Taken::Idle => Stdout::Idle,
+            Taken::End => break,
+        };
         // The scanner takes chunks until this thread closes the queue.
         chunks
-            .send(buf[..n].to_vec())
+            .send(next)
             .expect("the scanner ended before the command's output");
     }
     output.close();
 }
 
 /// The data session's outgoing direction after setup: frames in order,
-/// then END, which finishes the stream (DESIGN.md §6.2). Nothing flushes
-/// the stream before END: the receiver replies to no frame before it.
-/// Returns the session after the stream, for DONE.
-fn write_output(
-    mut data_out: DataWriter,
-    output: &Receiver<Output>,
-) -> FrameWriter<BufWriter<FdWriter>> {
+/// then END, which finishes the stream (DESIGN.md §6.2). The receiver
+/// replies to no frame before END, so only the idle points of eager
+/// delivery flush the stream before it: once their frames are written, and
+/// the writer has nothing left to write. Until then, the flush has no use,
+/// because the bytes before it cannot leave sooner, and it would cost
+/// compression. Returns the session after the stream, for DONE.
+fn write_output<W: Write>(
+    mut data_out: FrameWriter<Compressor<W>>,
+    mut items: DataItems,
+) -> FrameWriter<W> {
+    // A flush that an idle point asked for.
+    let mut flush = false;
     loop {
-        match output.recv().expect("the scanner ended before END") {
+        let item = match items.try_next() {
+            Some(item) => item,
+            None => {
+                if flush {
+                    flush_data(&mut data_out);
+                    flush = false;
+                }
+                items.wait_next()
+            }
+        };
+        match item {
             Output::Scanned(Frame::Literal(bytes)) => send_data(&mut data_out, frame::LIT, &bytes),
             Output::Scanned(Frame::Reference) => send_data(&mut data_out, frame::REF, b""),
             Output::Scanned(Frame::Run { byte, length }) => {
                 send_data(&mut data_out, frame::RLE, &Rle { byte, length }.encode());
             }
+            Output::Scanned(Frame::Flush) => flush = true,
             Output::End(end) => {
                 send_data(&mut data_out, frame::END, &end.encode());
                 // Sender stdout stays open until process exit.
@@ -827,7 +966,6 @@ fn receive_list<R: Read>(data_in: &mut FrameReader<R>, target: ListId) -> Vec<u8
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::sync::Mutex;
     use std::time::Duration;
 
     use super::*;
@@ -839,7 +977,8 @@ mod tests {
 
     /// `transfer` with a data queue of one frame, which the data writer
     /// drains slowly, while the lookups answer from another thread and
-    /// reject the stale blocks. The output stays exact and in order, and
+    /// reject the stale blocks, and idle points come now and then. The
+    /// output stays exact and in order, flushes follow the idle points, and
     /// the transfer ends (DESIGN.md §6.3). The wait has no deadline: a
     /// transfer that stalls hangs the test, and a debugger can inspect it.
     #[test]
@@ -866,15 +1005,18 @@ mod tests {
         for lookahead in [u64::from(BS), 64 * u64::from(BS)] {
             let (chunk_tx, chunk_rx) = bounded(1);
             let (answer_tx, answer_rx) = unbounded();
-            let (output_tx, output_rx) = bounded(1);
+            let (mut data, mut items) = data_queue(1);
             let (query_tx, query_rx) = unbounded();
             let (done_tx, done_rx) = bounded(1);
             let pins = Arc::new(Mutex::new(HashMap::new()));
 
             let command = input.clone();
             std::thread::spawn(move || {
-                for chunk in command.chunks(100) {
-                    chunk_tx.send(chunk.to_vec()).unwrap();
+                for (i, chunk) in command.chunks(100).enumerate() {
+                    chunk_tx.send(Stdout::Bytes(chunk.to_vec())).unwrap();
+                    if i % 13 == 0 {
+                        chunk_tx.send(Stdout::Idle).unwrap();
+                    }
                 }
             });
             // A lookup publishes the pin before it answers yes.
@@ -902,8 +1044,9 @@ mod tests {
                 }
             });
             std::thread::spawn(move || {
-                let mut output = Vec::new();
-                for (i, next) in output_rx.iter().enumerate() {
+                let (mut output, mut flushes) = (Vec::new(), 0);
+                for i in 0.. {
+                    let next = items.try_next().unwrap_or_else(|| items.wait_next());
                     if i % 7 == 0 {
                         std::thread::sleep(Duration::from_micros(200));
                     }
@@ -916,27 +1059,115 @@ mod tests {
                         Output::Scanned(Frame::Run { byte, length }) => {
                             output.extend(std::iter::repeat_n(byte, length as usize));
                         }
+                        Output::Scanned(Frame::Flush) => flushes += 1,
                         Output::End(_) => break,
                     }
                 }
-                done_tx.send(output).unwrap();
+                done_tx.send((output, flushes)).unwrap();
             });
             let table = HashTable::build(&values);
             std::thread::spawn(move || {
                 let mut scanner =
                     Scanner::new(table, BS, StrongHash::Blake3, lookahead, 1 << 20, None);
-                transfer(&mut scanner, &chunk_rx, &answer_rx, &output_tx, &query_tx);
-                let end = End {
+                transfer(&mut scanner, &chunk_rx, &answer_rx, &mut data, &query_tx);
+                data.end(End {
                     status: 0,
                     error: String::new(),
-                };
-                output_tx.send(Output::End(end)).unwrap();
+                });
             });
-            let output = done_rx
+            let (output, flushes) = done_rx
                 .recv()
                 .expect("the data writer ended without the output");
             assert!(output == input, "lookahead {lookahead}: the output differs");
+            assert!(flushes > 0, "lookahead {lookahead}: no flush");
         }
+    }
+
+    /// The data writer is idle only while it waits for items, after it has
+    /// taken and written every queued item (DESIGN.md §6.3). Its token
+    /// wakes the driver, which then finds the writer idle.
+    #[test]
+    fn the_writer_is_idle_only_after_every_queued_item() {
+        let (mut data, mut items) = data_queue(4);
+        assert!(data.writer_idle(), "nothing to write yet");
+        data.queue(Frame::Reference);
+        assert!(!data.writer_idle(), "an item waits");
+        assert!(items.try_next().is_some());
+        assert!(!data.writer_idle(), "the writer holds an item");
+        let writer = std::thread::spawn(move || {
+            let item = items.wait_next();
+            (items, item)
+        });
+        // No deadline: a writer that does not say that it is idle hangs the
+        // test.
+        data.wakes.recv().unwrap();
+        assert!(data.writer_idle());
+        data.queue(Frame::Flush);
+        let (_items, item) = writer.join().unwrap();
+        assert!(matches!(item, Output::Scanned(Frame::Flush)));
+        assert!(!data.writer_idle(), "the writer holds an item");
+    }
+
+    /// What a transport saw: the bytes of each write call, or a flush.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Seen {
+        Write(Vec<u8>),
+        Flush,
+    }
+
+    /// A transport that records what it sees.
+    #[derive(Clone, Default)]
+    struct Recorder(Arc<Mutex<Vec<Seen>>>);
+
+    impl Write for Recorder {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().push(Seen::Write(buf.to_vec()));
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.0.lock().unwrap().push(Seen::Flush);
+            Ok(())
+        }
+    }
+
+    /// The data writer makes the flush that an idle point asks for only
+    /// once it has nothing left to write: frames queued behind the flush
+    /// come first, because the bytes before it could not leave sooner
+    /// (DESIGN.md §6.2). Without compression, a flush reaches the transport
+    /// as a flush.
+    #[test]
+    fn the_data_writer_flushes_only_when_it_has_nothing_left_to_write() {
+        let recorder = Recorder::default();
+        let (mut data, items) = data_queue(8);
+        data.queue(Frame::Literal(b"before".to_vec()));
+        data.queue(Frame::Flush);
+        data.queue(Frame::Literal(b"after".to_vec()));
+        let writer = {
+            let transport = Compressor::new(recorder.clone(), 0, false, 0);
+            std::thread::spawn(move || write_output(FrameWriter::new(transport), items))
+        };
+        // No deadline: a writer that never becomes idle hangs the test.
+        data.wakes.recv().unwrap();
+        assert!(data.writer_idle());
+        let seen = std::mem::take(&mut *recorder.0.lock().unwrap());
+        let (flush, writes) = seen.split_last().unwrap();
+        assert_eq!(*flush, Seen::Flush, "{seen:?}");
+        let written: Vec<u8> = writes
+            .iter()
+            .flat_map(|seen| match seen {
+                Seen::Write(bytes) => bytes.clone(),
+                Seen::Flush => panic!("a flush before the last frame: {seen:?}"),
+            })
+            .collect();
+        let lit =
+            |payload: &[u8]| [&[frame::LIT, payload.len() as u8, 0, 0, 0][..], payload].concat();
+        assert_eq!(written, [lit(b"before"), lit(b"after")].concat());
+        data.end(End {
+            status: 0,
+            error: String::new(),
+        });
+        writer.join().unwrap();
     }
 
     /// The receiver's side of the data session, for the empty list, then
@@ -960,6 +1191,7 @@ mod tests {
             negative_cache: 0,
             sender_output_spool_limit: 0,
             sender_input_spool_limit: 0,
+            output_delivery: Delivery::Eager,
             command: vec![b"true".to_vec()],
         };
         let header = HashList {

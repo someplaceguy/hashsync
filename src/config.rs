@@ -74,8 +74,9 @@ pub struct Config {
     /// farther back than the window of the level, in the data stream and
     /// the input stream (DESIGN.md §7).
     pub compression_long: bool,
-    /// The sender's compression threads; 0 selects half the sender's
-    /// cores, at least one.
+    /// The zstd worker threads of the sender's data stream, and of the
+    /// receiver's input stream; 0 selects half the cores of the host that
+    /// compresses, at least one (DESIGN.md §6.6 and §7).
     pub compression_threads: u32,
     /// Path bytes of the receiver's tmp_data directory, which holds the
     /// segments of the pins and of the spools (DESIGN.md §6.5).
@@ -366,6 +367,17 @@ pub fn parse(text: &str) -> Result<Config, String> {
         hosts,
         roots,
     })
+}
+
+/// `requested` threads, or half the cores of this host, at least one, for
+/// 0: the count of probe threads, and of the worker threads of a zstd
+/// stream (DESIGN.md §7).
+pub fn thread_count(requested: u32) -> u32 {
+    match requested {
+        0 => std::thread::available_parallelism()
+            .map_or(1, |n| u32::try_from(n.get() / 2).unwrap_or(u32::MAX).max(1)),
+        n => n,
+    }
 }
 
 /// A spool limit: a size, or `unlimited` for none. No limit is `u64::MAX`

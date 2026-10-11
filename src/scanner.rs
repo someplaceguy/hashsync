@@ -15,6 +15,15 @@
 //! lend it a pool of probe threads, which probe the parts of a long stretch
 //! of windows at once.
 //!
+//! In eager delivery of the output (DESIGN.md §6.2), the driver also passes
+//! the idle points of the command's stdout (`idle`). The bytes before the
+//! last idle point leave without waiting for more output once they can
+//! leave at once: the driver records their tail, which fills no window,
+//! only while the data writer has nothing left to write (`tail_waits`,
+//! `send_tail`). On a slow link, the tail waits instead, and output that
+//! arrives meanwhile can fill its windows. A flush of the data stream
+//! follows the frames of those bytes.
+//!
 //! Offsets count output bytes from zero. `e` is the next byte to emit, `p`
 //! the next byte to scan, and `r` the end of the bytes read, with
 //! `e <= p <= r`:
@@ -23,6 +32,7 @@
 //!   it holds less than `lookahead + B` bytes, and a scan step starts only
 //!   while `p - e < lookahead`.
 //! - The records cover `[e, p)` in order, without gaps or overlaps.
+//! - `f`, the end of the bytes before the last idle point, is at most `r`.
 //! - The query states hold every offset at or above `e` that was a weak
 //!   hit, also when no record refers to it any more. Each offset is queried
 //!   at most once.
@@ -51,7 +61,7 @@ const PART_BUDGET: u64 = 1 << 20;
 /// links of the recency list, and the slot of the hash table.
 const NEGATIVE_ENTRY_BYTES: u64 = 96;
 
-/// A data frame, in output order.
+/// A data frame, in output order, or a flush.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Frame {
     /// LIT: at most `B` literal bytes.
@@ -60,6 +70,10 @@ pub enum Frame {
     Reference,
     /// RLE: `length` copies of `byte`.
     Run { byte: u8, length: u64 },
+    /// No frame: the frames of the bytes before an idle point are out, so
+    /// the data writer flushes the data stream once it has nothing left to
+    /// write (DESIGN.md §6.2 and §6.3).
+    Flush,
 }
 
 /// Scanned output that is not emitted yet (DESIGN.md §6.3).
@@ -166,6 +180,12 @@ pub struct Scanner<'a> {
     base: u64,
     e: u64,
     p: u64,
+    /// `f`: the end of the bytes before the last idle point of the
+    /// command's stdout. The bytes before it leave without waiting for more
+    /// output (DESIGN.md §6.3).
+    flush: u64,
+    /// The `f` of the last `Frame::Flush`.
+    flushed: u64,
     /// The command's stdout reached EOF.
     ended: bool,
     /// The rolling state of a recent window: the window at `p` uses it,
@@ -225,6 +245,8 @@ impl<'a> Scanner<'a> {
             base: 0,
             e: 0,
             p: 0,
+            flush: 0,
+            flushed: 0,
             ended: false,
             known: None,
             records: VecDeque::new(),
@@ -291,6 +313,39 @@ impl<'a> Scanner<'a> {
         self.ended = true;
     }
 
+    /// An idle point of the command's stdout, in eager delivery: it has no
+    /// byte ready, and the scanner has every byte that it gave. These bytes
+    /// leave without waiting for more output once the data writer is idle
+    /// (`tail_waits`), and `next_frame` gives a flush once their frames are
+    /// out (DESIGN.md §6.3).
+    pub fn idle(&mut self) {
+        self.flush = self.end();
+    }
+
+    /// True when the tail before the last idle point waits only for the
+    /// data writer (DESIGN.md §6.3): fewer than `B` bytes follow `p < f`,
+    /// and every record before `p` has left, but a last Literal shorter
+    /// than `B`, which the tail extends. The driver calls `send_tail` once
+    /// the data writer is idle. This function exists so that the tail
+    /// leaves only when it can leave at once: while the writer is busy, on a
+    /// slow link, the tail waits, and output that arrives meanwhile can fill
+    /// its windows, which then need not become literal.
+    pub fn tail_waits(&self) -> bool {
+        let held = match (self.records.len(), self.records.front()) {
+            (0, _) => true,
+            (1, Some(&Record::Literal { length, .. })) => length < self.block_size,
+            _ => false,
+        };
+        held && !self.ended && self.p < self.flush && self.end() - self.p < self.block_size
+    }
+
+    /// Record the tail that waits (`tail_waits`), so that the bytes before
+    /// the last idle point leave: the data writer is idle.
+    pub fn send_tail(&mut self) {
+        assert!(self.tail_waits(), "no tail waits for the data writer");
+        self.scan_tail(self.flush);
+    }
+
     /// Take in an answer (DESIGN.md §6.3). Records change only when
     /// `scan` resolves the queries.
     pub fn answer(&mut self, offset: u64, found: bool) {
@@ -323,8 +378,11 @@ impl<'a> Scanner<'a> {
         while self.p - self.e < self.lookahead && self.p < budget_end {
             let available = self.end() - self.p;
             if available < self.block_size {
+                // At EOF, the bytes that fill no window are a tail. Before
+                // EOF, they wait for more output, or, before an idle point,
+                // for `send_tail` (DESIGN.md §6.3).
                 if self.ended && available > 0 {
-                    self.scan_tail();
+                    self.scan_tail(self.end());
                     progress = true;
                 }
                 break;
@@ -514,11 +572,12 @@ impl<'a> Scanner<'a> {
         self.p += 1;
     }
 
-    /// At EOF, record the tail at `p`, shorter than a window: it continues
-    /// a last Run while its bytes match, and the rest is literal. A Run
-    /// already emitted is not continued (DESIGN.md §6.3).
-    fn scan_tail(&mut self) {
-        let tail = self.bytes(self.p, self.end() - self.p);
+    /// Record the tail from `p` to `end`, which fills no window, at EOF or
+    /// before an idle point: it continues a last Run while its bytes match,
+    /// and the rest is literal. A Run already emitted is not continued
+    /// (DESIGN.md §6.3). Before an idle point, every Run has left.
+    fn scan_tail(&mut self, end: u64) {
+        let tail = self.bytes(self.p, end - self.p);
         let (matching, byte) = match self.records.back() {
             Some(&Record::Run { byte, .. }) => {
                 (tail.iter().take_while(|&&b| b == byte).count(), byte)
@@ -532,7 +591,7 @@ impl<'a> Scanner<'a> {
         if rest > 0 {
             self.push_literal(self.p + matching as u64, rest as u64);
         }
-        self.p = self.end();
+        self.p = end;
     }
 
     /// Append literal bytes at `offset`, where the records end, extending
@@ -606,8 +665,14 @@ impl<'a> Scanner<'a> {
     /// The next data frame, if the first record is ready (DESIGN.md §6.3):
     /// a Ref, a Run for its known length, or up to `B` literal bytes. A
     /// last Literal shorter than `B` waits to grow until the output is
-    /// complete. A Query blocks everything behind it.
+    /// complete, except for its bytes before `f` once `p` has reached `f`.
+    /// A Query blocks everything behind it. Once the frames before a new `f`
+    /// are out, a flush comes first.
     pub fn next_frame(&mut self) -> Option<Frame> {
+        if self.flushed < self.flush && self.e >= self.flush {
+            self.flushed = self.flush;
+            return Some(Frame::Flush);
+        }
         let (frame, length) = match *self.records.front()? {
             Record::Query { .. } => return None,
             Record::Ref { .. } => {
@@ -621,10 +686,17 @@ impl<'a> Scanner<'a> {
             Record::Literal { offset, length } => {
                 let last = self.records.len() == 1;
                 let complete = self.ended && self.p == self.end();
-                if length < self.block_size && last && !complete {
-                    return None;
-                }
-                let n = length.min(self.block_size);
+                let n = if length < self.block_size && last && !complete {
+                    // Only the bytes before `f` leave, together with the
+                    // tail that `send_tail` adds to them; the rest waits to
+                    // grow.
+                    if self.p < self.flush || offset >= self.flush {
+                        return None;
+                    }
+                    length.min(self.flush - offset)
+                } else {
+                    length.min(self.block_size)
+                };
                 let bytes = self.bytes(offset, n).to_vec();
                 if n == length {
                     self.records.pop_front();
@@ -646,9 +718,12 @@ impl<'a> Scanner<'a> {
         Some(frame)
     }
 
-    /// All output is emitted: stdout reached EOF, and `e = p = r`.
+    /// All output is emitted: stdout reached EOF, `e = p = r`, and the flush
+    /// of the last idle point is out too. Else a driver that stops at the
+    /// last frame, while the data queue is full, would leave the bytes
+    /// before that idle point to wait for END (DESIGN.md §6.3).
     pub fn finished(&self) -> bool {
-        self.ended && self.e == self.end()
+        self.ended && self.e == self.end() && self.flushed == self.flush
     }
 }
 
@@ -874,6 +949,8 @@ pub(crate) mod tests {
         queries: Vec<(u64, Strong)>,
         pins: HashMap<u64, Vec<u8>>,
         output: Vec<u8>,
+        /// The output offset of each flush.
+        flushes: Vec<u64>,
     }
 
     impl Receiver {
@@ -891,6 +968,7 @@ pub(crate) mod tests {
                 queries: Vec::new(),
                 pins: HashMap::new(),
                 output: Vec::new(),
+                flushes: Vec::new(),
             }
         }
 
@@ -937,6 +1015,7 @@ pub(crate) mod tests {
                     self.output
                         .extend(std::iter::repeat_n(byte, length as usize));
                 }
+                Frame::Flush => self.flushes.push(c),
             }
             let c = self.output.len() as u64;
             self.pins.retain(|&offset, _| offset >= c);
@@ -961,6 +1040,8 @@ pub(crate) mod tests {
         receiver: Receiver,
         input: &'a [u8],
         pushed: usize,
+        /// `transfer` makes idle points now and then, as in eager delivery.
+        idle_points: bool,
     }
 
     impl<'a> Run<'a> {
@@ -989,6 +1070,7 @@ pub(crate) mod tests {
                 receiver,
                 input,
                 pushed: 0,
+                idle_points: false,
             }
         }
 
@@ -1035,6 +1117,18 @@ pub(crate) mod tests {
                 if choose(3) > 0 {
                     progress |= self.push(1 + choose(97));
                 }
+                if self.idle_points && !self.scanner.ended {
+                    match choose(10) {
+                        0 => self.idle_and_drain(),
+                        1 => self.scanner.idle(),
+                        _ => {}
+                    }
+                    // Now and then, the data writer is idle.
+                    if self.scanner.tail_waits() && choose(3) == 0 {
+                        self.scanner.send_tail();
+                        progress = true;
+                    }
+                }
                 for _ in 0..choose(4) {
                     if self.receiver.pending.is_empty() {
                         break;
@@ -1059,6 +1153,40 @@ pub(crate) mod tests {
                 }) || self.push(1)
                     || self.take_frame();
                 assert!(moved, "the scanner stalled");
+            }
+        }
+
+        /// An idle point, and then no more input, while the answers come,
+        /// the frames leave, and the data writer is idle, until nothing
+        /// moves. Every byte pushed so far must then be out, and a flush
+        /// must follow it (DESIGN.md §6.3).
+        fn idle_and_drain(&mut self) {
+            self.scanner.idle();
+            loop {
+                let mut progress = self.scan();
+                while !self.receiver.pending.is_empty() {
+                    self.receiver.answer(0, &mut self.scanner);
+                    progress = true;
+                }
+                while self.take_frame() {
+                    progress = true;
+                }
+                if self.scanner.tail_waits() {
+                    self.scanner.send_tail();
+                    progress = true;
+                }
+                if !progress {
+                    break;
+                }
+            }
+            let pushed = self.pushed as u64;
+            assert_eq!(
+                self.receiver.output.len() as u64,
+                pushed,
+                "bytes before the idle point stayed back"
+            );
+            if pushed > 0 {
+                assert_eq!(self.receiver.flushes.last(), Some(&pushed), "no flush");
             }
         }
 
@@ -1230,9 +1358,9 @@ pub(crate) mod tests {
 
     #[test]
     fn a_short_last_literal_waits_for_more_output_or_eof() {
-        // Before EOF, the last `B - 1` bytes wait for a whole window, and a
-        // Literal shorter than `B` at the end waits to grow: output latency
-        // does not matter (DESIGN.md §6.3).
+        // Without an idle point, as in batch delivery, the last `B - 1`
+        // bytes wait for a whole window before EOF, and a Literal shorter
+        // than `B` at the end waits to grow (DESIGN.md §6.3).
         let b = BS as usize;
         let input = noise(2 * b + 10, 60);
         let mut scanner = scanner_without_a_list();
@@ -1249,6 +1377,159 @@ pub(crate) mod tests {
             ]
         );
         assert!(scanner.finished());
+    }
+
+    /// `frames_without_a_list`, with a data writer that is idle: a tail
+    /// that waits for it leaves too.
+    fn frames_with_an_idle_writer(scanner: &mut Scanner) -> Vec<Frame> {
+        let mut frames = frames_without_a_list(scanner);
+        if scanner.tail_waits() {
+            scanner.send_tail();
+            frames.extend(frames_without_a_list(scanner));
+        }
+        frames
+    }
+
+    #[test]
+    fn an_idle_point_sends_the_tail_and_a_short_literal_then_a_flush() {
+        // In eager delivery, the bytes before an idle point leave without
+        // waiting for more output once the data writer is idle: the last
+        // `B - 1` bytes, which fill no window, become literal, with the
+        // short last Literal before them. A flush follows their frames,
+        // once. The bytes after the idle point wait as usual (DESIGN.md
+        // §6.3).
+        let b = BS as usize;
+        let input = noise(2 * b + 15, 61);
+        let mut scanner = scanner_without_a_list();
+        scanner.push(&input[..2 * b + 10]);
+        scanner.idle();
+        scanner.push(&input[2 * b + 10..]);
+        // Until the data writer is idle, the tail waits, and so does the
+        // short Literal before it.
+        assert_eq!(
+            frames_without_a_list(&mut scanner),
+            [Frame::Literal(input[..b].to_vec())]
+        );
+        assert!(scanner.tail_waits());
+        scanner.send_tail();
+        assert_eq!(
+            frames_without_a_list(&mut scanner),
+            [
+                Frame::Literal(input[b..2 * b].to_vec()),
+                Frame::Literal(input[2 * b..2 * b + 10].to_vec()),
+                Frame::Flush,
+            ]
+        );
+        assert!(!scanner.tail_waits(), "the bytes after the idle point");
+        scanner.idle();
+        assert_eq!(
+            frames_with_an_idle_writer(&mut scanner),
+            [Frame::Literal(input[2 * b + 10..].to_vec()), Frame::Flush]
+        );
+        // An idle point without new bytes needs no flush.
+        scanner.idle();
+        assert_eq!(frames_with_an_idle_writer(&mut scanner), []);
+        scanner.end_input();
+        assert_eq!(frames_without_a_list(&mut scanner), []);
+        assert!(scanner.finished());
+    }
+
+    #[test]
+    fn a_tail_before_an_idle_point_waits_for_the_records_before_it() {
+        // A run of three windows and a short tail of the same byte before an
+        // idle point. The tail leaves only once every record before it has
+        // left, so it cannot continue the run, which has left: it is literal
+        // (DESIGN.md §6.3).
+        let b = BS as usize;
+        let mut scanner = scanner_without_a_list();
+        scanner.push(&vec![5; 3 * b + 7]);
+        scanner.idle();
+        assert_eq!(
+            frames_with_an_idle_writer(&mut scanner),
+            [
+                Frame::Run {
+                    byte: 5,
+                    length: 3 * u64::from(BS)
+                },
+                Frame::Literal(vec![5; 7]),
+                Frame::Flush
+            ]
+        );
+    }
+
+    #[test]
+    fn a_query_before_an_idle_point_delays_its_flush() {
+        // The tail waits for the answer of a query before it, and the flush
+        // for the frames of every byte before the idle point.
+        let block = noise(BS as usize, 62);
+        let input = [&block[..], b"xy"].concat();
+        let mut run = Run::new(
+            &input,
+            Receiver::new(std::slice::from_ref(&block), &[]),
+            1 << 20,
+            1 << 20,
+            None,
+        );
+        run.push(input.len());
+        run.scanner.idle();
+        run.scan();
+        assert!(!run.take_frame(), "a frame before the answer");
+        assert!(!run.scanner.tail_waits(), "a tail before the answer");
+        run.receiver.answer(0, &mut run.scanner);
+        while run.scan() || run.take_frame() {}
+        run.scanner.send_tail();
+        while run.take_frame() {}
+        assert_eq!(run.receiver.output, input);
+        assert_eq!(run.receiver.flushes, [input.len() as u64]);
+    }
+
+    #[test]
+    fn a_tail_that_waits_for_the_data_writer_keeps_its_block() {
+        // An idle point comes 10 bytes into a listed block. While the data
+        // writer is busy, as on a slow link, the tail before the idle point
+        // waits, and the rest of the block arrives meanwhile: the block is
+        // queried, as without the idle point. With an idle data writer, the
+        // tail leaves as literal, and the block cannot be found any more
+        // (DESIGN.md §6.3).
+        let block = noise(BS as usize, 63);
+        let input = [&noise(5, 64)[..], &block].concat();
+        for writer_idle in [false, true] {
+            let receiver = Receiver::new(std::slice::from_ref(&block), &[]);
+            let mut run = Run::new(&input, receiver, 1 << 20, 1 << 20, None);
+            run.push(15);
+            run.scanner.idle();
+            run.scan();
+            assert!(run.scanner.tail_waits());
+            if writer_idle {
+                run.scanner.send_tail();
+            }
+            run.transfer_promptly();
+            assert_eq!(run.receiver.output, input);
+            let queries: Vec<u64> = run.receiver.queries.iter().map(|q| q.0).collect();
+            let expected: &[u64] = if writer_idle { &[] } else { &[5] };
+            assert_eq!(queries, expected, "writer idle: {writer_idle}");
+        }
+    }
+
+    #[test]
+    fn the_output_is_finished_only_once_the_last_flush_is_out() {
+        // An idle point, then EOF. After the last frame, the flush of the
+        // idle point must still come: a driver that stopped at the last
+        // frame, while the data queue was full, would leave the bytes before
+        // the idle point to wait for END (DESIGN.md §6.3).
+        let mut scanner = scanner_without_a_list();
+        scanner.push(b"question");
+        scanner.idle();
+        scanner.end_input();
+        while scanner.scan(&mut |_, _| panic!("no query without a list")) {}
+        assert_eq!(
+            scanner.next_frame(),
+            Some(Frame::Literal(b"question".to_vec()))
+        );
+        assert!(!scanner.finished(), "finished before the flush");
+        assert_eq!(scanner.next_frame(), Some(Frame::Flush));
+        assert!(scanner.finished());
+        assert_eq!(scanner.next_frame(), None);
     }
 
     #[test]
@@ -1540,7 +1821,7 @@ pub(crate) mod tests {
 
         /// Byte-exact reconstruction under any chunking, answer order and
         /// delay, rejection, rescan, runs across chunks, backpressure, scan
-        /// budget, and split of stretches among probe threads
+        /// budget, idle points, and split of stretches among probe threads
         /// (DESIGN.md §11).
         #[test]
         fn output_is_reproduced_exactly(
@@ -1550,6 +1831,7 @@ pub(crate) mod tests {
             negative in any::<bool>(),
             part in proptest::option::of(1usize..100),
             min_budget in 1u64..300,
+            idle_points in any::<bool>(),
         ) {
             let (valid, stale, piece) = overlapping_blocks(seed);
             let mut input = Vec::new();
@@ -1591,6 +1873,7 @@ pub(crate) mod tests {
             run.scanner.min_budget = min_budget;
             run.scanner.budget = min_budget;
             run.scanner.max_budget = if part.is_some() { 16 * min_budget } else { min_budget };
+            run.idle_points = idle_points;
             run.transfer(&choices);
             prop_assert_eq!(&run.receiver.output, &input);
             prop_assert!(run.scanner.records.is_empty() && run.scanner.entries.is_empty());
