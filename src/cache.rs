@@ -7,13 +7,23 @@
 //! directory on the path that this program can create (`sync_entries`).
 //! Published files are never edited in place.
 //!
+//! Each side handles its part of a list exchange through an `Exchange`:
+//! it lists its directory for the peer and index when the exchange
+//! starts, can publish its target, and at the end removes the listed
+//! files except that target, expires the old files of every directory,
+//! and removes the directories that are left empty. No locks are
+//! necessary: publication creates its directory again when expiry removed
+//! it, a listed list is removed only if its name still names the listed
+//! file, and every reader of a list keeps the bytes that it read.
+//!
 //! Cache directory and file operation failures end the run with `die`.
 //! The exceptions are absence — a missing list is a miss, and missing
 //! directories or already-removed files during lookup and cleanup are
-//! normal — and invalid file contents, which are removed and treated as
-//! a miss (DESIGN.md §5.6).
+//! normal — invalid file contents, which are removed and treated as a
+//! miss, and an empty directory that cannot be removed, which only warns
+//! (DESIGN.md §5.6).
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
@@ -21,31 +31,15 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use rustix::fs::{Mode, RenameFlags, Timespec, Timestamps, UTIME_NOW};
+use rustix::fs::{Mode, OFlags, RenameFlags, Timespec, Timestamps, UTIME_NOW};
 use rustix::io::{Errno, retry_on_intr};
 
 use crate::config;
-use crate::die::die;
+use crate::die::{die, warn};
 use crate::fsops::retry_interrupted;
+use crate::hash::{Strong, StrongHash};
 use crate::hashlist::ListId;
-
-pub fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-pub fn random_bytes<const N: usize>() -> [u8; N] {
-    let mut bytes = [0u8; N];
-    let mut filled = 0;
-    // Reads up to 256 bytes are not split, but handle a short read anyway.
-    while filled < N {
-        let n = retry_on_intr(|| {
-            rustix::rand::getrandom(&mut bytes[filled..], rustix::rand::GetRandomFlags::empty())
-        })
-        .unwrap_or_else(|e| panic!("getrandom: {e}"));
-        filled += n;
-    }
-    bytes
-}
+use crate::names::{hex, is_temporary, parse_hex, random_bytes, temporary_name};
 
 /// A cache operation failed for a reason other than absence
 /// (DESIGN.md §5.6 and §6.7).
@@ -100,7 +94,7 @@ pub fn account_id() -> [u8; 16] {
         // Publish a fresh ID without replacing a concurrent initializer's;
         // the next iteration uses whichever ID won.
         create_dirs(&base, &dir, 0o777);
-        let temp = dir.join(format!(".account-id.{}", hex(&random_bytes::<8>())));
+        let temp = dir.join(temporary_name());
         let written = write_file(&temp, 0o600, |file| {
             file.write_all(format!("{}\n", hex(&random_bytes::<16>())).as_bytes())
         });
@@ -146,21 +140,26 @@ fn use_account_id(base: &Path, path: &Path, mut file: File) -> [u8; 16] {
     if let Err(e) = retry_interrupted(|| file.sync_all()) {
         fatal("fsync", path, e);
     }
-    sync_entries(base, path);
+    if !sync_entries(base, path) {
+        fatal("make durable", path, "a directory on its path is gone");
+    }
     id
 }
 
 /// 32 hexadecimal digits, with optional trailing whitespace.
 fn parse_account_id(text: &[u8]) -> Option<[u8; 16]> {
-    let digits = text.trim_ascii_end();
-    if digits.len() != 32 {
-        return None;
-    }
-    let mut id = [0u8; 16];
-    for (byte, pair) in id.iter_mut().zip(digits.chunks_exact(2)) {
-        *byte = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
-    }
-    Some(id)
+    parse_hex(text.trim_ascii_end())
+}
+
+/// Create `path` exclusively with `mode`.
+fn create_new(path: &Path, mode: u32) -> std::io::Result<File> {
+    retry_interrupted(|| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(path)
+    })
 }
 
 /// Create `path` exclusively with `mode`, fill it, and fsync it.
@@ -169,16 +168,18 @@ fn write_file(
     mode: u32,
     fill: impl FnOnce(&mut File) -> std::io::Result<()>,
 ) -> std::io::Result<File> {
-    let mut file = retry_interrupted(|| {
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(mode)
-            .open(path)
-    })?;
-    fill(&mut file)?;
-    retry_interrupted(|| file.sync_all())?;
+    let mut file = create_new(path, mode)?;
+    fill_file(&mut file, fill)?;
     Ok(file)
+}
+
+/// Fill a new file, and fsync it.
+fn fill_file(
+    file: &mut File,
+    fill: impl FnOnce(&mut File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    fill(file)?;
+    retry_interrupted(|| file.sync_all())
 }
 
 /// Create `dir` with `mode`, together with the missing directories from
@@ -204,17 +205,28 @@ fn create_dirs(base: &Path, dir: &Path, mode: u32) {
 /// Every process that relies on `path` must do this itself. An entry that
 /// exists is not necessarily durable: the process that created it may not
 /// have reached its own fsync yet, or may have been killed before it.
-fn sync_entries(base: &Path, path: &Path) {
-    match base.parent() {
+///
+/// Returns false if a directory on the path is gone. Then the entry of
+/// `path` is gone too, and the caller decides whether that is normal
+/// absence.
+fn sync_entries(base: &Path, path: &Path) -> bool {
+    let parent = match base.parent() {
         // The first component of a relative path.
-        Some(parent) if parent.as_os_str().is_empty() => fsync_dir(Path::new(".")),
-        Some(parent) => fsync_dir(parent),
+        Some(parent) if parent.as_os_str().is_empty() => Some(Path::new(".")),
         // `/` has no entry to make durable.
-        None => {}
+        parent => parent,
+    };
+    if let Some(parent) = parent
+        && !fsync_dir(parent)
+    {
+        return false;
     }
     for dir in descend(base, path.parent().unwrap()) {
-        fsync_dir(&dir);
+        if !fsync_dir(&dir) {
+            return false;
+        }
     }
+    true
 }
 
 /// `base`, then each directory below it down to `dir`.
@@ -229,18 +241,23 @@ fn descend(base: &Path, dir: &Path) -> Vec<PathBuf> {
     dirs
 }
 
-fn fsync_dir(dir: &Path) {
-    let file =
-        retry_interrupted(|| File::open(dir)).unwrap_or_else(|e| fatal("open for fsync", dir, e));
+/// Fsync `dir`. Returns false if it is gone.
+fn fsync_dir(dir: &Path) -> bool {
+    let file = match retry_interrupted(|| File::open(dir)) {
+        Ok(file) => file,
+        Err(e) if absent(&e) => return false,
+        Err(e) => fatal("open for fsync", dir, e),
+    };
     if let Err(e) = retry_interrupted(|| file.sync_all()) {
         fatal("fsync", dir, e);
     }
+    true
 }
 
 /// Give a complete, fsynced temporary its published name. A concurrent
-/// cleanup (`sender_cache = false` or expiry) can remove the temporary
-/// first. That is normal absence: the effect is the same as removal of
-/// the published file just after the rename (DESIGN.md §5.6).
+/// cleanup, the end of another exchange or expiry, can remove the
+/// temporary first. That is normal absence: the effect is the same as
+/// removal of the published file just after the rename (DESIGN.md §5.6).
 fn rename_temporary(temp: &Path, path: &Path) {
     match retry_interrupted(|| std::fs::rename(temp, path)) {
         Ok(()) => {}
@@ -258,7 +275,7 @@ const WRAPPER: &[u8; 9] = b"hsynlist\x01";
 
 /// A durably published list. The open descriptor keeps the verified
 /// bytes reachable even if the file is replaced or removed.
-pub struct PublishedList {
+struct PublishedList {
     file: File,
     path: PathBuf,
 }
@@ -266,7 +283,7 @@ pub struct PublishedList {
 impl PublishedList {
     /// Renew after successful use, through the open descriptor; `ctime`
     /// is the renewal marker (DESIGN.md §5.6).
-    pub fn renew(&self) {
+    fn renew(&self) {
         let now = Timespec {
             tv_sec: 0,
             tv_nsec: UTIME_NOW,
@@ -281,8 +298,149 @@ impl PublishedList {
     }
 }
 
-/// One peer/index cache directory of hash lists.
-pub struct ListStore {
+/// One side's part of a list exchange, in its cache directory for the
+/// peer and the receiver's index (DESIGN.md §5.6).
+///
+/// An exchange lists the directory when it starts, can publish this
+/// side's target, and at its end removes the listed files except that
+/// target. So it removes only files that existed before the exchange: the
+/// lists that the target replaces, and the lists and temporaries that
+/// failed runs left. A run with another target starts only after this
+/// run's receiver has ended. The sender starts its exchange before it
+/// sends HELLO, and ends it only after HASHLIST, HASHDELTA, or HASHKEEP,
+/// which the receiver sends only after it received that HELLO. So no
+/// exchange that ends has a listing that holds the target of a later run,
+/// also when the sender outlives its receiver.
+pub struct Exchange {
+    store: ListStore,
+    /// The lists of the directory when the exchange started.
+    lists: Vec<Listed>,
+    /// The names of the hidden temporaries of the directory then.
+    temporaries: Vec<OsString>,
+    published: Option<PublishedList>,
+}
+
+/// A listed list, and the file that the listing opened. The open file
+/// keeps its inode, so its inode number cannot belong to another file
+/// until the exchange ends.
+struct Listed {
+    name: OsString,
+    file: File,
+}
+
+impl Exchange {
+    /// The receiver's exchange with sender account `peer`, in
+    /// `local-hashlists/B-I`.
+    pub fn receiver(peer: &[u8; 16], index_id: &[u8; 16]) -> Self {
+        Self::start(ListStore::new("local-hashlists", peer, index_id))
+    }
+
+    /// The sender's exchange with receiver account `peer`, in
+    /// `remote-hashlists/A-I`. The sender must start it before it sends
+    /// HELLO, so that the listing of an exchange that ends comes before
+    /// the end of its receiver (see `Exchange`).
+    pub fn sender(peer: &[u8; 16], index_id: &[u8; 16]) -> Self {
+        Self::start(ListStore::new("remote-hashlists", peer, index_id))
+    }
+
+    /// List the directory, and open its lists. A missing directory gives
+    /// an empty listing. Entries that are not regular files, and hidden
+    /// names that are not temporaries of this program (`is_temporary`),
+    /// are not part of the cache layout, and stay. On NFS, the exchanges
+    /// themselves cause such hidden names: they remove listed lists that
+    /// the listings of concurrent exchanges still have open.
+    fn start(store: ListStore) -> Self {
+        let mut lists = Vec::new();
+        let mut temporaries = Vec::new();
+        let listed = for_each_entry(&store.dir, |entry| {
+            match retry_interrupted(|| entry.file_type()) {
+                Ok(kind) if kind.is_file() => {}
+                Ok(_) => return,
+                Err(e) if absent(&e) => return,
+                Err(e) => fatal("stat", &entry.path(), e),
+            }
+            let name = entry.file_name();
+            let bytes = name.as_bytes();
+            if is_temporary(bytes) {
+                temporaries.push(name);
+            } else if !bytes.starts_with(b".")
+                && bytes.ends_with(b".cache")
+                && let Some(file) = open_list(&entry.path())
+            {
+                lists.push(Listed { name, file });
+            }
+        });
+        match listed {
+            Ok(()) => {}
+            Err(e) if absent(&e) => {}
+            Err(e) => fatal("list", &store.dir, e),
+        }
+        Exchange {
+            store,
+            lists,
+            temporaries,
+            published: None,
+        }
+    }
+
+    /// The IDs of the listed lists, which the sender advertises in HELLO.
+    /// Only names of the run's strong hash, `algorithm`, give IDs: a list
+    /// of another strong hash cannot be a base, and is only removed.
+    pub fn listed_ids(&self, algorithm: StrongHash) -> Vec<Strong> {
+        self.lists
+            .iter()
+            .filter_map(|listed| parse_name(&listed.name, algorithm))
+            .collect()
+    }
+
+    /// Durably publish this side's target, `encoded`, under its
+    /// content-derived name. Failures are fatal.
+    pub fn publish(&mut self, id: &ListId, encoded: &[u8]) {
+        self.published = Some(self.store.publish(id, encoded));
+    }
+
+    /// End the exchange: renew the published target, remove the listed
+    /// files except that target, and expire both cache trees. Without a
+    /// published target, this removes every listed file. The sender ends
+    /// its exchange before it sends CACHE_RESULT, the receiver after it
+    /// received it (DESIGN.md §5.6).
+    ///
+    /// A listed temporary belongs to an earlier run, or to a concurrent run
+    /// with the same target. Without it, that run publishes nothing, which
+    /// is normal absence.
+    pub fn finish(self, max_age: u64) {
+        if let Some(list) = &self.published {
+            list.renew();
+        }
+        let target = self
+            .published
+            .as_ref()
+            .map(|list| list.path.file_name().expect("a list path has a file name"));
+        for listed in &self.lists {
+            if target != Some(listed.name.as_os_str()) {
+                self.store.remove_if_listed(listed);
+            }
+        }
+        for name in &self.temporaries {
+            remove("remove", &self.store.dir.join(name));
+        }
+        expire(max_age);
+    }
+}
+
+/// The digest of a list file name, `<algorithm>-<digest>.cache`.
+fn parse_name(name: &OsStr, algorithm: StrongHash) -> Option<Strong> {
+    let digits = name
+        .as_bytes()
+        .strip_prefix(algorithm.id().as_bytes())?
+        .strip_prefix(b"-")?
+        .strip_suffix(b".cache")?;
+    parse_hex(digits)
+}
+
+/// One peer/index cache directory of hash lists: where its files are, and
+/// how they are published, read, and removed.
+struct ListStore {
     /// `$XDG_CACHE_HOME`, where `publish` starts to create directories.
     base: PathBuf,
     /// `base/hashsync/<tree>/<peer>-<index>`.
@@ -290,18 +448,6 @@ pub struct ListStore {
 }
 
 impl ListStore {
-    /// The receiver's directory for lists shared with sender account
-    /// `peer`: `local-hashlists/B-I`.
-    pub fn receiver_side(peer: &[u8; 16], index_id: &[u8; 16]) -> Self {
-        Self::new("local-hashlists", peer, index_id)
-    }
-
-    /// The sender's directory for lists of receiver account `peer`:
-    /// `remote-hashlists/A-I`.
-    pub fn sender_side(peer: &[u8; 16], index_id: &[u8; 16]) -> Self {
-        Self::new("remote-hashlists", peer, index_id)
-    }
-
     fn new(tree: &str, peer: &[u8; 16], index_id: &[u8; 16]) -> Self {
         let base = cache_base();
         let dir = base
@@ -317,20 +463,58 @@ impl ListStore {
 
     /// Durably publish `encoded` under its content-derived name.
     /// Republishes an existing name rather than trusting it. Failures
-    /// are fatal; a failure can leave the hidden temporary for expiry
-    /// (DESIGN.md §6.9).
-    pub fn publish(&self, id: &ListId, encoded: &[u8]) -> PublishedList {
-        create_dirs(&self.base, &self.dir, 0o700);
-        let temp = self.dir.join(format!(".{}", hex(&random_bytes::<8>())));
-        let file = write_file(&temp, 0o600, |file| {
+    /// are fatal; a failure can leave the hidden temporary until the next
+    /// exchange of this peer and index, or until expiry (DESIGN.md §6.9).
+    fn publish(&self, id: &ListId, encoded: &[u8]) -> PublishedList {
+        let (temp, mut file) = self.create_temporary();
+        let filled = fill_file(&mut file, |file| {
             file.write_all(WRAPPER)?;
             file.write_all(encoded)
-        })
-        .unwrap_or_else(|e| fatal("write", &temp, e));
+        });
+        if let Err(e) = filled {
+            fatal("write", &temp, e);
+        }
         let path = self.dir.join(Self::file_name(id));
         rename_temporary(&temp, &path);
+        // A directory on the path can be gone only if a concurrent cleanup
+        // removed the file, and expiry then the empty directory. A file
+        // that is gone needs no durability: this is normal absence
+        // (DESIGN.md §5.6).
         sync_entries(&self.base, &path);
         PublishedList { file, path }
+    }
+
+    /// Create a new hidden temporary in this directory, and create the
+    /// directory first when it is missing.
+    ///
+    /// This function exists so that publication needs no lock against
+    /// expiry, which removes this directory when it is empty. Expiry can
+    /// do so also just after this function created the directory, and
+    /// before the temporary exists. Then the creation of the temporary
+    /// fails with ENOENT, and this function creates the directory again.
+    /// When the temporary exists, the directory is not empty, and expiry
+    /// cannot remove it (DESIGN.md §5.6).
+    fn create_temporary(&self) -> (PathBuf, File) {
+        loop {
+            let temp = self.dir.join(temporary_name());
+            let error = match create_new(&temp, 0o600) {
+                Ok(file) => return (temp, file),
+                Err(e) => e,
+            };
+            if !absent(&error) {
+                fatal("create", &temp, error);
+            }
+            create_dirs(&self.base, &self.dir, 0o700);
+            // Try again if the directory exists now, or if expiry removed
+            // it again. Anything else in its place, such as a symlink to a
+            // directory that does not exist, would fail every new try in
+            // the same way.
+            match retry_interrupted(|| std::fs::symlink_metadata(&self.dir)) {
+                Ok(meta) if meta.is_dir() => {}
+                Err(e) if absent(&e) => {}
+                _ => fatal("create", &temp, error),
+            }
+        }
     }
 
     /// Read and verify a published list: the wrapper must be complete
@@ -340,7 +524,7 @@ impl ListStore {
     /// step 8; until then only tests verify the stored format through
     /// this.
     #[cfg_attr(not(test), expect(dead_code))]
-    pub fn read(&self, id: &ListId) -> Option<Vec<u8>> {
+    fn read(&self, id: &ListId) -> Option<Vec<u8>> {
         let path = self.dir.join(Self::file_name(id));
         let bytes = match retry_interrupted(|| std::fs::read(&path)) {
             Ok(bytes) => bytes,
@@ -356,15 +540,56 @@ impl ListStore {
         None
     }
 
-    /// Remove every stored list in this directory, for
-    /// `sender_cache = false`. A directory that never held lists is
-    /// normal absence.
-    pub fn remove_all(&self) {
-        let listed = for_each_entry(&self.dir, |entry| remove("remove", &entry.path()));
-        match listed {
+    /// Remove a listed list, but only if its name still names the file
+    /// that the exchange's listing opened.
+    ///
+    /// This function exists because a later run can publish the same list
+    /// again under the same name, after the listing, when its index has
+    /// returned to an earlier state. That file must stay. No system call
+    /// removes a name only if it names a given file, so this function
+    /// moves the name to a new temporary name, which no other process
+    /// uses, and compares the file there with the listed file. It removes
+    /// the listed file, and moves any other file back (DESIGN.md §5.6).
+    fn remove_if_listed(&self, listed: &Listed) {
+        let path = self.dir.join(&listed.name);
+        let original = match retry_interrupted(|| listed.file.metadata()) {
+            Ok(meta) if meta.is_file() => meta,
+            // Not part of the cache layout.
+            Ok(_) => return,
+            Err(e) => fatal("stat", &path, e),
+        };
+        let moved = self.dir.join(temporary_name());
+        match retry_interrupted(|| std::fs::rename(&path, &moved)) {
             Ok(()) => {}
-            Err(e) if absent(&e) => {}
-            Err(e) => fatal("list", &self.dir, e),
+            Err(e) if absent(&e) => return,
+            Err(e) => fatal("remove", &path, e),
+        }
+        let current = match retry_interrupted(|| std::fs::symlink_metadata(&moved)) {
+            Ok(meta) => meta,
+            // A concurrent cleanup removed it as a temporary.
+            Err(e) if absent(&e) => return,
+            Err(e) => fatal("stat", &moved, e),
+        };
+        if (current.dev(), current.ino()) == (original.dev(), original.ino()) {
+            remove("remove", &moved);
+            return;
+        }
+        match retry_on_intr(|| {
+            rustix::fs::renameat_with(
+                rustix::fs::CWD,
+                &moved,
+                rustix::fs::CWD,
+                &path,
+                RenameFlags::NOREPLACE,
+            )
+        }) {
+            Ok(()) => {}
+            // The list was published again meanwhile: the same content is
+            // in place.
+            Err(Errno::EXIST) => remove("remove", &moved),
+            // A concurrent cleanup removed it as a temporary.
+            Err(Errno::NOENT) => {}
+            Err(e) => fatal("restore", &path, e),
         }
     }
 }
@@ -375,6 +600,23 @@ impl ListStore {
 fn parse_list(bytes: &[u8], id: &ListId) -> Option<Vec<u8>> {
     let encoded = bytes.strip_prefix(WRAPPER)?;
     (id.algorithm.digest(encoded) == id.digest).then(|| encoded.to_vec())
+}
+
+/// Open a list for a listing, without following a symlink. `None` if it is
+/// gone, or if a symlink took its place, which is not part of the cache
+/// layout.
+fn open_list(path: &Path) -> Option<File> {
+    match retry_on_intr(|| {
+        rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+    }) {
+        Ok(fd) => Some(File::from(fd)),
+        Err(Errno::NOENT | Errno::LOOP) => None,
+        Err(e) => fatal("open", path, e),
+    }
 }
 
 /// Iterate a directory's entries, retrying interrupted reads; any other
@@ -391,10 +633,12 @@ fn for_each_entry(dir: &Path, mut each: impl FnMut(std::fs::DirEntry)) -> std::i
     }
 }
 
-/// Expire files older than `max_age` seconds in both local and remote
-/// cache trees, including abandoned hidden temporaries. Run after the
-/// exchange. Absence is normal; other failures are fatal.
-pub fn expire(max_age: u64) {
+/// Expire the files older than `max_age` seconds in every peer/index
+/// directory of both cache trees, lists and abandoned hidden temporaries,
+/// then remove the directories that are left empty. Run after the
+/// exchange. Absence is normal; other failures are fatal, except a failed
+/// removal of an empty directory, which only warns (DESIGN.md §5.6).
+fn expire(max_age: u64) {
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs().min(i64::MAX as u64) as i64);
@@ -413,6 +657,8 @@ fn expire_tree(tree: &Path, now: i64, max_age: u64) {
             Err(e) if absent(&e) => return,
             Err(e) => fatal("stat", &peer.path(), e),
         }
+        // Whether an entry stays in the directory.
+        let mut kept = false;
         let listed = for_each_entry(&peer.path(), |file| {
             // `DirEntry::metadata` does not follow symlinks.
             let meta = match retry_interrupted(|| file.metadata()) {
@@ -420,18 +666,21 @@ fn expire_tree(tree: &Path, now: i64, max_age: u64) {
                 Err(e) if absent(&e) => return,
                 Err(e) => fatal("stat", &file.path(), e),
             };
-            if !meta.is_file() {
-                return;
-            }
             let age = now.saturating_sub(meta.ctime());
-            if age > i64::try_from(max_age).unwrap_or(i64::MAX) {
+            if meta.is_file() && age > i64::try_from(max_age).unwrap_or(i64::MAX) {
                 remove("expire", &file.path());
+            } else {
+                kept = true;
             }
         });
         match listed {
             Ok(()) => {}
-            Err(e) if absent(&e) => {}
+            // A concurrent expiry removed the directory.
+            Err(e) if absent(&e) => return,
             Err(e) => fatal("list", &peer.path(), e),
+        }
+        if !kept {
+            remove_empty_dir(&peer.path());
         }
     });
     match listed {
@@ -441,13 +690,27 @@ fn expire_tree(tree: &Path, now: i64, max_age: u64) {
     }
 }
 
+/// Remove a peer/index directory that expiry left empty, so that the
+/// directories of old indexes and peers do not accumulate.
+///
+/// A concurrent publication can create a file in the directory at any
+/// time, and then the directory stays. A concurrent expiry can remove it
+/// first. Both are normal. Any other failure only warns: an empty
+/// directory that stays does no harm, so it must not end the run
+/// (DESIGN.md §5.6).
+fn remove_empty_dir(dir: &Path) {
+    match retry_on_intr(|| rustix::fs::rmdir(dir)) {
+        Ok(()) | Err(Errno::NOTEMPTY | Errno::EXIST | Errno::NOENT) => {}
+        Err(e) => warn(format!("cannot remove {}: {e}", dir.display())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Mutex;
 
     use super::*;
-    use crate::hash::StrongHash;
 
     /// Serializes tests that change `XDG_*`; the variables are process
     /// state.
@@ -495,15 +758,31 @@ mod tests {
         }
     }
 
+    /// The canonical list of `values`, and its BLAKE3 ID.
+    fn list(values: &[u64]) -> (ListId, Vec<u8>) {
+        let encoded = crate::hashlist::encode(values);
+        let id = ListId {
+            algorithm: StrongHash::Blake3,
+            digest: StrongHash::Blake3.digest(&encoded),
+        };
+        (id, encoded)
+    }
+
+    /// The names in `dir`, sorted.
+    fn names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
     #[test]
     fn published_lists_verify_and_reread() {
         with_home(|home| {
-            let store = ListStore::receiver_side(&[0xaa; 16], &[0xbb; 16]);
-            let encoded = crate::hashlist::encode(&[1, 2, 3]);
-            let id = ListId {
-                algorithm: StrongHash::Blake3,
-                digest: StrongHash::Blake3.digest(&encoded),
-            };
+            let store = ListStore::new("local-hashlists", &[0xaa; 16], &[0xbb; 16]);
+            let (id, encoded) = list(&[1, 2, 3]);
             let published = store.publish(&id, &encoded);
             published.renew();
 
@@ -538,24 +817,129 @@ mod tests {
     }
 
     #[test]
-    fn remove_all_clears_only_this_directory() {
+    fn an_exchange_keeps_only_its_target_among_the_listed_files() {
+        // An exchange lists its directory when it starts, and at its end
+        // removes the listed files except its published target: an older
+        // list, a list of another strong hash, a file name that is no list
+        // ID, and an abandoned temporary. It advertises only the IDs of the
+        // run's strong hash. Files that appear after the listing stay,
+        // because a later run can own them, and so does an entry that is
+        // not a file, or a hidden name that is not a temporary, such as
+        // the name that an NFS client gives to a removed file that is
+        // still open (DESIGN.md §5.6).
         with_home(|_| {
-            let ours = ListStore::receiver_side(&[1; 16], &[2; 16]);
-            let other = ListStore::receiver_side(&[3; 16], &[2; 16]);
-            let encoded = crate::hashlist::encode(&[]);
-            for store in [&ours, &other] {
-                let id = ListId {
-                    algorithm: StrongHash::Blake3,
-                    digest: StrongHash::Blake3.digest(&encoded),
-                };
-                store.publish(&id, &encoded);
+            let store = ListStore::new("remote-hashlists", &[6; 16], &[7; 16]);
+            let (older, older_bytes) = list(&[1]);
+            let (target, target_bytes) = list(&[2]);
+            store.publish(&older, &older_bytes);
+            store.publish(&target, &target_bytes);
+            let other_hash = format!("sha256-{}.cache", hex(&[8; 32]));
+            let abandoned = temporary_name();
+            let nfs = ".nfs000000000123456700000001";
+            for name in [other_hash.as_str(), "junk.cache", abandoned.as_str(), nfs] {
+                std::fs::write(store.dir.join(name), b"x").unwrap();
             }
-            ours.remove_all();
-            assert_eq!(std::fs::read_dir(&ours.dir).unwrap().count(), 0);
-            assert_eq!(std::fs::read_dir(&other.dir).unwrap().count(), 1);
-            // A directory that never held lists is fine.
-            ListStore::receiver_side(&[9; 16], &[2; 16]).remove_all();
+            std::fs::create_dir(store.dir.join("directory.cache")).unwrap();
+
+            let mut exchange = Exchange::sender(&[6; 16], &[7; 16]);
+            let mut advertised = exchange.listed_ids(StrongHash::Blake3);
+            advertised.sort();
+            let mut expected = vec![older.digest, target.digest];
+            expected.sort();
+            assert_eq!(advertised, expected);
+
+            let (later, later_bytes) = list(&[3]);
+            store.publish(&later, &later_bytes);
+            let later_temporary = temporary_name();
+            std::fs::write(store.dir.join(&later_temporary), b"x").unwrap();
+            exchange.publish(&target, &target_bytes);
+            exchange.finish(u64::MAX);
+
+            let mut expected = vec![
+                later_temporary,
+                nfs.to_owned(),
+                "directory.cache".to_owned(),
+                ListStore::file_name(&later),
+                ListStore::file_name(&target),
+            ];
+            expected.sort();
+            assert_eq!(names(&store.dir), expected);
         });
+    }
+
+    #[test]
+    fn an_exchange_without_a_target_removes_every_listed_file() {
+        // With caching disabled, a side publishes no target, and the end of
+        // the exchange removes every listed file, lists and temporaries,
+        // only in its own directory. Expiry then removes the empty
+        // directory (DESIGN.md §5.6).
+        with_home(|_| {
+            let ours = ListStore::new("local-hashlists", &[1; 16], &[2; 16]);
+            let other = ListStore::new("local-hashlists", &[3; 16], &[2; 16]);
+            let (id, encoded) = list(&[]);
+            ours.publish(&id, &encoded);
+            other.publish(&id, &encoded);
+            std::fs::write(ours.dir.join(temporary_name()), b"x").unwrap();
+            Exchange::receiver(&[1; 16], &[2; 16]).finish(u64::MAX);
+            assert!(!ours.dir.exists(), "the empty directory must be removed");
+            assert_eq!(names(&other.dir), [ListStore::file_name(&id)]);
+            // A directory that never held lists is fine.
+            Exchange::receiver(&[9; 16], &[2; 16]).finish(u64::MAX);
+        });
+    }
+
+    #[test]
+    fn a_list_published_again_after_the_listing_stays() {
+        // A later run can publish a listed list again under the same name,
+        // when its index has returned to an earlier state. The end of the
+        // exchange removes a listed name only if it still names the listed
+        // file, so the new file stays, and no temporary is left behind
+        // (DESIGN.md §5.6).
+        with_home(|_| {
+            let store = ListStore::new("remote-hashlists", &[4; 16], &[5; 16]);
+            let (again, again_bytes) = list(&[1]);
+            let (target, target_bytes) = list(&[2]);
+            store.publish(&again, &again_bytes);
+            let mut exchange = Exchange::sender(&[4; 16], &[5; 16]);
+            store.publish(&again, &again_bytes);
+            exchange.publish(&target, &target_bytes);
+            exchange.finish(u64::MAX);
+            let mut expected = vec![ListStore::file_name(&again), ListStore::file_name(&target)];
+            expected.sort();
+            assert_eq!(names(&store.dir), expected);
+            assert_eq!(store.read(&again).unwrap(), again_bytes);
+        });
+    }
+
+    #[test]
+    fn publication_creates_its_directory_again() {
+        // Expiry removes a directory when it is empty, also just after a
+        // concurrent publication created it. Then the creation of the
+        // temporary fails with ENOENT, and publication creates the
+        // directory again (DESIGN.md §5.6). The first publication in a
+        // directory takes the same path.
+        with_home(|_| {
+            let store = ListStore::new("local-hashlists", &[8; 16], &[9; 16]);
+            let (id, encoded) = list(&[5]);
+            store.publish(&id, &encoded);
+            std::fs::remove_file(store.dir.join(ListStore::file_name(&id))).unwrap();
+            std::fs::remove_dir(&store.dir).unwrap();
+            store.publish(&id, &encoded);
+            assert_eq!(store.read(&id).unwrap(), encoded);
+        });
+    }
+
+    #[test]
+    fn a_directory_gone_before_its_fsync_is_absence() {
+        // A concurrent cleanup can remove a published list, and expiry then
+        // its directory, before the publication makes the entries durable.
+        // The file is gone, so this is absence, not a failure (DESIGN.md
+        // §5.6).
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        std::fs::create_dir(&base).unwrap();
+        assert!(sync_entries(&base, &base.join("list")));
+        assert!(!sync_entries(&base, &base.join("gone/list")));
     }
 
     #[test]
@@ -564,7 +948,7 @@ mod tests {
         // its rename (DESIGN.md §5.6). Publication continues without the
         // file, as if the cleanup had removed it just after the rename.
         let dir = tempfile::tempdir().unwrap();
-        let temp = dir.path().join(".temporary");
+        let temp = dir.path().join(temporary_name());
         let path = dir.path().join("blake3-list.cache");
         std::fs::write(&temp, b"list").unwrap();
         std::fs::remove_file(&temp).unwrap();
@@ -581,14 +965,10 @@ mod tests {
     #[test]
     fn expiry_removes_old_files_and_keeps_fresh_ones() {
         with_home(|_| {
-            let store = ListStore::sender_side(&[4; 16], &[5; 16]);
-            let encoded = crate::hashlist::encode(&[7]);
-            let id = ListId {
-                algorithm: StrongHash::Blake3,
-                digest: StrongHash::Blake3.digest(&encoded),
-            };
+            let store = ListStore::new("remote-hashlists", &[4; 16], &[5; 16]);
+            let (id, encoded) = list(&[7]);
             store.publish(&id, &encoded);
-            std::fs::write(store.dir.join(".abandoned-temp"), b"x").unwrap();
+            std::fs::write(store.dir.join(temporary_name()), b"x").unwrap();
 
             // A fresh file survives any positive age bound, and `ctime`
             // cannot be faked: test the boundary with clocks set from the
@@ -605,10 +985,17 @@ mod tests {
             expire_tree(&cache_root().join("remote-hashlists"), first, 3600);
             assert_eq!(std::fs::read_dir(&store.dir).unwrap().count(), 2);
 
+            // A directory with an entry that is not a file stays: that
+            // entry is not part of the cache layout, and expiry keeps it.
+            let other = cache_root().join("remote-hashlists/other");
+            std::fs::create_dir_all(other.join("entry")).unwrap();
+
             // One hour after the last file was made, both the list and the
-            // hidden temporary are older than a half-hour bound.
+            // hidden temporary are older than a half-hour bound. Then the
+            // directory is empty, and expiry removes it too.
             expire_tree(&cache_root().join("remote-hashlists"), last + 3600, 1800);
-            assert_eq!(std::fs::read_dir(&store.dir).unwrap().count(), 0);
+            assert!(!store.dir.exists(), "the empty directory must be removed");
+            assert!(other.join("entry").exists());
 
             // A missing tree is normal absence.
             expire_tree(&cache_root().join("no-such-tree"), first, 0);

@@ -22,6 +22,7 @@ mod hashtable;
 mod index;
 mod input;
 mod lookup;
+mod names;
 mod pins;
 mod pool;
 mod protocol;

@@ -207,22 +207,20 @@ impl ReceiverHello {
 
 /// HELLO, sender to receiver. The sender sends it only after it
 /// accepted the receiver's HELLO, so it does not repeat those
-/// parameters. The base's digest uses the run's strong hash.
+/// parameters. The IDs of the advertised lists are digests of the run's
+/// strong hash (DESIGN.md §5.6).
 pub struct SenderHello {
     pub account_id: [u8; 16],
-    pub base: Option<Strong>,
+    pub lists: Vec<Strong>,
 }
 
 impl SenderHello {
     pub fn encode(&self) -> Vec<u8> {
         let mut enc = Enc::new();
         enc.raw(&self.account_id);
-        match &self.base {
-            None => enc.u8(0),
-            Some(base) => {
-                enc.u8(1);
-                enc.raw(base);
-            }
+        enc.u32(list_len(self.lists.len()));
+        for list in &self.lists {
+            enc.raw(list);
         }
         enc.buf
     }
@@ -231,10 +229,7 @@ impl SenderHello {
         let mut dec = Dec::new(payload, "HELLO");
         let hello = SenderHello {
             account_id: dec.array(),
-            base: match dec.flag() {
-                false => None,
-                true => Some(dec.array()),
-            },
+            lists: dec.list(Dec::array),
         };
         dec.done();
         hello
@@ -1238,16 +1233,19 @@ mod tests {
     }
 
     #[test]
-    fn sender_hello_roundtrips_with_and_without_base() {
+    fn sender_hello_roundtrips_with_and_without_lists() {
         let mut hello = SenderHello {
             account_id: [1; 16],
-            base: None,
+            lists: Vec::new(),
         };
         let decoded = SenderHello::decode(&hello.encode());
         assert_eq!(decoded.account_id, [1; 16]);
-        assert!(decoded.base.is_none());
-        hello.base = Some([5; 32]);
-        assert_eq!(SenderHello::decode(&hello.encode()).base, Some([5; 32]));
+        assert!(decoded.lists.is_empty());
+        hello.lists = vec![[5; 32], [6; 32]];
+        assert_eq!(
+            SenderHello::decode(&hello.encode()).lists,
+            [[5; 32], [6; 32]]
+        );
     }
 
     #[test]

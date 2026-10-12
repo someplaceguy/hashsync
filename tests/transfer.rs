@@ -1007,6 +1007,21 @@ fn cache_failures_are_fatal_on_either_side() {
 
     // Writable again: the run succeeds.
     transfer.run_ok(&refs(&command));
+
+    // Publication creates its directory again when expiry removed it, but
+    // a symlink to a directory that does not exist, in the place of the
+    // directory, must fail the run and not make it try forever (DESIGN.md
+    // §5.6).
+    let dir = transfer.peer_dir("receiver", "local-hashlists").unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::os::unix::fs::symlink(transfer.env.path("missing"), &dir).unwrap();
+    let output = transfer.run(&[], &refs(&command));
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot create ") && stderr.contains("/hashsync/local-hashlists/"),
+        "receiver cache failure:\n{stderr}"
+    );
 }
 
 #[test]
@@ -1842,19 +1857,90 @@ fn sender_cache_false_stores_nothing_and_removes_earlier_lists() {
     transfer.run_ok(&refs(&command));
     assert_eq!(transfer.cache_files("sender", "remote-hashlists").len(), 1);
 
-    // Then disable it: the earlier list for this receiver/index is
-    // removed and nothing new is stored (DESIGN.md §5.6).
+    // Then disable it: neither side stores a list for this peer and
+    // index, and both remove their earlier lists. Expiry then removes the
+    // empty directories (DESIGN.md §5.6).
     transfer.reconfigure(
         env!("CARGO_BIN_EXE_hashsync").as_bytes(),
         "sender_cache = false\n",
     );
     transfer.run_ok(&refs(&command));
-    assert_eq!(transfer.cache_files("sender", "remote-hashlists").len(), 0);
-    assert_eq!(
-        transfer.cache_files("receiver", "local-hashlists").len(),
-        1,
-        "the receiver still persists its target"
-    );
+    assert_eq!(transfer.peer_dir("sender", "remote-hashlists"), None);
+    assert_eq!(transfer.peer_dir("receiver", "local-hashlists"), None);
+}
+
+#[test]
+fn each_side_keeps_only_its_latest_list() {
+    // Each side lists its directory for the peer and index when its part
+    // of the exchange starts, and at the end removes the listed files
+    // except its target: the list that the new target replaces, and the
+    // list and the temporary that failed runs left. Expiry removes the
+    // empty directories of other peers and indexes (DESIGN.md §5.6).
+    let transfer = Transfer::new("");
+    transfer.env.write("tree/data", &common::tiled(8, 5));
+    let command = args(&["true"]);
+    transfer.run_ok(&refs(&command));
+    let first = transfer.cache_files("receiver", "local-hashlists");
+    assert_eq!(first.len(), 1, "receiver cache: {first:?}");
+    assert_eq!(transfer.cache_files("sender", "remote-hashlists"), first);
+
+    // A list and a temporary that failed runs left, and an empty
+    // directory, on each side.
+    let leftover = format!("blake3-{}.cache", "0".repeat(64));
+    let temporary = ".hashsync-0123456789abcdef";
+    for (side, tree) in [
+        ("receiver", "local-hashlists"),
+        ("sender", "remote-hashlists"),
+    ] {
+        let dir = transfer.peer_dir(side, tree).unwrap();
+        std::fs::write(dir.join(&leftover), b"").unwrap();
+        std::fs::write(dir.join(temporary), b"").unwrap();
+        std::fs::create_dir(dir.with_file_name("empty")).unwrap();
+    }
+
+    // A changed index has a new target.
+    transfer.env.write("tree/more", &common::tiled(8, 6));
+    transfer.run_ok(&refs(&command));
+    let second = transfer.cache_files("receiver", "local-hashlists");
+    assert_eq!(second.len(), 1, "receiver cache: {second:?}");
+    assert!(second[0].ends_with(".cache") && !first.contains(&second[0]));
+    // `cache_files` also checks that the empty directory is gone.
+    assert_eq!(transfer.cache_files("sender", "remote-hashlists"), second);
+}
+
+#[test]
+fn an_empty_cache_directory_that_cannot_be_removed_only_warns() {
+    // Expiry removes empty peer/index directories on both sides. A
+    // failure to remove one does not end the run: it warns, and the
+    // directory stays until a later run (DESIGN.md §5.6). A read-only
+    // tree lets the run publish in its existing directory, but not
+    // remove the other directory.
+    let transfer = Transfer::new("");
+    let command = args(&["true"]);
+    transfer.run_ok(&refs(&command));
+    let trees = [
+        "receiver/cache/hashsync/local-hashlists",
+        "sender/home/.cache/hashsync/remote-hashlists",
+    ];
+    for tree in trees {
+        transfer.env.mkdir(format!("{tree}/stale"));
+        transfer.env.chmod(tree, 0o555);
+    }
+    let output = transfer.run_ok(&refs(&command));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for tree in trees {
+        transfer.env.chmod(tree, 0o755);
+        let stale = transfer.env.path(format!("{tree}/stale"));
+        let warning = format!("warning: cannot remove {}: ", stale.display());
+        assert!(stderr.contains(&warning), "missing {warning:?}:\n{stderr}");
+        assert!(stale.exists());
+    }
+
+    // Writable again: the next run removes the directories.
+    transfer.run_ok(&refs(&command));
+    for tree in trees {
+        assert!(!transfer.env.path(format!("{tree}/stale")).exists());
+    }
 }
 
 #[test]
@@ -1931,13 +2017,13 @@ fn a_sender_with_another_protocol_version_is_rejected() {
 }
 
 /// The data frames of a fake sender, from HELLO through END: an account ID
-/// and no base in HELLO, then CACHE_RESULT, `output` in one LIT, and END
-/// with status 0 and no error text. They are plain frames, so a run that
-/// gets them needs `compression_level = 0`: with compression, the frames
-/// after HELLO would form a zstd frame.
+/// and no advertised list in HELLO, then CACHE_RESULT, `output` in one
+/// LIT, and END with status 0 and no error text. They are plain frames, so
+/// a run that gets them needs `compression_level = 0`: with compression,
+/// the frames after HELLO would form a zstd frame.
 fn fake_frames(output: &[u8]) -> Vec<u8> {
     let mut hello = vec![0x11; 16];
-    hello.push(0);
+    hello.extend_from_slice(&0u32.to_le_bytes());
     [
         frame(HELLO, &hello),
         frame(CACHE_RESULT, b""),

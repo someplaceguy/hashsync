@@ -68,10 +68,13 @@ asynchronous runtime or event loop.
    tmp_data directory (section 6.5), and starts data and control SSH
    sessions to the sender. It reads the data session through a spool.
 3. After both sides exchange protocol versions, HELLO negotiates parameters
-   and cached lists. The receiver durably publishes its target list, then
-   sends a full list, a delta, or confirmation that the sender's list is
-   current. The sender verifies it, builds its table, durably publishes it
-   when caching is enabled, and acknowledges the accepted target.
+   and cached lists. With sender caching enabled, the receiver durably
+   publishes its target list. It sends a full list, a delta, or
+   confirmation that the sender's list is current. The sender verifies it,
+   builds its table, and durably publishes it when caching is enabled.
+   Then it removes its other cached lists for this peer and index,
+   expires old cache files, and acknowledges the accepted target. On the
+   acknowledgement, the receiver does the same cleanup (section 5.6).
 4. The sender starts the command, whose stdout goes through a spool: the
    command waits for the transfer only when `sender_output_spool_limit`
    bytes wait in the spool. The scanner sends literals for misses, runs for
@@ -680,8 +683,8 @@ bytes, excluding the wrapper and peer identities.
 
 For both roles, a failed cache directory or file operation ends the run
 with `die`. This covers every operation, including publication, renewal,
-expiry, cleanup for `sender_cache = false`, and the removal of invalid
-files and abandoned temporaries, with two exceptions:
+the removal of listed and invalid files, and expiry, with three
+exceptions:
 
 - Absence is normal. An absent cached list is a cache miss. Missing cache
   directories during lookup or cleanup, and files that disappear during
@@ -692,43 +695,59 @@ files and abandoned temporaries, with two exceptions:
   list encodings, unsupported formats, and list bytes whose digest does not
   match the list ID in the file name. An I/O error while reading a file is
   fatal; successfully reading invalid contents is not.
+- A failure to remove an empty peer/index directory only prints a
+  warning, and the directory stays. A directory that is no longer empty,
+  or that is already gone, is normal and gets no warning.
 
 Validation failures in lists received over the protocol follow the
 exchange rules below.
 
 **Exchange.**
 
-1. Export and hash the target from one database snapshot. Once the sender's
-   account is known, durably publish the target in its receiver-side peer
-   directory before sending list data. Retain bytes or an open fd.
-   Failure to persist the receiver's target ends setup.
-2. The sender advertises its valid list with greatest `ctime`, breaking
-   ties by filename byte order, or explicit absence. Verify files before use
-   and retain the selected base.
-3. Equal IDs use HASHKEEP. Otherwise the receiver searches all its
-   `local-hashlists/*/*.cache` directories for the advertised base and
-   verifies it. A missing or damaged base uses HASHLIST. With a base, merge
-   sorted sets and encode removed and added values as lists; use HASHDELTA
-   only when smaller than the full transfer.
-4. The sender decodes or applies the delta, re-encodes canonically, and
-   verifies the full target digest. A bad delta requests HASHLIST once via
-   HASHFULL; the result of the bad delta is never published or used for
-   the table. A bad full list is a protocol error. HASHKEEP uses the
-   retained, verified base.
-5. Build the table and durably publish the verified target on the sender.
-   Reply CACHE_RESULT only after publication.
-   Then remove the advertised old file from that peer/index directory if
-   its ID differs.
-6. On CACHE_RESULT, the receiver may remove that exchange's old list from
-   its peer/index directory, unless it equals the target. On lost
-   acknowledgement, retain it until expiry. Never remove matching files
-   from other peer/index directories as part of this cleanup.
+A side's *listing* is the names of the lists and hidden temporaries in its
+peer/index directory when it lists the directory, with an open file for
+each list. The name of a hidden temporary starts with `.hashsync-`
+(section 11). Other hidden names are not part of the cache layout, and
+only expiry removes them. For example, an NFS client gives such a name to
+a removed file that is still open, and the removal of that name fails
+while the file is open.
 
-`sender_cache = false` advertises no base, stores nothing, removes earlier
-files in that receiver/index directory, and sends the same CACHE_RESULT
-after verification, table construction, and removal.
-The receiver still durably publishes its target. The negotiated setting
-determines whether the sender publishes; no storage-success flag is needed.
+1. Export and hash the target from one database snapshot. Once the sender's
+   account is known, the receiver lists its peer/index directory. With
+   sender caching enabled, it then durably publishes the target there
+   before sending list data, and retains bytes or an open fd. Failure to
+   persist the receiver's target ends setup.
+2. Before it sends HELLO, the sender lists its peer/index directory. With
+   sender caching enabled, it advertises the IDs of all listed lists of
+   the run's strong hash, usually one; otherwise none.
+3. If the target is one of the advertised lists, the receiver uses
+   HASHKEEP. Otherwise it searches all its `local-hashlists/*/*.cache`
+   directories for the advertised lists, in their order, and verifies the
+   first one that it finds. A missing or damaged base uses HASHLIST. With a
+   base, merge sorted sets and encode removed and added values as lists;
+   use HASHDELTA, which names the base, only when smaller than the full
+   transfer.
+4. The sender reads the list that HASHDELTA or HASHKEEP names through the
+   open file of its listing, and verifies it. It decodes or applies the
+   delta, re-encodes canonically, and verifies the full target digest. An
+   invalid listed list or a bad delta requests HASHLIST once via HASHFULL;
+   the result of a bad delta is never published or used for the table. A
+   bad full list is a protocol error.
+5. The sender builds the table, durably publishes the verified target
+   when sender caching is enabled, ends its exchange, and only then
+   replies CACHE_RESULT.
+6. On CACHE_RESULT, the receiver ends its exchange. Without CACHE_RESULT,
+   it removes nothing.
+
+To end its exchange, a side renews its published target, and the receiver
+also the base that it used. It removes the files of its listing except
+its published target, and then expires the cache (below). The removal of
+listed files touches no other peer/index directory.
+
+`sender_cache = false` advertises no list, and neither side publishes one,
+so the end of the exchange removes every listed file. The negotiated
+setting determines whether each side publishes; no storage-success flag is
+needed.
 
 **Publication, concurrency, and expiry.**
 
@@ -736,7 +755,13 @@ Publish complete files using a unique hidden temporary, file fsync, rename
 to the content-derived name, and directory fsync. Make new directory
 hierarchies durable too. Republish even an existing target ID rather than
 trusting its filename; HASHKEEP can copy its retained verified bytes.
-Published files are never edited in place.
+Published files are never edited in place. When the temporary cannot be
+created because its directory is missing, create the directory and try
+again: expiry can remove an empty directory at any time, also just after
+its creation. Once the temporary exists, the directory is not empty, and
+expiry cannot remove it. A directory that is gone at the fsync after the
+rename means that a concurrent cleanup removed the file: this is normal
+absence.
 
 No cache locks or mutable current-list pointer are needed. Retained fds or
 bytes survive replacement and unlink. Tolerate disappearance during directory
@@ -748,17 +773,37 @@ the published file just after publication. With sender caching enabled,
 acknowledgement promises completed publication, not immunity from later
 deletion.
 
-Touch verified files through their open descriptors after successful use.
-The sender renews its published target; the receiver renews its target and any
-base used after receiving CACHE_RESULT. Use `ctime` as the renewal marker.
-After the exchange, both sides expire files in both local and remote cache
-trees older than `hashlist_max_age` (default 90 days, sent in HELLO), and
-abandoned hidden temporaries of the same age. Equal base and target IDs
-never justify deleting the current target.
+A run with another target starts only after this run's receiver has ended
+(section 4.4). The sender lists its directory before it sends HELLO, and
+ends its exchange only after HASHLIST, HASHDELTA, or HASHKEEP, which its
+receiver sends only after it received that HELLO. So no exchange that ends
+has a listing that holds the target of a later run, also when a sender
+outlives its failed receiver. A later run can still publish a listed list
+again under the same name, when its index has returned to an earlier
+state. So a side removes a listed list only if its name still names the
+listed file: it moves the name to a new temporary name, compares the file
+there with its open file, removes it if they are the same, and moves any
+other file back. A listed temporary belongs to an earlier run, or to a
+concurrent run with the same target, which then publishes nothing: normal
+absence.
 
-Retained versions and lost acknowledgements may leave extra files. Database
-restore or rebuild needs no cache repair or publication checkpoint because
-lists identify their own content.
+The end of an exchange and expiry can remove the base of a concurrent
+exchange at any time. So each side reads its base once, through one open
+file, verifies the bytes that it read, and uses only these bytes, or that
+file, until the end of the exchange: the sender through the file of its
+listing. Neither side opens a list by name a second time.
+
+Touch verified files through their open descriptors after successful use.
+Use `ctime` as the renewal marker. To expire the cache, a side removes
+every file in every peer/index directory of both cache trees whose `ctime`
+is older than `hashlist_max_age` (default 30 days, sent in HELLO): lists
+and abandoned hidden temporaries. Then it removes every peer/index
+directory that is empty.
+
+A lost acknowledgement or a failed run can leave extra files until the
+next exchange of that peer and index, or until expiry. Database restore or
+rebuild needs no cache repair or publication checkpoint because lists
+identify their own content.
 
 ## 6. The transfer protocol
 
@@ -856,11 +901,10 @@ Strings and byte strings have a `u32` byte length; lists have a `u32` item
 count. Output offsets and lengths are `u64`; overflow is a protocol error.
 
 `S` is the negotiated strong algorithm's full digest length. Every digest of
-the run uses that algorithm, including the list IDs of the target and the
-base, so a list ID travels as its digest alone, `[u8; S]`. An optional
-digest begins with a 0/1 presence byte. A run has one target and at most
-one base; the HELLOs name them, and later frames refer to them without
-repeating them.
+the run uses that algorithm, including all list IDs, so a list ID travels
+as its digest alone, `[u8; S]`. A run has one target and at most one base:
+the receiver's HELLO names the target, and HASHDELTA names the base, one of
+the lists that the sender's HELLO advertises.
 
 | Session | Direction | Types |
 |---|---|---|
@@ -879,18 +923,20 @@ Payloads:
   `sender_output_spool_limit u64` and `sender_input_spool_limit u64` (bytes;
   `2^64 − 1` for `unlimited`), `output_delivery u8` (0 for eager, 1 for
   batch), and `command`, a list of argv byte strings.
-- HELLO, sender to receiver: `account_id [u8; 16]` and an optional
-  `base [u8; S]`.
+- HELLO, sender to receiver: `account_id [u8; 16]`, and `lists`, a list of
+  the IDs `[u8; S]` of the advertised lists (section 5.6).
 - HASHLIST: `length u64`. That many encoded bytes of the target follow the
   frame directly.
-- HASHDELTA: `removed_length u64, added_length u64`. The removed and added
-  encoded lists follow the frame directly. They change the advertised base
-  into the target.
-- HASHKEEP: empty. The advertised base is the target; no data follows.
+- HASHDELTA: `base [u8; S], removed_length u64, added_length u64`. The
+  removed and added encoded lists follow the frame directly. They change
+  the base, one of the advertised lists, into the target.
+- HASHKEEP: empty. The target is one of the advertised lists; no data
+  follows.
 - List bytes after HASHLIST and HASHDELTA are not frames. Enforce exact
   lengths and canonical encoding, including ordering and padding.
-- HASHFULL: empty. Request a full list once after a delta digest mismatch,
-  before command output (section 5.6). The response is HASHLIST.
+- HASHFULL: empty. Request a full list once when the listed list that
+  HASHDELTA or HASHKEEP names is invalid, or after a delta digest
+  mismatch, before command output (section 5.6). The response is HASHLIST.
 - CACHE_RESULT: empty. The sender's single acknowledgement of the target
   (section 5.6). A repeated one is a protocol error. The receiver sends the
   input only after it.
@@ -928,7 +974,7 @@ reads the target, whose length depends on it. Its HELLO does not repeat
 them.
 
 The data handshake is the version exchange, the features, receiver HELLO,
-sender HELLO, durable receiver publication, then
+sender HELLO, durable receiver publication with sender caching, then
 HASHLIST/HASHDELTA/HASHKEEP and its data. The sender replies with
 CACHE_RESULT, possibly after one HASHFULL fallback. The receiver handles the
 result and cache cleanup before entering its output loop. Its remaining
@@ -1709,7 +1755,8 @@ rather than exiting ahead of it:
   a fatal exit, every end restores them, also the normal end.
 - Process exit closes the unlinked segments of both roles, which frees all
   their storage.
-- Abandoned cache temporaries remain for expiry.
+- Abandoned cache temporaries remain until the next exchange of that peer
+  and index, or until expiry (section 5.6).
 
 Build with `panic = "abort"`; install a panic hook that performs the same
 cleanup before aborting. External failures use `die`; bugs and database
@@ -1852,7 +1899,7 @@ Use `$XDG_CONFIG_HOME/hashsync/config.toml`, or `--config PATH`:
 block_size     = "16KiB"   # at least 512 bytes; changes rebuild the index
 strong_hash    = "blake3"  # blake3 or sha256
 candidate_attempts = 128  # candidates tried per query, at least 1
-hashlist_max_age = "90d"
+hashlist_max_age = "30d"
 index_path     = "~/.local/state/hashsync/default.db"  # a directory
 threads        = 0         # 0 = 4 × cores, clamped to 16–64
 lookahead      = "256MiB"  # at least block_size; default max(256 MiB, 3 × block_size), for the probe threads
@@ -2040,6 +2087,15 @@ decision history, including fuller measurements, is in version control.
 - **Reconciliation sketches or range recursion:** add decoding/fallback
   complexity or transfer poorly when changes are spread throughout the
   uniform hash space. Cached full lists allow straightforward direct deltas.
+- **Removing only the advertised base after an exchange:** leaves the lists
+  of failed exchanges until expiry. Removing every other list found after
+  publication can remove the target of a later run, when a sender
+  outlives its failed receiver. A listing made before the sender's HELLO
+  needs no clock and holds no later target (section 5.6).
+- **Advertising only the sender's newest list, by `ctime`:** depends on the
+  clock, and a sender that outlives its failed receiver can publish a
+  newer list that the receiver no longer has; the next run then transfers
+  the full list. The sender advertises every listed list instead.
 - **Independent scanners for parts of the output:** skipped windows can
   cross a reference chosen by another scanner and leave possible matches
   unexamined. One scanner owns all offset decisions.
@@ -2268,6 +2324,11 @@ decision history, including fuller measurements, is in version control.
   the frames that the zstd streams carry. New weak and strong hashes are the
   exception: HELLO names both, and a sender that does not support them
   ends the run before command startup (section 6.2).
+- The name of every temporary file of this program is `.hashsync-` and
+  16 random hexadecimal digits: the cache temporaries, the temporary of
+  the account ID, and the segment files without `O_TMPFILE`. Then a file
+  that a failed run leaves shows its owner, and the cache can tell its
+  temporaries apart from other hidden names (section 5.6).
 - Run `cargo fmt`, `cargo clippy --all-targets`, and `cargo test` for
   implementation changes.
 - Test every rule of this document. Use separate processes for locking
@@ -2323,7 +2384,11 @@ decision history, including fuller measurements, is in version control.
     different protocol version on either side, detected before the
     features; feature bits that a side does not know, on either side;
   - crash recovery, process exclusion, and reads of later commits; cache
-    races, fatal cache I/O failures, and invalid cached lists;
+    races, also a publication whose directory is gone and a listed name
+    that a later run published again; fatal cache I/O failures, and a
+    warning for an empty directory that stays; the advertisement and
+    removal of listed files, hidden names that are not temporaries, and
+    the removal of empty directories; and invalid cached lists;
   - completion without truncation or premature exit; complete stderr
     forwarding with backpressure and late stderr EOF from descendants;
     truncated compression trailers; compressed control traffic that the

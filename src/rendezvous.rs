@@ -17,16 +17,16 @@ use rustix::event::{PollFd, PollFlags};
 use rustix::fs::{FileType, Mode, OFlags};
 use rustix::io::retry_on_intr;
 
-use crate::cache;
 use crate::die::{self, die};
 use crate::fsops::{any_ready, retry_interrupted};
+use crate::names;
 
 const RETRY_INTERVAL: Duration = Duration::from_millis(20);
 
 /// A fresh rendezvous token: the receiver generates it, both sender
 /// entry points receive it with `--token`.
 pub fn new_token() -> String {
-    cache::hex(&cache::random_bytes::<16>())
+    names::hex(&names::random_bytes::<16>())
 }
 
 /// The token as a safe path component: exactly the form `new_token`

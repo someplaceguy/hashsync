@@ -39,7 +39,7 @@ use std::time::Instant;
 use bstr::ByteSlice;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 
-use crate::cache::{self, ListStore};
+use crate::cache::{self, Exchange};
 use crate::config::Config;
 use crate::die::{self, die};
 use crate::fsid::FsCache;
@@ -224,11 +224,16 @@ pub fn run(
     let compressed = hello.compression_level != 0;
     let mut data_in = FrameReader::new(Decompressor::new(data_in.into_inner(), compressed));
 
-    // Durably publish the target in the sender's peer directory before
-    // sending list data; a publication failure is fatal and ends setup
-    // (DESIGN.md §5.6).
-    let store = ListStore::receiver_side(&sender.account_id, &meta.index_id);
-    let published = store.publish(&target, &encoded);
+    // This side's part of the exchange lists its directory for the sender
+    // and the index. With sender caching, it durably publishes the target
+    // there before sending list data, so that this side has every list
+    // that the sender can advertise later; a publication failure is fatal
+    // and ends setup. Without sender caching, the sender keeps no list,
+    // so this side keeps none either (DESIGN.md §5.6).
+    let mut exchange = Exchange::receiver(&sender.account_id, &meta.index_id);
+    if hello.sender_cache {
+        exchange.publish(&target, &encoded);
+    }
 
     // The full list, whose bytes follow HASHLIST directly; cached bases
     // and deltas arrive with PLAN.md step 8.
@@ -249,11 +254,11 @@ pub fn run(
         payload.is_empty(),
         "protocol error: CACHE_RESULT with a payload"
     );
-    // Renew the target after CACHE_RESULT; with a base this would renew
-    // it too (DESIGN.md §5.6). Then expire both cache trees.
-    published.renew();
-    drop(published);
-    cache::expire(config.hashlist_max_age);
+    // After CACHE_RESULT, the sender holds the target, or no list with
+    // caching disabled. The end of this side's part of the exchange keeps
+    // the same: it renews the published target, removes the other listed
+    // files, and expires both cache trees (DESIGN.md §5.6).
+    exchange.finish(config.hashlist_max_age);
 
     // The list exchange is complete: from here on until END, the input
     // writer owns the outgoing direction of the data session, and sends

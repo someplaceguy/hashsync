@@ -445,12 +445,18 @@ impl Serve {
 
     /// The versions and the features, then the data HELLOs: the
     /// receiver's, for the empty list and 4 KiB blocks, then the sender's
-    /// reply.
-    fn hello(&mut self, command: &[&str]) {
-        self.hello_with(4096, &empty_list(), command, 0);
+    /// reply, whose payload this returns.
+    fn hello(&mut self, command: &[&str]) -> Vec<u8> {
+        self.hello_with(4096, &empty_list(), command, 0)
     }
 
-    fn hello_with(&mut self, block_size: u32, list: &[u8], command: &[&str], level: i32) {
+    fn hello_with(
+        &mut self,
+        block_size: u32,
+        list: &[u8],
+        command: &[&str],
+        level: i32,
+    ) -> Vec<u8> {
         let delivery = self.delivery;
         self.send_hello(&hello_payload(
             block_size,
@@ -459,7 +465,7 @@ impl Serve {
             level,
             2 << 30,
             delivery,
-        ));
+        ))
     }
 
     /// The versions, the features, and the data HELLOs, as `hello`
@@ -477,14 +483,17 @@ impl Serve {
         ));
     }
 
-    fn send_hello(&mut self, payload: &[u8]) {
+    /// Returns the payload of the sender's HELLO.
+    fn send_hello(&mut self, payload: &[u8]) -> Vec<u8> {
         self.send_version_and_features();
         self.send(HELLO, payload);
         assert_eq!(
             self.recv_version_and_features(),
             version_and_features(FEATURES)
         );
-        assert_eq!(self.recv().0, HELLO);
+        let (kind, reply) = self.recv();
+        assert_eq!(kind, HELLO);
+        reply
     }
 
     /// Open the control session as the receiver does: connect as
@@ -577,10 +586,10 @@ impl Serve {
     }
 
     /// Wait until `serve` has published the list in its cache, which it
-    /// does right before CACHE_RESULT (DESIGN.md §5.6). No event tells the
-    /// receiver when, so this polls the cache directory, with no deadline:
-    /// a `serve` that neither publishes nor ends hangs the test, and a
-    /// debugger can inspect it.
+    /// does before it ends its exchange and sends CACHE_RESULT (DESIGN.md
+    /// §5.6). No event tells the receiver when, so this polls the cache
+    /// directory, with no deadline: a `serve` that neither publishes nor
+    /// ends hangs the test, and a debugger can inspect it.
     fn wait_for_published_list(&mut self) {
         let dir = self.home.path().join("cache/hashsync/remote-hashlists");
         let published = || {
@@ -678,6 +687,56 @@ fn feature_bits_that_serve_does_not_know_are_ignored() {
             (END, vec![0; 8])
         ]
     );
+    serve.expect_success();
+}
+
+#[test]
+fn serve_advertises_its_listed_lists_and_removes_only_listed_files() {
+    // Before its HELLO, `serve` lists its directory for this receiver and
+    // index, and advertises every listed list of the run's strong hash.
+    // After it published the target, it removes the listed files except
+    // the target: here an older list, a list of another strong hash, and
+    // an abandoned temporary. A file that appears after the listing stays,
+    // because a later run can own it (DESIGN.md §5.6).
+    let hex = |bytes: &[u8]| -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() };
+    let mut serve = Serve::start();
+    let dir = serve.home.path().join(format!(
+        "cache/hashsync/remote-hashlists/{}-{}",
+        "aa".repeat(16),
+        "bb".repeat(16)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let older = [7u8; 32];
+    let listed = [
+        format!("blake3-{}.cache", hex(&older)),
+        format!("sha256-{}.cache", hex(&[8; 32])),
+        ".hashsync-0123456789abcdef".to_owned(),
+    ];
+    for name in &listed {
+        std::fs::write(dir.join(name), b"").unwrap();
+    }
+
+    // The account ID, then the advertised lists: a count and the digests.
+    let reply = serve.hello(&["true"]);
+    assert_eq!(reply[16..], [&1u32.to_le_bytes()[..], &older].concat());
+    let later = format!("blake3-{}.cache", hex(&[9; 32]));
+    std::fs::write(dir.join(&later), b"").unwrap();
+
+    let mut control = serve.control_session(&empty_list(), 0);
+    let frames = serve.recv_through_end(0);
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    let target = format!("blake3-{}.cache", blake3::hash(&empty_list()).to_hex());
+    let mut expected = vec![later, target];
+    expected.sort();
+    assert_eq!(names, expected);
+
+    control.input_stop();
+    serve.end_ack();
+    assert_eq!(frames, [(CACHE_RESULT, Vec::new()), (END, vec![0; 8])]);
     serve.expect_success();
 }
 

@@ -27,9 +27,9 @@ use bstr::ByteSlice;
 use rustix::fs::{AtFlags, Mode, OFlags};
 use rustix::io::{Errno, retry_on_intr};
 
-use crate::cache;
 use crate::die::die;
 use crate::fsops;
+use crate::names;
 
 /// The bytes at which the current segment is full while no sealed segment
 /// is open (DESIGN.md §6.5).
@@ -95,8 +95,9 @@ impl Directory {
 }
 
 /// A new file in `dir` without a name: `O_TMPFILE`, or, where the
-/// filesystem or kernel lacks it, a unique name that is removed before any
-/// data is written (DESIGN.md §6.5). Mode 0600, close-on-exec.
+/// filesystem or kernel lacks it, a unique temporary name
+/// (`names::temporary_name`) that is removed before any data is written
+/// (DESIGN.md §6.5). Mode 0600, close-on-exec.
 fn open_unlinked(dir: BorrowedFd<'_>) -> Result<OwnedFd, Errno> {
     let mode = Mode::from_raw_mode(0o600);
     let tmpfile = OFlags::TMPFILE | OFlags::RDWR | OFlags::CLOEXEC;
@@ -107,7 +108,7 @@ fn open_unlinked(dir: BorrowedFd<'_>) -> Result<OwnedFd, Errno> {
     }
     let named = OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::RDWR | OFlags::CLOEXEC;
     loop {
-        let name = format!(".segment-{}", cache::hex(&cache::random_bytes::<8>()));
+        let name = names::temporary_name();
         match retry_on_intr(|| rustix::fs::openat(dir, name.as_str(), named, mode)) {
             Ok(fd) => {
                 retry_on_intr(|| rustix::fs::unlinkat(dir, name.as_str(), AtFlags::empty()))?;

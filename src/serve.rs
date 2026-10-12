@@ -59,7 +59,7 @@ use bstr::ByteSlice;
 use crossbeam_channel::{Receiver, Select, Sender, TryRecvError, bounded, unbounded};
 use rustix::process::Pid;
 
-use crate::cache::{self, ListStore, PublishedList};
+use crate::cache::{self, Exchange};
 use crate::config::{self, thread_count};
 use crate::die::{self, die};
 use crate::fsops::{self, IdlePointReader, retry_interrupted};
@@ -302,11 +302,21 @@ pub fn run(token: &str) -> ! {
         control_tx.clone(),
     );
     let _ = input_tx.send(input_writer);
+    // This side's part of the exchange lists its directory for the
+    // receiver and the index, and must start before HELLO: then the end
+    // of the exchange cannot remove the target of a later run, even when
+    // this side outlives its receiver. With caching, advertise every
+    // listed list; with caching disabled, none (DESIGN.md §5.6). The
+    // receiver uses the advertised lists from PLAN.md step 8 on; until
+    // then it sends a full list.
+    let mut exchange = Exchange::sender(&hello.account_id, &hello.index_id);
     let reply = SenderHello {
         account_id: cache::account_id(),
-        // Cached-list reuse arrives with PLAN.md step 8: advertise
-        // explicit absence and expect a full list.
-        base: None,
+        lists: if hello.sender_cache {
+            exchange.listed_ids(hello.strong_hash)
+        } else {
+            Vec::new()
+        },
     };
     // The receiver needs HELLO to send the list.
     send_data(&mut data_out, frame::HELLO, &reply.encode());
@@ -369,31 +379,26 @@ pub fn run(token: &str) -> ! {
     let table = HashTable::build(&values);
     drop(values);
 
-    // Durable publication, or cleanup with caching disabled; failures
-    // are fatal inside the cache module (DESIGN.md §5.6). Acknowledge
-    // the accepted target only afterwards, then renew and expire.
-    let store = ListStore::sender_side(&hello.account_id, &hello.index_id);
-    let published: Option<PublishedList> = if hello.sender_cache {
+    // With caching, durably publish the target. Then end this side's part
+    // of the exchange: renew the target, remove the other listed files, or
+    // every listed file with caching disabled, and expire both cache
+    // trees. Failures are fatal inside the cache module. Acknowledge the
+    // accepted target only afterwards (DESIGN.md §5.6).
+    if hello.sender_cache {
         let target = ListId {
             algorithm: hello.strong_hash,
             digest: hello.target,
         };
-        Some(store.publish(&target, &encoded))
-    } else {
-        store.remove_all();
-        None
-    };
+        exchange.publish(&target, &encoded);
+    }
     drop(encoded);
+    exchange.finish(hello.hashlist_max_age);
     // The receiver sends the input only after CACHE_RESULT, and the
     // command can wait for the input before it writes any output: so
     // CACHE_RESULT cannot wait in the stream for that output (DESIGN.md
     // §6.2).
     send_data(&mut data_out, frame::CACHE_RESULT, b"");
     flush_data(&mut data_out);
-    if let Some(list) = &published {
-        list.renew();
-    }
-    cache::expire(hello.hashlist_max_age);
 
     // The receiver's versions on both sessions must match before the
     // command starts (DESIGN.md §6.2). Both sessions stay monitored

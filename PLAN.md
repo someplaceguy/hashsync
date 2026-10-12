@@ -104,16 +104,22 @@ disabled. Block references and compressed output follow in steps 4 and 5.
   current roots and reporting missing or incompatible indexes clearly.
 - Export the full canonical hash list from one index snapshot. Complete
   HELLO, full-list verification, table construction, and `CACHE_RESULT`
-  before command startup. Initially advertise no cached base and always
-  send a full list; cached-list reuse and deltas follow in step 8.
+  before command startup. The sender advertises its listed lists, but the
+  receiver always sends a full list; cached-list reuse and deltas follow
+  in step 8.
 - Introduce account identities and durable list storage with this exchange,
-  applying the specified publication, renewal, and cleanup rules. Preserve
-  correct behavior across concurrent transfers, interrupted publication,
-  missing acknowledgements, database restore, and rebuild.
-- Support `sender_cache = false`, including removal of earlier retained
-  lists for that receiver/index, and `hashlist_max_age` expiry. Cache
-  directory and file operation failures on either role are fatal, with
-  the absence and invalid-content exceptions in DESIGN.md §5.6.
+  applying the specified listing, publication, renewal, and cleanup rules:
+  each side lists its directory for the peer and index when its part of
+  the exchange starts, the sender before its HELLO, and at the end removes
+  the listed files except its target, a name only while it still names the
+  listed file.
+  Preserve correct behavior across concurrent transfers, interrupted
+  publication, missing acknowledgements, database restore, and rebuild.
+- Support `sender_cache = false`, with which neither side keeps a list for
+  that peer and index, and `hashlist_max_age` expiry of lists, abandoned
+  temporaries, and empty peer/index directories. Cache directory and file
+  operation failures on either role are fatal, with the absence,
+  invalid-content, and empty-directory exceptions in DESIGN.md §5.6.
   `CACHE_RESULT` acknowledges the accepted target without a storage-success
   flag; enabled sender caching must publish durably before acknowledgement.
 - Complete only after stdout is validated and flushed, stderr is fully
@@ -234,9 +240,12 @@ Design coverage: §§4.2, 4.4, 8.
 - Reuse a verified unchanged list without retransmitting it. For a changed
   list, use a cached base and a direct delta when it is smaller than the
   full transfer.
-- Advertise the sender's most recent verified list and find bases across
-  the receiver's cached peer histories as specified. A base uses the same
-  strong hash as the target.
+- Find a base among the advertised lists across the receiver's cached peer
+  histories as specified, name it in HASHDELTA, and verify it on both
+  sides. A base uses the same strong hash as the target. Each side reads
+  its base once and keeps the verified bytes, or the open file, until the
+  end of the exchange, the sender through its listing: a concurrent
+  cleanup can remove the file at any time.
 - Fall back to a full list when a base is missing or invalid, or when delta
   verification requests the permitted retry. Remove invalid cached files;
   removal failures are fatal unless the file is already gone. Other cache

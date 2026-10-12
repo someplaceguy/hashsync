@@ -14,14 +14,15 @@ use crate::die::die;
 use crate::fsops;
 use crate::glob;
 use crate::hash::StrongHash;
+use crate::names;
 use crate::protocol::COMPRESSION_LEVELS;
 use crate::ssh;
 
 pub const MIN_BLOCK_SIZE: u64 = 512;
 pub const DEFAULT_BLOCK_SIZE: u32 = 16 * 1024;
 
-/// 90 days (DESIGN.md §5.6), in seconds.
-pub const DEFAULT_HASHLIST_MAX_AGE: u64 = 90 * 24 * 3600;
+/// 30 days (DESIGN.md §5.6), in seconds.
+pub const DEFAULT_HASHLIST_MAX_AGE: u64 = 30 * 24 * 3600;
 
 const DEFAULT_LOOKAHEAD: u64 = 256 << 20;
 const DEFAULT_NEGATIVE_CACHE: u64 = 128 << 20;
@@ -539,14 +540,14 @@ pub fn decode_escapes(text: &str, mode: Escapes) -> Result<Vec<u8>, String> {
         };
         let value = match next {
             b'x' => {
-                let digits = bytes
+                let [value] = bytes
                     .get(i + 2..i + 4)
-                    .filter(|d| d.iter().all(u8::is_ascii_hexdigit))
+                    .and_then(names::parse_hex)
                     .ok_or_else(|| {
                         "malformed \\x escape: expected two hexadecimal digits".to_string()
                     })?;
                 i += 4;
-                u8::from_str_radix(std::str::from_utf8(digits).unwrap(), 16).unwrap()
+                value
             }
             b'\\' => {
                 i += 2;
