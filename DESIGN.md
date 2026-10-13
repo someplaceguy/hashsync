@@ -39,8 +39,9 @@ asynchronous runtime or event loop.
   reference, or a repeated byte value and length.
 - **Query / answer**: a request for a window's full strong hash at an output
   offset, and the receiver's yes/no response.
-- **Pin**: a query offset's verified block, retained by the receiver in its
-  own **extent**: a range of bytes in a segment.
+- **Pin**: a query offset's verified block, retained by the receiver in an
+  **extent**: a range of bytes in a segment. Pins with identical content
+  share one extent (section 6.4).
 - **Segment**: an open, unlinked file in the **tmp_data directory** of a
   host, which holds the extents of pins or the bytes of a spool
   (section 6.5).
@@ -85,9 +86,10 @@ asynchronous runtime or event loop.
    destinations at each idle point of their sources, once the link can
    carry them (section 6.2).
 5. The receiver reads and verifies candidates, and writes each verified
-   block to a pin before it answers yes. The sender emits references for
-   yes answers and rescans rejected windows from the next byte. Output is
-   always emitted in order.
+   block to a pin before it answers yes; a block that a pin already holds
+   needs no lookup. The sender emits references for yes answers and
+   rescans rejected windows from the next byte. Output is always emitted
+   in order.
 6. The receiver reconstructs stdout from its spool of the data session.
    Until `receiver_output_spool_limit` bytes wait in the spool, a blocked
    stdout stops only the reconstruction. After all command stdout is
@@ -101,8 +103,9 @@ asynchronous runtime or event loop.
 **Verification is authoritative.** The index, hash lists, caches, and weak
 hash table are hints. Verify the exact buffer of a candidate before writing
 it to a pin, and the exact buffer read back from a pin before writing it to
-stdout. Both checks use the query's full strong hash. Stale files and
-collisions can reduce deduplication, never change the reconstructed output.
+stdout or to a copy (section 6.4). Both checks use the query's full strong
+hash. Stale files and collisions can reduce deduplication, never change the
+reconstructed output.
 
 **No timeouts.** Waits end when the expected event occurs or a peer,
 descriptor, or process goes away. Slow systems must not fail because of a
@@ -1199,9 +1202,11 @@ Let `B = block_size`. The pins are one user of segments, with extents of
 `B` bytes (section 6.5). The receiver keeps:
 
 - `c`: the output offset of reconstruction.
-- The pin map, from the query offset of each pin to its extent and the
-  full strong hash of its block. Each pin has its own extent, including
-  pins with identical content; extents are independent of output offsets.
+- The pin map, from the query offset of each pin to the full strong hash
+  of its block.
+- The pinned blocks, by full strong hash: the blocks of the pins. Each
+  one has one extent, which all its pins share, and `last`, the highest
+  query offset of its pins. Extents are independent of output offsets.
 - The open segments of the pins.
 - A bounded 256 MiB LRU cache of verified buffers, keyed by full strong
   hash, which can serve candidate lookups. It holds at least one buffer,
@@ -1214,11 +1219,31 @@ segment I/O, and stdout writes occur outside the lock; the file creation
 of step A1 is the one exception, and it occurs once per segment. In-memory
 payload storage is limited to the cache and worker/reconstruction buffers;
 pin metadata and queued requests still scale with outstanding work. The
-receiver releases the extent of a pin when nothing uses it any more: the
-output has passed the pin, or its lookup worker has found its write
-obsolete or has finished it in Completing. The receiver does not reject a
-match merely because many pins exist, and pin release requires no
-protocol message.
+receiver releases an extent when nothing uses it any more: the output has
+passed `last` of its block, a copy has replaced it, or its lookup worker
+has found its write obsolete or unneeded, or has finished it in
+Completing. The receiver does not reject a match merely because many pins
+exist, and pin release requires no protocol message.
+
+A new pin at `x` of a pinned block **shares** the extent of the block,
+with no lookup and no write, when the share keeps no more segments open,
+and no more bytes, than an extent of the pin's own would:
+
+- `x < last`: the extent stays in use until the output passes `last`
+  anyway.
+- The extent is in the current segment: the current segment is never
+  full (section 6.5), so an extent of the pin's own would go to it too,
+  and keep it open until the output passes `x`. `last` becomes `x`.
+- The extent is the only extent of its sealed segment, there is no
+  current segment, and one extent would fill a new segment even with
+  that sealed segment closed. A copy would close that segment and fill a
+  new one alone. `last` becomes `x`.
+
+Otherwise the extent is in a sealed segment and `x > last`. A share would
+keep that segment open for as long as the block recurs: with its released
+extents, or as one more sealed segment where a copy would join other
+extents. So the pin gets a **copy**: a new extent with the bytes of the
+block, which replaces the old extent for all pins of the block.
 
 A pool of 4–8 lookup workers, which share the database handle, answers
 queries out of order. Queue all answers nonblockingly under the lock,
@@ -1228,12 +1253,17 @@ answers from obsolete lookups.
 
 For `QUERY { offset: x, strong: h }`:
 
-1. Under the lock, check `c`. If `x < c`, answer no without a pin.
-   Otherwise try the verified-buffer cache.
-2. If uncached, select blocks matching `h[0..16]` through `strong`. Each
-   path of a block's inode gives one candidate; a block whose inode has no
-   path is one candidate too. Try candidates in any order. Repeated
-   location/offset pairs need only one read.
+1. Under the lock, check `c`. If `x < c`, answer no without a pin. If `h`
+   is pinned and the new pin can share its extent, publish `h` at `x`, and
+   queue yes. Otherwise try the verified-buffer cache.
+2. If uncached and `h` is pinned, read exactly `B` bytes from the extent
+   of `h` with `pread` outside the lock, verify the full digest of that
+   buffer, and continue at step 6: a pinned block needs no index. Segment
+   EOF, read errors, or a digest mismatch end the run with `die`, as for
+   REF. Otherwise, if uncached, select blocks matching `h[0..16]` through
+   `strong`. Each path of a block's inode gives one candidate; a block
+   whose inode has no path is one candidate too. Try candidates in any
+   order. Repeated location/offset pairs need only one read.
 3. Try at most `candidate_attempts` candidates (default 128, positive). Try
    each candidate at every current location of its root until one verifies:
    all copies of an immutable group are searched, and together they use one
@@ -1250,20 +1280,29 @@ For `QUERY { offset: x, strong: h }`:
    candidate; filesystem failures are misses, not fatal. Alternate copies
    need not share the indexed inode identity.
 6. If nothing verified, answer no. Otherwise recheck `c` under the lock. If
-   `x < c`, answer no without an extent. If still needed, allocate an
-   extent under the lock (section 6.5, steps A1 to A3).
+   `x < c`, answer no without an extent. If `h` is pinned now, and the new
+   pin can share its extent, publish the pin as in step 1. If still
+   needed, allocate an extent under the lock (section 6.5, steps A1 to
+   A3).
 7. Outside the lock, write the `B` bytes of the verified buffer to the
    extent with `pwrite`. Segments are open without `O_APPEND`; concurrent
    workers write only their assigned, nonoverlapping extents.
 8. Reacquire the lock and recheck `x < c`. If now obsolete, leave the extent
    unpublished, release it (section 6.5, steps R1 to R3), and answer no.
    In Completing, release the extent without an answer. Otherwise publish
-   `{ extent, strong: h }` at `x` and queue yes.
+   `h` at `x`, and queue yes. All pins of `h` keep the extent of the pin
+   with the highest query offset:
+   - If `h` is not pinned, it is now, with this extent, and `last = x`.
+   - If `x > last`, this extent replaces that of `h`, which is released,
+     and `last = x`.
+   - If `x < last`, another lookup has published a pin of `h` above `x`
+     meanwhile. The pin shares the extent of `h`, and this extent is
+     released.
 
 A yes is binding because the receiver owns an independent copy of the
 verified bytes in a segment. A later source-file change cannot affect
-REF. Output may pass `x` and release its extent before the answer is sent;
-the sender then discards that obsolete answer.
+REF. Output may pass `x` before the answer is sent; the sender then
+discards that obsolete answer.
 
 Reconstruction reads the data session from its spool (section 6.5). Until
 `receiver_output_spool_limit` bytes of the compressed session wait there,
@@ -1274,26 +1313,32 @@ data frames in order at `c`:
 
 - LIT writes its payload; RLE writes the repeated byte. Accept any positive
   RLE length, though the sender emits runs of at least `B`.
-- REF obtains the pin at `c` under the lock. Outside it, read exactly `B`
-  bytes from the pin's extent with `pread`, and verify the full digest
-  against the pin's stored hash before writing that buffer to stdout. Keep
-  the extent in use until the write completes and `c` advances. A missing
-  pin is a protocol error; segment EOF, read errors, or a digest mismatch
-  end the run with `die` without emitting that block or attempting to
-  reread the source file.
+- REF obtains the pin at `c` and the extent of its block under the lock.
+  Outside it, read exactly `B` bytes from that extent with `pread`, and
+  verify the full digest against the pin's hash before writing that
+  buffer to stdout. The pin stays until the write completes and `c`
+  advances. A missing pin is a protocol error; segment EOF, read errors,
+  or a digest mismatch end the run with `die` without emitting that block
+  or attempting to reread the source file.
 - After each frame's output is written, advance `c` under the lock. In
   bounded batches, detach pins whose query offsets are below it, including
-  pins covered by literals or runs, and release their extents (section
-  6.5, steps R1 to R3). After each batch, release the lock and close the
-  files of the segments that the batch removed from the open segments.
+  pins covered by literals or runs. A detached pin at `last` is the last
+  pin of its block: the block is no longer pinned, and its extent is
+  released (section 6.5, steps R1 to R3). After each batch, release the
+  lock and close the files of the segments that the batch removed from the
+  open segments.
 - END carries the command status into shutdown (section 6.9). EOF without
   END or before the compressed stream is complete is failure.
 
 The shared lock makes pin publication and output advancement atomic relative
-to each other: a lookup either publishes before the offset passes and has its
-extent released, or observes the obsolete offset and releases its extent.
-No extent is released while its write or REF read is still using it, so no
-segment is closed while one of its extents is in use.
+to each other: a lookup either publishes before the offset passes, and the
+pin is detached later, or observes the obsolete offset and releases its
+extent. No extent is released while its write is still using it. A read of
+an extent, for REF or for a copy, can end after the release of the extent:
+a copy can replace the extent, and the output can pass `last` during the
+read of a copy. The read still gets the bytes of the extent: it keeps the
+file of the segment open until it ends, and the bytes of an extent never
+change.
 
 ### 6.5 Segments and spools
 
@@ -1370,8 +1415,9 @@ Release an extent, under the lock of the user:
   segment.
 - **R2.** If the count is 0 and the segment is sealed, remove it from the
   open segments, and close its file after the lock is released, on the
-  thread that released the extent. The current segment stays open when
-  its count is 0: it is not full.
+  thread that released the extent, or at the end of a read that still
+  uses the file (section 6.4). The current segment stays open when its
+  count is 0: it is not full.
 - **R3.** If step R2 removed a segment, `n` is now smaller. If the current
   segment is now full, seal it. If its count of extents in use is 0, also
   remove it from the open segments, and close its file as in step R2.
@@ -2190,6 +2236,15 @@ decision history, including fuller measurements, is in version control.
   it large are released. In a simulation, after 8 GiB of pins piled up
   and drained, up to 8 GiB of released bytes stayed allocated, against
   16 MiB with the full rule.
+- **Other rules for pins with identical content:** an extent for each pin
+  wrote the block of each pin again, and looked the block up in the index
+  again when the cache had lost it. A copy for each new pin of a
+  pinned block frees nothing where pins pile up: a released extent frees
+  its storage only when its segment closes, and the other pins of the
+  segment keep it open. Other shares of extents in sealed segments above
+  `last` would let a block that recurs keep a sealed segment open, with
+  all its released extents, for as long as it recurs; each such segment
+  also doubles the size at which the current segment is full.
 - **Spooling the reconstructed output:** it would write every referenced
   block a second time, and every run in full. For 3.29 GB of `/nix/store`
   files, 97% references at 4 KiB blocks, the data session took 6.3 MB, and
@@ -2340,8 +2395,10 @@ decision history, including fuller measurements, is in version control.
   - pins: concurrent lookups, obsolete writes, unaligned block sizes, the
     full rule after each allocation and each closure of a sealed segment,
     the bound on open segments for any release order, sealed segments held
-    open by extents in use, storage failures, corruption detection, and
-    cleanup on exit;
+    open by extents in use, shares and copies of pinned blocks without
+    lookups, also of blocks alone in their segments, while a read uses
+    the extent, and when lookups of one block race, storage failures,
+    corruption detection, and cleanup on exit;
   - spools: limits, segments that close behind the reader, a stop that
     closes all segments and wakes both ends, a consumer of stdout that
     reads nothing, and a producer that waits when both spools of its

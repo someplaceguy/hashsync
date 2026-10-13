@@ -2,20 +2,31 @@
 //! answers promise, kept in extents of segments (DESIGN.md §6.5) until
 //! the output passes their query offsets.
 //!
-//! One lock protects the output offset `c`, the published pins, the open
-//! segments of the pins, the cache of verified blocks, and the queue of
-//! answers, whose closure marks Completing. So a lookup either publishes
-//! its pin before the output passes the pin's offset, and the pin is
-//! released later, or it sees the obsolete offset and releases its extent
-//! at once. An extent is released only after its last use, the REF read or
-//! the lookup's write.
+//! The pins of one block, by full strong hash, share one extent, so a
+//! query for a pinned block needs no lookup. Its pin shares the extent,
+//! with no write, unless the share would keep more segments open, or
+//! more bytes, than an extent of the pin's own would. Then the pin gets a
+//! copy of the block in a new extent, which replaces the old one for all
+//! pins of the block.
+//!
+//! One lock protects the output offset `c`, the published pins, the pinned
+//! blocks, the open segments of the pins, the cache of verified blocks,
+//! and the queue of answers, whose closure marks Completing. So a lookup
+//! either publishes its pin before the output passes the pin's offset, and
+//! the output detaches the pin later, or it sees the obsolete offset and
+//! releases its extent at once. An extent is released after the write of
+//! its lookup, when the output detaches the last pin of its block, or when
+//! a copy replaces it. A read of a released extent, for REF or for a copy,
+//! still gets its bytes: the read holds the file of the segment open, and
+//! the bytes of an extent never change.
 //!
 //! The release of the last extent in use of a sealed segment gives its
-//! file back, and the thread that released the extent closes it. Source
-//! reads, segment reads, writes, and closes, and stdout writes happen
-//! outside the lock. The one exception is the creation of a segment, which
-//! happens under the lock, once per segment. Answers are queued under the
-//! lock, until Completing closes the queue.
+//! file back, and the thread that released the extent closes it, unless a
+//! read still holds the file: then the file closes at the end of the read.
+//! Source reads, segment reads, writes, and closes, and stdout writes
+//! happen outside the lock. The one exception is the creation of a
+//! segment, which happens under the lock, once per segment. Answers are
+//! queued under the lock, until Completing closes the queue.
 //!
 //! At the normal end, after the lookups have ended, `close` closes all
 //! open segments of the pins, which frees their storage (DESIGN.md §6.9).
@@ -23,7 +34,8 @@
 //! Pin storage failures end the run with `die` (DESIGN.md §6.7): a yes
 //! answer cannot be taken back.
 
-use std::collections::BTreeMap;
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::num::NonZeroUsize;
 use std::os::unix::fs::FileExt;
@@ -44,9 +56,9 @@ pub type Block = Arc<Vec<u8>>;
 /// block is larger (DESIGN.md §6.4).
 const CACHE_BYTES: u64 = 256 << 20;
 
-/// The pins released per acquisition of the lock when the output advances,
+/// The pins detached per acquisition of the lock when the output advances,
 /// so that other threads never wait long for the lock.
-const RELEASE_BATCH: usize = 256;
+const DETACH_BATCH: usize = 256;
 
 /// Read the block at `offset` of the segment file `file` into `buf`, and
 /// require the full digest `strong` of that buffer. EOF is `UnexpectedEof`.
@@ -67,17 +79,35 @@ fn read_block(
     Ok(())
 }
 
-/// A published pin.
-struct Pin {
+/// A pinned block: the block of one or more published pins.
+struct Pinned {
+    /// The extent of the block, which all its pins share.
     extent: Extent,
-    strong: Strong,
+    /// `last`: the highest query offset of the pins of the block. The
+    /// output detaches the pins in offset order, so the pin at `last` is
+    /// the last pin of the block, and the extent is released with it.
+    last: u64,
+}
+
+/// Where a lookup takes the block that it writes to a new extent.
+enum Source {
+    /// The cache of verified blocks.
+    Cache(Block),
+    /// The extent of the pinned block, which a copy reads back: the file of
+    /// its segment, and the offset of the extent in that file.
+    Pinned(Arc<File>, u64),
+    /// The candidates of the index, which `find` reads.
+    Index,
 }
 
 struct State {
     /// `c`: reconstruction has written the output up to here.
     output: u64,
-    /// The published pins, by query offset.
-    pins: BTreeMap<u64, Pin>,
+    /// The published pins, by query offset: the full strong hash of the
+    /// block of each.
+    pins: BTreeMap<u64, Strong>,
+    /// The blocks of the published pins, by full strong hash.
+    pinned: HashMap<Strong, Pinned>,
     /// The open segments of the pins, which hold their extents.
     segments: Segments,
     /// Verified blocks by full strong hash. Pins never hold them.
@@ -101,6 +131,43 @@ impl State {
             let _ = answers.send(Answer { offset, found });
         }
     }
+
+    /// Publish the pin at `offset` of the block with the full strong hash
+    /// `strong`, which is pinned, and answer yes. Two queries at one offset
+    /// are a protocol error.
+    fn pin(&mut self, offset: u64, strong: &Strong) {
+        let previous = self.pins.insert(offset, *strong);
+        assert!(
+            previous.is_none(),
+            "protocol error: two queries at offset {offset}"
+        );
+        self.answer(offset, true);
+    }
+
+    /// Publish the pin at `offset` on the extent of its block `strong`, if
+    /// the block is pinned and the share keeps no more segments open, and
+    /// no more bytes, than an extent of the pin's own would (DESIGN.md
+    /// §6.4). Returns whether the pin is published.
+    ///
+    /// Below `last`, the extent stays in use until the output passes
+    /// `last` anyway. Above `last`, the share keeps the extent in use until
+    /// the output passes the pin, and `last` moves up to the pin. If that
+    /// costs more than a new extent would, the pin gets a copy instead: a
+    /// share would keep a sealed segment open for as long as the block
+    /// recurs.
+    fn share(&mut self, offset: u64, strong: &Strong) -> bool {
+        let Some(pinned) = self.pinned.get_mut(strong) else {
+            return false;
+        };
+        if offset > pinned.last {
+            if self.segments.costs_more_to_keep(&pinned.extent) {
+                return false;
+            }
+            pinned.last = offset;
+        }
+        self.pin(offset, strong);
+        true
+    }
 }
 
 /// The pins and the state that they share with reconstruction.
@@ -109,6 +176,8 @@ pub struct Pins {
     /// data session.
     dir: Arc<Directory>,
     strong: StrongHash,
+    /// The bytes of a block, for the buffer of a copy.
+    block_size: usize,
     state: Mutex<State>,
 }
 
@@ -137,9 +206,11 @@ impl Pins {
         Pins {
             dir,
             strong,
+            block_size: block_size as usize,
             state: Mutex::new(State {
                 output: 0,
                 pins: BTreeMap::new(),
+                pinned: HashMap::new(),
                 segments: Segments::new(u64::from(block_size), minimum),
                 cache: LruCache::sparse(NonZeroUsize::new(blocks).unwrap_or(NonZeroUsize::MIN)),
                 answers: Some(answers),
@@ -152,13 +223,16 @@ impl Pins {
     }
 
     /// Answer `QUERY { offset, strong }` (DESIGN.md §6.4, steps 1 to 8).
-    /// The block comes from the cache of verified blocks, or from `find`,
-    /// which reads and verifies candidates outside the lock. A found block
+    /// The pin of a pinned block shares its extent, with no lookup and no
+    /// write, or gets a copy: from the cache of verified blocks, or from
+    /// the extent of the block, read back and verified outside the lock.
+    /// Any other block comes from the cache, or from `find`, which reads
+    /// and verifies candidates outside the lock. A copy or a found block
     /// goes to a new extent; then the pin is published and answered yes,
     /// unless the output passed `offset` in the meantime. An obsolete
     /// query is answered no; in Completing, nothing is answered.
     pub fn answer(&self, offset: u64, strong: &Strong, find: impl FnOnce() -> Option<Block>) {
-        let cached = {
+        let source = {
             let mut state = self.lock();
             if state.completing() {
                 return;
@@ -166,16 +240,35 @@ impl Pins {
             if offset < state.output {
                 return state.answer(offset, false);
             }
-            state.cache.get(strong).cloned()
+            if state.share(offset, strong) {
+                return;
+            }
+            if let Some(block) = state.cache.get(strong) {
+                Source::Cache(Arc::clone(block))
+            } else if let Some(pinned) = state.pinned.get(strong) {
+                let extent = &pinned.extent;
+                Source::Pinned(Arc::clone(extent.file()), extent.offset())
+            } else {
+                Source::Index
+            }
         };
-        let searched = cached.is_none();
-        let Some(block) = cached.or_else(find) else {
-            return self.lock().answer(offset, false);
+        let (block, read) = match source {
+            Source::Cache(block) => (block, false),
+            // A pinned block needs no lookup in the index.
+            Source::Pinned(file, at) => {
+                let mut buf = vec![0; self.block_size];
+                self.read_pin(&file, at, &mut buf, strong, offset);
+                (Arc::new(buf), true)
+            }
+            Source::Index => match find() {
+                Some(block) => (block, true),
+                None => return self.lock().answer(offset, false),
+            },
         };
         let extent = {
             let mut state = self.lock();
             // Verified reads populate the cache.
-            if searched {
+            if read {
                 state.cache.put(*strong, Arc::clone(&block));
             }
             if state.completing() {
@@ -183,6 +276,11 @@ impl Pins {
             }
             if offset < state.output {
                 return state.answer(offset, false);
+            }
+            // Another lookup can have published a pin of the block, or a
+            // copy of it, in the meantime.
+            if state.share(offset, strong) {
+                return;
             }
             // Without a current segment, this creates a file: the only
             // segment I/O under the lock.
@@ -197,76 +295,107 @@ impl Pins {
     }
 
     /// The end of a lookup (DESIGN.md §6.4, step 8): `extent` holds the
-    /// block of the query at `offset`. Publish the pin and answer yes. If
-    /// the output passed `offset` during the write, answer no and release
-    /// the extent. In Completing, release the extent without an answer.
+    /// block of the query at `offset`. Publish the pin and answer yes.
+    /// All pins of the block keep the extent of the pin with the highest
+    /// offset: above `last`, `extent` replaces the extent of the block, as
+    /// a copy. Below `last`, after another lookup published a pin of the
+    /// block above `offset`, the pin shares the extent of the block. The
+    /// extent that the pins do not keep is released. If the output passed
+    /// `offset` during the write, answer no and release `extent`. In
+    /// Completing, release it without an answer.
     fn publish(&self, offset: u64, strong: &Strong, extent: Extent) {
         let mut state = self.lock();
-        if state.completing() || offset < state.output {
+        let unused = if state.completing() || offset < state.output {
             // In Completing, this queues nothing.
             state.answer(offset, false);
-            let closed = state.segments.release(extent);
-            drop(state);
-            return drop(closed);
-        }
-        let previous = state.pins.insert(
-            offset,
-            Pin {
-                extent,
-                strong: *strong,
-            },
-        );
-        assert!(
-            previous.is_none(),
-            "protocol error: two queries at offset {offset}"
-        );
-        state.answer(offset, true);
+            Some(extent)
+        } else {
+            let unused = match state.pinned.entry(*strong) {
+                Entry::Vacant(entry) => {
+                    entry.insert(Pinned {
+                        extent,
+                        last: offset,
+                    });
+                    None
+                }
+                Entry::Occupied(entry) if offset < entry.get().last => Some(extent),
+                Entry::Occupied(mut entry) => {
+                    let pinned = entry.get_mut();
+                    pinned.last = offset;
+                    Some(std::mem::replace(&mut pinned.extent, extent))
+                }
+            };
+            state.pin(offset, strong);
+            unused
+        };
+        let closed = unused.map(|extent| state.segments.release(extent));
+        drop(state);
+        drop(closed);
     }
 
     /// Read the pin at the output offset into `buf` for REF, and verify
     /// the buffer against the pin's full digest (DESIGN.md §6.4). The pin
-    /// stays in use until `reached` moves the output past it. A missing pin
-    /// is a protocol error; a pin that cannot be read back intact ends
+    /// stays published until `reached` moves the output past it. A missing
+    /// pin is a protocol error; a pin that cannot be read back intact ends
     /// the run.
     pub fn read_reference(&self, buf: &mut [u8]) {
-        let (output, file, offset, strong) = {
+        let (output, strong, file, at) = {
             let state = self.lock();
-            let pin = state
+            let strong = *state
                 .pins
                 .get(&state.output)
                 .unwrap_or_else(|| panic!("protocol error: REF without a pin at {}", state.output));
-            let extent = &pin.extent;
-            let file = Arc::clone(extent.file());
-            (state.output, file, extent.offset(), pin.strong)
+            let extent = &state.pinned[&strong].extent;
+            (
+                state.output,
+                strong,
+                Arc::clone(extent.file()),
+                extent.offset(),
+            )
         };
-        if let Err(e) = read_block(&file, offset, buf, self.strong, &strong) {
+        self.read_pin(&file, at, buf, &strong, output);
+    }
+
+    /// Read the block with the full digest `strong` from the extent at `at`
+    /// of the segment file `file` into `buf`, for the pin at `offset`, and
+    /// verify the buffer. A pin that cannot be read back intact ends the
+    /// run.
+    fn read_pin(&self, file: &File, at: u64, buf: &mut [u8], strong: &Strong, offset: u64) {
+        if let Err(e) = read_block(file, at, buf, self.strong, strong) {
             self.dir
-                .fail("read", format_args!("the pin at offset {output}: {e}"));
+                .fail("read", format_args!("the pin at offset {offset}: {e}"));
         }
     }
 
     /// Reconstruction wrote the output up to `offset`: publish it, and
-    /// release the pins below it, in batches. After each batch, close the
-    /// segments that it removed from the open segments, outside the lock
-    /// (DESIGN.md §6.4 and §6.5).
+    /// detach the pins below it, in batches. A detached pin at `last` of
+    /// its block releases the extent of the block. After each batch, close
+    /// the segments that it removed from the open segments, outside the
+    /// lock (DESIGN.md §6.4 and §6.5).
     pub fn reached(&self, offset: u64) {
         let mut state = self.lock();
         assert!(offset >= state.output, "the output offset went back");
         state.output = offset;
         loop {
             let mut closed = Vec::new();
-            let mut released = 0;
-            while released < RELEASE_BATCH
+            let mut detached = 0;
+            while detached < DETACH_BATCH
                 && let Some(pin) = state.pins.first_entry()
                 && *pin.key() < offset
             {
-                let extent = pin.remove().extent;
-                closed.extend(state.segments.release(extent).into_iter().flatten());
-                released += 1;
+                let (at, strong) = pin.remove_entry();
+                let Entry::Occupied(pinned) = state.pinned.entry(strong) else {
+                    unreachable!("the pin at {at} has no pinned block");
+                };
+                if pinned.get().last == at {
+                    let extent = pinned.remove().extent;
+                    closed.extend(state.segments.release(extent).into_iter().flatten());
+                }
+                detached += 1;
             }
             drop(state);
             drop(closed);
-            if released < RELEASE_BATCH {
+            if detached < DETACH_BATCH {
                 return;
             }
             state = self.lock();
@@ -295,7 +424,7 @@ impl Pins {
         // them. A `drop` of the `Arc` succeeds then, and closes nothing.
         //
         // The lookups, which hold the extents that they write, have ended:
-        // only the pins hold the files.
+        // only the pinned blocks hold the files.
         drop(self);
     }
 }
@@ -357,16 +486,24 @@ mod tests {
         }
     }
 
-    fn block(seed: u8, block_size: u32) -> (Strong, Block) {
-        let bytes: Vec<u8> = (0..block_size)
-            .map(|i| (i as u8).wrapping_mul(31) ^ seed)
+    /// A block that is different for each `seed`: the seed is in its first
+    /// bytes.
+    fn block(seed: u64, block_size: u32) -> (Strong, Block) {
+        let mut bytes: Vec<u8> = (0..block_size)
+            .map(|i| (i as u8).wrapping_mul(31))
             .collect();
+        bytes[..8].copy_from_slice(&seed.to_le_bytes());
         (StrongHash::Blake3.digest(&bytes), Arc::new(bytes))
     }
 
     /// `count` different blocks.
-    fn blocks(count: u8, block_size: u32) -> Vec<(Strong, Block)> {
+    fn blocks(count: u64, block_size: u32) -> Vec<(Strong, Block)> {
         (0..count).map(|seed| block(seed, block_size)).collect()
+    }
+
+    /// The `find` of a query that must not look its block up in the index.
+    fn no_lookup() -> Option<Block> {
+        panic!("a lookup of a pinned block")
     }
 
     fn answers(setup: &Setup) -> Vec<(u64, bool)> {
@@ -403,7 +540,7 @@ mod tests {
     /// that segment.
     fn extent(setup: &Setup, offset: u64) -> (usize, u64) {
         let state = setup.pins.lock();
-        let extent = &state.pins[&offset].extent;
+        let extent = &state.pinned[&state.pins[&offset]].extent;
         let open = state.segments.open();
         let position = open
             .iter()
@@ -430,24 +567,194 @@ mod tests {
         assert_eq!(open_segments(&setup), [1]);
         setup.pins.reached(u64::from(BS));
         assert!(setup.pins.lock().pins.is_empty());
+        assert!(setup.pins.lock().pinned.is_empty());
         // The current segment is not full: it stays open without extents
         // in use.
         assert_eq!(open_segments(&setup), [0]);
     }
 
     #[test]
-    fn a_verified_block_is_cached_for_other_offsets() {
+    fn the_pins_of_a_block_share_its_extent() {
+        // Queries for a pinned block need no lookup, no read, and no write.
+        // Below the highest pin of the block, and above it while the extent
+        // is in the current segment, the pins share the extent. The extent
+        // is released with the highest pin.
         let setup = setup(BS);
         let (strong, data) = block(2, BS);
         setup.pins.answer(10, &strong, || Some(Arc::clone(&data)));
+        // A read of the block would put it in the cache again.
+        setup.pins.lock().cache.clear();
+        setup.pins.answer(30, &strong, no_lookup);
+        setup.pins.answer(20, &strong, no_lookup);
+        assert!(setup.pins.lock().cache.is_empty(), "a share read the block");
+        assert_eq!(answers(&setup), [10, 30, 20].map(|offset| (offset, true)));
+        for offset in [10, 20, 30] {
+            assert_eq!(extent(&setup, offset), (0, 0));
+        }
+        for offset in [10, 20, 30] {
+            setup.pins.reached(offset);
+            assert_eq!(read_back(&setup, BS), *data);
+            assert_eq!(open_segments(&setup), [1]);
+        }
+        setup.pins.reached(31);
+        assert!(setup.pins.lock().pinned.is_empty());
+        assert_eq!(open_segments(&setup), [0]);
+    }
+
+    #[test]
+    fn a_verified_block_is_cached_for_later_pins() {
+        // The output passes the only pin of a block. A later query for the
+        // block takes it from the cache of verified blocks, with no lookup,
+        // and writes it to a new extent: the extents follow each other
+        // without gaps.
+        let setup = setup(BS);
+        let (strong, data) = block(2, BS);
+        setup.pins.answer(10, &strong, || Some(Arc::clone(&data)));
+        setup.pins.reached(20);
         setup
             .pins
             .answer(20, &strong, || panic!("the cache must answer"));
         assert_eq!(answers(&setup), vec![(10, true), (20, true)]);
-        // Each pin has its own extent, even with identical content, and
-        // the extents follow each other without gaps.
-        assert_eq!(extent(&setup, 10), (0, 0));
         assert_eq!(extent(&setup, 20), (0, u64::from(BS)));
+        assert_eq!(read_back(&setup, BS), *data);
+    }
+
+    #[test]
+    fn a_pinned_block_in_a_sealed_segment_gets_a_copy_above_its_pins() {
+        // One extent fills a segment while no sealed segment is open, and
+        // two while one is. The first pin of block `h` fills the first
+        // segment, and the pin of block `b` goes to the second one. A query
+        // for `h` above its pins gets a copy of `h` from the cache, which
+        // fills the second segment. The copy replaces the extent of `h` for
+        // all its pins, so the first segment closes. Without `h` in the
+        // cache, the next copy reads `h` back from its extent, and goes to
+        // a third segment. A query below the highest pin of `h` shares the
+        // extent. No query for `h` after the first one looks it up.
+        let size = u64::from(BS);
+        let setup = setup_with_minimum(BS, size);
+        let (h, data) = block(1, BS);
+        let (b, other) = block(2, BS);
+        setup.pins.answer(0, &h, || Some(Arc::clone(&data)));
+        setup.pins.answer(size, &b, || Some(Arc::clone(&other)));
+        assert_eq!(open_segments(&setup), [1, 1]);
+        setup.pins.answer(2 * size, &h, no_lookup);
+        assert_eq!(open_segments(&setup), [2]);
+        assert_eq!(extent(&setup, 0), (0, size));
+        // The cache still holds the buffer of the first lookup.
+        let cached = setup.pins.lock().cache.peek(&h).cloned().unwrap();
+        assert!(Arc::ptr_eq(&cached, &data), "the copy read the extent");
+        setup.pins.lock().cache.clear();
+        setup.pins.answer(4 * size, &h, no_lookup);
+        setup.pins.answer(3 * size, &h, no_lookup);
+        assert_eq!(open_segments(&setup), [1, 1]);
+        for i in [0, 2, 3, 4] {
+            assert_eq!(extent(&setup, i * size), (1, 0));
+        }
+        assert!(setup.pins.lock().cache.contains(&h), "a verified read");
+        assert_eq!(answers(&setup), [0, 1, 2, 4, 3].map(|i| (i * size, true)));
+        for (i, expected) in (1..).zip([&data, &other, &data, &data, &data]) {
+            assert_eq!(read_back(&setup, BS), **expected);
+            setup.pins.reached(i * size);
+        }
+        assert_eq!(open_segments(&setup), []);
+    }
+
+    #[test]
+    fn a_block_alone_in_a_sealed_segment_is_shared_while_a_copy_would_be_alone() {
+        // One extent fills a segment while no sealed segment is open, two
+        // while one is, and four while two are. The pin of block `h` fills
+        // the first segment alone, and a copy of `h` would fill a new
+        // segment alone once the first one closes. So the query for `h`
+        // above its pin shares the extent, with no read and no write.
+        // Blocks `b` and `c` then fill a second segment. A copy of `h` would
+        // now go to a segment that gets other extents too, so the next
+        // query for `h` gets a copy, read back from the extent of `h`, and
+        // the first segment closes.
+        let size = u64::from(BS);
+        let setup = setup_with_minimum(BS, size);
+        let (h, data) = block(1, BS);
+        setup.pins.answer(0, &h, || Some(Arc::clone(&data)));
+        // A read of the block would put it in the cache again.
+        setup.pins.lock().cache.clear();
+        setup.pins.answer(size, &h, no_lookup);
+        assert_eq!(open_segments(&setup), [1]);
+        assert_eq!(extent(&setup, size), (0, 0));
+        assert!(setup.pins.lock().cache.is_empty(), "a share read the block");
+        let (b, other) = block(2, BS);
+        let (c, more) = block(3, BS);
+        setup.pins.answer(2 * size, &b, || Some(Arc::clone(&other)));
+        setup.pins.answer(3 * size, &c, || Some(Arc::clone(&more)));
+        assert_eq!(open_segments(&setup), [1, 2]);
+        setup.pins.answer(4 * size, &h, no_lookup);
+        assert_eq!(open_segments(&setup), [2, 1]);
+        for i in [0, 1, 4] {
+            assert_eq!(extent(&setup, i * size), (1, 0));
+        }
+        assert!(setup.pins.lock().cache.contains(&h), "a verified read");
+        assert_eq!(answers(&setup), [0, 1, 2, 3, 4].map(|i| (i * size, true)));
+        for (i, expected) in (1..).zip([&data, &data, &other, &more, &data]) {
+            assert_eq!(read_back(&setup, BS), **expected);
+            setup.pins.reached(i * size);
+        }
+        assert_eq!(open_segments(&setup), []);
+    }
+
+    #[test]
+    fn a_pin_published_during_a_lookup_is_shared() {
+        // While the lookup of the query at 10 reads its candidates, the
+        // lookup of the query at 20, for the same block, publishes its pin.
+        // The query at 10 then shares the extent of that pin, with no
+        // write: the extent of the next block follows at once.
+        let setup = setup(BS);
+        let (strong, data) = block(4, BS);
+        setup.pins.answer(10, &strong, || {
+            setup.pins.answer(20, &strong, || Some(Arc::clone(&data)));
+            Some(Arc::clone(&data))
+        });
+        let (other, more) = block(5, BS);
+        setup.pins.answer(30, &other, || Some(Arc::clone(&more)));
+        assert_eq!(answers(&setup), vec![(20, true), (10, true), (30, true)]);
+        assert_eq!(extent(&setup, 10), (0, 0));
+        assert_eq!(extent(&setup, 20), (0, 0));
+        assert_eq!(extent(&setup, 30), (0, u64::from(BS)));
+    }
+
+    #[test]
+    fn racing_lookups_keep_the_extent_of_the_highest_pin() {
+        // Three lookups write one block to new extents, and none of them
+        // sees the pins of the others before it publishes its own. At each
+        // publication, all pins of the block keep the extent of the pin
+        // with the highest offset, and the other extent is released. One
+        // extent fills a segment while no sealed segment is open, and two
+        // while one is.
+        let size = u64::from(BS);
+        let setup = setup_with_minimum(BS, size);
+        let (strong, data) = block(6, BS);
+        let written = |setup: &Setup| {
+            let extent = allocate(setup);
+            extent.file().write_all_at(&data, extent.offset()).unwrap();
+            extent
+        };
+        let (high, low) = (written(&setup), written(&setup));
+        setup.pins.publish(2 * size, &strong, high);
+        setup.pins.publish(size, &strong, low);
+        // The extent of the low pin was in the current segment, which stays
+        // open.
+        assert_eq!(open_segments(&setup), [1, 0]);
+        assert_eq!(extent(&setup, size), (0, 0));
+        let top = written(&setup);
+        setup.pins.publish(3 * size, &strong, top);
+        assert_eq!(open_segments(&setup), [1]);
+        for i in 1..4 {
+            assert_eq!(extent(&setup, i * size), (0, size));
+        }
+        assert_eq!(answers(&setup), [2, 1, 3].map(|i| (i * size, true)));
+        setup.pins.reached(size);
+        for i in 2..5 {
+            assert_eq!(read_back(&setup, BS), *data);
+            setup.pins.reached(i * size);
+        }
+        assert_eq!(open_segments(&setup), []);
     }
 
     #[test]
@@ -631,24 +938,21 @@ mod tests {
     }
 
     #[test]
-    fn one_advance_of_the_output_releases_more_pins_than_one_batch() {
-        // The minimum is 64 extents. The pins fill three segments, with
-        // 64, 128, and 256 extents, and a part of the fourth one. One
-        // advance of the output passes all pins: it releases them in three
-        // batches, and it closes the four segments.
+    fn one_advance_of_the_output_detaches_more_pins_than_one_batch() {
+        // The minimum is 64 extents. The pins of different blocks fill
+        // three segments, with 64, 128, and 256 extents, and a part of the
+        // fourth one. One advance of the output passes all pins: it
+        // detaches them in three batches, releases their extents, and
+        // closes the four segments.
         let block_size = 512;
         let size = u64::from(block_size);
         let setup = setup_with_minimum(block_size, 64 * size);
-        let count = 2 * RELEASE_BATCH as u64 + 44;
-        let (strong, data) = block(9, block_size);
-        for i in 0..count {
-            setup
-                .pins
-                .answer(i * size, &strong, || Some(Arc::clone(&data)));
-        }
+        let count = 2 * DETACH_BATCH as u64 + 44;
+        pin_all(&setup, (0..).map(|i| i * size), &blocks(count, block_size));
         assert_eq!(open_segments(&setup), [64, 128, 256, 108]);
         setup.pins.reached(count * size);
         assert!(setup.pins.lock().pins.is_empty());
+        assert!(setup.pins.lock().pinned.is_empty());
         assert_eq!(open_segments(&setup), []);
     }
 
@@ -718,17 +1022,12 @@ mod tests {
 
     #[test]
     fn the_first_segment_of_a_run_is_full_at_16_mib() {
-        // Blocks of 1 MiB, in the pins of a run: sixteen extents fill the
-        // first segment.
+        // Different blocks of 1 MiB, in the pins of a run: sixteen extents
+        // fill the first segment.
         let block_size = 1 << 20;
         let setup = setup(block_size);
-        let (strong, data) = block(7, block_size);
-        for i in 0..17 {
-            let offset = i * u64::from(block_size);
-            setup
-                .pins
-                .answer(offset, &strong, || Some(Arc::clone(&data)));
-        }
+        let size = u64::from(block_size);
+        pin_all(&setup, (0..).map(|i| i * size), &blocks(17, block_size));
         assert_eq!(open_segments(&setup), [16, 1]);
     }
 
@@ -740,51 +1039,61 @@ mod tests {
         // and reads their pins, as for REF. It passes the odd queries
         // without their answers, as literals do. Such a query becomes
         // obsolete before its lookup or during its write, or its pin is
-        // published first. In each case, the extent is released, so every
-        // sealed segment closes.
+        // published first. With 16 blocks, the queries in flight are for
+        // different blocks. With two blocks, they share extents, and they
+        // copy them out of sealed segments, also while the output reads
+        // them. The output empties the cache now and then, so that copies
+        // also read their blocks back from extents. In each case, the
+        // extent is released, so every sealed segment closes.
         const QUERIES: u64 = 2000;
         let block_size = 512;
         let size = u64::from(block_size);
-        let setup = setup_with_minimum(block_size, 4 * size);
-        let blocks = blocks(16, block_size);
-        let block_of = |i: u64| &blocks[(i % 16) as usize];
-        let (queries, queue) = unbounded();
-        let mut found = HashMap::new();
-        std::thread::scope(|scope| {
-            for _ in 0..4 {
-                scope.spawn(|| {
-                    for i in &queue {
-                        let (strong, data) = block_of(i);
-                        let find = || Some(Arc::clone(data));
-                        setup.pins.answer(i * size, strong, find);
-                    }
-                });
-            }
-            for i in 0..QUERIES {
-                if i % 3 == 0 {
-                    for query in i..(i + 3).min(QUERIES) {
-                        queries.send(query).unwrap();
-                    }
+        for (count, minimum) in [(16, 4), (2, 4), (2, 1)] {
+            let setup = setup_with_minimum(block_size, minimum * size);
+            let blocks = blocks(count, block_size);
+            let block_of = |i: u64| &blocks[(i % count) as usize];
+            let (queries, queue) = unbounded();
+            let mut found = HashMap::new();
+            std::thread::scope(|scope| {
+                for _ in 0..4 {
+                    scope.spawn(|| {
+                        for i in &queue {
+                            let (strong, data) = block_of(i);
+                            let find = || Some(Arc::clone(data));
+                            setup.pins.answer(i * size, strong, find);
+                        }
+                    });
                 }
-                if i % 2 == 0 {
-                    while !found.contains_key(&(i * size)) {
-                        let answer = setup.answers.recv().unwrap();
-                        found.insert(answer.offset, answer.found);
+                for i in 0..QUERIES {
+                    if i % 3 == 0 {
+                        for query in i..(i + 3).min(QUERIES) {
+                            queries.send(query).unwrap();
+                        }
                     }
-                    assert!(found[&(i * size)], "a query at the output is obsolete");
-                    assert_eq!(read_back(&setup, block_size), *block_of(i).1);
+                    if i % 5 == 0 {
+                        setup.pins.lock().cache.clear();
+                    }
+                    if i % 2 == 0 {
+                        while !found.contains_key(&(i * size)) {
+                            let answer = setup.answers.recv().unwrap();
+                            found.insert(answer.offset, answer.found);
+                        }
+                        assert!(found[&(i * size)], "a query at the output is obsolete");
+                        assert_eq!(read_back(&setup, block_size), *block_of(i).1);
+                    }
+                    setup.pins.reached((i + 1) * size);
                 }
-                setup.pins.reached((i + 1) * size);
-            }
-            // The workers end.
-            drop(queries);
-        });
-        found.extend(setup.answers.try_iter().map(|a| (a.offset, a.found)));
-        assert_eq!(found.len() as u64, QUERIES, "one answer for each query");
-        assert!(setup.pins.lock().pins.is_empty());
-        // Only a current segment can be open, without extents in use.
-        let open = open_segments(&setup);
-        assert!(matches!(open[..], [] | [0]), "extents in use: {open:?}");
+                // The workers end.
+                drop(queries);
+            });
+            found.extend(setup.answers.try_iter().map(|a| (a.offset, a.found)));
+            assert_eq!(found.len() as u64, QUERIES, "one answer for each query");
+            assert!(setup.pins.lock().pins.is_empty());
+            assert!(setup.pins.lock().pinned.is_empty());
+            // Only a current segment can be open, without extents in use.
+            let open = open_segments(&setup);
+            assert!(matches!(open[..], [] | [0]), "extents in use: {open:?}");
+        }
     }
 
     #[test]
@@ -794,7 +1103,7 @@ mod tests {
         setup.pins.answer(0, &strong, || Some(Arc::clone(&data)));
         let (file, offset) = {
             let state = setup.pins.lock();
-            let extent = &state.pins[&0].extent;
+            let extent = &state.pinned[&strong].extent;
             (Arc::clone(extent.file()), extent.offset())
         };
         file.write_all_at(b"X", offset + 7).unwrap();

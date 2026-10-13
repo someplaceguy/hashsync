@@ -1,13 +1,14 @@
 //! The receiver's lookup workers (DESIGN.md §6.4): a pool that answers
 //! queries out of order, each worker with its own index reader.
 //!
-//! For a query, a worker takes the candidate blocks with the query's
-//! strong-hash prefix from the index, reads each candidate from the root's
-//! current location, and verifies the full digest of the bytes it read.
-//! The first verified block goes to the pins. Every candidate counts
-//! against `candidate_attempts`, including one without a usable location,
-//! so stale rows cannot make a lookup unbounded. Filesystem failures only
-//! reject a candidate.
+//! The pins answer a query for a block that a pin or the cache of verified
+//! blocks holds, without the index. For any other query, a worker takes
+//! the candidate blocks with the query's strong-hash prefix from the
+//! index, reads each candidate from the root's current location, and
+//! verifies the full digest of the bytes it read. The first verified block
+//! goes to the pins. Every candidate counts against `candidate_attempts`,
+//! including one without a usable location, so stale rows cannot make a
+//! lookup unbounded. Filesystem failures only reject a candidate.
 //!
 //! A worker ends when the query queue is closed and empty. In Completing,
 //! the queries left in the queue cost no reads: the pins skip them.

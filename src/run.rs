@@ -402,7 +402,7 @@ struct Counts {
 /// Reconstruct stdout in order from the data frames until END, and return
 /// END with the counts (DESIGN.md §6.4). Offset overflow is checked before
 /// a frame's output is written. Once it is written, the pins learn the new
-/// offset, which releases the pins below it.
+/// offset, which detaches the pins below it.
 fn reconstruct<R: Read>(
     data_in: &mut FrameReader<R>,
     pins: &Pins,

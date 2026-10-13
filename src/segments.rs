@@ -149,6 +149,19 @@ impl<F> Extent<F> {
     }
 }
 
+/// A sealed segment, which is open while an extent in use holds it.
+struct Sealed<F> {
+    segment: Weak<Segment<F>>,
+    /// Whether the segment got only one extent before its seal.
+    single: bool,
+}
+
+impl<F> Sealed<F> {
+    fn is_open(&self) -> bool {
+        self.segment.strong_count() > 0
+    }
+}
+
 /// The open segments of one user, with the rules that allocate and release
 /// extents (DESIGN.md §6.5). No count of extents in use is stored: each
 /// extent in use holds its segment, and `current` holds the current
@@ -161,10 +174,9 @@ pub struct Segments<F = File> {
     /// `None` before the first allocation, and from a seal until the next
     /// allocation.
     current: Option<(Arc<Segment<F>>, u64)>,
-    /// The sealed segments, in creation order. A sealed segment is open
-    /// while an extent in use holds it. The list can hold closed segments
-    /// until the next count.
-    sealed: Vec<Weak<Segment<F>>>,
+    /// The sealed segments, in creation order. The list can hold closed
+    /// segments until the next count.
+    sealed: Vec<Sealed<F>>,
     /// The bytes of every extent.
     extent_size: u64,
     /// The bytes at which the current segment is full while no sealed
@@ -196,6 +208,36 @@ impl<F> Segments<F> {
     /// The bytes of every extent.
     pub fn extent_size(&self) -> u64 {
         self.extent_size
+    }
+
+    /// Whether to keep `extent` in use for longer can cost more storage,
+    /// more open segments or more bytes in them, than to release it and
+    /// use a new extent in its place. This function exists so that a user
+    /// that can copy its extents, as the pins can, needs no knowledge of
+    /// the rules of the segments for that choice.
+    ///
+    /// A new extent would go to the current segment, which is never full
+    /// (DESIGN.md §6.5), so to keep an extent of the current segment costs
+    /// less. Without a current segment, a new extent would go to a new
+    /// segment. If `extent` is the single extent of its sealed segment, and
+    /// one extent would fill a new segment even with that segment closed,
+    /// a new extent would only put one segment, with the same bytes, in the
+    /// place of another. Any other extent is in a sealed segment, which it
+    /// keeps open: with the released extents of that segment, or as one
+    /// more sealed segment where a new extent would join other extents.
+    pub fn costs_more_to_keep(&self, extent: &Extent<F>) -> bool {
+        if let Some((current, _)) = &self.current {
+            return !Arc::ptr_eq(current, &extent.segment);
+        }
+        let segment = Arc::as_ptr(&extent.segment);
+        let alone = |sealed: &Sealed<F>| sealed.single && sealed.segment.as_ptr() == segment;
+        if !self.sealed.iter().any(alone) {
+            return true;
+        }
+        // `n` counts only the sealed segments that are open, and the
+        // release of `extent` would close its segment.
+        let open = self.sealed.iter().filter(|sealed| sealed.is_open());
+        !is_full(self.extent_size, self.minimum, open.count() - 1)
     }
 
     /// Allocate an extent (DESIGN.md §6.5, steps A1 to A3); `create` makes
@@ -259,11 +301,14 @@ impl<F> Segments<F> {
     /// the reference to the segment that `current` held.
     fn seal_if_full(&mut self) -> Option<Arc<Segment<F>>> {
         // `n` counts only the sealed segments that are open.
-        self.sealed.retain(|segment| segment.strong_count() > 0);
-        let (segment, _) = self
+        self.sealed.retain(Sealed::is_open);
+        let (segment, size) = self
             .current
             .take_if(|(_, size)| is_full(*size, self.minimum, self.sealed.len()))?;
-        self.sealed.push(Arc::downgrade(&segment));
+        self.sealed.push(Sealed {
+            segment: Arc::downgrade(&segment),
+            single: size == self.extent_size,
+        });
         Some(segment)
     }
 }
@@ -274,10 +319,10 @@ impl<F> Segments<F> {
     /// of its extents in use. The tests of the users of segments compare
     /// these files with the files of their extents.
     pub fn open(&self) -> Vec<(*const F, usize)> {
-        let sealed = self.sealed.iter().filter_map(|segment| {
+        let sealed = self.sealed.iter().filter_map(|sealed| {
             // Counted before the upgrade, which adds a reference.
-            let in_use = segment.strong_count();
-            Some((Arc::as_ptr(&segment.upgrade()?.file), in_use))
+            let in_use = sealed.segment.strong_count();
+            Some((Arc::as_ptr(&sealed.segment.upgrade()?.file), in_use))
         });
         // `current` holds the current segment too.
         let current = self.current.iter().map(|(segment, _)| {
@@ -406,8 +451,9 @@ mod tests {
 
         /// The numbers of the sealed segments that are open, oldest first.
         fn sealed(&self) -> Vec<u64> {
-            let sealed = self.segments.sealed.iter().filter_map(Weak::upgrade);
-            sealed.map(|segment| *segment.file).collect()
+            let segments = self.segments.sealed.iter().map(|sealed| &sealed.segment);
+            let open = segments.filter_map(Weak::upgrade);
+            open.map(|segment| *segment.file).collect()
         }
 
         /// The current segment: its number and its size.
@@ -450,6 +496,63 @@ mod tests {
         assert_eq!(numbered.sealed(), [1]);
         assert_eq!(numbered.current(), None);
         assert_eq!(Arc::strong_count(&reference), 1);
+    }
+
+    #[test]
+    fn keeping_an_extent_costs_more_unless_it_is_current_or_alone() {
+        // Extents of 2 bytes, and a minimum of 1: one extent fills a
+        // segment while at most one sealed segment is open. So a new extent
+        // in place of an extent that is alone is alone too while at most two
+        // sealed segments are open, that of the old extent included. To
+        // keep such an extent costs no more than a new extent, and to keep
+        // an extent of the current segment costs less.
+        let mut numbered = Numbered::new(2, 1);
+        // Extents 0 and 1 fill segments 0 and 1 alone (step A3).
+        let [first, second] = [numbered.allocate(), numbered.allocate()];
+        assert!(!numbered.segments.costs_more_to_keep(&first));
+        assert!(!numbered.segments.costs_more_to_keep(&second));
+        // Extent 2 goes to segment 2, which is not full: while segment 2 is
+        // current, a new extent would go there too. Extent 3 fills segment
+        // 2, and three sealed segments are open.
+        let third = numbered.allocate();
+        assert!(numbered.segments.costs_more_to_keep(&first));
+        assert!(!numbered.segments.costs_more_to_keep(&third));
+        let fourth = numbered.allocate();
+        assert_eq!(numbered.sealed(), [0, 1, 2]);
+        assert!(numbered.segments.costs_more_to_keep(&first));
+        // Segment 0 closes. Segment 2 holds two extents.
+        numbered.release(first);
+        assert!(!numbered.segments.costs_more_to_keep(&second));
+        assert!(numbered.segments.costs_more_to_keep(&third));
+        assert!(numbered.segments.costs_more_to_keep(&fourth));
+        // Extent 4 goes to segment 3, which is not full until segment 1
+        // closes. Then it is sealed with extent 4 alone (step R3).
+        let fifth = numbered.allocate();
+        numbered.release(second);
+        assert_eq!(numbered.sealed(), [2, 3]);
+        assert!(!numbered.segments.costs_more_to_keep(&fifth));
+    }
+
+    #[test]
+    fn a_segment_that_r3_closes_does_not_count_as_open() {
+        // Extents of 2 bytes, and a minimum of 1. Segments 0 and 1 get one
+        // extent each, segment 2 two, and segment 3, the current segment,
+        // two. The release of the extents of segment 3 keeps it open, as
+        // the current segment. The release of those of segment 2 closes
+        // it: then segment 3 is full, and it closes at its seal (step R3).
+        // The list of sealed segments still has segment 3, but only two
+        // sealed segments are open. So a new extent in place of extent 1
+        // would be alone in a new segment, as extent 1 is in segment 1.
+        let mut numbered = Numbered::new(2, 1);
+        let mut extents: Vec<Extent<u64>> = (0..6).map(|_| numbered.allocate()).collect();
+        assert_eq!(numbered.sealed(), [0, 1, 2]);
+        assert_eq!(numbered.current(), Some((3, 4)));
+        for extent in extents.drain(2..).rev() {
+            numbered.release(extent);
+        }
+        assert_eq!(numbered.sealed(), [0, 1]);
+        assert_eq!(numbered.current(), None);
+        assert!(!numbered.segments.costs_more_to_keep(&extents[1]));
     }
 
     proptest! {
