@@ -2,22 +2,25 @@
 //! [--ssh CMD] [USER@]HOST -- COMMAND ...` (DESIGN.md §3, §5.6, §6, §8):
 //! the receiver.
 //!
-//! The run updates the index (or opens it read-only), exports and
-//! publishes the hash list, prepares the pins and the lookup workers,
-//! starts both SSH sessions, and completes the exchange. It then
+//! The run updates the index (or opens it read-only), exports and publishes
+//! the hash list, prepares the pins and the lookup workers, starts both SSH
+//! sessions, and completes the list exchange, which gives the sender the
+//! target in the cheapest form available: a confirmation that it already
+//! has the list, a delta from a list both sides have, or the full list
+//! (DESIGN.md §5.6). It then
 //! reconstructs stdout from literals, runs, and references, which arrive
 //! through the compression stream, while the lookup workers answer the
 //! sender's queries (DESIGN.md §6.4). The data session goes through a
 //! spool, so that a blocked stdout does not stop the transfer until
 //! `receiver_output_spool_limit` bytes wait in the spool (DESIGN.md §6.5).
 //! Queries and answers have compression streams of their own (DESIGN.md
-//! §6.2). Meanwhile, the input goes to the command's stdin, in INPUT
-//! frames on the data session, until END: with `--stdin` or
-//! `--batch-stdin`, the receiver's stdin, and else no bytes (DESIGN.md
-//! §6.6). The output and the input each have a delivery: eager, which sends
-//! their bytes on at each idle point of their source, or batch (DESIGN.md
-//! §6.2). It returns the command's status once both sessions exited
-//! successfully, after a summary.
+//! §6.2). Meanwhile, the input goes to the command's stdin, in INPUT frames
+//! on the data session, until END: with `--stdin` or `--batch-stdin`, the
+//! receiver's stdin, and else no bytes (DESIGN.md §6.6). The output and the
+//! input each have a delivery: eager, which sends their bytes on at each
+//! idle point of their source, or batch (DESIGN.md §6.2). It returns the
+//! command's status once both sessions exited successfully, after a
+//! summary.
 //!
 //! The end is orderly (DESIGN.md §6.9). After END_ACK, DONE tells the
 //! receiver that the sender needs neither session any more. The main
@@ -39,20 +42,20 @@ use std::time::Instant;
 use bstr::ByteSlice;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 
-use crate::cache::{self, Exchange};
+use crate::cache::{self, Base, Exchange};
 use crate::config::Config;
 use crate::die::{self, die};
 use crate::fsid::FsCache;
 use crate::fsops;
-use crate::hash::weak;
+use crate::hash::{Strong, weak};
 use crate::hashlist::{self, ListId};
 use crate::index::{self, Settings};
 use crate::input::{InputStop, ReceiverInput};
 use crate::lookup;
 use crate::pins::Pins;
 use crate::protocol::{
-    self, Answer, Compressor, Decompressor, Delivery, End, FrameReader, FrameWriter, HashList,
-    Query, ReceiverHello, Rle, SenderHello, flush_data, frame, send_data,
+    self, Answer, Compressor, Decompressor, Delivery, End, FrameReader, FrameWriter, Query,
+    ReceiverHello, Rle, SenderHello, TargetList, flush_data, frame, send_data,
 };
 use crate::rendezvous;
 use crate::roots::{self, Location};
@@ -104,8 +107,10 @@ pub fn run(
     let meta = index.read_meta().expect("the index lost its metadata");
 
     // Export and hash the target from one database snapshot, before the
-    // sessions start (DESIGN.md §3 and §5.6).
-    let encoded = hashlist::encode(&index.export_weak_hashes());
+    // sessions start (DESIGN.md §3 and §5.6). The values are kept until the
+    // receiver knows whether it can send the target as a delta.
+    let values = index.export_weak_hashes();
+    let encoded = hashlist::encode(&values);
     let target = ListId {
         algorithm: config.strong_hash,
         digest: config.strong_hash.digest(&encoded),
@@ -235,30 +240,21 @@ pub fn run(
         exchange.publish(&target, &encoded);
     }
 
-    // The full list, whose bytes follow HASHLIST directly; cached bases
-    // and deltas arrive with PLAN.md step 6.
-    let header = HashList {
-        length: encoded.len() as u64,
-    };
-    send_data(&mut data_out, frame::HASHLIST, &header.encode());
-    if let Err(e) = data_out.send_bytes(&encoded) {
-        die(format!("data session: {e}"));
-    }
-    flush_data(&mut data_out);
-    let hash_list_bytes = encoded.len() as u64;
-    drop(encoded);
-
-    // The run has one target, so the acknowledgement names none.
-    let payload = expect_data(&mut data_in, frame::CACHE_RESULT, "CACHE_RESULT");
-    assert!(
-        payload.is_empty(),
-        "protocol error: CACHE_RESULT with a payload"
-    );
-    // After CACHE_RESULT, the sender holds the target, or no list with
-    // caching disabled. The end of this side's part of the exchange keeps
-    // the same: it renews the published target, removes the other listed
-    // files, and expires both cache trees (DESIGN.md §5.6).
-    exchange.finish(config.hashlist_max_age);
+    // Send the target in the smallest form that the sender's lists allow:
+    // none of its bytes if the sender has it, otherwise a delta from a list
+    // both sides have, otherwise the full list (DESIGN.md §5.6).
+    let Offer {
+        message,
+        base,
+        fallback,
+    } = Offer::choose(&exchange, &sender.lists, &target, values, encoded);
+    let list_bytes = give_target(&mut data_out, &mut data_in, message, fallback);
+    // After CACHE_RESULT the sender holds the target, or no list at all if
+    // caching is disabled, and the end of the receiver's exchange matches
+    // that: it renews the published target and the base of HASHDELTA (even
+    // if the sender asked for the full list instead), removes the other
+    // listed files, and expires both cache trees (DESIGN.md §5.6).
+    exchange.finish(base, config.hashlist_max_age);
 
     // The list exchange is complete: from here on until END, the input
     // writer owns the outgoing direction of the data session, and sends
@@ -354,18 +350,18 @@ pub fn run(
     if end.status == 127 && !end.error.is_empty() {
         die::error(format!("remote command failed to start: {}", end.error));
     }
-    print_summary(start, &counts, hash_list_bytes);
+    print_summary(start, &counts, &list_bytes);
     die::finish(end.status)
 }
 
 /// The summary on stderr (DESIGN.md §8). The first line gives the bytes
-/// of output, the wire bytes that the data session received, and the
-/// bytes of the hash list and the delta. The second line gives, as rsync
-/// does, the bytes sent and received on both sessions, the elapsed time
-/// of the run with the rate of that traffic, and the speedup: the output
-/// bytes over the traffic. The threads that count the traffic have ended,
-/// so the counts are exact.
-fn print_summary(start: Instant, counts: &Counts, hash_list_bytes: u64) {
+/// of output, the wire bytes that the data session received, and the bytes
+/// of the full lists and of the delta that the receiver sent. The second
+/// line gives, as rsync does, the bytes sent and received on both
+/// sessions, the elapsed time of the run with the rate of that traffic,
+/// and the speedup: the output bytes over the traffic. The threads that
+/// count the traffic have ended, so the counts are exact.
+fn print_summary(start: Instant, counts: &Counts, lists: &ListBytes) {
     let elapsed = start.elapsed().as_secs_f64();
     let sent = SENT.load(Relaxed);
     let wire = DATA_RECEIVED.load(Relaxed);
@@ -378,8 +374,8 @@ fn print_summary(start: Instant, counts: &Counts, hash_list_bytes: u64) {
         Bytes(counts.reference),
         Bytes(counts.run),
         Bytes(wire),
-        Bytes(hash_list_bytes),
-        Bytes(0),
+        Bytes(lists.full),
+        Bytes(lists.delta),
     ));
     die::note(format_args!(
         "sent {} and received {} in {elapsed:.1}s ({}/s), speedup {:.2}",
@@ -388,6 +384,137 @@ fn print_summary(start: Instant, counts: &Counts, hash_list_bytes: u64) {
         Bytes((traffic as f64 / elapsed).round() as u64),
         counts.output as f64 / traffic as f64,
     ));
+}
+
+/// How the receiver hands the sender its target (DESIGN.md §5.6).
+struct Offer {
+    /// The first message: HASHKEEP, HASHDELTA, or HASHLIST.
+    message: TargetList,
+    /// The base of HASHDELTA. The end of the exchange renews it, even if
+    /// the sender asks for the full list instead of using the delta.
+    base: Option<Base>,
+    /// The full list, which the sender may ask for once with HASHFULL
+    /// after HASHKEEP or HASHDELTA.
+    fallback: Option<TargetList>,
+}
+
+impl Offer {
+    /// Choose how to send the target, whose values and encoding are
+    /// `values` and `encoded`: HASHKEEP if the sender advertised the
+    /// target; otherwise HASHDELTA from the base that the receiver finds
+    /// among the `advertised` lists, if the delta takes fewer bytes than
+    /// the full list; otherwise HASHLIST, which is also the choice when the
+    /// first advertised list that the receiver finds is damaged.
+    fn choose(
+        exchange: &Exchange,
+        advertised: &[Strong],
+        target: &ListId,
+        values: Vec<u64>,
+        encoded: Vec<u8>,
+    ) -> Offer {
+        let full = TargetList::Full(encoded);
+        if advertised.contains(&target.digest) {
+            return Offer {
+                message: TargetList::Keep,
+                base: None,
+                fallback: Some(full),
+            };
+        }
+        if let Some((base, base_values)) = exchange.find_base(advertised, target.algorithm) {
+            let (removed, added) = hashlist::delta(&base_values, &values);
+            let delta = TargetList::Delta {
+                base: base.digest,
+                removed: hashlist::encode(&removed),
+                added: hashlist::encode(&added),
+            };
+            if delta.size() < full.size() {
+                return Offer {
+                    message: delta,
+                    base: Some(base),
+                    fallback: Some(full),
+                };
+            }
+        }
+        Offer {
+            message: full,
+            base: None,
+            fallback: None,
+        }
+    }
+}
+
+/// The bytes of the hash lists that the receiver sent, for the summary
+/// (DESIGN.md §8).
+#[derive(Default)]
+struct ListBytes {
+    /// Full lists, sent after HASHLIST.
+    full: u64,
+    /// The removed and added lists of a delta, sent after HASHDELTA.
+    delta: u64,
+}
+
+impl ListBytes {
+    /// Count the lists that `message` carries.
+    fn count(&mut self, message: &TargetList) {
+        match message {
+            TargetList::Full(list) => self.full += list.len() as u64,
+            TargetList::Keep => {}
+            TargetList::Delta { removed, added, .. } => {
+                self.delta += (removed.len() + added.len()) as u64;
+            }
+        }
+    }
+}
+
+/// Send the sender its target as `message`, then wait for CACHE_RESULT.
+/// After HASHKEEP or HASHDELTA, the sender asks once for the full list with
+/// HASHFULL if it cannot use the list that the message names, or if the
+/// delta does not produce the target (DESIGN.md §5.6). This function then
+/// sends `fallback`, the full list. Returns the bytes of the lists sent.
+fn give_target<R: Read, W: Write>(
+    data_out: &mut FrameWriter<W>,
+    data_in: &mut FrameReader<R>,
+    message: TargetList,
+    mut fallback: Option<TargetList>,
+) -> ListBytes {
+    let mut sent = ListBytes::default();
+    send_target(data_out, &message, &mut sent);
+    loop {
+        let (kind, empty) = match data_in.next() {
+            Ok(Some(reply)) => (reply.kind, reply.payload.is_empty()),
+            Ok(None) => die_data(&std::io::ErrorKind::UnexpectedEof.into()),
+            Err(e) => die_data(&e),
+        };
+        match kind {
+            // The run has one target, so the acknowledgement names none.
+            frame::CACHE_RESULT => {
+                assert!(empty, "protocol error: CACHE_RESULT with a payload");
+                return sent;
+            }
+            frame::HASHFULL => {
+                assert!(empty, "protocol error: HASHFULL with a payload");
+                let Some(full) = fallback.take() else {
+                    panic!("protocol error: HASHFULL after the full list");
+                };
+                send_target(data_out, &full, &mut sent);
+            }
+            kind => panic!("protocol error: expected CACHE_RESULT, received frame type {kind}"),
+        }
+    }
+}
+
+/// Send the target list `message` and count its lists in `sent`. The
+/// sender replies to it, so it must not stay in a buffer.
+fn send_target<W: Write>(
+    data_out: &mut FrameWriter<W>,
+    message: &TargetList,
+    sent: &mut ListBytes,
+) {
+    if let Err(e) = message.send(data_out) {
+        die(format!("data session: {e}"));
+    }
+    flush_data(data_out);
+    sent.count(message);
 }
 
 /// The bytes of reconstructed output, for the summary.
@@ -666,4 +793,138 @@ fn write_answers(
     }
     let (stdin, _) = control_out.into_inner().into_transport().into_parts();
     stdin.inner
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cache::tests::with_home;
+    use crate::hashlist::tests::list;
+
+    /// What the receiver offers for a target with `values`, when the sender
+    /// advertised `advertised` and the receiver's directory for the sender
+    /// holds `cached`.
+    fn offer(values: &[u64], advertised: &[&ListId], cached: &[(&ListId, &[u8])]) -> Offer {
+        let (peer, index) = ([5; 16], [6; 16]);
+        let mut earlier = Exchange::receiver(&peer, &index);
+        for &(id, encoded) in cached {
+            earlier.publish(id, encoded);
+        }
+        let exchange = Exchange::receiver(&peer, &index);
+        let (target, encoded) = list(values);
+        let advertised: Vec<Strong> = advertised.iter().map(|id| id.digest).collect();
+        Offer::choose(&exchange, &advertised, &target, values.to_vec(), encoded)
+    }
+
+    /// The receiver sends no list bytes for a target that the sender has, a
+    /// delta from a list both sides have when that is smaller than the full
+    /// list, and the full list otherwise. The sender can ask for the full
+    /// list only after HASHKEEP or HASHDELTA (DESIGN.md §5.6).
+    #[test]
+    fn the_receiver_offers_the_smallest_form_of_the_target() {
+        with_home(|_| {
+            let wide: Vec<u64> = (0..100).map(|i| i << 56).collect();
+            let (target, encoded) = list(&wide);
+            let full = Some(TargetList::Full(encoded));
+            let keep = offer(&wide, &[&target], &[]);
+            assert_eq!((keep.message, keep.fallback), (TargetList::Keep, full));
+
+            // If the receiver has none of the advertised lists, it sends
+            // the full list.
+            let (base, base_bytes) = list(&wide);
+            let mut changed = wide.clone();
+            changed[50] += 1;
+            let (_, changed_bytes) = list(&changed);
+            let changed_full = TargetList::Full(changed_bytes);
+            for advertised in [&[&base][..], &[]] {
+                let full = offer(&changed, advertised, &[]);
+                assert_eq!((&full.message, &full.fallback), (&changed_full, &None));
+                assert!(full.base.is_none());
+            }
+
+            // With one value changed in a list of 100, the delta is smaller.
+            let delta = offer(&changed, &[&base], &[(&base, &base_bytes)]);
+            let expected = TargetList::Delta {
+                base: base.digest,
+                removed: hashlist::encode(&[wide[50]]),
+                added: hashlist::encode(&[changed[50]]),
+            };
+            assert_eq!(delta.message, expected);
+            assert_eq!(delta.base.unwrap().digest, base.digest);
+            assert_eq!(delta.fallback, Some(changed_full));
+
+            // When every value of a short list changes, the delta takes
+            // more bytes than the full list.
+            let (small, small_bytes) = list(&[1]);
+            let full = offer(&[2], &[&small], &[(&small, &small_bytes)]);
+            assert_eq!(full.message, TargetList::Full(hashlist::encode(&[2])));
+        });
+    }
+
+    /// Run `give_target` with `message` and `fallback` against `replies`,
+    /// the sender's frames, uncompressed. Returns what the receiver sent and
+    /// the list bytes that it counted.
+    fn give(
+        message: TargetList,
+        fallback: Option<TargetList>,
+        replies: &[u8],
+    ) -> (Vec<u8>, ListBytes) {
+        let mut data_out = FrameWriter::new(Vec::new());
+        let mut data_in = FrameReader::new(replies);
+        let sent = give_target(&mut data_out, &mut data_in, message, fallback);
+        (data_out.into_inner(), sent)
+    }
+
+    /// One uncompressed frame.
+    fn frame_bytes(kind: u8, payload: &[u8]) -> Vec<u8> {
+        let mut out = FrameWriter::new(Vec::new());
+        out.send(kind, payload).unwrap();
+        out.into_inner()
+    }
+
+    /// The frame of `message` followed by its lists.
+    fn message_bytes(message: &TargetList) -> Vec<u8> {
+        let mut out = FrameWriter::new(Vec::new());
+        message.send(&mut out).unwrap();
+        out.into_inner()
+    }
+
+    /// After HASHKEEP or HASHDELTA, the sender can ask for the full list once
+    /// with HASHFULL: the receiver sends it and waits for CACHE_RESULT
+    /// again. After a full list, only CACHE_RESULT can follow (DESIGN.md
+    /// §5.6).
+    #[test]
+    fn hashfull_gets_the_full_list_once() {
+        let list = hashlist::encode(&[1, 2, 3]);
+        let full = || TargetList::Full(list.clone());
+        let result = frame_bytes(frame::CACHE_RESULT, b"");
+        let replies = [frame_bytes(frame::HASHFULL, b""), result.clone()].concat();
+        let (sent, bytes) = give(TargetList::Keep, Some(full()), &replies);
+        let keep_then_full = [message_bytes(&TargetList::Keep), message_bytes(&full())];
+        assert_eq!(sent, keep_then_full.concat());
+        assert_eq!((bytes.full, bytes.delta), (list.len() as u64, 0));
+
+        let (sent, bytes) = give(full(), None, &result);
+        assert_eq!(sent, message_bytes(&full()));
+        assert_eq!((bytes.full, bytes.delta), (list.len() as u64, 0));
+    }
+
+    #[test]
+    #[should_panic(expected = "protocol error: HASHFULL after the full list")]
+    fn hashfull_after_the_full_list_is_a_protocol_error() {
+        let full = TargetList::Full(hashlist::encode(&[1]));
+        give(full, None, &frame_bytes(frame::HASHFULL, b""));
+    }
+
+    #[test]
+    #[should_panic(expected = "protocol error: HASHFULL after the full list")]
+    fn a_second_hashfull_is_a_protocol_error() {
+        let full = TargetList::Full(hashlist::encode(&[1]));
+        let hashfull = frame_bytes(frame::HASHFULL, b"");
+        give(
+            TargetList::Keep,
+            Some(full),
+            &[hashfull.clone(), hashfull].concat(),
+        );
+    }
 }

@@ -767,7 +767,10 @@ rename means that a concurrent cleanup removed the file: this is normal
 absence.
 
 No cache locks or mutable current-list pointer are needed. Retained fds or
-bytes survive replacement and unlink. Tolerate disappearance during directory
+bytes survive replacement and unlink. On NFS, a retained fd survives only on
+its own host: once another host removes the file, calls through the fd can
+fail with ESTALE. For a list or a temporary, that just means the file is
+gone, which is normal absence. Tolerate disappearance during directory
 scans and fall back to a full transfer. Cleanup racing with replacement or
 removal of a published file may lose a future cache hit; it cannot invalidate
 retained bytes. A concurrent cleanup can remove a temporary before its
@@ -1032,9 +1035,10 @@ The frames of the receiver-to-sender direction of the data session are not
 compressed: zstd cannot make the hash list smaller (section 10), and the
 input stream has a zstd stream of its own, in the payloads of INPUT frames,
 so the sender can find END_ACK after input that it discards without
-decompressing it (section 6.6). Each frame goes to SSH in one write: SSH
-sends what one read of its stdin returns in packets of its own, so a header
-that arrives alone, before its payload, can cost a packet.
+decompressing it (section 6.6). Each frame goes to SSH in a single write,
+together with any list bytes that follow HASHLIST or HASHDELTA. SSH puts the
+bytes of each read of its stdin into packets of their own, so a header that
+arrived ahead of its payload could cost an extra packet.
 
 ### 6.3 The sender's scanner
 
@@ -1748,8 +1752,8 @@ give `128 + signal`.
 
 | Role | Responsibilities |
 |---|---|
-| Sender main | Handshake and command startup, then obtain the command's exit status without reaping, wait for the completion conditions of section 6.9, and send DONE. |
-| Sender data reader | Read the data session for the whole run: the protocol version, the features, HELLO, the list, the input, END_ACK, and EOF. EOF before DONE means that the receiver disappeared. Append the input to the input spool (section 6.6). |
+| Sender main | Run the handshake, reading the data session itself until the list exchange is done, and start the command. Then obtain the command's exit status without reaping, wait for the completion conditions of section 6.9, and send DONE. |
+| Sender data reader | Read the data session once the list exchange is done: the input, END_ACK, and EOF. EOF before DONE means that the receiver disappeared. Append the input to the input spool (section 6.6). |
 | Sender spool thread | Copy command stdout into its spool until EOF, and in eager delivery mark its idle points (section 6.5). |
 | Sender output reader | Fill lookahead from the spool of command stdout, and pass its idle points to the scanner, until its EOF; then close the spool. |
 | Sender stderr relay | Copy command stderr to sender stderr through EOF and flush (section 6.1). |
@@ -1825,11 +1829,13 @@ objects under them. The index recovers from its write-ahead log, as after
 a crash.
 
 The receiver monitors both sessions and termination signals. The sender
-monitors stdin and the control socket. The data reader monitors stdin
-while it reads it, and until the stop of the input, the session watcher
-monitors it too, because the data reader can wait at the limit of the
-input spool (section 6.6).
-Unexpected EOF or session loss is fatal, also during rendezvous and setup,
+monitors stdin and the control socket. Its main thread reads stdin during
+the list exchange and the data reader reads it afterwards, but stdin can
+still go unread for a long time: while the main thread waits for `attach`,
+while it builds the table, publishes the target and ends its exchange
+before it starts the data reader, and while the data reader waits at the
+limit of the input spool (section 6.6). So until the input stops, the
+session watcher monitors stdin as well. Unexpected EOF or session loss is fatal, also during rendezvous and setup,
 when no command output is flowing. A broken stdout is detected when a write
 to it fails; neither role watches an idle stdout. As under plain SSH, a
 consumer that exits after it reads all output does not fail the run. Normal

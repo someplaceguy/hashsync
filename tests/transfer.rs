@@ -1,9 +1,9 @@
-//! End-to-end `run` transfers (PLAN.md steps 3 to 5) over a fake `ssh`
+//! End-to-end `run` transfers (PLAN.md steps 3 to 6) over a fake `ssh`
 //! that executes the remote command string with a local `/bin/sh`, under a
 //! separate HOME for the sender side. This exercises the real bootstrap
 //! quoting, the rendezvous socket, both sessions, the cache publication
-//! rules on both sides, block references with their pins, runs, and the
-//! compression stream.
+//! rules on both sides, the reuse of cached lists, block references with
+//! their pins, runs, and the compression stream.
 //!
 //! The tests wait for events, and no wait has a deadline whose end fails a
 //! test: a regression hangs the test, so that a debugger can examine it.
@@ -18,7 +18,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::AsFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::Arc;
@@ -1857,14 +1857,17 @@ fn sender_cache_false_stores_nothing_and_removes_earlier_lists() {
     transfer.run_ok(&refs(&command));
     assert_eq!(transfer.cache_files("sender", "remote-hashlists").len(), 1);
 
-    // Then disable it: neither side stores a list for this peer and
-    // index, and both remove their earlier lists. Expiry then removes the
-    // empty directories (DESIGN.md §5.6).
+    // Then disable it. The sender advertises no list, so the receiver sends
+    // the full list; neither side stores a list for this peer and index,
+    // and both remove their earlier lists. Expiry then removes the empty
+    // directories (DESIGN.md §5.6).
     transfer.reconfigure(
         env!("CARGO_BIN_EXE_hashsync").as_bytes(),
         "sender_cache = false\n",
     );
-    transfer.run_ok(&refs(&command));
+    let output = transfer.run_ok(&refs(&command));
+    let (full, delta) = list_bytes(&output);
+    assert!(full > 0 && delta == 0, "full {full}, delta {delta}");
     assert_eq!(transfer.peer_dir("sender", "remote-hashlists"), None);
     assert_eq!(transfer.peer_dir("receiver", "local-hashlists"), None);
 }
@@ -1906,6 +1909,309 @@ fn each_side_keeps_only_its_latest_list() {
     assert!(second[0].ends_with(".cache") && !first.contains(&second[0]));
     // `cache_files` also checks that the empty directory is gone.
     assert_eq!(transfer.cache_files("sender", "remote-hashlists"), second);
+}
+
+/// The full-list and delta bytes that a run with `EXACT` amounts sent, from
+/// its summary.
+fn list_bytes(output: &Output) -> (usize, usize) {
+    let counts = summary_counts(output);
+    (counts[5], counts[6])
+}
+
+/// The command `cat` for the file `name` in the indexed tree.
+fn cat(transfer: &Transfer, name: &str) -> Vec<OsString> {
+    let path = transfer.env.path(format!("tree/{name}"));
+    args(&["cat", path.to_str().unwrap()])
+}
+
+/// Run `cat` on the file `name` in the indexed tree, in batch delivery, and
+/// check the run with `all_references`. Returns the list bytes that the run
+/// sent.
+fn cat_references(transfer: &Transfer, name: &str) -> (usize, usize) {
+    let output = transfer.run(&[BATCH], &refs(&cat(transfer, name)));
+    all_references(transfer, name, output)
+}
+
+/// Require that `output` comes from a successful run whose stdout is the
+/// file `name` of the indexed tree, with every block sent as a reference.
+/// That only works if the sender built its table from the whole target.
+/// Returns the list bytes that the run sent.
+fn all_references(transfer: &Transfer, name: &str, output: Output) -> (usize, usize) {
+    let output = succeeded(output);
+    let expected = std::fs::read(transfer.env.path(format!("tree/{name}"))).unwrap();
+    assert!(output.stdout == expected, "the output differs");
+    assert_eq!(
+        summary(&output)[2],
+        expected.len(),
+        "every block is a reference"
+    );
+    list_bytes(&output)
+}
+
+/// The one list that each side keeps. Both sides must keep the same list.
+fn kept_list(transfer: &Transfer) -> String {
+    let kept = transfer.cache_files("receiver", "local-hashlists");
+    assert_eq!(kept.len(), 1, "receiver cache: {kept:?}");
+    assert_eq!(transfer.cache_files("sender", "remote-hashlists"), kept);
+    kept.into_iter().next().unwrap()
+}
+
+#[test]
+fn an_unchanged_list_is_kept_and_a_changed_one_goes_as_a_delta() {
+    // The first run sends the full list. With the index unchanged, the next
+    // run sends no list bytes at all, because the sender already has the
+    // target. After a change, a run sends the delta from the list that both
+    // sides keep, which is smaller. However the sender gets the target, it
+    // builds its table from it, so the blocks of the files become references
+    // (DESIGN.md §5.6).
+    let transfer = Transfer::new("");
+    transfer.env.write("tree/first", &tiled(64, 7));
+    let (full, delta) = cat_references(&transfer, "first");
+    assert!(full > 0 && delta == 0, "full {full}, delta {delta}");
+    let first_list = kept_list(&transfer);
+
+    assert_eq!(cat_references(&transfer, "first"), (0, 0));
+    assert_eq!(kept_list(&transfer), first_list);
+
+    transfer.env.write("tree/second", &tiled(4, 9));
+    let (none, delta) = cat_references(&transfer, "second");
+    assert_eq!(none, 0);
+    assert!(delta > 0 && delta < full, "delta {delta}, full {full}");
+    assert_ne!(kept_list(&transfer), first_list);
+}
+
+#[test]
+fn a_base_from_the_directory_of_another_peer_serves() {
+    // Lists are named by their content, so the receiver looks for a base in
+    // the directories of all its peers and indexes (DESIGN.md §5.6). Here
+    // the receiver's copy of the list that the sender keeps sits in another
+    // peer's directory. The run sends a delta from it and leaves it there,
+    // renewed.
+    let transfer = Transfer::new("");
+    transfer.env.write("tree/first", &tiled(64, 7));
+    cat_references(&transfer, "first");
+    let base = kept_list(&transfer);
+    let own = transfer.peer_dir("receiver", "local-hashlists").unwrap();
+    let other = own.with_file_name(format!("{}-{}", "ab".repeat(16), "cd".repeat(16)));
+    std::fs::rename(&own, &other).unwrap();
+    let ctime = |path: &std::path::Path| {
+        let meta = std::fs::metadata(path).unwrap();
+        (meta.ctime(), meta.ctime_nsec())
+    };
+    let before = ctime(&other.join(&base));
+    // Wait, with no deadline, until the filesystem clock has moved past
+    // `before`, so that the renewal shows in the ctime: otherwise the next
+    // run could renew the base within the same timestamp tick. The probe is
+    // on the same filesystem as the cache.
+    let probe = transfer.env.path("probe");
+    loop {
+        std::fs::write(&probe, b"").unwrap();
+        if ctime(&probe) > before {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    transfer.env.write("tree/second", &tiled(4, 9));
+    let (full, delta) = cat_references(&transfer, "second");
+    assert_eq!(full, 0);
+    assert!(delta > 0);
+    assert!(
+        ctime(&other.join(&base)) > before,
+        "the base must stay, renewed"
+    );
+    let target = transfer.cache_files("sender", "remote-hashlists");
+    assert_eq!(target.len(), 1);
+    assert_ne!(target[0], base);
+    assert!(own.join(&target[0]).exists());
+}
+
+#[test]
+fn a_damaged_cached_list_gives_way_to_the_full_list_on_either_side() {
+    // A damaged cached list is a miss, and its file is removed (DESIGN.md
+    // §5.6). If the damage is on the receiver, the run sends the full list
+    // right away. The sender only finds out when it reads the list that
+    // HASHKEEP or HASHDELTA names, so there the run sends the full list
+    // after HASHFULL. Either way, both sides end up keeping only the valid
+    // target.
+    let transfer = Transfer::new("");
+    transfer.env.write("tree/first", &tiled(64, 7));
+    cat_references(&transfer, "first");
+    let damage = |side: &str, tree: &str| {
+        let dir = transfer.peer_dir(side, tree).unwrap();
+        std::fs::write(dir.join(kept_list(&transfer)), b"damaged").unwrap();
+    };
+
+    damage("receiver", "local-hashlists");
+    transfer.env.write("tree/second", &tiled(4, 9));
+    let (full, delta) = cat_references(&transfer, "second");
+    assert!(full > 0 && delta == 0, "full {full}, delta {delta}");
+
+    // HASHKEEP of the unchanged list, then the full list.
+    damage("sender", "remote-hashlists");
+    assert_eq!(cat_references(&transfer, "second"), (full, 0));
+
+    // HASHDELTA from the previous run's list, then the full list.
+    damage("sender", "remote-hashlists");
+    transfer.env.write("tree/third", &tiled(4, 11));
+    let (third, delta) = cat_references(&transfer, "third");
+    assert!(third > full && delta > 0, "full {third}, delta {delta}");
+    for (side, tree) in [
+        ("receiver", "local-hashlists"),
+        ("sender", "remote-hashlists"),
+    ] {
+        let dir = transfer.peer_dir(side, tree).unwrap();
+        let bytes = std::fs::read(dir.join(kept_list(&transfer))).unwrap();
+        assert_eq!(bytes.len(), "hsynlist\x01".len() + third, "{side}");
+    }
+}
+
+#[test]
+fn lists_stay_usable_after_failed_runs_and_restores() {
+    // If a run's sender ends before it publishes its target, the sender
+    // still has the previous run's list, and the receiver, which got no
+    // CACHE_RESULT, has both that list and the target. The next run then
+    // sends a delta from the list that both have. An index that goes back to
+    // an earlier state has that state's list as its target again, which a
+    // delta can reach as well. Each time, both sides end up keeping only the
+    // target (DESIGN.md §5.6).
+    let transfer = Transfer::new("");
+    transfer.env.write("tree/first", &tiled(64, 7));
+    cat_references(&transfer, "first");
+    let first = kept_list(&transfer);
+    let receiver_dir = transfer.peer_dir("receiver", "local-hashlists").unwrap();
+    let sender_dir = transfer.peer_dir("sender", "remote-hashlists").unwrap();
+    let first_file = std::fs::read(receiver_dir.join(&first)).unwrap();
+    transfer.env.write("tree/second", &tiled(4, 9));
+    cat_references(&transfer, "second");
+    let second = kept_list(&transfer);
+
+    std::fs::write(receiver_dir.join(&first), &first_file).unwrap();
+    std::fs::write(sender_dir.join(&first), &first_file).unwrap();
+    std::fs::remove_file(sender_dir.join(&second)).unwrap();
+    transfer.env.write("tree/third", &tiled(4, 11));
+    let (full, delta) = cat_references(&transfer, "third");
+    assert!(full == 0 && delta > 0, "full {full}, delta {delta}");
+    kept_list(&transfer);
+
+    std::fs::remove_file(transfer.env.path("tree/third")).unwrap();
+    let (full, delta) = cat_references(&transfer, "second");
+    assert!(full == 0 && delta > 0, "full {full}, delta {delta}");
+    assert_eq!(kept_list(&transfer), second);
+}
+
+#[test]
+fn a_rebuilt_index_starts_its_lists_again() {
+    // A rebuild gives the index a new ID, and the caches are partitioned by
+    // index: the sender has no list for the new one, so the next run sends
+    // the full list. The old index's lists stay until they expire (DESIGN.md
+    // §4.4 and §5.6).
+    let transfer = Transfer::new("");
+    transfer.env.write("tree/first", &tiled(64, 7));
+    let (full, _) = cat_references(&transfer, "first");
+    let old = transfer.peer_dir("receiver", "local-hashlists").unwrap();
+    let list = kept_list(&transfer);
+    let output = transfer.env.run(&["update", "--rebuild"]);
+    assert!(output.status.success());
+    assert_eq!(cat_references(&transfer, "first"), (full, 0));
+    for tree in [
+        "receiver/cache/hashsync/local-hashlists",
+        "sender/home/.cache/hashsync/remote-hashlists",
+    ] {
+        let dirs: Vec<PathBuf> = std::fs::read_dir(transfer.env.path(tree))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(dirs.len(), 2, "{tree}: {dirs:?}");
+        assert!(dirs.iter().all(|dir| dir.join(&list).exists()), "{dirs:?}");
+    }
+    assert!(old.join(&list).exists());
+}
+
+#[test]
+fn a_sender_reads_its_base_after_a_concurrent_exchange_removed_it() {
+    // Read-only runs of one index can overlap, with the same sender account.
+    // The sender opens its listing before its HELLO, but reads the base that
+    // HASHDELTA names only after `attach` has connected, so a concurrent
+    // exchange can remove the base in between (DESIGN.md §5.6). Here a gate
+    // holds back the control session of the first run while a second run
+    // goes through its whole exchange and removes the base from both caches.
+    // The first run must still send a delta, which its sender can only
+    // apply through the file that its listing opened.
+    let transfer = Transfer::new("");
+    transfer.env.write("tree/first", &tiled(64, 7));
+    cat_references(&transfer, "first");
+    let base = kept_list(&transfer);
+    transfer.env.write("tree/second", &tiled(64, 9));
+    transfer.env.update();
+    let gate = transfer.env.path("gate");
+    let mut gate_writer = held_fifo(&gate);
+    wrap_ssh(
+        &transfer,
+        r#"if [ $session = control ] && [ -n "${HASHSYNC_TEST_GATE:-}" ]; then
+    read -r go <"$HASHSYNC_TEST_GATE"
+fi
+exec "$ssh" "$@""#,
+    );
+    let first = transfer
+        .invocation(
+            &[EXACT, BATCH, "--no-update"],
+            &refs(&cat(&transfer, "second")),
+        )
+        .env("HASHSYNC_TEST_GATE", &gate)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut first = KillOnDrop(first);
+
+    // The first run's receiver publishes its target only after the sender's
+    // HELLO, so once the target shows up, the sender has opened its listing.
+    // It is now waiting for `attach`, before it reads anything that names
+    // the base. Poll for the target with no deadline.
+    let receiver_dir = transfer.peer_dir("receiver", "local-hashlists").unwrap();
+    let target_published = || {
+        let names = transfer.cache_files("receiver", "local-hashlists");
+        names
+            .into_iter()
+            .any(|name| !name.starts_with('.') && name != base)
+    };
+    while !target_published() {
+        assert!(first.0.try_wait().unwrap().is_none(), "the first run ended");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    // The second run has no gate. The end of its exchange removes the base
+    // on both sides.
+    let second = transfer.run(&[BATCH, "--no-update"], &refs(&cat(&transfer, "second")));
+    let (full, delta) = all_references(&transfer, "second", second);
+    assert!(
+        full == 0 && delta > 0,
+        "second run: full {full}, delta {delta}"
+    );
+    let sender_dir = transfer.peer_dir("sender", "remote-hashlists").unwrap();
+    assert!(!receiver_dir.join(&base).exists() && !sender_dir.join(&base).exists());
+
+    gate_writer.write_all(b"go\n").unwrap();
+    let (full, delta) = all_references(&transfer, "second", output_of(first));
+    assert!(
+        full == 0 && delta > 0,
+        "first run: full {full}, delta {delta}"
+    );
+    kept_list(&transfer);
+}
+
+#[test]
+fn a_delta_larger_than_the_full_list_is_not_sent() {
+    // When every value of a short list changes, the removed and added
+    // values take more bytes than the full list, so the run sends the full
+    // list instead (DESIGN.md §5.6): 8 bytes of header and 9 for its one
+    // value.
+    let transfer = Transfer::new("");
+    transfer.env.write("tree/one", &tiled(1, 7));
+    assert_eq!(cat_references(&transfer, "one"), (17, 0));
+    transfer.env.write("tree/one", &tiled(1, 8));
+    assert_eq!(cat_references(&transfer, "one"), (17, 0));
 }
 
 #[test]

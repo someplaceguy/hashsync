@@ -34,10 +34,13 @@
 //! the input spool, and ends the threads of the input, which the main
 //! thread then joins (DESIGN.md §6.9).
 //!
-//! The sender's data reader waits while the input spool holds its limit,
-//! and then it reads nothing from the data session: it cannot see the loss
-//! of the session. So until the stop, the session watcher sees it instead,
-//! and ends the run.
+//! The sender goes through long stretches in which no thread reads the data
+//! session: its main thread does other setup work before and after it reads
+//! the list exchange, and the data reader can wait at the limit of the
+//! input spool (DESIGN.md §6.9). Nothing would notice the loss of the
+//! session then, so until the input stops, the session watcher waits for
+//! the session to hang up, and ends the run if it does. The watcher starts
+//! before the sender's HELLO, so it covers the wait for `attach` too.
 
 use std::io::{BufWriter, ErrorKind, IsTerminal, PipeReader, PipeWriter, Read, Write};
 use std::os::fd::{AsFd, OwnedFd};
@@ -519,10 +522,11 @@ impl StoppedInput {
 }
 
 /// The session watcher (DESIGN.md §6.6, step M1): wait until the data
-/// session hangs up, unless the stop pipe closes first. Until the stop, the
-/// data reader can wait at the limit of the input spool, and then it does
-/// not read the EOF that the loss of the session causes. So a hangup before
-/// the stop ends the run: the receiver disappeared.
+/// session hangs up, unless the stop pipe closes first. This thread exists
+/// because until the stop, there are long stretches in which no other
+/// thread reads the data session, and so none would see the EOF that its
+/// loss causes (see the module doc). A hangup before the stop therefore
+/// ends the run: the receiver disappeared.
 fn watch_session(session: impl AsFd, stopped: &PipeReader) {
     // A pipe tells its hangup with `POLLHUP`, which `poll` always reports,
     // and a socket whose peer shut down its writes tells it with

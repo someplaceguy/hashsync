@@ -51,10 +51,6 @@ pub const FEATURES: u64 = 0;
 
 /// Frame types. `type u8, length u32, payload`, integers little endian.
 pub mod frame {
-    // The full frame space is defined here (DESIGN.md §6.2); later
-    // milestones send the remaining types.
-    #![allow(dead_code)]
-
     pub const HELLO: u8 = 1;
     pub const HASHLIST: u8 = 2;
     pub const HASHDELTA: u8 = 3;
@@ -73,6 +69,9 @@ pub mod frame {
     pub const INPUT_END: u8 = 16;
     pub const INPUT_STOP: u8 = 17;
 }
+
+/// The size of a frame header, `type u8, length u32`.
+const FRAME_HEADER: usize = 5;
 
 /// When the bytes of the output, or of the input, go on from the buffers
 /// on their way to their destination (DESIGN.md §6.2).
@@ -236,24 +235,100 @@ impl SenderHello {
     }
 }
 
-/// HASHLIST: the encoded length of the target list, whose bytes follow the
-/// frame directly.
-pub struct HashList {
-    pub length: u64,
+/// The message in which the receiver hands the sender its target
+/// (DESIGN.md §5.6): a frame, followed directly by the encoded lists that it
+/// announces, outside any frame.
+#[derive(Debug, PartialEq, Eq)]
+pub enum TargetList {
+    /// HASHLIST, with the full target.
+    Full(Vec<u8>),
+    /// HASHKEEP: the target is one of the lists that the sender advertised.
+    Keep,
+    /// HASHDELTA: the removed and added lists that turn `base`, one of the
+    /// advertised lists, into the target.
+    Delta {
+        base: Strong,
+        removed: Vec<u8>,
+        added: Vec<u8>,
+    },
 }
 
-impl HashList {
-    pub fn encode(&self) -> Vec<u8> {
+impl TargetList {
+    /// The type and payload of the frame. The payload holds the base, if
+    /// there is one, and the lengths of the lists that follow.
+    fn frame(&self) -> (u8, Vec<u8>) {
         let mut enc = Enc::new();
-        enc.u64(self.length);
-        enc.buf
+        let kind = match self {
+            TargetList::Full(list) => {
+                enc.u64(list.len() as u64);
+                frame::HASHLIST
+            }
+            TargetList::Keep => frame::HASHKEEP,
+            TargetList::Delta {
+                base,
+                removed,
+                added,
+            } => {
+                enc.raw(base);
+                enc.u64(removed.len() as u64);
+                enc.u64(added.len() as u64);
+                frame::HASHDELTA
+            }
+        };
+        (kind, enc.buf)
     }
 
-    pub fn decode(payload: &[u8]) -> Self {
-        let mut dec = Dec::new(payload, "HASHLIST");
-        let header = HashList { length: dec.u64() };
-        dec.done();
-        header
+    /// The lists that follow the frame, in order.
+    fn lists(&self) -> Vec<&[u8]> {
+        match self {
+            TargetList::Full(list) => vec![list],
+            TargetList::Keep => Vec::new(),
+            TargetList::Delta { removed, added, .. } => vec![removed, added],
+        }
+    }
+
+    /// The number of bytes that the message takes on the data session: the
+    /// frame plus the lists after it.
+    pub fn size(&self) -> usize {
+        let lists: usize = self.lists().iter().map(|list| list.len()).sum();
+        FRAME_HEADER + self.frame().1.len() + lists
+    }
+
+    /// Send the frame and the lists after it in a single write call
+    /// (`FrameWriter::send_followed_by`).
+    pub fn send<W: Write>(&self, out: &mut FrameWriter<W>) -> std::io::Result<()> {
+        let (kind, payload) = self.frame();
+        out.send_followed_by(kind, &payload, &self.lists())
+    }
+
+    /// Receive the frame and the lists after it. EOF is `UnexpectedEof`,
+    /// and any other frame is a protocol error.
+    pub fn receive<R: Read>(input: &mut FrameReader<R>) -> std::io::Result<TargetList> {
+        let frame = input.next()?.ok_or(std::io::ErrorKind::UnexpectedEof)?;
+        let list = match frame.kind {
+            frame::HASHLIST => {
+                let mut dec = Dec::new(frame.payload, "HASHLIST");
+                let length = dec.u64();
+                dec.done();
+                TargetList::Full(input.bytes(length)?)
+            }
+            frame::HASHKEEP => {
+                Dec::new(frame.payload, "HASHKEEP").done();
+                TargetList::Keep
+            }
+            frame::HASHDELTA => {
+                let mut dec = Dec::new(frame.payload, "HASHDELTA");
+                let (base, removed, added) = (dec.array(), dec.u64(), dec.u64());
+                dec.done();
+                TargetList::Delta {
+                    base,
+                    removed: input.bytes(removed)?,
+                    added: input.bytes(added)?,
+                }
+            }
+            kind => panic!("protocol error: expected the target list, received frame type {kind}"),
+        };
+        Ok(list)
     }
 }
 
@@ -560,7 +635,7 @@ impl<R: Read> FrameReader<R> {
     /// frame is `UnexpectedEof`: a truncated stream, for the caller's
     /// `die`.
     pub fn next(&mut self) -> std::io::Result<Option<Frame<'_>>> {
-        let mut header = [0u8; 5];
+        let mut header = [0u8; FRAME_HEADER];
         if !self.read_whole(&mut header)? {
             return Ok(None);
         }
@@ -625,14 +700,15 @@ pub fn drain_to_eof(mut reader: impl Read) -> std::io::Result<bool> {
     }
 }
 
-/// Writes frames to a transport, each frame with one write call where the
-/// transport takes it whole (`send`). A writer that sends many small
-/// frames also wraps its transport in a `BufWriter`, which makes fewer
-/// calls. A control writer flushes before it waits (`next_from`). On the
-/// data session, the sender flushes its stream before it waits for a reply
-/// and, in eager delivery of the output, at the idle points of the
-/// command's stdout; the receiver sends each INPUT frame at once
-/// (DESIGN.md §6.2 and §6.6).
+/// Writes frames to a transport. Each frame goes out in one write call,
+/// together with any bytes that follow it outside a frame, whenever the
+/// transport takes it whole (`send`, `send_followed_by`). A writer that
+/// sends many small frames also wraps its transport in a `BufWriter`, which
+/// makes fewer calls. A control writer flushes before it waits
+/// (`next_from`). On the data session, the sender flushes its stream before
+/// it waits for a reply and, in eager delivery of the output, at the idle
+/// points of the command's stdout; the receiver sends each INPUT frame at
+/// once (DESIGN.md §6.2 and §6.6).
 pub struct FrameWriter<W: Write> {
     writer: W,
 }
@@ -663,12 +739,29 @@ impl<W: Write> FrameWriter<W> {
     /// before the payload arrives, and the header costs a packet
     /// (DESIGN.md §6.2).
     pub fn send(&mut self, kind: u8, payload: &[u8]) -> std::io::Result<()> {
-        let length = u32::try_from(payload.len())
-            .unwrap_or_else(|_| panic!("frame type {kind} with {} bytes", payload.len()));
-        let mut header = [kind, 0, 0, 0, 0];
-        header[1..].copy_from_slice(&length.to_le_bytes());
-        let mut parts = [IoSlice::new(&header), IoSlice::new(payload)];
-        let mut parts = &mut parts[..];
+        let header = frame_header(kind, payload);
+        self.write_parts(&mut [IoSlice::new(&header), IoSlice::new(payload)])
+    }
+
+    /// Write one frame followed directly by `after`, bytes that belong to
+    /// no frame: the lists after HASHLIST or HASHDELTA. They go in the same
+    /// write call as the frame, for the reason given at `send`: otherwise
+    /// SSH could send the frame and each list in packets of their own.
+    pub fn send_followed_by(
+        &mut self,
+        kind: u8,
+        payload: &[u8],
+        after: &[&[u8]],
+    ) -> std::io::Result<()> {
+        let header = frame_header(kind, payload);
+        let mut parts = vec![IoSlice::new(&header), IoSlice::new(payload)];
+        parts.extend(after.iter().map(|bytes| IoSlice::new(bytes)));
+        self.write_parts(&mut parts)
+    }
+
+    /// Write `parts` with one vectored write call, and the rest with more
+    /// calls if the transport takes only some of the bytes.
+    fn write_parts(&mut self, mut parts: &mut [IoSlice<'_>]) -> std::io::Result<()> {
         while !parts.is_empty() {
             match self.writer.write_vectored(parts) {
                 Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
@@ -678,12 +771,6 @@ impl<W: Write> FrameWriter<W> {
             }
         }
         Ok(())
-    }
-
-    /// Bytes that follow a frame outside any frame: the list bytes after
-    /// HASHLIST or HASHDELTA.
-    pub fn send_bytes(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-        self.writer.write_all(bytes)
     }
 
     pub fn flush(&mut self) -> std::io::Result<()> {
@@ -705,6 +792,17 @@ impl<W: Write> FrameWriter<W> {
             }
         }
     }
+}
+
+/// The header of a frame of type `kind` with `payload`: `type u8,
+/// length u32`.
+fn frame_header(kind: u8, payload: &[u8]) -> [u8; FRAME_HEADER] {
+    let length = u32::try_from(payload.len())
+        .unwrap_or_else(|_| panic!("frame type {kind} with {} bytes", payload.len()));
+    let mut header = [0; FRAME_HEADER];
+    header[0] = kind;
+    header[1..].copy_from_slice(&length.to_le_bytes());
+    header
 }
 
 /// Send one frame on the data session. A failure is the loss of the
@@ -1043,23 +1141,67 @@ mod tests {
     }
 
     #[test]
-    fn list_bytes_follow_their_frame_directly() {
+    fn target_lists_carry_their_lists_after_the_frame() {
+        // The list bytes after HASHLIST and HASHDELTA are not frames: they
+        // follow the frame directly, with the removed list first. The base
+        // of a delta travels as just its digest (DESIGN.md §6.2).
+        let lists = [
+            TargetList::Full(b"full".to_vec()),
+            TargetList::Keep,
+            TargetList::Delta {
+                base: [4; 32],
+                removed: b"rm".to_vec(),
+                added: b"add".to_vec(),
+            },
+        ];
         let mut out = Vec::new();
         let mut writer = FrameWriter::new(&mut out);
-        let header = HashList { length: 3 };
-        writer.send(frame::HASHLIST, &header.encode()).unwrap();
-        writer.send_bytes(b"abc").unwrap();
+        for list in &lists {
+            list.send(&mut writer).unwrap();
+        }
         writer.send(frame::END_ACK, b"").unwrap();
+        let expected = [
+            &[frame::HASHLIST, 8, 0, 0, 0][..],
+            &4u64.to_le_bytes(),
+            b"full",
+            &[frame::HASHKEEP, 0, 0, 0, 0],
+            &[frame::HASHDELTA, 48, 0, 0, 0],
+            &[4; 32],
+            &2u64.to_le_bytes(),
+            &3u64.to_le_bytes(),
+            b"rmadd",
+            &[frame::END_ACK, 0, 0, 0, 0],
+        ]
+        .concat();
+        assert_eq!(out, expected);
+        let sizes: Vec<usize> = lists.iter().map(TargetList::size).collect();
+        assert_eq!(sizes, [17, 5, 58]);
 
         let mut reader = FrameReader::new(&out[..]);
-        let payload = reader.expect(frame::HASHLIST, "HASHLIST").unwrap();
-        let length = HashList::decode(payload).length;
-        assert_eq!(reader.bytes(length).unwrap(), b"abc");
+        for list in lists {
+            assert_eq!(TargetList::receive(&mut reader).unwrap(), list);
+        }
         assert_eq!(reader.next().unwrap().unwrap().kind, frame::END_ACK);
-
-        let mut short = FrameReader::new(&b"ab"[..]);
-        let error = short.bytes(3).unwrap_err();
+        let error = TargetList::receive(&mut reader).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+
+        // The lists must arrive in full: here the added list is one byte
+        // short.
+        let mut reader = FrameReader::new(&expected[..expected.len() - 6]);
+        TargetList::receive(&mut reader).unwrap();
+        TargetList::receive(&mut reader).unwrap();
+        let error = TargetList::receive(&mut reader).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    #[should_panic(expected = "protocol error: expected the target list, received frame type 11")]
+    fn another_frame_in_place_of_the_target_list_is_a_protocol_error() {
+        let mut out = Vec::new();
+        FrameWriter::new(&mut out)
+            .send(frame::END_ACK, b"")
+            .unwrap();
+        let _ = TargetList::receive(&mut FrameReader::new(&out[..]));
     }
 
     #[test]
@@ -1139,6 +1281,41 @@ mod tests {
         let calls = writer.into_inner().calls;
         assert_eq!(calls.len(), 3);
         assert_eq!(calls.concat(), input);
+    }
+
+    #[test]
+    fn a_target_list_is_one_write_call() {
+        // The lists after HASHLIST and HASHDELTA are not frames, but SSH
+        // would still put them in packets of their own if it read them
+        // separately from their frame (DESIGN.md §6.2). A transport that
+        // takes only part of the bytes gets the rest in later calls, in
+        // order.
+        let lists = [
+            TargetList::Full(b"full".to_vec()),
+            TargetList::Keep,
+            TargetList::Delta {
+                base: [4; 32],
+                removed: b"rm".to_vec(),
+                added: b"add".to_vec(),
+            },
+        ];
+        for list in &lists {
+            let mut whole = Vec::new();
+            list.send(&mut FrameWriter::new(&mut whole)).unwrap();
+            let mut writer = FrameWriter::new(Calls {
+                calls: Vec::new(),
+                most: usize::MAX,
+            });
+            list.send(&mut writer).unwrap();
+            assert_eq!(writer.into_inner().calls, [whole.clone()]);
+
+            let mut writer = FrameWriter::new(Calls {
+                calls: Vec::new(),
+                most: 7,
+            });
+            list.send(&mut writer).unwrap();
+            assert_eq!(writer.into_inner().calls.concat(), whole);
+        }
     }
 
     fn receiver_hello() -> ReceiverHello {

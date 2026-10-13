@@ -20,23 +20,27 @@ process-isolation tests, and protocol fuzzing from DESIGN.md §11. Run
 `cargo fmt`, `cargo clippy --all-targets`, and `cargo test` for implementation
 changes.
 
-**Status:** Steps 1 to 5 are implemented: `update` (with `--rebuild` and
+**Status:** Steps 1 to 6 are implemented: `update` (with `--rebuild` and
 `-j`) and `stats` maintain the index for mutable roots, reuse unchanged
 files by identity, size, and ctime, and recover interrupted work; `run`
 (with `--no-update` and `--ssh`), `serve`, and `attach` transfer a remote
-command's output over two SSH sessions, with the full hash-list exchange,
+command's output over two SSH sessions, with the hash-list exchange,
 account identities, and durable list caches, replace indexed blocks with
 references verified through the receiver's pins, send constant-byte runs
 compactly, and compress the data stream and both directions of the control
-session with zstd. The command's stdout and the data session go through
-spools, so that a slow stage of the transfer does not stop the others.
+session with zstd. The list exchange reuses cached lists: an unchanged list
+costs no list bytes, and a changed one is sent as a direct delta from a list
+both sides have whenever that is smaller than the full list, which remains
+the fallback (DESIGN.md §5.6). The command's stdout and
+the data session go through spools, so that a slow stage of the transfer
+does not stop the others.
 With `--stdin`, the receiver's stdin goes to the command's stdin,
 compressed as the data stream is, through an input spool on each side
 (DESIGN.md §6.6). The output and the input reach their destinations at
 each idle point of their sources, once the link can carry them, unless
 `--batch-stdout` or `--batch-stdin` asks for batch delivery (DESIGN.md
 §6.2).
-Step 6 is the next milestone.
+Step 7 is the next milestone.
 
 ## 1. Build and inspect a local index
 

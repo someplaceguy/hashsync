@@ -2,10 +2,10 @@
 //!
 //! `serve` listens on `$XDG_RUNTIME_DIR/hashsync/T.sock`, falling back to
 //! a private directory under `/tmp`. `attach` retries a not-yet-listening
-//! socket while its stdin remains open, with no deadline. Both waits
-//! observe receiver disappearance: `attach` polls its stdin, whose write
-//! side is gone when the SSH session dies, and `serve`'s data reader
-//! reads stdin throughout the run.
+//! socket while its stdin remains open, with no deadline. Both waits notice
+//! when the receiver goes away: `attach` polls its stdin, whose write side
+//! closes when the SSH session dies, and `serve`'s session watcher waits
+//! for the same hangup on `serve`'s stdin (see `Listener::accept`).
 
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
@@ -132,9 +132,10 @@ pub fn listen(token: &str) -> Listener {
 }
 
 impl Listener {
-    /// Accept the control connection. The wait needs no check of its
-    /// own: `serve`'s data reader owns stdin for the whole run and dies
-    /// when the receiver disappears.
+    /// Accept the control connection. The wait needs no check of its own:
+    /// nothing in `serve` reads stdin meanwhile, but the input's session
+    /// watcher sees the hangup when the receiver goes away, and ends the
+    /// run (DESIGN.md §6.9).
     pub fn accept(&self) -> UnixStream {
         match retry_interrupted(|| self.listener.accept()) {
             Ok((stream, _)) => stream,

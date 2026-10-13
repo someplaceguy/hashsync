@@ -1,12 +1,12 @@
 //! `hashsync` copies a remote command's stdout, replacing blocks that the
 //! receiver already holds with verified local content. See `DESIGN.md`.
 //!
-//! This build implements PLAN.md steps 1–5: `update` and `stats` for
-//! mutable roots, and `run` transfers that replace indexed blocks with
-//! verified references, send constant-byte runs compactly, compress the
-//! data stream, spool the command's output and the data session, and, with
-//! `--stdin`, send the receiver's stdin to the command, both in eager or
-//! batch delivery.
+//! This build implements PLAN.md steps 1–6: `update` and `stats` for
+//! mutable roots, and `run`. A transfer reuses the hash lists of earlier
+//! transfers, replaces indexed blocks with verified references, sends runs
+//! of one byte compactly, compresses the data stream, spools the command's
+//! output and the data session, and with `--stdin` sends the receiver's
+//! stdin to the command. Output and input each use eager or batch delivery.
 
 mod attach;
 mod blocks;

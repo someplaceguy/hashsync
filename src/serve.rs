@@ -8,20 +8,25 @@
 //! compression is disabled, and so do the queries and the answers on the
 //! control session after the features (DESIGN.md §6.2).
 //!
-//! Each incoming direction has one owner for the whole run, so session
-//! loss is fatal at any moment — during rendezvous, setup, startup
-//! failure, and transfer alike (DESIGN.md §6.9). The data reader owns
-//! stdin and walks the receiver's fixed sequence: the protocol version and
-//! the features, HELLO, HASHLIST and the list bytes, the input, END_ACK,
-//! closure. From acceptance, the control reader owns the incoming
-//! direction of the control socket: the protocol version and the features,
-//! then answers. The control writer owns the outgoing one: the protocol
-//! version and the features, then queries, and INPUT_STOP. The main
-//! thread writes the setup frames, then gives the data session to the data
-//! writer and runs the scanner (DESIGN.md §6.8): it takes command output
-//! from the output reader and answers from the control reader, lends long
-//! stretches of windows to the probe threads, and queues queries for the
-//! control writer and frames for the data writer. The command's stdout
+//! Losing a session is fatal at any point: during rendezvous, setup, a
+//! failed command start, and the transfer itself (DESIGN.md §6.9). Each
+//! incoming direction has one owner at a time. The main thread reads the
+//! receiver's side of the data session until the list exchange is done:
+//! the protocol version and features, HELLO, and the target list. The
+//! target list is either HASHLIST with the full list, or HASHKEEP or
+//! HASHDELTA naming a list that the sender advertised; if the main thread
+//! cannot use that list, it asks once for the full list with HASHFULL
+//! (DESIGN.md §5.6). After that, it hands stdin to the data reader for the
+//! rest of the run: the input, END_ACK, and the closure. From acceptance,
+//! the control reader owns the incoming direction of the control socket:
+//! the protocol version and the features, then answers. The control writer
+//! owns the outgoing one: the protocol version and the features, then
+//! queries, and INPUT_STOP. The main thread writes the setup frames, then
+//! gives the data session to the data writer and runs the scanner
+//! (DESIGN.md §6.8): it takes command output from the output reader and
+//! answers from the control reader, lends long stretches of windows to the
+//! probe threads, and queues queries for the control writer and frames for
+//! the data writer. The command's stdout
 //! goes through a spool, so the command waits for the scanner only when
 //! `sender_output_spool_limit` bytes wait for it (DESIGN.md §6.5). In eager
 //! delivery of the output, the spool also marks the idle points of the
@@ -38,13 +43,15 @@
 //! DONE tells the receiver that this side needs neither session any more,
 //! and the receiver then closes both stdin pipes. The data reader monitors
 //! the receiver until that EOF, and the main thread joins it last. Until
-//! DONE, stdin EOF means that the receiver disappeared. While the data
-//! reader waits at the limit of the input spool, it reads nothing, so
-//! until the stop of the input, the session watcher of the input monitors
-//! stdin too. The input has no use any more once no process reads the
-//! command's stdin, or once the command has exited. Then the input stops,
-//! which INPUT_STOP tells the receiver, and the data reader discards the
-//! INPUT frames that still arrive before END_ACK.
+//! DONE, stdin EOF means that the receiver disappeared. Stdin can still go
+//! unread for a long time: while the main thread waits for `attach`, while
+//! it builds the table, publishes the target and ends its exchange before
+//! it starts the data reader, and while the data reader waits at the limit
+//! of the input spool. So until the input stops, the input's session
+//! watcher monitors stdin as well. The input has no use any more once no
+//! process reads the command's stdin, or once the command has exited. Then
+//! the input stops, which INPUT_STOP tells the receiver, and the data
+//! reader discards the INPUT frames that still arrive before END_ACK.
 
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::net::Shutdown;
@@ -63,14 +70,14 @@ use crate::cache::{self, Exchange};
 use crate::config::{self, thread_count};
 use crate::die::{self, die};
 use crate::fsops::{self, IdlePointReader, retry_interrupted};
-use crate::hash;
+use crate::hash::{self, Strong};
 use crate::hashlist::{self, ListId};
 use crate::hashtable::HashTable;
 use crate::input::SenderInput;
 use crate::pool::Pool;
 use crate::protocol::{
     self, Answer, COMPRESSION_LEVELS, Compressor, Decompressor, Delivery, End, FrameReader,
-    FrameWriter, HashList, Query, ReceiverHello, Rle, SenderControl, SenderHello, flush_data,
+    FrameWriter, Query, ReceiverHello, Rle, SenderControl, SenderHello, TargetList, flush_data,
     frame, send_data,
 };
 use crate::rendezvous;
@@ -250,37 +257,31 @@ pub fn run(token: &str) -> ! {
     // Listen before anything else, so `attach`'s retries can end.
     let listener = rendezvous::listen(token);
 
-    let progress = Arc::new(Progress::new());
-    let (hello_tx, hello_rx) = bounded(1);
-    let (list_tx, list_rx) = bounded(1);
-    let (input_tx, input_rx) = bounded(1);
-    let (ack_tx, ack_rx) = bounded(1);
-    // The first thread, and the last that the normal end joins: it reads
-    // stdin until the EOF that the receiver causes after DONE.
-    let data_reader = {
-        let progress = Arc::clone(&progress);
-        std::thread::Builder::new()
-            .name("data-reader".into())
-            .spawn(move || {
-                let data_in = FrameReader::new(BufReader::new(fsops::stdin()));
-                data_reader(data_in, hello_tx, list_tx, input_rx, ack_tx, &progress)
-            })
-            .expect("cannot start the data reader")
-    };
+    // This thread reads the data session itself until the list exchange is
+    // done, and then hands it to the data reader.
+    let mut data_in = FrameReader::new(BufReader::new(fsops::stdin()));
     let mut data_out = FrameWriter::new(BufWriter::with_capacity(WRITE_BUFFER, fsops::stdout()));
 
-    // This side's protocol version and features go first, without waiting
-    // for the receiver's, which the data reader reads (DESIGN.md §6.2).
+    // The sender's protocol version and features go first, without waiting
+    // for the receiver's (DESIGN.md §6.2).
     if let Err(e) = data_out
         .send_version_and_features()
         .and_then(|()| data_out.flush())
     {
         die(format!("data session: {e}"));
     }
+    match data_in.read_version_and_features("receiver") {
+        Ok(true) => {}
+        Ok(false) => die("the receiver disappeared"),
+        Err(e) => die_data(&e),
+    }
 
     // Data HELLOs: the receiver speaks first, this side replies only
     // after it accepted the receiver's parameters.
-    let hello: ReceiverHello = hello_rx.recv().expect("the data reader ended before HELLO");
+    let payload = data_in
+        .expect(frame::HELLO, "HELLO")
+        .unwrap_or_else(|e| die_data(&e));
+    let hello = ReceiverHello::decode(payload);
     validate_hello(&hello);
     // This side's tmp_data directory, for the spool of the command's
     // output. An unusable directory ends the run when it opens: here,
@@ -290,10 +291,10 @@ pub fn run(token: &str) -> ! {
     // INPUT_STOP of the stop of the input (DESIGN.md §6.2).
     let (control_tx, control_rx) = unbounded();
     // The input spool, which the data reader fills from the INPUT frames
-    // that follow the list exchange. Until the stop of the input, the
+    // that follow the list exchange. Until the input stops, the input's
     // session watcher monitors stdin, the incoming direction of the data
-    // session, which the data reader does not read while it waits at the
-    // limit of the input spool (DESIGN.md §6.6).
+    // session, because there are long stretches in which no thread reads
+    // it (see the module doc, and DESIGN.md §6.6 and §6.9).
     let (input_writer, mut input) = SenderInput::new(
         Arc::clone(&tmp_data),
         hello.sender_input_spool_limit,
@@ -301,14 +302,13 @@ pub fn run(token: &str) -> ! {
         rustix::stdio::stdin(),
         control_tx.clone(),
     );
-    let _ = input_tx.send(input_writer);
     // This side's part of the exchange lists its directory for the
     // receiver and the index, and must start before HELLO: then the end
     // of the exchange cannot remove the target of a later run, even when
     // this side outlives its receiver. With caching, advertise every
     // listed list; with caching disabled, none (DESIGN.md §5.6). The
-    // receiver uses the advertised lists from PLAN.md step 6 on; until
-    // then it sends a full list.
+    // receiver can then name one of these lists as the target, or send a
+    // delta from one of them.
     let mut exchange = Exchange::sender(&hello.account_id, &hello.index_id);
     let reply = SenderHello {
         account_id: cache::account_id(),
@@ -340,6 +340,7 @@ pub fn run(token: &str) -> ! {
     // arrived, then forwards answers. After the features, each direction
     // is one zstd stream at the data session's level.
     let control = listener.accept();
+    let progress = Arc::new(Progress::new());
     let control_writer = {
         let progress = Arc::clone(&progress);
         let control_out = clone_control(&control);
@@ -369,30 +370,43 @@ pub fn run(token: &str) -> ! {
             .expect("cannot start the control reader")
     };
 
-    // The list, assembled and digest-verified by the data reader; then the
-    // canonical decoding and the table (DESIGN.md §5.6).
-    let encoded: Vec<u8> = list_rx
-        .recv()
-        .expect("the data reader ended before the hash list");
-    let values = hashlist::decode(&encoded)
-        .unwrap_or_else(|e| panic!("protocol error: bad full hash list: {e}"));
+    // Get the target and verify it: the full list, the advertised list that
+    // HASHKEEP names, or the one that HASHDELTA changes, with a single
+    // HASHFULL fallback if that does not produce the target (DESIGN.md
+    // §5.6). Then build the table.
+    let target = ListId {
+        algorithm: hello.strong_hash,
+        digest: hello.target,
+    };
+    let (encoded, values) =
+        resolve_target(&mut data_in, &mut data_out, &exchange, &reply.lists, target);
     let table = HashTable::build(&values);
     drop(values);
 
-    // With caching, durably publish the target. Then end this side's part
-    // of the exchange: renew the target, remove the other listed files, or
-    // every listed file with caching disabled, and expire both cache
-    // trees. Failures are fatal inside the cache module. Acknowledge the
-    // accepted target only afterwards (DESIGN.md §5.6).
+    // With caching, durably publish the target, even one that the sender
+    // already had, because publication never trusts an existing name. Then
+    // end the sender's exchange: renew the target, remove the other listed
+    // files (all of them with caching disabled), and expire both cache
+    // trees. Failures are fatal inside the cache module. Only then
+    // acknowledge the target (DESIGN.md §5.6).
     if hello.sender_cache {
-        let target = ListId {
-            algorithm: hello.strong_hash,
-            digest: hello.target,
-        };
         exchange.publish(&target, &encoded);
     }
     drop(encoded);
-    exchange.finish(hello.hashlist_max_age);
+    exchange.finish(None, hello.hashlist_max_age);
+
+    // The list exchange is done, so the data reader takes over the incoming
+    // direction of the data session for the rest of the run: the input,
+    // END_ACK, and the EOF that the receiver causes after DONE. The normal
+    // end joins it last.
+    let (ack_tx, ack_rx) = bounded(1);
+    let data_reader = {
+        let progress = Arc::clone(&progress);
+        std::thread::Builder::new()
+            .name("data-reader".into())
+            .spawn(move || data_reader(data_in, input_writer, ack_tx, &progress))
+            .expect("cannot start the data reader")
+    };
     // The receiver sends the input only after CACHE_RESULT, and the
     // command can wait for the input before it writes any output: so
     // CACHE_RESULT cannot wait in the stream for that output (DESIGN.md
@@ -750,52 +764,27 @@ fn write_control(
     }
 }
 
-/// The single owner of the data session's incoming direction, for the
-/// whole run: the protocol version and the features, HELLO, the list, the
-/// input, END_ACK, then closure. EOF before DONE is the receiver's
-/// disappearance and is fatal (DESIGN.md §6.9). The receiver closes the
-/// session after DONE, so EOF then is the normal end of this thread, and
-/// the main thread joins it. The payloads of INPUT frames go to the writer
-/// of the input spool, from `input_rx` (DESIGN.md §6.6).
+/// The owner of the incoming direction of the data session once the list
+/// exchange is done, for the rest of the run: the input, END_ACK, then the
+/// closure. EOF before DONE means that the receiver disappeared, which is
+/// fatal (DESIGN.md §6.9). The receiver closes the session after DONE, so
+/// EOF then is the normal end of this thread, which the main thread joins.
+/// The payloads of INPUT frames go to `input`, the writer of the input
+/// spool (DESIGN.md §6.6).
 fn data_reader<R: Read>(
     mut data_in: FrameReader<R>,
-    hello_tx: Sender<ReceiverHello>,
-    list_tx: Sender<Vec<u8>>,
-    input_rx: Receiver<SpoolWriter>,
+    input: SpoolWriter,
     ack_tx: Sender<()>,
     progress: &Progress,
 ) {
-    match data_in.read_version_and_features("receiver") {
-        Ok(true) => {}
-        Ok(false) => die("the receiver disappeared"),
-        Err(e) => die_data(&e),
-    }
-    let payload = data_in
-        .expect(frame::HELLO, "HELLO")
-        .unwrap_or_else(|e| die_data(&e));
-    let hello = ReceiverHello::decode(payload);
-    let target = ListId {
-        algorithm: hello.strong_hash,
-        digest: hello.target,
-    };
-    let _ = hello_tx.send(hello);
-
-    // The receiver sends the list only after this side's HELLO reply;
-    // reading ahead of the main thread is safe because this thread only
-    // validates and never replies.
-    let encoded = receive_list(&mut data_in, target);
-    let _ = list_tx.send(encoded);
-
     // The input, then END_ACK, which must answer a sent END, are the
-    // receiver's remaining data-session frames (DESIGN.md §6.2). A write
-    // to the input spool waits while the spool holds its limit, and after
-    // the stop it discards the payload. The receiver stops sending the
-    // input at END, so END_ACK can come without INPUT_END.
-    let mut input = Some(
-        input_rx
-            .recv()
-            .expect("the main thread ended before the input spool"),
-    );
+    // receiver's remaining data-session frames (DESIGN.md §6.2). Any other
+    // frame is a protocol error, including a full list that the sender did
+    // not ask for with HASHFULL. A write to the input spool waits while the
+    // spool holds its limit, and after the stop it discards the payload.
+    // The receiver stops sending the input at END, so END_ACK can come
+    // without INPUT_END.
+    let mut input = Some(input);
     loop {
         let received = match data_in.next() {
             Ok(Some(received)) => received,
@@ -950,22 +939,84 @@ fn validate_hello(hello: &ReceiverHello) {
     }
 }
 
-/// Receive the full canonical list: HASHLIST, then the list bytes that
-/// follow it directly, verified against the target digest
-/// (DESIGN.md §5.6).
-fn receive_list<R: Read>(data_in: &mut FrameReader<R>, target: ListId) -> Vec<u8> {
-    let payload = data_in
-        .expect(frame::HASHLIST, "HASHLIST")
-        .unwrap_or_else(|e| die_data(&e));
-    let header = HashList::decode(payload);
-    let encoded = data_in
-        .bytes(header.length)
-        .unwrap_or_else(|e| die_data(&e));
+/// Read the receiver's target list, which follows the sender's HELLO on
+/// `data_in`, and return the target's bytes and values (DESIGN.md §5.6). A
+/// full list must be the target itself (`verify_full_list`). HASHKEEP and
+/// HASHDELTA name one of the `advertised` lists, which is read through the
+/// listing of `exchange`: for HASHKEEP it is the target, and for HASHDELTA
+/// it is the base that the delta turns into the target. If that list is
+/// invalid, or the delta does not produce the target, this sends HASHFULL
+/// on `data_out` and uses the full list that the receiver sends back; the
+/// result of a bad delta is never used. Nothing after the target list, or
+/// after that full list, is read here: the input that follows belongs to
+/// the data reader.
+fn resolve_target<R: Read, W: Write>(
+    data_in: &mut FrameReader<R>,
+    data_out: &mut FrameWriter<W>,
+    exchange: &Exchange,
+    advertised: &[Strong],
+    target: ListId,
+) -> (Vec<u8>, Vec<u64>) {
+    let mut next = || TargetList::receive(data_in).unwrap_or_else(|e| die_data(&e));
+    let cached = match next() {
+        TargetList::Full(encoded) => return verify_full_list(encoded, target),
+        TargetList::Keep => {
+            assert!(
+                advertised.contains(&target.digest),
+                "protocol error: HASHKEEP, but {target} was not advertised"
+            );
+            exchange.read_listed(&target)
+        }
+        TargetList::Delta {
+            base,
+            removed,
+            added,
+        } => {
+            let base = ListId {
+                algorithm: target.algorithm,
+                digest: base,
+            };
+            assert!(
+                advertised.contains(&base.digest),
+                "protocol error: HASHDELTA from {base}, which was not advertised"
+            );
+            let decode = |list: &[u8], which: &str| {
+                hashlist::decode(list).unwrap_or_else(|e| {
+                    panic!("protocol error: bad {which} list in HASHDELTA: {e}")
+                })
+            };
+            let (removed, added) = (decode(&removed, "removed"), decode(&added, "added"));
+            exchange.read_listed(&base).and_then(|(_, base)| {
+                let values = hashlist::apply(&base, &removed, &added);
+                let encoded = hashlist::encode(&values);
+                (target.algorithm.digest(&encoded) == target.digest).then_some((encoded, values))
+            })
+        }
+    };
+    if let Some(list) = cached {
+        return list;
+    }
+    // The receiver answers with the full list, and the sender waits for it,
+    // so the request must not stay in the compressor (DESIGN.md §6.2).
+    send_data(data_out, frame::HASHFULL, b"");
+    flush_data(data_out);
+    let TargetList::Full(encoded) = next() else {
+        panic!("protocol error: the answer to HASHFULL is not the full list");
+    };
+    verify_full_list(encoded, target)
+}
+
+/// The bytes and values of the full list `encoded`, which must be the
+/// target. A list that does not match the digest of `target`, or is not
+/// canonical, is a bad full list and a protocol error (DESIGN.md §5.6).
+fn verify_full_list(encoded: Vec<u8>, target: ListId) -> (Vec<u8>, Vec<u64>) {
     assert!(
         target.algorithm.digest(&encoded) == target.digest,
         "protocol error: the full hash list does not match {target}"
     );
-    encoded
+    let values = hashlist::decode(&encoded)
+        .unwrap_or_else(|e| panic!("protocol error: bad full hash list: {e}"));
+    (encoded, values)
 }
 
 #[cfg(test)]
@@ -974,8 +1025,11 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::cache::tests::with_home;
+    use crate::hash::StrongHash;
     use crate::hash::weak::WeakHasher;
-    use crate::hash::{Strong, StrongHash};
+    use crate::hashlist::tests::list;
+    use crate::names::hex;
     use crate::scanner::tests::noise;
 
     const BS: u32 = 64;
@@ -1175,38 +1229,10 @@ mod tests {
         writer.join().unwrap();
     }
 
-    /// The receiver's side of the data session, for the empty list, then
-    /// `frames`, as frames, then `trailing`, as bytes.
+    /// The receiver's side of the data session after the list exchange:
+    /// `frames` as frames, then `trailing` as raw bytes.
     fn receiver_session(frames: &[(u8, &[u8])], trailing: &[u8]) -> Vec<u8> {
-        let list = hashlist::encode(&[]);
-        let hello = ReceiverHello {
-            block_size: BS,
-            weak_hash_id: hash::weak::ID.to_string(),
-            strong_hash: StrongHash::Blake3,
-            target: StrongHash::Blake3.digest(&list),
-            account_id: [1; 16],
-            index_id: [2; 16],
-            sender_cache: false,
-            hashlist_max_age: 0,
-            compression_level: 0,
-            compression_long: false,
-            compression_threads: 0,
-            probe_threads: 0,
-            lookahead: u64::from(BS),
-            negative_cache: 0,
-            sender_output_spool_limit: 0,
-            sender_input_spool_limit: 0,
-            output_delivery: Delivery::Eager,
-            command: vec![b"true".to_vec()],
-        };
-        let header = HashList {
-            length: list.len() as u64,
-        };
         let mut session = FrameWriter::new(Vec::new());
-        session.send_version_and_features().unwrap();
-        session.send(frame::HELLO, &hello.encode()).unwrap();
-        session.send(frame::HASHLIST, &header.encode()).unwrap();
-        session.send_bytes(&list).unwrap();
         for &(kind, payload) in frames {
             session.send(kind, payload).unwrap();
         }
@@ -1223,24 +1249,201 @@ mod tests {
         let path = tempdir.path().join("tmp-data");
         let dir = Arc::new(Directory::open(path.as_os_str().as_bytes()));
         let (writer, mut input) = Spool::pipe(dir, u64::MAX);
-        let (hello_tx, _hello_rx) = bounded(1);
-        let (list_tx, _list_rx) = bounded(1);
-        let (input_tx, input_rx) = bounded(1);
         let (ack_tx, _ack_rx) = bounded(1);
-        input_tx.send(writer).unwrap();
         let progress = Progress::new();
         progress.advance(Phase::DoneSent);
-        data_reader(
-            FrameReader::new(session),
-            hello_tx,
-            list_tx,
-            input_rx,
-            ack_tx,
-            &progress,
-        );
+        data_reader(FrameReader::new(session), writer, ack_tx, &progress);
         let mut appended = Vec::new();
         input.read_to_end(&mut appended).unwrap();
         appended
+    }
+
+    /// The data reader starts after the list exchange, so a full list that
+    /// arrives then, without a HASHFULL that asked for it, is a protocol
+    /// error (DESIGN.md §5.6).
+    #[test]
+    #[should_panic(expected = "protocol error: unexpected data frame type 2")]
+    fn a_full_list_that_was_not_asked_for_is_a_protocol_error() {
+        let mut session = FrameWriter::new(Vec::new());
+        let full = TargetList::Full(hashlist::encode(&[]));
+        full.send(&mut session).unwrap();
+        read_session(&session.into_inner());
+    }
+
+    /// The receiver's account and index in the sender's cache tests.
+    const PEER: [u8; 16] = [1; 16];
+    const INDEX: [u8; 16] = [2; 16];
+
+    /// Publish `encoded` as the list `id` in the sender's cache for `PEER`
+    /// and `INDEX`, as an earlier run would have.
+    fn cache(id: &ListId, encoded: &[u8]) {
+        Exchange::sender(&PEER, &INDEX).publish(id, encoded);
+    }
+
+    /// Run `resolve_target` on `lists`, the target lists that the receiver
+    /// sends, in a new exchange for `PEER` and `INDEX` that advertised
+    /// `advertised`, or every list in its listing for `None`. Returns the
+    /// target's bytes and values, the bytes of the frames that it sent, and
+    /// how many bytes of `lists` it left unread.
+    fn resolve(
+        advertised: Option<&[Strong]>,
+        target: ListId,
+        lists: &[TargetList],
+    ) -> ((Vec<u8>, Vec<u64>), Vec<u8>, usize) {
+        let exchange = Exchange::sender(&PEER, &INDEX);
+        let advertised = match advertised {
+            Some(advertised) => advertised.to_vec(),
+            None => exchange.listed_ids(StrongHash::Blake3),
+        };
+        let mut session = FrameWriter::new(Vec::new());
+        for list in lists {
+            list.send(&mut session).unwrap();
+        }
+        let session = session.into_inner();
+        let mut data_in = FrameReader::new(&session[..]);
+        let mut data_out = FrameWriter::new(Vec::new());
+        let target = resolve_target(&mut data_in, &mut data_out, &exchange, &advertised, target);
+        (target, data_out.into_inner(), data_in.into_inner().len())
+    }
+
+    /// HASHLIST carries the target itself, HASHKEEP takes it from the
+    /// listing, and HASHDELTA turns the base from the listing into it, all
+    /// without HASHFULL. Nothing after the target list is read, because the
+    /// input that follows belongs to the data reader: here an unrequested
+    /// full list follows, and it stays unread (DESIGN.md §5.6).
+    #[test]
+    fn each_target_list_gives_the_target() {
+        with_home(|_| {
+            let (base, base_bytes) = list(&[1, 2, 3]);
+            let (target, encoded) = list(&[2, 3, 4]);
+            cache(&base, &base_bytes);
+            cache(&target, &encoded);
+            let expected = (encoded.clone(), vec![2, 3, 4]);
+            let lists = [
+                ("HASHLIST", TargetList::Full(encoded.clone())),
+                ("HASHKEEP", TargetList::Keep),
+                (
+                    "HASHDELTA",
+                    TargetList::Delta {
+                        base: base.digest,
+                        removed: hashlist::encode(&[1]),
+                        added: hashlist::encode(&[4]),
+                    },
+                ),
+            ];
+            for (name, message) in lists {
+                let unasked = TargetList::Full(encoded.clone());
+                let unread = unasked.size();
+                let result = resolve(None, target, &[message, unasked]);
+                assert_eq!(result, (expected.clone(), Vec::new(), unread), "{name}");
+            }
+        });
+    }
+
+    /// A delta that does not produce the target, and an invalid listed
+    /// list, each make the sender ask for the full list with a single
+    /// HASHFULL and use that instead. The invalid list is removed
+    /// (DESIGN.md §5.6).
+    #[test]
+    fn an_unusable_cached_list_asks_once_for_the_full_list() {
+        with_home(|home| {
+            let (base, base_bytes) = list(&[1, 2, 3]);
+            let (target, encoded) = list(&[2, 3, 4]);
+            cache(&base, &base_bytes);
+            let expected = (encoded.clone(), vec![2, 3, 4]);
+            let hashfull = vec![frame::HASHFULL, 0, 0, 0, 0];
+
+            let wrong = TargetList::Delta {
+                base: base.digest,
+                removed: hashlist::encode(&[1]),
+                added: hashlist::encode(&[5]),
+            };
+            let full = TargetList::Full(encoded.clone());
+            let result = resolve(None, target, &[wrong, full]);
+            assert_eq!(result, (expected.clone(), hashfull.clone(), 0));
+
+            let path = home.join(format!(
+                "cache/hashsync/remote-hashlists/{}-{}/{target}.cache",
+                hex(&PEER),
+                hex(&INDEX)
+            ));
+            std::fs::write(&path, b"damaged").unwrap();
+            let full = TargetList::Full(encoded);
+            let result = resolve(None, target, &[TargetList::Keep, full]);
+            assert_eq!(result, (expected, hashfull, 0));
+            assert!(!path.exists(), "the invalid list must be removed");
+        });
+    }
+
+    /// A full list must match the digest of the target (DESIGN.md §5.6).
+    #[test]
+    #[should_panic(expected = "protocol error: the full hash list does not match")]
+    fn a_bad_full_list_is_a_protocol_error() {
+        with_home(|_| {
+            let (target, _) = list(&[1]);
+            let other = TargetList::Full(hashlist::encode(&[2]));
+            resolve(Some(&[]), target, &[other]);
+        });
+    }
+
+    /// So must the full list that HASHFULL asks for, here after a HASHKEEP
+    /// of a list that the listing does not have (DESIGN.md §5.6).
+    #[test]
+    #[should_panic(expected = "protocol error: the full hash list does not match")]
+    fn a_bad_full_list_after_hashfull_is_a_protocol_error() {
+        with_home(|_| {
+            let (target, _) = list(&[1]);
+            let other = TargetList::Full(hashlist::encode(&[2]));
+            resolve(Some(&[target.digest]), target, &[TargetList::Keep, other]);
+        });
+    }
+
+    /// HASHKEEP must name a list that the sender advertised. With caching
+    /// disabled, the sender advertises none, even though its listing may
+    /// hold the target (DESIGN.md §5.6).
+    #[test]
+    #[should_panic(expected = "protocol error: HASHKEEP, but")]
+    fn hashkeep_of_a_list_that_was_not_advertised_is_a_protocol_error() {
+        with_home(|_| {
+            let (target, encoded) = list(&[3]);
+            cache(&target, &encoded);
+            resolve(Some(&[]), target, &[TargetList::Keep]);
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "protocol error: HASHDELTA from")]
+    fn hashdelta_from_a_list_that_was_not_advertised_is_a_protocol_error() {
+        with_home(|_| {
+            let (base, base_bytes) = list(&[3]);
+            let (target, _) = list(&[4]);
+            cache(&base, &base_bytes);
+            let delta = TargetList::Delta {
+                base: base.digest,
+                removed: hashlist::encode(&[3]),
+                added: hashlist::encode(&[4]),
+            };
+            resolve(Some(&[]), target, &[delta]);
+        });
+    }
+
+    /// The lists of a delta must be canonical, just like a full list
+    /// (DESIGN.md §6.2): here the added list announces a value that never
+    /// follows.
+    #[test]
+    #[should_panic(expected = "protocol error: bad added list in HASHDELTA")]
+    fn a_delta_list_that_is_not_canonical_is_a_protocol_error() {
+        with_home(|_| {
+            let (base, base_bytes) = list(&[3]);
+            let (target, _) = list(&[3, 4]);
+            cache(&base, &base_bytes);
+            let delta = TargetList::Delta {
+                base: base.digest,
+                removed: hashlist::encode(&[]),
+                added: 1u64.to_le_bytes().to_vec(),
+            };
+            resolve(None, target, &[delta]);
+        });
     }
 
     /// A byte after END_ACK is a protocol error, also after DONE, and also

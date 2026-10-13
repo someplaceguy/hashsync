@@ -1,4 +1,5 @@
-//! The canonical hash-list encoding and the list ID (DESIGN.md §5.4).
+//! The canonical hash-list encoding, the list ID (DESIGN.md §5.4), and
+//! direct deltas between lists (§5.6).
 //!
 //! Sorted distinct 64-bit values become gaps, and each gap is Golomb-Rice
 //! coded: `g >> k` one bits, a zero, then the low `k` bits, packed
@@ -6,6 +7,13 @@
 //! is `N` alone; both sides derive `k` from it. Equal sets must produce
 //! equal bytes, so the decoder enforces the canonical form: no value
 //! overflow, zero padding, and the exact byte length.
+//!
+//! A delta from a base list to a target list is a pair of lists: the
+//! values that only the base has, which the target drops, and the values
+//! that only the target has, which it adds. Each goes on the wire as a list
+//! of its own.
+
+use std::cmp::Ordering;
 
 use crate::hash::{Strong, StrongHash};
 
@@ -128,11 +136,64 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<u64>, String> {
     Ok(values)
 }
 
-/// Packs bits least-significant-bit first. The header bytes are pushed
-/// directly to `out` before the first bit.
+/// The delta from `base` to `target`, both sorted and distinct: the values
+/// to remove (those that only `base` has) and the values to add (those that
+/// only `target` has), each sorted and distinct.
+pub fn delta(base: &[u64], target: &[u64]) -> (Vec<u64>, Vec<u64>) {
+    let (mut removed, mut added) = (Vec::new(), Vec::new());
+    let (mut b, mut t) = (0, 0);
+    while b < base.len() && t < target.len() {
+        match base[b].cmp(&target[t]) {
+            Ordering::Less => {
+                removed.push(base[b]);
+                b += 1;
+            }
+            Ordering::Greater => {
+                added.push(target[t]);
+                t += 1;
+            }
+            Ordering::Equal => (b, t) = (b + 1, t + 1),
+        }
+    }
+    removed.extend_from_slice(&base[b..]);
+    added.extend_from_slice(&target[t..]);
+    (removed, added)
+}
+
+/// Apply a delta to `base`: the values of `base` minus `removed`, plus
+/// `added`. All three inputs are sorted and distinct, and so is the result.
+///
+/// This is plain set arithmetic, so any delta gives a result, even one
+/// that was not made from this base: removing a value that `base` lacks
+/// does nothing, and adding one that it already has keeps a single copy.
+/// The caller needs no separate check for such deltas, because it compares
+/// the result with the target's digest anyway, and only the target matches
+/// (DESIGN.md §5.6).
+pub fn apply(base: &[u64], removed: &[u64], added: &[u64]) -> Vec<u64> {
+    let mut values = Vec::with_capacity(base.len() + added.len());
+    let mut removed = removed.iter().copied().peekable();
+    let mut added = added.iter().copied().peekable();
+    for &value in base {
+        while let Some(new) = added.next_if(|&new| new < value) {
+            values.push(new);
+        }
+        while removed.next_if(|&old| old < value).is_some() {}
+        let gone = removed.next_if_eq(&value).is_some();
+        let again = added.next_if_eq(&value).is_some();
+        if !gone || again {
+            values.push(value);
+        }
+    }
+    values.extend(added);
+    values
+}
+
+/// Packs bits least-significant-bit first, a 64-bit word at a time. The
+/// header bytes are pushed directly to `out` before the first bit.
 struct BitWriter {
     out: Vec<u8>,
-    /// Pending bits, below bit `pending_len`.
+    /// The bits not written yet, below bit `pending_len`, which is always
+    /// less than 64.
     pending: u64,
     pending_len: u32,
 }
@@ -149,22 +210,27 @@ impl BitWriter {
         }
     }
 
-    /// Append the low `count` bits of `value`, lowest first; higher bits
-    /// are ignored.
+    /// Append the low `count` bits of `value`, lowest first. `count` is at
+    /// most 64, and the higher bits of `value` are ignored.
     fn bits(&mut self, value: u64, count: u32) {
         let value = match count {
             64 => value,
-            _ => value & ((1u64 << count) - 1),
+            _ => value & ((1 << count) - 1),
         };
-        let mut acc = u128::from(self.pending) | (u128::from(value) << self.pending_len);
-        let mut total = self.pending_len + count;
-        while total >= 8 {
-            self.out.push(acc as u8);
-            acc >>= 8;
-            total -= 8;
+        self.pending |= value << self.pending_len;
+        let total = self.pending_len + count;
+        if total < 64 {
+            self.pending_len = total;
+            return;
         }
-        self.pending = acc as u64;
-        self.pending_len = total;
+        // The word is full: write it out, and keep the bits of `value`
+        // that did not fit.
+        self.out.extend_from_slice(&self.pending.to_le_bytes());
+        self.pending = match self.pending_len {
+            0 => 0,
+            used => value >> (64 - used),
+        };
+        self.pending_len = total - 64;
     }
 
     /// Append `count` one bits.
@@ -176,16 +242,18 @@ impl BitWriter {
         }
     }
 
-    /// Pad the last byte with zeros.
+    /// Write out the pending bits, padding the last byte with zeros.
     fn finish(mut self) -> Vec<u8> {
-        if self.pending_len > 0 {
-            self.out.push(self.pending as u8);
-        }
+        let bytes = self.pending_len.div_ceil(8) as usize;
+        self.out
+            .extend_from_slice(&self.pending.to_le_bytes()[..bytes]);
         self.out
     }
 }
 
-/// Reads bits least-significant-bit first.
+/// Reads bits least-significant-bit first, 64 at a time, so that a list of
+/// millions of values decodes in a fraction of a second. Both sides decode
+/// a cached list for every delta (DESIGN.md §5.6).
 struct BitReader<'a> {
     body: &'a [u8],
     /// The next unread bit position.
@@ -197,29 +265,58 @@ impl BitReader<'_> {
         BitReader { body, position: 0 }
     }
 
-    fn bit(&mut self) -> Option<bool> {
-        let byte = self.body.get(self.position / 8)?;
-        let bit = byte >> (self.position % 8) & 1;
-        self.position += 1;
-        Some(bit == 1)
+    /// The number of bits not read yet.
+    fn remaining(&self) -> usize {
+        self.body.len() * 8 - self.position
     }
 
-    /// The next `count` bits, lowest first.
+    /// The next 64 bits, lowest first, without consuming them. Bits past
+    /// the end of the body read as zero.
+    fn peek(&self) -> u64 {
+        let start = self.position / 8;
+        let word = match self.body.get(start..start + 16) {
+            Some(bytes) => u128::from_le_bytes(bytes.try_into().unwrap()),
+            None => {
+                let mut bytes = [0; 16];
+                let rest = &self.body[start..];
+                bytes[..rest.len()].copy_from_slice(rest);
+                u128::from_le_bytes(bytes)
+            }
+        };
+        (word >> (self.position % 8)) as u64
+    }
+
+    /// Read the next `count` bits, lowest first. `count` is at most 64.
     fn bits(&mut self, count: u32) -> Option<u64> {
-        let mut value = 0u64;
-        for i in 0..count {
-            value |= u64::from(self.bit()?) << i;
+        if count as usize > self.remaining() {
+            return None;
         }
+        let value = match count {
+            64 => self.peek(),
+            _ => self.peek() & ((1 << count) - 1),
+        };
+        self.position += count as usize;
         Some(value)
     }
 
-    /// Count one bits up to the terminating zero bit.
+    /// Count the one bits up to the terminating zero bit, and consume the
+    /// zero as well.
     fn unary(&mut self) -> Option<u64> {
-        let mut count = 0u64;
-        while self.bit()? {
-            count += 1;
+        let mut count = 0;
+        loop {
+            let ones = self.peek().trailing_ones();
+            // The zeros that `peek` returns past the end of the body do not
+            // terminate a code.
+            if ones as usize >= self.remaining() {
+                return None;
+            }
+            if ones < 64 {
+                self.position += ones as usize + 1;
+                return Some(count + u64::from(ones));
+            }
+            self.position += 64;
+            count += 64;
         }
-        Some(count)
     }
 
     /// Bytes the consumed bits occupy.
@@ -239,10 +336,21 @@ impl BitReader<'_> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use proptest::prelude::*;
 
     use super::*;
+
+    /// The canonical encoding of `values`, which must be sorted and
+    /// distinct, and its BLAKE3 ID. Tests in other modules use this too.
+    pub(crate) fn list(values: &[u64]) -> (ListId, Vec<u8>) {
+        let encoded = encode(values);
+        let id = ListId {
+            algorithm: StrongHash::Blake3,
+            digest: StrongHash::Blake3.digest(&encoded),
+        };
+        (id, encoded)
+    }
 
     fn roundtrip(values: &[u64]) -> Vec<u8> {
         let encoded = encode(values);
@@ -276,6 +384,15 @@ mod tests {
         roundtrip(&[u64::MAX - 1, u64::MAX]);
         let wide: Vec<u64> = (0..100).map(|i| i * 0x0288_DF0C_AC5B_63E6).collect();
         roundtrip(&wide);
+
+        // With 129 values k is 56, so the gap from 127 to the largest value
+        // has a quotient of 255, whose unary code spans several of the
+        // reader's words. Dropping the last byte truncates it.
+        let mut far: Vec<u64> = (0..128).collect();
+        far.push(u64::MAX);
+        let encoded = roundtrip(&far);
+        let truncated = &encoded[..encoded.len() - 1];
+        assert!(decode(truncated).unwrap_err().contains("truncated"));
     }
 
     #[test]
@@ -307,6 +424,17 @@ mod tests {
         trailing.push(0);
         assert!(decode(&trailing).unwrap_err().contains("excess"));
 
+        // A unary code that runs to the end of the body has no terminating
+        // zero. The reader sees zeros past the end, and they must not
+        // terminate the code. Here N = 1, first with one byte of one bits,
+        // then with nine, the first eight of which fill a whole word of the
+        // reader.
+        let mut ones = 1u64.to_le_bytes().to_vec();
+        ones.push(0xff);
+        assert!(decode(&ones).unwrap_err().contains("truncated"));
+        ones.extend([0xff; 8]);
+        assert!(decode(&ones).unwrap_err().contains("truncated"));
+
         // The padding bits of the last byte must be zero.
         let mut padding = encode(&[0]);
         assert_eq!(*padding.last().unwrap() >> 1, 0);
@@ -336,7 +464,106 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_delta_holds_only_the_changes() {
+        assert_eq!(delta(&[1, 2, 3], &[1, 2, 3]), (vec![], vec![]));
+        assert_eq!(delta(&[], &[4, 5]), (vec![], vec![4, 5]));
+        assert_eq!(delta(&[4, 5], &[]), (vec![4, 5], vec![]));
+        assert_eq!(
+            delta(&[1, 3, 5, 7], &[2, 3, 6, 7, 9]),
+            (vec![1, 5], vec![2, 6, 9])
+        );
+    }
+
+    /// The sorted distinct values of `values`.
+    fn set(values: &[u64]) -> Vec<u64> {
+        let mut set = values.to_vec();
+        set.sort_unstable();
+        set.dedup();
+        set
+    }
+
+    /// The canonical encoding of `values`, built one bit at a time exactly
+    /// as DESIGN.md §5.4 spells it out, without the word-sized steps of
+    /// `BitWriter`.
+    fn reference_encoding(values: &[u64]) -> Vec<u8> {
+        // `k = W - ceil(log2(N))`, and 0 without values.
+        let n = values.len() as u64;
+        let ceil_log2 = |n: u64| {
+            if n <= 1 {
+                0
+            } else {
+                64 - (n - 1).leading_zeros()
+            }
+        };
+        let k = if n == 0 { 0 } else { 64 - ceil_log2(n) };
+        let mut bits = Vec::new();
+        let mut previous: Option<u64> = None;
+        for &value in values {
+            let gap = previous.map_or(value, |p| value - p - 1);
+            previous = Some(value);
+            let quotient = if k == 64 { 0 } else { gap >> k };
+            bits.extend(std::iter::repeat_n(true, quotient as usize));
+            bits.push(false);
+            bits.extend((0..k).map(|i| gap >> i & 1 == 1));
+        }
+        let mut out = n.to_le_bytes().to_vec();
+        for chunk in bits.chunks(8) {
+            let byte = chunk
+                .iter()
+                .enumerate()
+                .fold(0u8, |byte, (i, &bit)| byte | u8::from(bit) << i);
+            out.push(byte);
+        }
+        out
+    }
+
     proptest! {
+        #[test]
+        fn the_encoding_matches_the_bit_by_bit_definition(
+            values in proptest::collection::vec(any::<u64>(), 0..300),
+            dense in proptest::collection::vec(0u64..2000, 0..300),
+        ) {
+            // The list ID is the digest of these bytes, so every set must
+            // keep encoding to the same bytes: the word-sized writer has to
+            // match the definition, including for sets with long unary
+            // codes.
+            for values in [set(&values), set(&dense), {
+                let mut far = set(&dense);
+                far.push(u64::MAX);
+                far
+            }] {
+                prop_assert_eq!(encode(&values), reference_encoding(&values));
+            }
+        }
+
+        #[test]
+        fn a_delta_changes_its_base_into_its_target(
+            base in proptest::collection::vec(0u64..64, 0..40),
+            target in proptest::collection::vec(0u64..64, 0..40),
+        ) {
+            // Small values, so that the sets share many of them.
+            let (base, target) = (set(&base), set(&target));
+            let (removed, added) = delta(&base, &target);
+            prop_assert_eq!(apply(&base, &removed, &added), target);
+        }
+
+        #[test]
+        fn any_delta_applies_as_set_operations(
+            base in proptest::collection::vec(0u64..64, 0..40),
+            removed in proptest::collection::vec(0u64..64, 0..20),
+            added in proptest::collection::vec(0u64..64, 0..20),
+        ) {
+            // Including deltas that were not made from this base: the
+            // result is the base without the removed values, plus the added
+            // ones.
+            let (base, removed, added) = (set(&base), set(&removed), set(&added));
+            let mut expected: Vec<u64> =
+                base.iter().copied().filter(|v| !removed.contains(v)).collect();
+            expected.extend(&added);
+            prop_assert_eq!(apply(&base, &removed, &added), set(&expected));
+        }
+
         #[test]
         fn sets_roundtrip(mut values in proptest::collection::vec(any::<u64>(), 0..300)) {
             values.sort_unstable();

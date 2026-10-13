@@ -769,6 +769,10 @@ fn an_unsupported_compression_level_is_rejected() {
 
 #[test]
 fn receiver_loss_during_rendezvous_is_fatal() {
+    // `attach` never connects here, so the main thread of `serve` keeps
+    // waiting for it, and nothing reads stdin, where the target list would
+    // arrive. Only the session watcher can notice that the data session is
+    // gone (DESIGN.md §6.9).
     let mut serve = Serve::start();
     serve.hello(&["true"]);
     serve.lose_data_session();
