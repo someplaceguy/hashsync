@@ -106,7 +106,7 @@ disabled. Block references and compressed output follow in steps 4 and 5.
   HELLO, full-list verification, table construction, and `CACHE_RESULT`
   before command startup. The sender advertises its listed lists, but the
   receiver always sends a full list; cached-list reuse and deltas follow
-  in step 8.
+  in step 6.
 - Introduce account identities and durable list storage with this exchange,
   applying the specified listing, publication, renewal, and cleanup rules:
   each side lists its directory for the peer and index when its part of
@@ -189,7 +189,33 @@ network traffic even when local block reuse is limited.
 
 Design coverage: §§6.2–6.9, 7–8.
 
-## 6. Reuse immutable trees and their alternate copies
+## 6. Reuse hash lists across transfers
+
+- Reuse a verified unchanged list without retransmitting it. For a changed
+  list, use a cached base and a direct delta when it is smaller than the
+  full transfer.
+- Find a base among the advertised lists across the receiver's cached peer
+  histories as specified, name it in HASHDELTA, and verify it on both
+  sides. A base uses the same strong hash as the target. Each side reads
+  its base once and keeps the verified bytes, or the open file, until the
+  end of the exchange, the sender through its listing: a concurrent
+  cleanup can remove the file at any time.
+- Fall back to a full list when a base is missing or invalid, or when delta
+  verification requests the permitted retry. Remove invalid cached files;
+  removal failures are fatal unless the file is already gone. Other cache
+  I/O failures are fatal as specified in step 3. Failed cache data must never
+  change reconstructed output.
+- Extend cache validation to reuse and deltas under concurrent transfers,
+  interrupted publication, missing acknowledgements, database restore,
+  and rebuild. Retain the storage controls and failure behavior from step 3.
+- Include actual hash-list and delta traffic in the summary.
+
+Result: subsequent transfers spend less bandwidth on setup and remain
+usable when cached data is missing or stale.
+
+Design coverage: §§5.6, 6.1–6.2, 6.7–6.9, 7–8.
+
+## 7. Reuse immutable trees and their alternate copies
 
 - Support immutable roots and every identifier form, including byte-valued
   identifiers and multiple configured locations sharing one identifier.
@@ -218,7 +244,7 @@ indexed identity.
 
 Design coverage: §§4.2–4.6, 6.4, 7–8.
 
-## 7. Prune content that is no longer available
+## 8. Prune content that is no longer available
 
 Deliver `hashsync prune`.
 
@@ -234,32 +260,6 @@ Result: users can remove stale index entries without a content scan or
 mistaking an unavailable copy for deleted data.
 
 Design coverage: §§4.2, 4.4, 8.
-
-## 8. Reuse hash lists across transfers
-
-- Reuse a verified unchanged list without retransmitting it. For a changed
-  list, use a cached base and a direct delta when it is smaller than the
-  full transfer.
-- Find a base among the advertised lists across the receiver's cached peer
-  histories as specified, name it in HASHDELTA, and verify it on both
-  sides. A base uses the same strong hash as the target. Each side reads
-  its base once and keeps the verified bytes, or the open file, until the
-  end of the exchange, the sender through its listing: a concurrent
-  cleanup can remove the file at any time.
-- Fall back to a full list when a base is missing or invalid, or when delta
-  verification requests the permitted retry. Remove invalid cached files;
-  removal failures are fatal unless the file is already gone. Other cache
-  I/O failures are fatal as specified in step 3. Failed cache data must never
-  change reconstructed output.
-- Extend cache validation to reuse and deltas under concurrent transfers,
-  interrupted publication, missing acknowledgements, database restore,
-  and rebuild. Retain the storage controls and failure behavior from step 3.
-- Include actual hash-list and delta traffic in the summary.
-
-Result: subsequent transfers spend less bandwidth on setup and remain
-usable when cached data is missing or stale.
-
-Design coverage: §§5.6, 6.1–6.2, 6.7–6.9, 7–8.
 
 ## 9. Deliver installable builds
 

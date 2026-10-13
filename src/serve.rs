@@ -307,7 +307,7 @@ pub fn run(token: &str) -> ! {
     // of the exchange cannot remove the target of a later run, even when
     // this side outlives its receiver. With caching, advertise every
     // listed list; with caching disabled, none (DESIGN.md §5.6). The
-    // receiver uses the advertised lists from PLAN.md step 8 on; until
+    // receiver uses the advertised lists from PLAN.md step 6 on; until
     // then it sends a full list.
     let mut exchange = Exchange::sender(&hello.account_id, &hello.index_id);
     let reply = SenderHello {

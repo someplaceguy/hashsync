@@ -236,7 +236,7 @@ pub fn run(
     }
 
     // The full list, whose bytes follow HASHLIST directly; cached bases
-    // and deltas arrive with PLAN.md step 8.
+    // and deltas arrive with PLAN.md step 6.
     let header = HashList {
         length: encoded.len() as u64,
     };

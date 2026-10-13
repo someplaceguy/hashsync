@@ -521,7 +521,7 @@ impl ListStore {
     /// and the bytes must match the ID's digest. An absent file is a
     /// miss; an invalid file is removed and is a miss; a read failure is
     /// fatal (DESIGN.md §5.6). Cached-list reuse arrives with PLAN.md
-    /// step 8; until then only tests verify the stored format through
+    /// step 6; until then only tests verify the stored format through
     /// this.
     #[cfg_attr(not(test), expect(dead_code))]
     fn read(&self, id: &ListId) -> Option<Vec<u8>> {
