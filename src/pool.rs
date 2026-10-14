@@ -36,10 +36,21 @@ struct Threads(Vec<JoinHandle<()>>);
 impl Pool {
     /// Start a pool of `count` threads, or of rayon's default for 0: one
     /// thread per core. The name of each thread is `name` followed by the
-    /// index of the thread in the pool, for example `scan0`.
+    /// index of the thread in the pool, for example `scan0`. A thread that
+    /// cannot start is a fatal error of this host.
     pub fn start(name: &str, count: usize) -> Pool {
-        let mut threads = Vec::with_capacity(count);
-        let pool = rayon::ThreadPoolBuilder::new()
+        Pool::try_start(name, count).unwrap_or_else(|e| panic!("cannot start the {name} pool: {e}"))
+    }
+
+    /// As `start`, but a thread that cannot start is an error for the
+    /// caller, for a count that the peer chose. The threads that did start
+    /// have ended when this returns the error.
+    pub fn try_start(name: &str, count: usize) -> Result<Pool, rayon::ThreadPoolBuildError> {
+        // The list grows as the threads start, with no reservation for
+        // `count`: the client's REQUEST can set it, to any value, and rayon
+        // starts at most 65,535 threads whatever it is.
+        let mut threads = Vec::new();
+        let built = rayon::ThreadPoolBuilder::new()
             .num_threads(count)
             .spawn_handler(|thread| {
                 let spawned = std::thread::Builder::new()
@@ -48,12 +59,14 @@ impl Pool {
                 threads.push(spawned);
                 Ok(())
             })
-            .build()
-            .unwrap_or_else(|e| panic!("cannot start the {name} pool: {e}"));
-        Pool {
-            pool,
-            _threads: Threads(threads),
-        }
+            .build();
+        // After a failed start, rayon has told the threads that started to
+        // end, and the drop of their handles waits for them.
+        let threads = Threads(threads);
+        Ok(Pool {
+            pool: built?,
+            _threads: threads,
+        })
     }
 }
 

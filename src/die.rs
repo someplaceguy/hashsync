@@ -1,7 +1,7 @@
 //! How the process ends, and what it reports on stderr (DESIGN.md §6.9).
 //!
 //! Every end goes through this module: `die` after an external failure,
-//! `finish` at the normal end, and the receiver's termination signals. So
+//! `finish` at the normal end, and the client's termination signals. So
 //! one place chooses the reported cause and the exit status, and does the
 //! cleanup that the kernel does not do. The first end wins; a later one,
 //! from another thread, waits for the process to exit instead of exiting
@@ -41,7 +41,7 @@ const EXIT_FAILURE: i32 = 1;
 
 /// Report `message`, clean up once, and exit with status 1.
 ///
-/// When the receiver has received SIGINT or SIGTERM, the signal is the
+/// When the client has received SIGINT or SIGTERM, the signal is the
 /// reported cause instead, and the status is `128 + signal`. The same
 /// signal usually also ends the SSH sessions and the consumer of stdout,
 /// so the failure that `message` describes can be its consequence
@@ -86,13 +86,32 @@ pub fn note(message: impl Display) {
     }
 }
 
-/// Write `hashsync: `, the message, and a newline to stderr as one write.
-/// A pipe keeps a write of up to `PIPE_BUF` (4 KiB) whole, so the line
-/// does not interleave with those of other threads or of the processes
-/// that share stderr, such as the SSH children. Failures are ignored (see
-/// the module documentation).
+/// Set once this process is the server, by `serve` and `attach`. SSH
+/// carries the server's stderr to the client's, where its lines mix with
+/// the client's own: the marker tells the user which host a message comes
+/// from, and so on which host to act on it (DESIGN.md §8).
+static SERVER: AtomicBool = AtomicBool::new(false);
+
+/// Mark every later line of this process, and its panic reports, as the
+/// server's. Called first in the server's entry points, before any other
+/// thread starts.
+pub fn report_as_server() {
+    SERVER.store(true, Relaxed);
+}
+
+/// Write the prefix of this process's lines, `hashsync: ` or, on the
+/// server, `hashsync (server): `, then the message and a newline, to
+/// stderr as one write. A pipe keeps a write of up to `PIPE_BUF` (4 KiB)
+/// whole, so the line does not interleave with those of other threads or
+/// of the processes that share stderr, such as the SSH children. Failures
+/// are ignored (see the module documentation).
 fn report(message: std::fmt::Arguments<'_>) {
-    let line = format!("hashsync: {message}\n");
+    let host = if SERVER.load(Relaxed) {
+        " (server)"
+    } else {
+        ""
+    };
+    let line = format!("hashsync{host}: {message}\n");
     let _ = fsops::stderr().write_all(line.as_bytes());
 }
 
@@ -100,7 +119,7 @@ fn report(message: std::fmt::Arguments<'_>) {
 enum End<'a> {
     Normal(i32),
     Failure(&'a dyn Display),
-    /// A termination signal that the receiver received.
+    /// A termination signal that the client received.
     Signal(i32),
 }
 
@@ -149,12 +168,12 @@ fn signal_name(signal: i32) -> String {
 }
 
 /// The signal mask that this process started with, which children get
-/// back. Every role blocks SIGXFSZ in every thread
-/// (`block_file_size_signal`), and the receiver also blocks SIGINT and
+/// back. Every process blocks SIGXFSZ in every thread
+/// (`block_file_size_signal`), and the client also blocks SIGINT and
 /// SIGTERM (`handle_termination_signals`).
 static CHILD_SIGNAL_MASK: OnceLock<sys::SignalMask> = OnceLock::new();
 
-/// Block SIGXFSZ in every thread, in every role. Then a write past the
+/// Block SIGXFSZ in every thread, in every process. Then a write past the
 /// file-size limit fails with `EFBIG`, and the writer handles that failure
 /// as any other one. A write to a segment, stdout, or a cache file ends
 /// the run with `die`, whose cleanup kills the children and removes the
@@ -172,10 +191,10 @@ pub fn block_file_size_signal() {
     }
 }
 
-/// Set in a process that holds the termination signals: the receiver.
+/// Set in a process that holds the termination signals: the client.
 static HOLDS_TERMINATION_SIGNALS: AtomicBool = AtomicBool::new(false);
 
-/// The receiver's handling of SIGINT and SIGTERM (DESIGN.md §6.8): end the
+/// The client's handling of SIGINT and SIGTERM (DESIGN.md §6.8): end the
 /// run with `128 + signal`, whatever failure the signal causes first.
 ///
 /// Both signals stay blocked in every thread and are never accepted, so a
@@ -205,7 +224,7 @@ pub fn handle_termination_signals() {
         .expect("cannot start the signal thread");
 }
 
-/// The termination signal that the receiver received, if any. A process
+/// The termination signal that the client received, if any. A process
 /// that does not hold the signals has none to report, even when one stays
 /// pending under a mask that it inherited.
 fn received_termination_signal() -> Option<i32> {
@@ -215,21 +234,54 @@ fn received_termination_signal() -> Option<i32> {
     sys::pending_termination_signal()
 }
 
-/// Run the fatal cleanup after the default panic report.
+/// Run the fatal cleanup after the panic report: the default one, or on
+/// the server, the same content with the server's marker on every line.
 pub fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        default_hook(info);
+        if SERVER.load(Relaxed) {
+            report_panic(info);
+        } else {
+            default_hook(info);
+        }
         fatal_cleanup();
     }));
 }
 
+/// The server's panic report. A protocol error panics (DESIGN.md §6.7),
+/// and SSH carries the report to the client's stderr, so each of its
+/// lines goes through `report`, which marks it as the server's, as the
+/// default report would not. It gives what the default report gives: the
+/// thread, the location, the message, and the backtrace when
+/// `RUST_BACKTRACE` asks for one.
+fn report_panic(info: &std::panic::PanicHookInfo<'_>) {
+    let thread = std::thread::current();
+    let name = thread.name().unwrap_or("<unnamed>");
+    match info.location() {
+        Some(location) => report(format_args!("thread '{name}' panicked at {location}:")),
+        None => report(format_args!("thread '{name}' panicked:")),
+    }
+    for line in info.payload_as_str().unwrap_or("Box<dyn Any>").lines() {
+        report(format_args!("{line}"));
+    }
+    let backtrace = std::backtrace::Backtrace::capture();
+    if backtrace.status() == std::backtrace::BacktraceStatus::Captured {
+        for line in backtrace.to_string().lines() {
+            report(format_args!("{line}"));
+        }
+    } else {
+        report(format_args!(
+            "note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace"
+        ));
+    }
+}
+
 /// What an end must undo (DESIGN.md §6.9). A fatal end kills the children:
-/// the receiver's SSH sessions, and the sender's command with its process
+/// the client's SSH sessions, and the server's command with its process
 /// group. Every end restores the file status flags that this process added
 /// to an open file description that other processes can share: the
-/// receiver's stdin, which its stdin reader makes non-blocking. Every end
-/// also removes the files: the sender's rendezvous socket. Registered
+/// client's stdin, which its stdin reader makes non-blocking. Every end
+/// also removes the files: the server's rendezvous socket. Registered
 /// identifiers stay valid because children are never reaped: their PIDs
 /// and the command's group ID stay reserved until this process exits.
 ///
@@ -279,10 +331,14 @@ pub enum KillGuard {
 /// Spawn `command` and register its fatal-end kill as one step, so that a
 /// concurrent end either runs after the registration or blocks the spawn.
 /// The child starts with the signal mask that this process started with,
-/// without the signals that this process blocks in every thread.
+/// without the signals that this process blocks in every thread, and with
+/// the descriptor limit from before any raise of this process.
 pub fn spawn_guarded(guard: KillGuard, command: &mut Command) -> std::io::Result<Child> {
     if let Some(&mask) = CHILD_SIGNAL_MASK.get() {
         sys::set_child_signal_mask(command, mask);
+    }
+    if let Some(limit) = fsops::original_descriptor_limit() {
+        sys::set_child_descriptor_limit(command, limit);
     }
     let mut registry = registry();
     let child = command.spawn()?;

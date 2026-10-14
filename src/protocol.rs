@@ -1,7 +1,7 @@
 //! The transfer protocol's version exchange, features, frames, and payload
 //! layouts (DESIGN.md §6.2).
 //!
-//! Both roles share these definitions. The version exchange never
+//! Both hosts share these definitions. The version exchange never
 //! changes; DESIGN.md §11 says which other changes require a protocol
 //! version bump or a new feature.
 //!
@@ -9,16 +9,17 @@
 //! needs a bound beyond its field: a corrupt value costs only the bytes
 //! that really follow it.
 //!
-//! After its HELLO, the sender's data-session frames through END share one
-//! zstd stream unless compression is disabled: `Compressor` writes it and
-//! `Decompressor` reads it. DONE follows the stream, outside it. After the
-//! features, each direction of the control session is one zstd stream too,
-//! which the closure of the session ends. The frames of the
-//! receiver-to-sender direction of the data session are not compressed:
-//! the hash list is already as small as zstd can make it, and the sender
-//! must find END_ACK after input that it discards without decoding. The
-//! input has a zstd stream of its own, in the payloads of the INPUT frames
-//! (DESIGN.md §6.6).
+//! The data session has two levels of frames. Session frames are never
+//! compressed: the handshake, CHUNK, STREAM_END and END. The stream frames
+//! of a stream, LIT, REF and RLE, form one zstd frame, unless compression
+//! is disabled, and the payloads of the stream's CHUNK frames are
+//! consecutive pieces of it: the stream's data writer writes it through a
+//! `Compressor` (`stream::write_stream`), and a `StreamReader` reads it
+//! back. So a reader finds the session frames
+//! without decoding a stream, and a stopped stream is discarded without
+//! being decoded. After the features, each direction of the control
+//! session is one zstd stream too, which a `Decompressor` reads; the
+//! closure of the session ends it.
 //!
 //! Malformed payloads, invalid compressed data, and violated frame rules
 //! are bugs in a compatible peer: parsers panic (DESIGN.md §6.7). Transport
@@ -34,6 +35,7 @@ use zstd_sys::ZSTD_EndDirective;
 
 use crate::die::die;
 use crate::hash::{Strong, StrongHash};
+use crate::settings::{Deduplicated, RemoteCommand, RunSettings};
 use crate::sys::{ZstdCCtx, ZstdDCtx};
 
 /// The first bytes of each session, in both directions, as a
@@ -50,31 +52,34 @@ pub const PROTOCOL_VERSION: u32 = 1;
 pub const FEATURES: u64 = 0;
 
 /// Frame types. `type u8, length u32, payload`, integers little endian.
+/// The numbers follow the three levels of frames (DESIGN.md §6.2).
 pub mod frame {
-    pub const HELLO: u8 = 1;
-    pub const HASHLIST: u8 = 2;
-    pub const HASHDELTA: u8 = 3;
-    pub const HASHKEEP: u8 = 4;
-    pub const HASHFULL: u8 = 5;
-    pub const CACHE_RESULT: u8 = 6;
-    pub const LIT: u8 = 7;
-    pub const REF: u8 = 8;
-    pub const RLE: u8 = 9;
+    // Session frames: the data session, never compressed.
+    pub const REQUEST: u8 = 1;
+    pub const HELLO: u8 = 2;
+    pub const HASHLIST: u8 = 3;
+    pub const HASHDELTA: u8 = 4;
+    pub const HASHKEEP: u8 = 5;
+    pub const HASHFULL: u8 = 6;
+    pub const CACHE_RESULT: u8 = 7;
+    pub const CHUNK: u8 = 8;
+    pub const STREAM_END: u8 = 9;
     pub const END: u8 = 10;
-    pub const END_ACK: u8 = 11;
-    pub const QUERY: u8 = 12;
-    pub const ANSWER: u8 = 13;
-    pub const DONE: u8 = 14;
-    pub const INPUT: u8 = 15;
-    pub const INPUT_END: u8 = 16;
-    pub const INPUT_STOP: u8 = 17;
+    // Stream frames: inside the zstd frame of a stream.
+    pub const LIT: u8 = 11;
+    pub const REF: u8 = 12;
+    pub const RLE: u8 = 13;
+    // Control frames: the control session.
+    pub const QUERY: u8 = 14;
+    pub const ANSWER: u8 = 15;
+    pub const STOP: u8 = 16;
 }
 
 /// The size of a frame header, `type u8, length u32`.
 const FRAME_HEADER: usize = 5;
 
-/// When the bytes of the output, or of the input, go on from the buffers
-/// on their way to their destination (DESIGN.md §6.2).
+/// When the bytes of a stream go on from the buffers on their way to the
+/// stream's destination (DESIGN.md §6.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Delivery {
     /// At each idle point of their source, when it has no byte ready, and
@@ -86,9 +91,123 @@ pub enum Delivery {
     Batch,
 }
 
-/// HELLO, receiver to sender. Its block size and hashes are the run's:
-/// the sender uses them or ends the run. Every digest of the run,
-/// including the target's, uses `strong_hash` (DESIGN.md §6.2).
+/// REQUEST, client to server: the first frame of the data session after
+/// the protocol version and the features. It holds the command and every
+/// setting of the run, and each host applies the settings that concern its
+/// roles (DESIGN.md §6.2).
+#[derive(Debug, PartialEq, Eq)]
+pub struct Request {
+    pub command: RemoteCommand,
+    /// The streams that the run deduplicates, which give the server its
+    /// roles.
+    pub deduplicated: Deduplicated,
+    pub settings: RunSettings,
+    /// The client's global `-q`, which the server applies to its own
+    /// notes, such as those of an update of its index.
+    pub quiet: bool,
+    /// The opposite of the client's global `--no-human-readable`, which the
+    /// server applies to its own notes too.
+    pub human_readable: bool,
+}
+
+impl Request {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut enc = Enc::new();
+        let words = match &self.command {
+            RemoteCommand::Shell(line) => {
+                enc.u8(0);
+                std::slice::from_ref(line)
+            }
+            RemoteCommand::Argv(words) => {
+                enc.u8(1);
+                &words[..]
+            }
+        };
+        enc.u32(list_len(words.len()));
+        for word in words {
+            enc.bytes(word);
+        }
+        // One bit per stream: 1 the forward stream, 2 the backward one.
+        enc.u8(match self.deduplicated {
+            Deduplicated::Stdin => 1,
+            Deduplicated::Stdout => 2,
+            Deduplicated::Both => 3,
+        });
+        let settings = &self.settings;
+        enc.u8(settings.no_update.into());
+        enc.u8(settings.sender_cache.into());
+        enc.i32(settings.compression_level);
+        enc.u8(settings.compression_long.into());
+        enc.u32(settings.compression_threads);
+        enc.u32(settings.probe_threads);
+        // 0 for the default, which depends on the block size of the
+        // stream's receiver. An explicit 0 is below every block size, so
+        // the client ends the run before the server could use it.
+        enc.u64(settings.lookahead.unwrap_or(0));
+        enc.u64(settings.negative_cache);
+        enc.u64(settings.spool_limit);
+        enc.u8(settings.batch_stdin.into());
+        enc.u8(settings.batch_stdout.into());
+        enc.u8(self.quiet.into());
+        enc.u8(self.human_readable.into());
+        enc.buf
+    }
+
+    /// The server checks the values that it must support, such as the
+    /// compression level, after decoding (DESIGN.md §6.2).
+    pub fn decode(payload: &[u8]) -> Self {
+        let mut dec = Dec::new(payload, "REQUEST");
+        let shell = match dec.u8() {
+            0 => true,
+            1 => false,
+            v => panic!("protocol error: invalid command kind {v} in REQUEST frame"),
+        };
+        let mut words = dec.list(Dec::string_bytes);
+        let command = if shell {
+            assert!(
+                words.len() == 1,
+                "protocol error: a command line of {} words",
+                words.len()
+            );
+            RemoteCommand::Shell(words.pop().unwrap())
+        } else {
+            assert!(!words.is_empty(), "protocol error: empty command");
+            RemoteCommand::Argv(words)
+        };
+        let deduplicated = match dec.u8() {
+            1 => Deduplicated::Stdin,
+            2 => Deduplicated::Stdout,
+            3 => Deduplicated::Both,
+            v => panic!("protocol error: invalid deduplicated streams {v} in REQUEST frame"),
+        };
+        let settings = RunSettings {
+            no_update: dec.flag(),
+            sender_cache: dec.flag(),
+            compression_level: dec.i32(),
+            compression_long: dec.flag(),
+            compression_threads: dec.u32(),
+            probe_threads: dec.u32(),
+            lookahead: Some(dec.u64()).filter(|&lookahead| lookahead != 0),
+            negative_cache: dec.u64(),
+            spool_limit: dec.u64(),
+            batch_stdin: dec.flag(),
+            batch_stdout: dec.flag(),
+        };
+        let request = Request {
+            command,
+            deduplicated,
+            settings,
+            quiet: dec.flag(),
+            human_readable: dec.flag(),
+        };
+        dec.done();
+        request
+    }
+}
+
+/// HELLO, receiver to sender. Its block size and hashes are the stream's:
+/// the sender uses them or ends the run. Every digest of the stream's list
+/// exchange, including the target's, uses `strong_hash` (DESIGN.md §6.2).
 pub struct ReceiverHello {
     pub block_size: u32,
     pub weak_hash_id: String,
@@ -97,31 +216,6 @@ pub struct ReceiverHello {
     pub target: Strong,
     pub account_id: [u8; 16],
     pub index_id: [u8; 16],
-    pub sender_cache: bool,
-    /// Seconds.
-    pub hashlist_max_age: u64,
-    pub compression_level: i32,
-    /// zstd long-distance matching (DESIGN.md §7).
-    pub compression_long: bool,
-    pub compression_threads: u32,
-    /// Threads that probe the weak table for the scanner; 0 selects half
-    /// the sender's cores, at least one (DESIGN.md §6.3).
-    pub probe_threads: u32,
-    pub lookahead: u64,
-    /// Bytes.
-    pub negative_cache: u64,
-    /// The most bytes of command output that wait in the sender's spool
-    /// before the command waits; `u64::MAX` sets no limit (DESIGN.md
-    /// §6.5).
-    pub sender_output_spool_limit: u64,
-    /// The most bytes of the input stream that wait in the sender's input
-    /// spool before the sender stops reading the data session; `u64::MAX`
-    /// sets no limit (DESIGN.md §6.6).
-    pub sender_input_spool_limit: u64,
-    /// The delivery of the command's output (DESIGN.md §6.2).
-    pub output_delivery: Delivery,
-    /// The command's argv; argv[0] is found in PATH and run directly.
-    pub command: Vec<Vec<u8>>,
 }
 
 impl ReceiverHello {
@@ -133,31 +227,12 @@ impl ReceiverHello {
         enc.raw(&self.target);
         enc.raw(&self.account_id);
         enc.raw(&self.index_id);
-        enc.u8(self.sender_cache.into());
-        enc.u64(self.hashlist_max_age);
-        enc.i32(self.compression_level);
-        enc.u8(self.compression_long.into());
-        enc.u32(self.compression_threads);
-        enc.u32(self.probe_threads);
-        enc.u64(self.lookahead);
-        enc.u64(self.negative_cache);
-        enc.u64(self.sender_output_spool_limit);
-        enc.u64(self.sender_input_spool_limit);
-        enc.u8(match self.output_delivery {
-            Delivery::Eager => 0,
-            Delivery::Batch => 1,
-        });
-        enc.u32(list_len(self.command.len()));
-        for arg in &self.command {
-            enc.bytes(arg);
-        }
         enc.buf
     }
 
     /// The target's length depends on the strong hash, so an unsupported
     /// strong hash ends the run here, before the target is read
-    /// (DESIGN.md §6.2). The sender checks the other parameters after
-    /// decoding.
+    /// (DESIGN.md §6.2). The sender checks the weak hash after decoding.
     pub fn decode(payload: &[u8]) -> Self {
         let mut dec = Dec::new(payload, "HELLO");
         let block_size = dec.u32();
@@ -175,38 +250,16 @@ impl ReceiverHello {
             target: dec.array(),
             account_id: dec.array(),
             index_id: dec.array(),
-            sender_cache: dec.flag(),
-            hashlist_max_age: dec.u64(),
-            compression_level: dec.i32(),
-            compression_long: dec.flag(),
-            compression_threads: dec.u32(),
-            probe_threads: dec.u32(),
-            lookahead: dec.u64(),
-            negative_cache: dec.u64(),
-            sender_output_spool_limit: dec.u64(),
-            sender_input_spool_limit: dec.u64(),
-            output_delivery: match dec.u8() {
-                0 => Delivery::Eager,
-                1 => Delivery::Batch,
-                v => panic!("protocol error: invalid delivery {v} in HELLO frame"),
-            },
-            command: dec.list(Dec::string_bytes),
         };
         dec.done();
         assert!(hello.block_size > 0, "protocol error: block size 0");
-        assert!(
-            hello.lookahead >= u64::from(hello.block_size),
-            "protocol error: lookahead {} below the block size",
-            hello.lookahead
-        );
-        assert!(!hello.command.is_empty(), "protocol error: empty command");
         hello
     }
 }
 
 /// HELLO, sender to receiver. The sender sends it only after it
 /// accepted the receiver's HELLO, so it does not repeat those
-/// parameters. The IDs of the advertised lists are digests of the run's
+/// parameters. The IDs of the advertised lists are digests of the stream's
 /// strong hash (DESIGN.md §5.6).
 pub struct SenderHello {
     pub account_id: [u8; 16],
@@ -332,10 +385,16 @@ impl TargetList {
     }
 }
 
-/// END: the command's exit status and, for a startup failure, error text.
+/// END: the command's exit status, the error text of a startup failure,
+/// and the server's counts of its ends of both streams: of the forward
+/// stream, whose decoder it runs, and of the backward stream, whose source
+/// reader it runs. The client counts its own ends, so with END it has what
+/// the summary needs of a stream that stopped (DESIGN.md §8).
 pub struct End {
     pub status: i32,
     pub error: String,
+    pub forward: Counts,
+    pub backward: SourceRead,
 }
 
 impl End {
@@ -343,6 +402,8 @@ impl End {
         let mut enc = Enc::new();
         enc.i32(self.status);
         enc.bytes(self.error.as_bytes());
+        self.forward.encode(&mut enc);
+        self.backward.encode(&mut enc);
         enc.buf
     }
 
@@ -351,9 +412,77 @@ impl End {
         let end = End {
             status: dec.i32(),
             error: dec.string(),
+            forward: Counts::decode(&mut dec),
+            backward: SourceRead::decode(&mut dec),
         };
         dec.done();
         end
+    }
+}
+
+/// What the source reader of a stream read, for the summary (DESIGN.md
+/// §8): the bytes that it read from the stream's source, and whether it
+/// reached the EOF of that source: it read the EOF, or, as the stdin reader
+/// can at the stop, found the source at its EOF without a read. A stream is
+/// whole when its source reader reached the EOF, and its destination took
+/// every byte that the source reader read.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SourceRead {
+    pub bytes: u64,
+    pub eof: bool,
+}
+
+impl SourceRead {
+    fn encode(&self, enc: &mut Enc) {
+        enc.u64(self.bytes);
+        enc.u8(self.eof.into());
+    }
+
+    fn decode(dec: &mut Dec) -> Self {
+        SourceRead {
+            bytes: dec.u64(),
+            eof: dec.flag(),
+        }
+    }
+}
+
+/// The bytes of the receiving end of a stream, for the summary (DESIGN.md
+/// §8): those that its decoder wrote to the stream's destination, by the
+/// kind of stream frame that carried them, and the bytes of the CHUNK
+/// payloads that it decoded.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Counts {
+    /// All of them.
+    pub bytes: u64,
+    pub literal: u64,
+    pub reference: u64,
+    pub run: u64,
+    /// The bytes of the CHUNK payloads that the decoder consumed: of the
+    /// stream's zstd frame, or of its stream frames without compression.
+    pub wire: u64,
+}
+
+impl Counts {
+    fn encode(&self, enc: &mut Enc) {
+        for count in [
+            self.bytes,
+            self.literal,
+            self.reference,
+            self.run,
+            self.wire,
+        ] {
+            enc.u64(count);
+        }
+    }
+
+    fn decode(dec: &mut Dec) -> Self {
+        Counts {
+            bytes: dec.u64(),
+            literal: dec.u64(),
+            reference: dec.u64(),
+            run: dec.u64(),
+            wire: dec.u64(),
+        }
     }
 }
 
@@ -383,13 +512,26 @@ impl Query {
     }
 }
 
-/// A frame of the sender's control session, in the queue of its control
+/// A frame of the control session, in the queue of a host's control
 /// writer, which sends the frames in queue order (DESIGN.md §6.2): the
-/// scanner's queries, and INPUT_STOP, which tells the receiver that the
-/// sender stopped the input (DESIGN.md §6.6).
-pub enum SenderControl {
+/// queries of the stream that the host scans, the answers for the stream
+/// that it receives, and STOP, which the host that receives a stream sends
+/// when it stops that stream (DESIGN.md §6.6).
+pub enum ControlFrame {
     Query(Query),
-    InputStop,
+    Answer(Answer),
+    Stop,
+}
+
+impl ControlFrame {
+    /// The type and the payload of the frame.
+    pub fn encode(&self) -> (u8, Vec<u8>) {
+        match self {
+            ControlFrame::Query(query) => (frame::QUERY, query.encode()),
+            ControlFrame::Answer(answer) => (frame::ANSWER, answer.encode()),
+            ControlFrame::Stop => (frame::STOP, Vec::new()),
+        }
+    }
 }
 
 /// ANSWER: whether the receiver pinned a verified block for the query at
@@ -703,12 +845,11 @@ pub fn drain_to_eof(mut reader: impl Read) -> std::io::Result<bool> {
 /// Writes frames to a transport. Each frame goes out in one write call,
 /// together with any bytes that follow it outside a frame, whenever the
 /// transport takes it whole (`send`, `send_followed_by`). A writer that
-/// sends many small frames also wraps its transport in a `BufWriter`, which
-/// makes fewer calls. A control writer flushes before it waits
-/// (`next_from`). On the data session, the sender flushes its stream before
-/// it waits for a reply and, in eager delivery of the output, at the idle
-/// points of the command's stdout; the receiver sends each INPUT frame at
-/// once (DESIGN.md §6.2 and §6.6).
+/// sends many small frames also wraps its transport in a buffer, which
+/// makes fewer calls: a `BufWriter` on the control session, a `ChunkWriter`
+/// for the stream frames of the data session. A control writer flushes
+/// before it waits (`next_from`), and the data writer of a stream at its
+/// idle points in eager delivery (DESIGN.md §6.2).
 pub struct FrameWriter<W: Write> {
     writer: W,
 }
@@ -805,19 +946,45 @@ fn frame_header(kind: u8, payload: &[u8]) -> [u8; FRAME_HEADER] {
     header
 }
 
-/// Send one frame on the data session. A failure is the loss of the
-/// session, which ends the run (DESIGN.md §6.9).
-pub fn send_data<W: Write>(out: &mut FrameWriter<W>, kind: u8, payload: &[u8]) {
+/// Send one frame on the data session, whose other end is `peer`. A
+/// failure ends the run (`die_data`).
+pub fn send_data<W: Write>(out: &mut FrameWriter<W>, kind: u8, payload: &[u8], peer: &str) {
     if let Err(e) = out.send(kind, payload) {
-        die(format!("data session: {e}"));
+        die_data(peer, &e);
     }
 }
 
 /// Flush the data session. A failure ends the run, as in `send_data`.
-pub fn flush_data<W: Write>(out: &mut FrameWriter<W>) {
+pub fn flush_data<W: Write>(out: &mut FrameWriter<W>, peer: &str) {
     if let Err(e) = out.flush() {
-        die(format!("data session: {e}"));
+        die_data(peer, &e);
     }
+}
+
+/// End the run because `peer`, the other host, disappeared: one of its
+/// sessions ended while this host still needed it (DESIGN.md §6.9). This
+/// function exists so that each host words the loss of its peer one way,
+/// whichever of its threads, and whichever session, sees it first.
+pub fn lost(peer: &str) -> ! {
+    die(format!("the {peer} disappeared"))
+}
+
+/// End the run after a read or a write of the data session failed
+/// (`die_session`).
+pub fn die_data(peer: &str, e: &std::io::Error) -> ! {
+    die_session("data session", peer, e)
+}
+
+/// End the run after a read or a write of `session` failed. EOF inside a
+/// frame, and a write to a session that `peer` closed, are the loss of
+/// `peer` (`lost`); any other failure is reported as a failure of
+/// `session`.
+pub fn die_session(session: &str, peer: &str, e: &std::io::Error) -> ! {
+    use std::io::ErrorKind::{BrokenPipe, ConnectionReset, UnexpectedEof};
+    if matches!(e.kind(), UnexpectedEof | BrokenPipe | ConnectionReset) {
+        lost(peer);
+    }
+    die(format!("{session}: {e}"))
 }
 
 /// The compression levels that a sender supports (DESIGN.md §7): zstd
@@ -829,14 +996,13 @@ pub const COMPRESSION_LEVELS: RangeInclusive<i32> = 0..=19;
 /// default, so the receiver needs no setting for it.
 const LONG_WINDOW_LOG: u32 = 27;
 
-/// One compressed direction of a session (DESIGN.md §6.2): one zstd stream
-/// for all frames, or the frames as they are when compression is disabled.
-/// `flush` makes every byte written so far decodable by the peer, for a
-/// frame that it must answer. The sender's data session begins the stream
-/// after its HELLO, and `finish` ends it after END. The zstd frame has a
-/// checksum: the trailer that the receiver checks (DESIGN.md §6.9). Each
-/// direction of the control session begins its stream after the features,
-/// and no frame ends it: the closure of the session ends it.
+/// One compressed stream (DESIGN.md §6.2): the stream frames of a stream
+/// on the data session, in one zstd frame, or one direction of the control
+/// session after the features. With compression disabled, the bytes pass
+/// as they are. `flush` makes every byte written so far decodable by the
+/// peer. `finish` ends the zstd frame of a stream, whose checksum the
+/// reader checks; no frame ends the stream of a control session, which
+/// ends with the closure of the session.
 ///
 /// Transport failures are `io::Error`s for the caller's `die`. A failure of
 /// zstd itself panics.
@@ -877,7 +1043,7 @@ impl<W: Write> Compressor<W> {
         Self::new(transport, level, false, 0)
     }
 
-    /// End the stream, flush the transport, and return it.
+    /// End the zstd frame, flush the transport, and return it.
     pub fn finish(mut self) -> std::io::Result<W> {
         if let Some(zstd) = &mut self.zstd {
             zstd.drain(&mut self.transport, ZSTD_EndDirective::ZSTD_e_end)?;
@@ -890,11 +1056,6 @@ impl<W: Write> Compressor<W> {
     /// the bytes that zstd still holds are lost.
     pub fn into_transport(self) -> W {
         self.transport
-    }
-
-    /// The transport, for a look at its state.
-    pub fn transport(&self) -> &W {
-        &self.transport
     }
 }
 
@@ -952,63 +1113,66 @@ impl<W: Write> Write for Compressor<W> {
     }
 }
 
-/// The reading end of a `Compressor`'s stream (DESIGN.md §6.2): the decoded
-/// bytes of one zstd frame, or the bytes of the transport when compression
-/// is disabled. On the data session, after END, `finish` checks that the
-/// frame ends there. On the control session, the frame never ends.
-///
-/// EOF of the transport inside the frame is `UnexpectedEof`: a truncated
-/// stream, or the closure of a control session. Other transport failures
-/// are `io::Error`s too, for the caller. Invalid compressed data, including
-/// a wrong checksum, and a frame that ends before END or on the control
-/// session are protocol errors and panic (DESIGN.md §6.7): a truncated
-/// stream cannot end a frame, because its end needs the last block and the
-/// checksum.
-pub struct Decompressor<R: BufRead> {
-    transport: R,
-    /// `None` when compression is disabled.
-    zstd: Option<Decoding>,
-}
+/// The most bytes of one CHUNK frame (DESIGN.md §6.2).
+pub const CHUNK_BYTES: usize = 256 << 10;
 
+/// The magic number of a zstd frame, little-endian on the wire, and the
+/// bit of its frame header descriptor, the byte after it, that announces
+/// the checksum at the end of the frame (RFC 8878, section 3.1.1).
+const ZSTD_MAGIC: [u8; 4] = 0xFD2F_B528u32.to_le_bytes();
+const ZSTD_CHECKSUM_FLAG: u8 = 1 << 2;
+
+/// The decoding of a zstd frame, which `StreamReader` and `Decompressor`
+/// share.
 struct Decoding {
     decoder: ZstdDCtx,
     /// Decoded bytes, of which `[start, end)` are not read yet.
     buffer: Box<[u8]>,
     start: usize,
     end: usize,
-    /// zstd decoded the whole frame and verified its checksum.
+    /// zstd decoded the whole frame, and verified its checksum if the frame
+    /// has one.
     ended: bool,
+    /// The first bytes that zstd took: the magic number of the frame and its
+    /// frame header descriptor, which tells whether the frame has a
+    /// checksum. zstd itself accepts a frame without one.
+    start_of_frame: [u8; 5],
+    /// How many bytes of `start_of_frame` zstd took so far.
+    taken: usize,
+    /// The bytes of the transport that zstd took so far.
+    consumed: u64,
 }
 
-impl<R: BufRead> Decompressor<R> {
-    pub fn new(transport: R, compressed: bool) -> Self {
-        let zstd = compressed.then(|| Decoding {
+impl Decoding {
+    fn new() -> Self {
+        Decoding {
             decoder: ZstdDCtx::new(),
             buffer: vec![0; ZstdDCtx::out_size()].into_boxed_slice(),
             start: 0,
             end: 0,
             ended: false,
-        });
-        Decompressor { transport, zstd }
-    }
-
-    /// After END: read the rest of the zstd frame, which must hold no more
-    /// decoded bytes, and return the transport, right after the frame
-    /// (DESIGN.md §6.9). Only the frame is read: this does not wait for the
-    /// transport's EOF. Without compression, END ends the stream.
-    pub fn finish(mut self) -> std::io::Result<R> {
-        if let Some(zstd) = &mut self.zstd {
-            let more = zstd.available(&mut self.transport)?;
-            assert!(!more, "protocol error: data after END");
+            start_of_frame: [0; 5],
+            taken: 0,
+            consumed: 0,
         }
-        Ok(self.transport)
     }
-}
 
-impl Decoding {
+    /// True when the frame is a zstd frame that announces its checksum,
+    /// which zstd then verified at its end.
+    fn has_checksum(&self) -> bool {
+        let [magic @ .., descriptor] = self.start_of_frame;
+        self.taken == self.start_of_frame.len()
+            && magic == ZSTD_MAGIC
+            && descriptor & ZSTD_CHECKSUM_FLAG != 0
+    }
+
     /// True when decoded bytes wait to be read, after decoding more if the
-    /// buffer holds none; false at the end of the frame. Interrupted
-    /// transport reads are retried (DESIGN.md §3).
+    /// buffer holds none; false at the end of the frame. EOF of the
+    /// transport inside the frame is `UnexpectedEof`: a truncated stream
+    /// cannot end the frame, because its end needs the last block and the
+    /// checksum. Invalid compressed data, including a wrong checksum, is a
+    /// protocol error and panics (DESIGN.md §6.7). Interrupted transport
+    /// reads are retried (DESIGN.md §3).
     fn available(&mut self, transport: &mut impl BufRead) -> std::io::Result<bool> {
         if self.start < self.end {
             return Ok(true);
@@ -1037,7 +1201,11 @@ impl Decoding {
                 .decoder
                 .decompress_stream(input, &mut self.buffer)
                 .unwrap_or_else(|e| panic!("protocol error: invalid compressed data: {e}"));
+            let n = (self.start_of_frame.len() - self.taken).min(status.read);
+            self.start_of_frame[self.taken..self.taken + n].copy_from_slice(&input[..n]);
+            self.taken += n;
             transport.consume(status.read);
+            self.consumed += status.read as u64;
             // At the end of the frame, zstd consumed nothing after it.
             self.ended = status.remaining == 0;
             (self.start, self.end) = (0, status.written);
@@ -1047,6 +1215,108 @@ impl Decoding {
             input_needed = true;
         }
         Ok(false)
+    }
+
+    /// Move decoded bytes into `buf`, which `available` found.
+    fn take(&mut self, buf: &mut [u8]) -> usize {
+        let n = buf.len().min(self.end - self.start);
+        buf[..n].copy_from_slice(&self.buffer[self.start..self.start + n]);
+        self.start += n;
+        n
+    }
+}
+
+/// The reading end of a stream on the data session (DESIGN.md §6.2): its
+/// stream frames, decoded from its zstd frame, or the bytes of the
+/// transport as they are when compression is disabled. A read returns 0 at
+/// the end of the zstd frame, or at the EOF of the transport without
+/// compression: the normal end of the stream frames, which `finish` then
+/// checks. EOF of the transport inside the zstd frame is `UnexpectedEof`.
+pub struct StreamReader<R: BufRead> {
+    transport: R,
+    /// `None` when compression is disabled.
+    zstd: Option<Decoding>,
+    /// The bytes of the transport read so far without compression.
+    consumed: u64,
+}
+
+impl<R: BufRead> StreamReader<R> {
+    pub fn new(transport: R, compressed: bool) -> Self {
+        StreamReader {
+            transport,
+            zstd: compressed.then(Decoding::new),
+            consumed: 0,
+        }
+    }
+
+    /// The bytes of the transport that this reader decoded so far, which a
+    /// buffer of the transport does not count: at a stop, the bytes that
+    /// wait there are dropped undecoded (DESIGN.md §8).
+    pub fn consumed(&self) -> u64 {
+        match &self.zstd {
+            Some(zstd) => zstd.consumed,
+            None => self.consumed,
+        }
+    }
+
+    /// After a read returned 0: require the normal end of the stream, a
+    /// zstd frame that ended with its checksum, and right after it, the end
+    /// of the transport. Without compression, the transport has ended
+    /// already. A frame without a checksum, and bytes after the frame, are
+    /// protocol errors and panic (DESIGN.md §6.6).
+    pub fn finish(mut self) -> std::io::Result<()> {
+        if let Some(zstd) = &self.zstd {
+            assert!(
+                zstd.has_checksum(),
+                "protocol error: the zstd frame of a stream has no checksum"
+            );
+        }
+        let rest = loop {
+            match self.transport.fill_buf() {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                result => break result?,
+            }
+        };
+        assert!(
+            rest.is_empty(),
+            "protocol error: bytes after the zstd frame of a stream"
+        );
+        Ok(())
+    }
+}
+
+impl<R: BufRead> Read for StreamReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let Some(zstd) = &mut self.zstd else {
+            let n = self.transport.read(buf)?;
+            self.consumed += n as u64;
+            return Ok(n);
+        };
+        if buf.is_empty() || !zstd.available(&mut self.transport)? {
+            return Ok(0);
+        }
+        Ok(zstd.take(buf))
+    }
+}
+
+/// The reading end of one direction of the control session after the
+/// features (DESIGN.md §6.2): the decoded bytes of a zstd frame that never
+/// ends, or the bytes of the transport when compression is disabled. The
+/// closure of the session ends the stream: EOF of the transport is
+/// `UnexpectedEof` inside the frame. The end of the frame is a protocol
+/// error and panics.
+pub struct Decompressor<R: BufRead> {
+    transport: R,
+    /// `None` when compression is disabled.
+    zstd: Option<Decoding>,
+}
+
+impl<R: BufRead> Decompressor<R> {
+    pub fn new(transport: R, compressed: bool) -> Self {
+        Decompressor {
+            transport,
+            zstd: compressed.then(Decoding::new),
+        }
     }
 }
 
@@ -1058,16 +1328,11 @@ impl<R: BufRead> Read for Decompressor<R> {
         if buf.is_empty() {
             return Ok(0);
         }
-        // Only the data session's frame ends, after END, and only `finish`
-        // reads after END.
         assert!(
             zstd.available(&mut self.transport)?,
-            "protocol error: the compressed stream ended early"
+            "protocol error: the zstd frame of the control session ended"
         );
-        let n = buf.len().min(zstd.end - zstd.start);
-        buf[..n].copy_from_slice(&zstd.buffer[zstd.start..zstd.start + n]);
-        zstd.start += n;
-        Ok(n)
+        Ok(zstd.take(buf))
     }
 }
 
@@ -1092,6 +1357,8 @@ fn read_exactly<R: Read>(reader: R, length: u64, out: &mut Vec<u8>) -> std::io::
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
     use crate::scanner::tests::noise;
 
@@ -1109,11 +1376,14 @@ mod tests {
         let mut out = Vec::new();
         let mut writer = FrameWriter::new(&mut out);
         writer.send(frame::LIT, b"abc").unwrap();
-        writer.send(frame::END_ACK, b"").unwrap();
+        writer.send(frame::STREAM_END, b"").unwrap();
         assert_eq!(out[..5], [frame::LIT, 3, 0, 0, 0]);
         assert_eq!(
             read_all(&out),
-            vec![(frame::LIT, b"abc".to_vec()), (frame::END_ACK, Vec::new())]
+            vec![
+                (frame::LIT, b"abc".to_vec()),
+                (frame::STREAM_END, Vec::new())
+            ]
         );
     }
 
@@ -1159,7 +1429,7 @@ mod tests {
         for list in &lists {
             list.send(&mut writer).unwrap();
         }
-        writer.send(frame::END_ACK, b"").unwrap();
+        writer.send(frame::STREAM_END, b"").unwrap();
         let expected = [
             &[frame::HASHLIST, 8, 0, 0, 0][..],
             &4u64.to_le_bytes(),
@@ -1170,7 +1440,7 @@ mod tests {
             &2u64.to_le_bytes(),
             &3u64.to_le_bytes(),
             b"rmadd",
-            &[frame::END_ACK, 0, 0, 0, 0],
+            &[frame::STREAM_END, 0, 0, 0, 0],
         ]
         .concat();
         assert_eq!(out, expected);
@@ -1181,7 +1451,7 @@ mod tests {
         for list in lists {
             assert_eq!(TargetList::receive(&mut reader).unwrap(), list);
         }
-        assert_eq!(reader.next().unwrap().unwrap().kind, frame::END_ACK);
+        assert_eq!(reader.next().unwrap().unwrap().kind, frame::STREAM_END);
         let error = TargetList::receive(&mut reader).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
 
@@ -1195,11 +1465,11 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "protocol error: expected the target list, received frame type 11")]
+    #[should_panic(expected = "protocol error: expected the target list, received frame type 9")]
     fn another_frame_in_place_of_the_target_list_is_a_protocol_error() {
         let mut out = Vec::new();
         FrameWriter::new(&mut out)
-            .send(frame::END_ACK, b"")
+            .send(frame::STREAM_END, b"")
             .unwrap();
         let _ = TargetList::receive(&mut FrameReader::new(&out[..]));
     }
@@ -1264,23 +1534,23 @@ mod tests {
         // own, so the header of a frame must not arrive alone (DESIGN.md
         // §6.2). A transport that takes only a part of a frame gets the
         // rest in more calls.
-        let input = [&[frame::INPUT, 7, 0, 0, 0][..], b"payload"].concat();
+        let chunk = [&[frame::CHUNK, 7, 0, 0, 0][..], b"payload"].concat();
         let mut writer = FrameWriter::new(Calls {
             calls: Vec::new(),
             most: usize::MAX,
         });
-        writer.send(frame::INPUT, b"payload").unwrap();
-        writer.send(frame::INPUT_END, b"").unwrap();
-        let input_end = vec![frame::INPUT_END, 0, 0, 0, 0];
-        assert_eq!(writer.into_inner().calls, [input.clone(), input_end]);
+        writer.send(frame::CHUNK, b"payload").unwrap();
+        writer.send(frame::STREAM_END, b"").unwrap();
+        let stream_end = vec![frame::STREAM_END, 0, 0, 0, 0];
+        assert_eq!(writer.into_inner().calls, [chunk.clone(), stream_end]);
         let mut writer = FrameWriter::new(Calls {
             calls: Vec::new(),
             most: 5,
         });
-        writer.send(frame::INPUT, b"payload").unwrap();
+        writer.send(frame::CHUNK, b"payload").unwrap();
         let calls = writer.into_inner().calls;
         assert_eq!(calls.len(), 3);
-        assert_eq!(calls.concat(), input);
+        assert_eq!(calls.concat(), chunk);
     }
 
     #[test]
@@ -1326,18 +1596,6 @@ mod tests {
             target: [3; 32],
             account_id: [7; 16],
             index_id: [9; 16],
-            sender_cache: true,
-            hashlist_max_age: 90 * 24 * 3600,
-            compression_level: 0,
-            compression_long: true,
-            compression_threads: 0,
-            probe_threads: 5,
-            lookahead: 256 << 20,
-            negative_cache: 128 << 20,
-            sender_output_spool_limit: 2 << 30,
-            sender_input_spool_limit: 3 << 30,
-            output_delivery: Delivery::Batch,
-            command: vec![b"printf".to_vec(), b"%s".to_vec(), b"\xff\xfe".to_vec()],
         }
     }
 
@@ -1352,24 +1610,105 @@ mod tests {
 
     #[test]
     fn a_corrupt_argument_count_costs_only_the_arguments_that_arrive() {
-        // The count announces u32::MAX arguments, but none follow. A list
-        // reserved for that count takes 96 GiB, which overcommit can grant
-        // without memory, so compare the peak virtual size. Tests that
-        // run in parallel add much less than the bound.
-        let mut payload = ReceiverHello {
-            command: Vec::new(),
-            ..receiver_hello()
-        }
-        .encode();
-        let count = payload.len() - 4;
-        payload[count..].copy_from_slice(&u32::MAX.to_le_bytes());
+        // The command of REQUEST announces u32::MAX arguments, but none
+        // follow. A list reserved for that count takes 96 GiB, which
+        // overcommit can grant without memory, so compare the peak virtual
+        // size. Tests that run in parallel add much less than the bound.
+        let mut payload = vec![1];
+        payload.extend_from_slice(&u32::MAX.to_le_bytes());
         let before = peak_virtual_size();
-        let Err(unwound) = std::panic::catch_unwind(|| ReceiverHello::decode(&payload)) else {
-            panic!("a HELLO without its arguments must not decode");
+        let Err(unwound) = std::panic::catch_unwind(|| Request::decode(&payload)) else {
+            panic!("a REQUEST without its arguments must not decode");
         };
         let message = unwound.downcast::<String>().unwrap();
-        assert!(message.contains("truncated HELLO frame"), "{message}");
+        assert!(message.contains("truncated REQUEST frame"), "{message}");
         assert!(peak_virtual_size() - before < 16 << 30);
+    }
+
+    /// A REQUEST for `command` with the defaults of `hashsync ssh`.
+    fn request(command: RemoteCommand) -> Request {
+        Request {
+            command,
+            deduplicated: Deduplicated::Stdout,
+            settings: crate::settings::tests::settings(&[]),
+            quiet: false,
+            human_readable: true,
+        }
+    }
+
+    #[test]
+    fn requests_roundtrip() {
+        let settings = crate::settings::tests::settings(&[
+            "--batch-stdout",
+            "--lookahead",
+            "64KiB",
+            "--spool-limit",
+            "unlimited",
+            "--no-sender-cache",
+            "--compression-level",
+            "3",
+        ]);
+        for command in [
+            RemoteCommand::Shell(b"printf %s \xff\xfe".to_vec()),
+            RemoteCommand::Shell(Vec::new()),
+            RemoteCommand::Argv(vec![
+                b"printf".to_vec(),
+                b"%s".to_vec(),
+                b"\xff\xfe".to_vec(),
+            ]),
+        ] {
+            for deduplicated in [
+                Deduplicated::Stdout,
+                Deduplicated::Stdin,
+                Deduplicated::Both,
+            ] {
+                let request = Request {
+                    deduplicated,
+                    settings: settings.clone(),
+                    quiet: true,
+                    human_readable: false,
+                    ..request(command.clone())
+                };
+                assert_eq!(Request::decode(&request.encode()), request);
+            }
+        }
+        // The default lookahead travels as 0.
+        let defaults = request(RemoteCommand::Shell(b"true".to_vec()));
+        assert_eq!(Request::decode(&defaults.encode()), defaults);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid command kind 2 in REQUEST")]
+    fn a_command_is_a_line_or_words() {
+        let mut payload = request(RemoteCommand::Shell(b"true".to_vec())).encode();
+        payload[0] = 2;
+        Request::decode(&payload);
+    }
+
+    #[test]
+    #[should_panic(expected = "protocol error: a command line of 2 words")]
+    fn a_command_line_is_one_string() {
+        let mut payload = request(RemoteCommand::Argv(vec![b"a".to_vec(), b"b".to_vec()])).encode();
+        payload[0] = 0;
+        Request::decode(&payload);
+    }
+
+    #[test]
+    fn a_run_deduplicates_one_stream_or_both() {
+        // Only 1, 2 and 3 name deduplicated streams: none is no run, and
+        // the values above 3 name nothing (DESIGN.md §6.2).
+        let mut payload = request(RemoteCommand::Shell(b"true".to_vec())).encode();
+        // After the command kind, the count of the words, and the one word
+        // with its length.
+        let at = 1 + 4 + 4 + 4;
+        assert_eq!(payload[at], 2, "the backward stream");
+        for value in [0, 4, 255] {
+            payload[at] = value;
+            let message = caught(|| Request::decode(&payload)).unwrap_err();
+            let expected =
+                format!("protocol error: invalid deduplicated streams {value} in REQUEST");
+            assert!(message.contains(&expected), "{message}");
+        }
     }
 
     #[test]
@@ -1379,34 +1718,9 @@ mod tests {
         assert_eq!(decoded.block_size, 4096);
         assert_eq!(decoded.weak_hash_id, "weak");
         assert_eq!(decoded.strong_hash, StrongHash::Sha256);
-        assert_eq!(decoded.account_id, [7; 16]);
         assert_eq!(decoded.target, hello.target);
-        assert!(decoded.sender_cache);
-        assert!(decoded.compression_long);
-        assert_eq!(decoded.probe_threads, 5);
-        assert_eq!(decoded.negative_cache, 128 << 20);
-        assert_eq!(decoded.sender_output_spool_limit, 2 << 30);
-        assert_eq!(decoded.sender_input_spool_limit, 3 << 30);
-        assert_eq!(decoded.output_delivery, Delivery::Batch);
-        assert_eq!(decoded.command, hello.command);
-        let eager = ReceiverHello {
-            output_delivery: Delivery::Eager,
-            ..receiver_hello()
-        };
-        let decoded = ReceiverHello::decode(&eager.encode());
-        assert_eq!(decoded.output_delivery, Delivery::Eager);
-    }
-
-    #[test]
-    #[should_panic(expected = "invalid delivery 2 in HELLO")]
-    fn a_delivery_is_eager_or_batch() {
-        let mut payload = receiver_hello().encode();
-        // The delivery byte precedes the argument count and the three
-        // arguments, each with its length.
-        let at = payload.len() - 1 - (4 + 3 * 4 + 6 + 2 + 2);
-        assert_eq!(payload[at], 1, "the batch delivery");
-        payload[at] = 2;
-        ReceiverHello::decode(&payload);
+        assert_eq!(decoded.account_id, [7; 16]);
+        assert_eq!(decoded.index_id, [9; 16]);
     }
 
     #[test]
@@ -1463,26 +1777,59 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "lookahead 4095 below the block size")]
-    fn the_lookahead_covers_a_window() {
-        ReceiverHello::decode(
-            &ReceiverHello {
-                lookahead: 4095,
-                ..receiver_hello()
-            }
-            .encode(),
-        );
-    }
-
-    #[test]
     #[should_panic(expected = "excess bytes")]
     fn trailing_payload_bytes_are_rejected() {
         let mut payload = End {
             status: 0,
             error: String::new(),
+            forward: Counts::default(),
+            backward: SourceRead::default(),
         }
         .encode();
         payload.push(0);
+        End::decode(&payload);
+    }
+
+    #[test]
+    fn end_carries_the_counts_of_both_streams() {
+        // The server's counts of its end of the forward stream, then of its
+        // end of the backward stream, follow the status and the error text
+        // (DESIGN.md §6.2).
+        let forward = Counts {
+            bytes: 7,
+            literal: 1,
+            reference: 4,
+            run: 2,
+            wire: u64::MAX,
+        };
+        for eof in [false, true] {
+            let backward = SourceRead { bytes: 9, eof };
+            let end = End {
+                status: -3,
+                error: "missing".into(),
+                forward: forward.clone(),
+                backward: backward.clone(),
+            };
+            let decoded = End::decode(&end.encode());
+            assert_eq!((decoded.status, &decoded.error[..]), (-3, "missing"));
+            assert_eq!(
+                (decoded.forward, decoded.backward),
+                (forward.clone(), backward)
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "protocol error: invalid flag 2 in END frame")]
+    fn the_eof_of_the_backward_source_is_a_flag() {
+        let mut payload = End {
+            status: 0,
+            error: String::new(),
+            forward: Counts::default(),
+            backward: SourceRead::default(),
+        }
+        .encode();
+        *payload.last_mut().unwrap() = 2;
         End::decode(&payload);
     }
 
@@ -1498,16 +1845,8 @@ mod tests {
         assert_eq!((rle.byte, rle.length), (0xfe, u64::MAX));
     }
 
-    fn end_payload() -> Vec<u8> {
-        End {
-            status: 3,
-            error: String::new(),
-        }
-        .encode()
-    }
-
-    /// The frames of the sender's data session after HELLO, through a
-    /// `Compressor`, and the finished stream.
+    /// The zstd frame of a stream with `frames`, through a `Compressor` at
+    /// zstd `level`, or the frames as they are at level 0.
     fn compressed(level: i32, long: bool, threads: u32, frames: &[(u8, &[u8])]) -> Vec<u8> {
         let mut writer = FrameWriter::new(Compressor::new(Vec::new(), level, long, threads));
         for &(kind, payload) in frames {
@@ -1516,8 +1855,23 @@ mod tests {
         writer.into_inner().finish().unwrap()
     }
 
+    /// Read the stream frames of `stream` through a `StreamReader`, until
+    /// their normal end, which `finish` checks.
+    fn read_stream(stream: &[u8], compressed: bool) -> Vec<(u8, Vec<u8>)> {
+        let mut reader = FrameReader::new(StreamReader::new(stream, compressed));
+        let mut frames = Vec::new();
+        while let Some(frame) = reader.next().unwrap() {
+            frames.push((frame.kind, frame.payload.to_vec()));
+        }
+        reader.into_inner().finish().unwrap();
+        frames
+    }
+
     #[test]
     fn frames_roundtrip_through_the_compressed_stream() {
+        // A stream's frames form one zstd frame, whose end is the normal
+        // end of the frames; at level 0 the frames are as they are, and the
+        // end of the transport ends them (DESIGN.md §6.2).
         let zeros = vec![0; 100_000];
         let run = Rle {
             byte: 7,
@@ -1525,29 +1879,42 @@ mod tests {
         }
         .encode();
         let frames = [
-            (frame::CACHE_RESULT, &b""[..]),
-            (frame::LIT, &zeros),
+            (frame::LIT, &zeros[..]),
+            (frame::REF, &b""[..]),
             (frame::RLE, &run),
-            (frame::END, &end_payload()),
         ];
         let plain = compressed(0, false, 0, &frames);
         let cases = [(0, false, 0), (1, false, 1), (19, false, 3), (19, true, 3)];
         for (level, long, threads) in cases {
-            let mut stream = compressed(level, long, threads, &frames);
+            let stream = compressed(level, long, threads, &frames);
             if level != 0 {
                 assert!(stream.len() < plain.len() / 10, "level {level}");
             }
-            // Bytes that follow the stream stay in the transport.
-            stream.extend_from_slice(b"after");
-            let mut reader = FrameReader::new(Decompressor::new(&stream[..], level != 0));
-            for &(kind, payload) in &frames {
-                assert_eq!(reader.expect(kind, "a frame").unwrap(), payload);
-            }
-            let mut rest = Vec::new();
-            let mut transport = reader.into_inner().finish().unwrap();
-            transport.read_to_end(&mut rest).unwrap();
-            assert_eq!(rest, b"after", "level {level}");
+            let expected: Vec<(u8, Vec<u8>)> = frames
+                .iter()
+                .map(|&(kind, payload)| (kind, payload.to_vec()))
+                .collect();
+            assert_eq!(read_stream(&stream, level != 0), expected, "level {level}");
         }
+        // An empty stream is an empty zstd frame, or no bytes at all.
+        assert!(read_stream(&compressed(3, false, 0, &[]), true).is_empty());
+        assert!(read_stream(&[], false).is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "protocol error: the zstd frame of a stream has no checksum")]
+    fn a_zstd_frame_without_its_checksum_is_a_protocol_error() {
+        // The normal end of a stream is the end of a zstd frame with its
+        // checksum (DESIGN.md §6.6). The same frame without its checksum,
+        // which zstd itself takes as whole, is not.
+        let mut stream = compressed(3, false, 0, &[(frame::LIT, b"literal")]);
+        assert_ne!(stream[4] & ZSTD_CHECKSUM_FLAG, 0, "no checksum to remove");
+        stream[4] &= !ZSTD_CHECKSUM_FLAG;
+        stream.truncate(stream.len() - 4);
+        let mut reader = FrameReader::new(StreamReader::new(&stream[..], true));
+        assert_eq!(reader.expect(frame::LIT, "LIT").unwrap(), b"literal");
+        assert!(reader.next().unwrap().is_none(), "the frame did not end");
+        let _ = reader.into_inner().finish();
     }
 
     #[test]
@@ -1557,12 +1924,10 @@ mod tests {
         // again. The receiver decodes the 128 MiB window without a setting.
         let repeated = noise(256 << 10, 1);
         let gap = noise(4 << 20, 2);
-        let end = end_payload();
         let frames = [
             (frame::LIT, &repeated[..]),
             (frame::LIT, &gap[..]),
             (frame::LIT, &repeated[..]),
-            (frame::END, &end[..]),
         ];
         let short = compressed(1, false, 2, &frames);
         let long = compressed(1, true, 2, &frames);
@@ -1572,11 +1937,8 @@ mod tests {
             long.len(),
             short.len()
         );
-        let mut reader = FrameReader::new(Decompressor::new(&long[..], true));
-        for &(kind, payload) in &frames {
-            assert!(reader.expect(kind, "a frame").unwrap() == payload);
-        }
-        reader.into_inner().finish().unwrap();
+        let decoded = read_stream(&long, true);
+        assert!(decoded.len() == 3 && decoded[2].1 == repeated);
     }
 
     /// A transport whose bytes stay visible while it is in use.
@@ -1597,17 +1959,17 @@ mod tests {
     #[test]
     fn a_flush_makes_every_frame_so_far_decodable() {
         // The bytes sent until a flush decode to every frame written
-        // before it, although the stream goes on: the sender flushes
-        // before it waits for a reply (DESIGN.md §6.2).
+        // before it, although the stream goes on: the data writer flushes
+        // at the idle points of eager delivery (DESIGN.md §6.2).
         for (long, threads) in [(false, 0), (false, 1), (false, 3), (true, 1), (true, 3)] {
             let sent = Shared::default();
             let mut writer = FrameWriter::new(Compressor::new(sent.clone(), 9, long, threads));
-            writer.send(frame::CACHE_RESULT, b"").unwrap();
+            writer.send(frame::REF, b"").unwrap();
             writer.send(frame::LIT, &[1; 1000]).unwrap();
             writer.flush().unwrap();
             let so_far = sent.0.borrow().clone();
-            let mut reader = FrameReader::new(Decompressor::new(&so_far[..], true));
-            assert_eq!(reader.expect(frame::CACHE_RESULT, "").unwrap(), b"");
+            let mut reader = FrameReader::new(StreamReader::new(&so_far[..], true));
+            assert_eq!(reader.expect(frame::REF, "REF").unwrap(), b"");
             assert_eq!(reader.expect(frame::LIT, "LIT").unwrap(), [1; 1000]);
             let error = reader.next().unwrap_err();
             assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
@@ -1655,29 +2017,40 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "protocol error: the zstd frame of the control session ended")]
+    fn the_end_of_a_control_frame_is_a_protocol_error() {
+        // Only the closure of the session ends a control stream.
+        let stream = compressed(3, false, 0, &[(frame::ANSWER, &[0; 9])]);
+        let mut reader = FrameReader::new(Decompressor::new(&stream[..], true));
+        reader.expect(frame::ANSWER, "ANSWER").unwrap();
+        let _ = reader.next();
+    }
+
+    #[test]
     fn a_truncated_stream_is_unexpected_eof() {
-        // Wherever the stream ends early, even inside the trailer after
-        // END, reading reports UnexpectedEof, never a clean end
-        // (DESIGN.md §6.9).
-        let stream = compressed(
-            3,
-            false,
-            1,
-            &[(frame::LIT, b"literal"), (frame::END, &end_payload())],
-        );
-        for cut in 0..stream.len() {
-            let mut reader = FrameReader::new(Decompressor::new(&stream[..cut], true));
-            let result = (move || {
-                reader.expect(frame::LIT, "LIT")?;
-                reader.expect(frame::END, "END")?;
-                reader.into_inner().finish()
-            })();
-            let error = result.err().unwrap_or_else(|| panic!("cut at {cut}"));
-            assert_eq!(
-                error.kind(),
-                std::io::ErrorKind::UnexpectedEof,
-                "cut at {cut}"
-            );
+        // Wherever the stream ends early, also inside the trailer of its
+        // zstd frame, reading reports UnexpectedEof, never the normal end
+        // (DESIGN.md §6.6). Without compression, only the frames show the
+        // cut.
+        let frames = [(frame::LIT, &b"literal"[..]), (frame::REF, &b""[..])];
+        for compressed_stream in [true, false] {
+            let level = if compressed_stream { 3 } else { 0 };
+            let stream = compressed(level, false, 1, &frames);
+            for cut in 0..stream.len() {
+                let mut reader =
+                    FrameReader::new(StreamReader::new(&stream[..cut], compressed_stream));
+                let result = (|| {
+                    reader.expect(frame::LIT, "LIT")?;
+                    reader.expect(frame::REF, "REF")?;
+                    reader.next().map(|_| ())
+                })();
+                let error = result.err().unwrap_or_else(|| panic!("cut at {cut}"));
+                assert_eq!(
+                    error.kind(),
+                    std::io::ErrorKind::UnexpectedEof,
+                    "cut at {cut}"
+                );
+            }
         }
     }
 
@@ -1722,78 +2095,47 @@ mod tests {
         // Before each byte, also in the trailer, the transport is
         // interrupted more times in a row than zstd accepts steps without
         // progress (DESIGN.md §3).
-        let stream = compressed(
-            3,
-            false,
-            1,
-            &[(frame::LIT, b"literal"), (frame::END, &end_payload())],
-        );
+        let stream = compressed(3, false, 1, &[(frame::LIT, b"literal")]);
         let transport = Interrupting {
             bytes: &stream,
             interruptions: 20,
             buffered: false,
         };
-        let mut reader = FrameReader::new(Decompressor::new(transport, true));
+        let mut reader = FrameReader::new(StreamReader::new(transport, true));
         assert_eq!(reader.expect(frame::LIT, "LIT").unwrap(), b"literal");
-        assert_eq!(reader.expect(frame::END, "END").unwrap(), end_payload());
-        let transport = reader.into_inner().finish().unwrap();
-        assert!(transport.bytes.is_empty(), "the frame did not end");
+        assert!(reader.next().unwrap().is_none(), "the frame did not end");
+        reader.into_inner().finish().unwrap();
     }
 
     #[test]
-    #[should_panic(expected = "protocol error: data after END")]
-    fn data_after_end_is_a_protocol_error() {
-        let stream = compressed(
-            3,
-            false,
-            1,
-            &[(frame::END, &end_payload()), (frame::LIT, b"late")],
-        );
-        let mut reader = FrameReader::new(Decompressor::new(&stream[..], true));
-        reader.expect(frame::END, "END").unwrap();
-        let _ = reader.into_inner().finish();
+    #[should_panic(expected = "protocol error: bytes after the zstd frame of a stream")]
+    fn bytes_after_the_zstd_frame_are_a_protocol_error() {
+        let mut stream = compressed(3, false, 1, &[(frame::LIT, b"literal")]);
+        stream.push(0);
+        read_stream(&stream, true);
     }
 
-    /// LIT, then `partial`, in a zstd frame that ends without END.
-    fn ended_before_end(partial: &[u8]) -> Vec<u8> {
+    #[test]
+    fn a_zstd_frame_that_ends_inside_a_stream_frame_is_unexpected_eof() {
+        // Two bytes of a frame header, then the end of the zstd frame: the
+        // frame reader sees the end inside a frame, as for a truncation.
         let mut writer = FrameWriter::new(Compressor::new(Vec::new(), 3, false, 1));
         writer.send(frame::LIT, b"literal").unwrap();
         let mut compressor = writer.into_inner();
-        compressor.write_all(partial).unwrap();
-        compressor.finish().unwrap()
-    }
-
-    /// Read LIT, then try to read the next frame.
-    fn read_after_lit(stream: &[u8]) {
-        let mut reader = FrameReader::new(Decompressor::new(stream, true));
+        compressor.write_all(&[frame::REF, 0]).unwrap();
+        let stream = compressor.finish().unwrap();
+        let mut reader = FrameReader::new(StreamReader::new(&stream[..], true));
         reader.expect(frame::LIT, "LIT").unwrap();
-        let _ = reader.next();
-    }
-
-    #[test]
-    #[should_panic(expected = "protocol error: the compressed stream ended early")]
-    fn a_frame_that_ends_before_end_is_a_protocol_error() {
-        // Only the sender ends the zstd frame, after END; a truncated
-        // stream cannot end it (DESIGN.md §6.7).
-        read_after_lit(&ended_before_end(b""));
-    }
-
-    #[test]
-    #[should_panic(expected = "protocol error: the compressed stream ended early")]
-    fn a_frame_that_ends_inside_a_frame_is_a_protocol_error() {
-        // Two bytes of a frame header, which a check after the frame
-        // reader would see as UnexpectedEof, like a truncation.
-        read_after_lit(&ended_before_end(&[frame::END, 0]));
+        let error = reader.next().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 
     #[test]
     #[should_panic(expected = "protocol error: invalid compressed data")]
     fn a_wrong_checksum_is_a_protocol_error() {
-        let mut stream = compressed(3, false, 1, &[(frame::END, &end_payload())]);
+        let mut stream = compressed(3, false, 1, &[(frame::LIT, b"literal")]);
         *stream.last_mut().unwrap() ^= 1;
-        let mut reader = FrameReader::new(Decompressor::new(&stream[..], true));
-        reader.expect(frame::END, "END").unwrap();
-        let _ = reader.into_inner().finish();
+        read_stream(&stream, true);
     }
 
     #[test]
@@ -1803,5 +2145,278 @@ mod tests {
         enc.u8(0);
         enc.u64(0);
         Rle::decode(&enc.buf);
+    }
+
+    /// The decoders of the payloads of the session frames, for the fuzzing
+    /// below.
+    #[derive(Clone, Copy, Debug)]
+    enum Payload {
+        Request,
+        ReceiverHello,
+        SenderHello,
+        End,
+        Query,
+        Answer,
+        Rle,
+        /// HASHLIST, HASHKEEP or HASHDELTA with the lists after it, which
+        /// the decoder reads from a stream, not from one payload.
+        TargetList,
+    }
+
+    impl Payload {
+        /// Decode `bytes`, and encode the value again. Only the target list
+        /// fails without a panic: with `UnexpectedEof`, when its stream
+        /// ends before the message does.
+        fn roundtrip(self, bytes: &[u8]) -> std::io::Result<Vec<u8>> {
+            Ok(match self {
+                Payload::Request => Request::decode(bytes).encode(),
+                Payload::ReceiverHello => ReceiverHello::decode(bytes).encode(),
+                Payload::SenderHello => SenderHello::decode(bytes).encode(),
+                Payload::End => End::decode(bytes).encode(),
+                Payload::Query => Query::decode(bytes).encode(),
+                Payload::Answer => Answer::decode(bytes).encode(),
+                Payload::Rle => Rle::decode(bytes).encode(),
+                Payload::TargetList => {
+                    let list = TargetList::receive(&mut FrameReader::new(bytes))?;
+                    let mut out = FrameWriter::new(Vec::new());
+                    list.send(&mut out).unwrap();
+                    out.into_inner()
+                }
+            })
+        }
+
+        /// The bytes of `valid`, a valid encoding, that the damage must
+        /// leave alone, and where the bytes after them start. Only HELLO of
+        /// the receiver has such bytes: the length of the weak-hash ID,
+        /// which tells where the strong-hash ID starts, and the strong-hash
+        /// ID. An unknown strong-hash ID ends the run with `die`, which
+        /// would end this test process; the serve tests check that end.
+        fn protected(self, valid: &[u8]) -> (Vec<std::ops::Range<usize>>, usize) {
+            let Payload::ReceiverHello = self else {
+                return (Vec::new(), 0);
+            };
+            let length = |at: usize| u32::from_le_bytes(valid[at..at + 4].try_into().unwrap());
+            let strong = 8 + length(4) as usize;
+            let end = strong + 4 + length(strong) as usize;
+            (vec![4..8, strong..end], end)
+        }
+
+        /// Whether `outcome`, of damaged bytes, is one that the decoder may
+        /// have: a value, a protocol error, or for the target list, the end
+        /// of its stream.
+        fn allows(self, outcome: &Result<std::io::Result<Vec<u8>>, String>) -> bool {
+            match outcome {
+                Ok(Ok(_)) => true,
+                Ok(Err(e)) => {
+                    matches!(self, Payload::TargetList)
+                        && e.kind() == std::io::ErrorKind::UnexpectedEof
+                }
+                Err(message) => message.contains("protocol error"),
+            }
+        }
+    }
+
+    /// Run `decode`, and return its value, or the message of its panic.
+    fn caught<T>(decode: impl FnOnce() -> T) -> Result<T, String> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(decode)).map_err(|payload| {
+            payload
+                .downcast::<String>()
+                .map(|message| *message)
+                .or_else(|payload| {
+                    payload
+                        .downcast::<&str>()
+                        .map(|message| message.to_string())
+                })
+                .unwrap_or_default()
+        })
+    }
+
+    /// A valid encoding of a payload of each kind, from random values.
+    fn any_payload() -> impl Strategy<Value = (Payload, Vec<u8>)> {
+        use proptest::collection::vec;
+        let word = || vec(any::<u8>(), 0..6);
+        let command = prop_oneof![
+            word().prop_map(RemoteCommand::Shell),
+            vec(word(), 1..4).prop_map(RemoteCommand::Argv),
+        ];
+        let deduplicated = prop_oneof![
+            Just(Deduplicated::Stdout),
+            Just(Deduplicated::Stdin),
+            Just(Deduplicated::Both),
+        ];
+        let settings = (
+            any::<[bool; 5]>(),
+            any::<i32>(),
+            any::<[u32; 2]>(),
+            any::<[u64; 3]>(),
+        )
+            .prop_map(|(flags, compression_level, threads, sizes)| {
+                let [
+                    no_update,
+                    sender_cache,
+                    compression_long,
+                    batch_stdin,
+                    batch_stdout,
+                ] = flags;
+                let [lookahead, negative_cache, spool_limit] = sizes;
+                RunSettings {
+                    no_update,
+                    sender_cache,
+                    compression_level,
+                    compression_long,
+                    compression_threads: threads[0],
+                    probe_threads: threads[1],
+                    lookahead: Some(lookahead).filter(|&lookahead| lookahead != 0),
+                    negative_cache,
+                    spool_limit,
+                    batch_stdin,
+                    batch_stdout,
+                }
+            });
+        let request = (command, deduplicated, settings, any::<[bool; 2]>()).prop_map(
+            |(command, deduplicated, settings, [quiet, human_readable])| {
+                let request = Request {
+                    command,
+                    deduplicated,
+                    settings,
+                    quiet,
+                    human_readable,
+                };
+                (Payload::Request, request.encode())
+            },
+        );
+        let strong_hash = prop_oneof![Just(StrongHash::Blake3), Just(StrongHash::Sha256)];
+        let receiver_hello = (
+            1u32..,
+            "\\PC{0,10}",
+            strong_hash,
+            any::<Strong>(),
+            any::<[[u8; 16]; 2]>(),
+        )
+            .prop_map(|(block_size, weak_hash_id, strong_hash, target, ids)| {
+                let hello = ReceiverHello {
+                    block_size,
+                    weak_hash_id,
+                    strong_hash,
+                    target,
+                    account_id: ids[0],
+                    index_id: ids[1],
+                };
+                (Payload::ReceiverHello, hello.encode())
+            });
+        let sender_hello =
+            (any::<[u8; 16]>(), vec(any::<Strong>(), 0..4)).prop_map(|(account_id, lists)| {
+                let hello = SenderHello { account_id, lists };
+                (Payload::SenderHello, hello.encode())
+            });
+        let end = (
+            any::<i32>(),
+            "\\PC{0,12}",
+            any::<[u64; 5]>(),
+            any::<(u64, bool)>(),
+        )
+            .prop_map(|(status, error, forward, (bytes, eof))| {
+                let [bytes_written, literal, reference, run, wire] = forward;
+                let end = End {
+                    status,
+                    error,
+                    forward: Counts {
+                        bytes: bytes_written,
+                        literal,
+                        reference,
+                        run,
+                        wire,
+                    },
+                    backward: SourceRead { bytes, eof },
+                };
+                (Payload::End, end.encode())
+            });
+        let query = (any::<u64>(), any::<Strong>())
+            .prop_map(|(offset, strong)| (Payload::Query, Query { offset, strong }.encode()));
+        let answer = (any::<u64>(), any::<bool>())
+            .prop_map(|(offset, found)| (Payload::Answer, Answer { offset, found }.encode()));
+        let rle = (any::<u8>(), 1u64..)
+            .prop_map(|(byte, length)| (Payload::Rle, Rle { byte, length }.encode()));
+        let list = || vec(any::<u8>(), 0..48);
+        let sent = |list: TargetList| {
+            let mut out = FrameWriter::new(Vec::new());
+            list.send(&mut out).unwrap();
+            (Payload::TargetList, out.into_inner())
+        };
+        let target_list = prop_oneof![
+            list().prop_map(move |list| sent(TargetList::Full(list))),
+            Just(()).prop_map(move |()| sent(TargetList::Keep)),
+            (any::<Strong>(), list(), list()).prop_map(move |(base, removed, added)| {
+                sent(TargetList::Delta {
+                    base,
+                    removed,
+                    added,
+                })
+            }),
+        ];
+        prop_oneof![
+            request,
+            receiver_hello,
+            sender_hello,
+            end,
+            query,
+            answer,
+            rle,
+            target_list,
+        ]
+    }
+
+    proptest! {
+        /// The decoders of the payloads of the session frames under damage
+        /// (DESIGN.md §6.7 and §11). A valid encoding decodes to the value
+        /// that it encodes. Cut short, it is a protocol error, or for the
+        /// target list, which reads a stream, the end of that stream. With
+        /// a changed byte, and as random bytes, it decodes to some value or
+        /// is a protocol error, or the target list ends with its stream. No
+        /// input hangs a decoder, takes more memory than it holds, or
+        /// panics otherwise.
+        #[test]
+        fn session_payloads_decode_or_are_protocol_errors(
+            (payload, valid) in any_payload(),
+            cut in any::<prop::sample::Index>(),
+            changed in any::<prop::sample::Index>(),
+            flip in 1u8..=255,
+            random in proptest::collection::vec(any::<u8>(), 0..96),
+        ) {
+            prop_assert_eq!(
+                caught(|| payload.roundtrip(&valid).unwrap()),
+                Ok(valid.clone())
+            );
+
+            let at = cut.index(valid.len());
+            let outcome = caught(|| payload.roundtrip(&valid[..at]));
+            let cut_short = match &outcome {
+                Ok(Err(e)) => {
+                    matches!(payload, Payload::TargetList)
+                        && e.kind() == std::io::ErrorKind::UnexpectedEof
+                }
+                Err(message) => {
+                    !matches!(payload, Payload::TargetList)
+                        && message.contains("protocol error: truncated")
+                }
+                Ok(Ok(_)) => false,
+            };
+            prop_assert!(cut_short, "{:?} cut at {}: {:?}", payload, at, outcome);
+
+            let (protected, after) = payload.protected(&valid);
+            let free: Vec<usize> = (0..valid.len())
+                .filter(|at| !protected.iter().any(|range| range.contains(at)))
+                .collect();
+            if !free.is_empty() {
+                let mut damaged = valid.clone();
+                damaged[free[changed.index(free.len())]] ^= flip;
+                let outcome = caught(|| payload.roundtrip(&damaged));
+                prop_assert!(payload.allows(&outcome), "{:?} {:?}: {:?}", payload, damaged, outcome);
+            }
+
+            let random = [&valid[..after], &random].concat();
+            let outcome = caught(|| payload.roundtrip(&random));
+            prop_assert!(payload.allows(&outcome), "{:?} {:?}: {:?}", payload, random, outcome);
+        }
     }
 }

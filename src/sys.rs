@@ -15,6 +15,7 @@ use linux_raw_sys::general::fsuuid2;
 use rustix::fs::Fsid;
 use rustix::io::Errno;
 use rustix::ioctl::{self, Getter, Opcode};
+use rustix::process::{Resource, Rlimit};
 use zstd_sys::{ZSTD_EndDirective, ZSTD_cParameter};
 
 /// The opaque inode handle of the object behind `fd`, encoded as
@@ -97,11 +98,30 @@ pub fn fsid_bytes(fsid: &Fsid) -> [u8; 8] {
 
 /// Lock the whole file behind `fd` for its open file description
 /// (`F_OFD_SETLKW`): shared, or exclusive, which needs `fd` open for
-/// writing. Waits as long as another owner holds a conflicting lock. The
-/// lock goes when the last descriptor of the open file description closes;
-/// unlike a classic POSIX lock, it does not go when another descriptor of
-/// the same file closes.
+/// writing. Waits as long as another owner holds a conflicting lock. A
+/// description that holds the other kind of lock already gets the new kind
+/// in its place, with no moment without a lock: an exclusive lock becomes
+/// shared at once. The lock goes when the last descriptor of the open file
+/// description closes; unlike a classic POSIX lock, it does not go when
+/// another descriptor of the same file closes.
 pub fn lock_file(fd: BorrowedFd<'_>, exclusive: bool) -> Result<(), Errno> {
+    set_file_lock(fd, exclusive, libc::F_OFD_SETLKW)
+}
+
+/// As `lock_file`, but without a wait (`F_OFD_SETLK`): false when another
+/// owner holds a conflicting lock.
+pub fn try_lock_file(fd: BorrowedFd<'_>, exclusive: bool) -> Result<bool, Errno> {
+    match set_file_lock(fd, exclusive, libc::F_OFD_SETLK) {
+        Ok(()) => Ok(true),
+        // POSIX allows either error for a lock that another owner holds.
+        Err(Errno::AGAIN | Errno::ACCESS) => Ok(false),
+        Err(errno) => Err(errno),
+    }
+}
+
+/// Set the lock of `lock_file` with the fcntl `command`, `F_OFD_SETLKW` or
+/// `F_OFD_SETLK`.
+fn set_file_lock(fd: BorrowedFd<'_>, exclusive: bool, command: libc::c_int) -> Result<(), Errno> {
     let lock_type = if exclusive {
         libc::F_WRLCK
     } else {
@@ -113,17 +133,11 @@ pub fn lock_file(fd: BorrowedFd<'_>, exclusive: bool) -> Result<(), Errno> {
     lock.l_type = lock_type as libc::c_short;
     lock.l_whence = libc::SEEK_SET as libc::c_short;
     // `l_start` and `l_len` 0: from the start to the end of the file,
-    // however long it grows. `l_pid` must be 0 for this command.
+    // however long it grows. `l_pid` must be 0 for these commands.
     loop {
-        // SAFETY: `F_OFD_SETLKW` takes a pointer to an initialized `flock`
-        // and only reads it.
-        let rc = unsafe {
-            libc::fcntl(
-                fd.as_raw_fd(),
-                libc::F_OFD_SETLKW,
-                std::ptr::from_ref(&lock),
-            )
-        };
+        // SAFETY: both commands take a pointer to an initialized `flock`
+        // and only read it.
+        let rc = unsafe { libc::fcntl(fd.as_raw_fd(), command, std::ptr::from_ref(&lock)) };
         if rc == 0 {
             return Ok(());
         }
@@ -198,7 +212,7 @@ fn signal_set(signals: &[c_int]) -> libc::sigset_t {
     }
 }
 
-/// SIGINT and SIGTERM: the signals that end a receiver's run.
+/// SIGINT and SIGTERM: the signals that end a client's run.
 const TERMINATION_SIGNALS: [c_int; 2] = [libc::SIGINT, libc::SIGTERM];
 
 /// A thread's set of blocked signals.
@@ -244,6 +258,16 @@ pub fn set_child_signal_mask(command: &mut std::process::Command, mask: SignalMa
     };
     // SAFETY: the hook runs in the child between `fork` and `exec`, where
     // only async-signal-safe functions may run; `pthread_sigmask` is one.
+    unsafe { command.pre_exec(hook) };
+}
+
+/// Start `command`'s child with `limit` as its descriptor limit, instead of
+/// this process's, which `Command` keeps.
+pub fn set_child_descriptor_limit(command: &mut std::process::Command, limit: Rlimit) {
+    let hook = move || Ok(rustix::process::setrlimit(Resource::Nofile, limit)?);
+    // SAFETY: the hook runs in the child between `fork` and `exec`, where
+    // only async-signal-safe functions may run. rustix's `setrlimit` is one
+    // system call, which takes no lock and allocates nothing.
     unsafe { command.pre_exec(hook) };
 }
 

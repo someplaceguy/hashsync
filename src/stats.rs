@@ -30,7 +30,7 @@ pub fn run(config: &Config) {
 
     let index_id: String = meta.index_id.iter().map(|b| format!("{b:02x}")).collect();
     // The report is the output of the command, so a failure to write it
-    // is an external failure, as for the output of `run`.
+    // is an external failure, as for the output of `hashsync ssh`.
     let report = format!(
         "index path:       {path}\n\
          schema version:   {schema_version}\n\

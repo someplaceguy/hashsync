@@ -451,12 +451,14 @@ pub struct Base {
 /// side's target, and at its end removes the listed files except that
 /// target. So it removes only files that existed before the exchange: the
 /// lists that the target replaces, and the lists and temporaries that
-/// failed runs left. A run with another target starts only after this
-/// run's receiver has ended. The sender starts its exchange before it
-/// sends HELLO, and ends it only after HASHLIST, HASHDELTA, or HASHKEEP,
-/// which the receiver sends only after it received that HELLO. So no
-/// exchange that ends has a listing that holds the target of a later run,
-/// also when the sender outlives its receiver.
+/// failed runs left. A run with another target needs the exclusive lock of
+/// the index for its update, and the receiver holds its lock from before
+/// its HELLO until after the list exchange. The sender starts its exchange
+/// after the receiver's HELLO and before its own, and ends it only after
+/// HASHLIST, HASHDELTA, or HASHKEEP, which the receiver sends only after
+/// it received the sender's HELLO. So no exchange that ends has a listing
+/// that holds the target of a later run, also when the sender outlives its
+/// receiver.
 ///
 /// The end of another exchange, or expiry, can remove a list at any moment,
 /// including the base that a concurrent exchange is about to read. So each
@@ -484,7 +486,7 @@ impl Exchange {
     /// The sender's exchange with receiver account `peer`, in
     /// `remote-hashlists/A-I`. The sender must start it before it sends
     /// HELLO, so that the listing of an exchange that ends comes before
-    /// the end of its receiver (see `Exchange`).
+    /// the receiver releases the lock of its index (see `Exchange`).
     pub fn sender(peer: &[u8; 16], index_id: &[u8; 16]) -> Self {
         Self::start(ListStore::new("remote-hashlists", peer, index_id))
     }
@@ -530,7 +532,7 @@ impl Exchange {
     }
 
     /// The IDs of the listed lists, which the sender advertises in HELLO.
-    /// Only names of the run's strong hash, `algorithm`, give IDs: a list
+    /// Only names of the stream's strong hash, `algorithm`, give IDs: a list
     /// of another strong hash cannot be a base, and is only removed.
     pub fn listed_ids(&self, algorithm: StrongHash) -> Vec<Strong> {
         self.lists
@@ -557,7 +559,7 @@ impl Exchange {
 
     /// For the receiver: find a base for a delta to the target, and return
     /// it with its values (DESIGN.md §5.6). The base is the first of the
-    /// `advertised` lists, in the run's strong hash `algorithm`, that is in
+    /// `advertised` lists, in the stream's strong hash `algorithm`, that is in
     /// any of the receiver's peer/index directories. Lists are named by
     /// their content, so a copy that another peer or index left works just
     /// as well. Each advertised list is looked up in the listing first,
@@ -846,6 +848,7 @@ fn remove_empty_dir(dir: &Path) {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::os::fd::AsRawFd;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Mutex;
 
@@ -985,7 +988,11 @@ pub(crate) mod tests {
         let fifo = dir.path().join("fifo.cache");
         rustix::fs::mkfifoat(rustix::fs::CWD, &fifo, Mode::from_raw_mode(0o600)).unwrap();
         let socket = dir.path().join("socket.cache");
-        let _bound = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        // Bound through the directory's descriptor: a long `TMPDIR` would
+        // exceed the `sun_path` limit of a socket address.
+        let opened = std::fs::File::open(dir.path()).unwrap();
+        let address = format!("/proc/self/fd/{}/socket.cache", opened.as_raw_fd());
+        let _bound = std::os::unix::net::UnixListener::bind(address).unwrap();
         let symlink = dir.path().join("symlink.cache");
         std::os::unix::fs::symlink(&directory, &symlink).unwrap();
         for path in [&directory, &fifo, &socket, &symlink] {
@@ -1001,7 +1008,7 @@ pub(crate) mod tests {
         // removes the listed files except its published target: an older
         // list, a list of another strong hash, a file name that is no list
         // ID, and an abandoned temporary. It advertises only the IDs of the
-        // run's strong hash. Files that appear after the listing stay,
+        // stream's strong hash. Files that appear after the listing stay,
         // because a later run can own them, and so does an entry that is
         // not a file, or a hidden name that is not a temporary, such as
         // the name that an NFS client gives to a removed file that is
@@ -1182,7 +1189,7 @@ pub(crate) mod tests {
             assert_eq!(base(&[&theirs, &mine]), Some((theirs.digest, vec![3, 4])));
             assert_eq!(base(&[&nowhere, &remote_only]), None);
             assert_eq!(base(&[]), None);
-            // Only lists in the run's strong hash can be a base.
+            // Only lists in the stream's strong hash can be a base.
             assert!(
                 exchange
                     .find_base(&[theirs.digest], StrongHash::Sha256)

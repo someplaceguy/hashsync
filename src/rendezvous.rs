@@ -3,7 +3,7 @@
 //! `serve` listens on `$XDG_RUNTIME_DIR/hashsync/T.sock`, falling back to
 //! a private directory under `/tmp`. `attach` retries a not-yet-listening
 //! socket while its stdin remains open, with no deadline. Both waits notice
-//! when the receiver goes away: `attach` polls its stdin, whose write side
+//! when the client goes away: `attach` polls its stdin, whose write side
 //! closes when the SSH session dies, and `serve`'s session watcher waits
 //! for the same hangup on `serve`'s stdin (see `Listener::accept`).
 
@@ -23,14 +23,14 @@ use crate::names;
 
 const RETRY_INTERVAL: Duration = Duration::from_millis(20);
 
-/// A fresh rendezvous token: the receiver generates it, both sender
+/// A fresh rendezvous token: the client generates it, and both server
 /// entry points receive it with `--token`.
 pub fn new_token() -> String {
     names::hex(&names::random_bytes::<16>())
 }
 
 /// The token as a safe path component: exactly the form `new_token`
-/// produces. Both entry points receive it from our own receiver.
+/// produces. Both entry points receive it from our own client.
 fn checked(token: &str) -> &str {
     if token.len() != 32 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
         die(format!("invalid token {token:?}"));
@@ -133,9 +133,9 @@ pub fn listen(token: &str) -> Listener {
 
 impl Listener {
     /// Accept the control connection. The wait needs no check of its own:
-    /// nothing in `serve` reads stdin meanwhile, but the input's session
-    /// watcher sees the hangup when the receiver goes away, and ends the
-    /// run (DESIGN.md §6.9).
+    /// nothing in `serve` reads stdin meanwhile, but the session watcher
+    /// sees the hangup when the client goes away, and ends the run
+    /// (DESIGN.md §6.6).
     pub fn accept(&self) -> UnixStream {
         match retry_interrupted(|| self.listener.accept()) {
             Ok((stream, _)) => stream,
@@ -184,7 +184,7 @@ pub fn connect(token: &str) -> UnixStream {
 fn wait_for_serve(path: &std::path::Path, reason: &dyn std::fmt::Display) {
     if stdin_gone() {
         die(format!(
-            "the receiver disappeared while waiting for {}: {reason}",
+            "the client disappeared while waiting for {}: {reason}",
             path.display()
         ));
     }

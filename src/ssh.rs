@@ -1,10 +1,10 @@
 //! The two SSH sessions and their command lines (DESIGN.md §6.1).
 //!
-//! The configured `ssh` command is shell-split; the first word is the
-//! executable and the rest are its options. Leading `-o` options inserted
-//! by hashsync take precedence under SSH's first-value rule, and the
-//! trailing `-T -x` disable PTYs and X11 forwarding even if the configured
-//! options requested them.
+//! The `--ssh` command is shell-split; the first word is the executable
+//! and the rest are its options. Leading `-o` options inserted by hashsync
+//! take precedence under SSH's first-value rule, and the trailing `-T -x`
+//! disable PTYs and X11 forwarding even if the `--ssh` options requested
+//! them.
 //!
 //! SSH runs its remote command through the remote login shell, so the
 //! bootstrap single-quotes every argument for POSIX shells, preserving
@@ -91,10 +91,58 @@ pub fn remote_command(argv: &[&[u8]]) -> Vec<u8> {
     out
 }
 
+/// How the client reaches the server (DESIGN.md §6.1 and §8).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Remote {
+    /// The shell-split `--ssh` command; the first word is the executable.
+    pub ssh: Vec<Vec<u8>>,
+    /// `-l USER`, which goes to SSH as it is.
+    pub login: Option<Vec<u8>>,
+    /// The SSH destination, `[USER@]HOST`, which goes to SSH unchanged.
+    pub host: Vec<u8>,
+    /// `--hashsync-path`: one executable name or path, not a shell
+    /// fragment, which the bootstrap quotes as one word.
+    pub hashsync_path: Vec<u8>,
+}
+
+impl Remote {
+    /// The remote of `hashsync ssh` from its options: `ssh_command`
+    /// (`--ssh`, shell-split without byte escapes, as no CLI argument has
+    /// them; `ssh` by default), `login`, `host` and `hashsync_path`
+    /// (`hashsync` by default).
+    pub fn new(
+        ssh_command: Option<&[u8]>,
+        login: Option<&[u8]>,
+        host: &[u8],
+        hashsync_path: Option<&[u8]>,
+    ) -> Result<Remote, String> {
+        let ssh = match ssh_command {
+            None => vec![b"ssh".to_vec()],
+            Some(text) => match shell_split(text) {
+                Ok(words) if words.is_empty() => return Err("--ssh: empty command".into()),
+                Ok(words) => words,
+                Err(e) => return Err(format!("--ssh: {e}")),
+            },
+        };
+        let hashsync_path = match hashsync_path {
+            None => b"hashsync".to_vec(),
+            Some([]) => return Err("--hashsync-path: empty path".into()),
+            Some(path) => path.to_vec(),
+        };
+        Ok(Remote {
+            ssh,
+            login: login.map(<[u8]>::to_vec),
+            host: host.to_vec(),
+            hashsync_path,
+        })
+    }
+}
+
 /// One session's local argv: the split `ssh` command with the options,
-/// HOST, and remote command that DESIGN.md §6.1 specifies.
-pub fn session_argv(ssh: &[Vec<u8>], host: &[u8], remote: &[u8]) -> Vec<OsString> {
-    let mut argv: Vec<Vec<u8>> = Vec::with_capacity(ssh.len() + 10);
+/// `-l USER`, HOST, and remote command that DESIGN.md §6.1 specifies.
+pub fn session_argv(remote: &Remote, command: &[u8]) -> Vec<OsString> {
+    let ssh = &remote.ssh;
+    let mut argv: Vec<Vec<u8>> = Vec::with_capacity(ssh.len() + 12);
     argv.push(ssh[0].clone());
     for option in ["-o", "ClearAllForwardings=yes", "-o", "RemoteCommand=none"] {
         argv.push(option.into());
@@ -103,15 +151,19 @@ pub fn session_argv(ssh: &[Vec<u8>], host: &[u8], remote: &[u8]) -> Vec<OsString
     for option in ["-T", "-x", "-o", "Compression=no"] {
         argv.push(option.into());
     }
-    argv.push(host.to_vec());
-    argv.push(remote.to_vec());
+    if let Some(login) = &remote.login {
+        argv.push(b"-l".to_vec());
+        argv.push(login.clone());
+    }
+    argv.push(remote.host.clone());
+    argv.push(command.to_vec());
     argv.into_iter().map(OsString::from_vec).collect()
 }
 
 /// One running SSH session. The child stays unreaped so its PID stays
 /// reserved (DESIGN.md §6.8); dropping `stdin` closes the pipe, and the
-/// sender takes that EOF as the receiver's disappearance until it has sent
-/// DONE, so the receiver holds `stdin` until DONE (DESIGN.md §6.9).
+/// server takes that EOF as the client's disappearance until it has sent
+/// END, so the client holds `stdin` until END (DESIGN.md §6.9).
 pub struct Session {
     pub child: Child,
     pub stdin: ChildStdin,
@@ -125,22 +177,17 @@ impl Session {
 }
 
 /// Start the data and control sessions together. Each SSH child is
-/// SIGKILLed on a fatal exit; stderr is inherited, so the sender's
-/// relayed bytes and SSH's own errors reach the receiver's stderr.
-pub fn start_sessions(
-    ssh: &[Vec<u8>],
-    sender_command: &[u8],
-    host: &[u8],
-    token: &str,
-) -> (Session, Session) {
-    let data = spawn(ssh, host, sender_command, b"serve", token);
-    let control = spawn(ssh, host, sender_command, b"attach", token);
+/// SIGKILLed on a fatal exit; stderr is inherited, so the server's
+/// relayed bytes and SSH's own errors reach the client's stderr.
+pub fn start_sessions(remote: &Remote, token: &str) -> (Session, Session) {
+    let data = spawn(remote, b"serve", token);
+    let control = spawn(remote, b"attach", token);
     (data, control)
 }
 
-fn spawn(ssh: &[Vec<u8>], host: &[u8], sender_command: &[u8], role: &[u8], token: &str) -> Session {
-    let remote = remote_command(&[sender_command, role, b"--token", token.as_bytes()]);
-    let argv = session_argv(ssh, host, &remote);
+fn spawn(remote: &Remote, role: &[u8], token: &str) -> Session {
+    let command = remote_command(&[&remote.hashsync_path, role, b"--token", token.as_bytes()]);
+    let argv = session_argv(remote, &command);
     let mut command = Command::new(&argv[0]);
     command
         .args(&argv[1..])
@@ -208,32 +255,52 @@ mod tests {
 
     #[test]
     fn session_argv_places_the_specified_options() {
-        let ssh = vec![
-            b"ssh".to_vec(),
-            b"-C".to_vec(),
-            b"-p".to_vec(),
-            b"22".to_vec(),
+        let mut remote = Remote::new(Some(b"ssh -C -p 22"), None, b"user@host", None).unwrap();
+        let words = |remote: &Remote| -> Vec<Vec<u8>> {
+            let argv = session_argv(remote, b"exec 'hashsync'");
+            argv.iter().map(|w| w.as_encoded_bytes().to_vec()).collect()
+        };
+        let expected: Vec<&[u8]> = vec![
+            b"ssh",
+            b"-o",
+            b"ClearAllForwardings=yes",
+            b"-o",
+            b"RemoteCommand=none",
+            b"-C",
+            b"-p",
+            b"22",
+            b"-T",
+            b"-x",
+            b"-o",
+            b"Compression=no",
+            b"user@host",
+            b"exec 'hashsync'",
         ];
-        let argv = session_argv(&ssh, b"user@host", b"exec 'hashsync'");
-        let words: Vec<&[u8]> = argv.iter().map(|w| w.as_encoded_bytes()).collect();
-        assert_eq!(
-            words,
-            vec![
-                &b"ssh"[..],
-                b"-o",
-                b"ClearAllForwardings=yes",
-                b"-o",
-                b"RemoteCommand=none",
-                b"-C",
-                b"-p",
-                b"22",
-                b"-T",
-                b"-x",
-                b"-o",
-                b"Compression=no",
-                b"user@host",
-                b"exec 'hashsync'",
-            ]
-        );
+        assert_eq!(words(&remote), expected);
+        // `-l USER` goes right before HOST.
+        remote.login = Some(b"backup".to_vec());
+        let mut with_login = expected.clone();
+        with_login.splice(12..12, [&b"-l"[..], b"backup"]);
+        assert_eq!(words(&remote), with_login);
+    }
+
+    #[test]
+    fn the_remote_has_defaults_and_rejects_bad_commands() {
+        let remote = Remote::new(None, None, b"host", None).unwrap();
+        assert_eq!(remote.ssh, [b"ssh"]);
+        assert_eq!(remote.hashsync_path, b"hashsync");
+        // `--ssh` gets no byte escapes: a CLI argument has none.
+        let remote =
+            Remote::new(Some(br"ssh -o 'X\x41'"), None, b"host", Some(b"/opt/h s")).unwrap();
+        assert_eq!(remote.ssh, [&b"ssh"[..], b"-o", br"X\x41"]);
+        assert_eq!(remote.hashsync_path, b"/opt/h s");
+        for (ssh, path, error) in [
+            (Some(&b""[..]), None, "--ssh: empty command"),
+            (Some(b"  "), None, "--ssh: empty command"),
+            (Some(b"ssh 'open"), None, "--ssh: unterminated single quote"),
+            (None, Some(&b""[..]), "--hashsync-path: empty path"),
+        ] {
+            assert_eq!(Remote::new(ssh, None, b"host", path), Err(error.into()));
+        }
     }
 }

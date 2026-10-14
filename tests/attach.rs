@@ -19,9 +19,9 @@ const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 fn after_socket_closure_attach_discards_stdin_until_eof() {
     // `serve` closes the socket first. Then the stdin relay's next write
     // fails, and `attach` reads and discards the rest of its stdin, more
-    // than a pipe holds, so that the receiver's control writer does not
+    // than a pipe holds, so that the client's control writer does not
     // block. At socket EOF, `attach` waits for that relay, and exits zero
-    // only at stdin EOF, which the receiver causes after DONE
+    // only at stdin EOF, which the client causes after END
     // (DESIGN.md §6.1 and §6.9).
     let home = tempfile::Builder::new()
         .prefix("hashsync-attach-")
@@ -76,4 +76,39 @@ fn after_socket_closure_attach_discards_stdin_until_eof() {
     pipe.read_to_string(&mut stderr).unwrap();
     let status = attach.0.wait().unwrap();
     assert_eq!(status.code(), Some(0), "stderr:\n{stderr}");
+}
+
+#[test]
+fn attach_marks_its_lines_as_the_servers() {
+    // `attach` runs on the server, and SSH carries its stderr to the
+    // client's, so its lines carry the server's marker (DESIGN.md §8). An
+    // invalid token is the error that it reports before anything else.
+    let output = Command::new(env!("CARGO_BIN_EXE_hashsync"))
+        .args(["attach", "--token", "bad"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(stderr, "hashsync (server): invalid token \"bad\"\n");
+}
+
+#[test]
+fn a_usage_error_on_the_server_has_no_marker() {
+    // A usage error of the command line of `serve` or `attach` comes before
+    // either runs, so its lines carry no server marker (DESIGN.md §8).
+    for subcommand in ["serve", "attach"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_hashsync"))
+            .args([subcommand, "--no-such-option"])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{subcommand}:\n{stderr}");
+        assert!(
+            stderr.starts_with("error: unexpected argument '--no-such-option'"),
+            "{subcommand}:\n{stderr}"
+        );
+        assert!(!stderr.contains("(server)"), "{subcommand}:\n{stderr}");
+    }
 }

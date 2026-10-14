@@ -22,24 +22,30 @@ changes.
 
 **Status:** Steps 1 to 6 are implemented: `update` (with `--rebuild` and
 `-j`) and `stats` maintain the index for mutable roots, reuse unchanged
-files by identity, size, and ctime, and recover interrupted work; `run`
-(with `--no-update` and `--ssh`), `serve`, and `attach` transfer a remote
-command's output over two SSH sessions, with the hash-list exchange,
-account identities, and durable list caches, replace indexed blocks with
-references verified through the receiver's pins, send constant-byte runs
-compactly, and compress the data stream and both directions of the control
-session with zstd. The list exchange reuses cached lists: an unchanged list
-costs no list bytes, and a changed one is sent as a direct delta from a list
-both sides have whenever that is smaller than the full list, which remains
-the fallback (DESIGN.md §5.6). The command's stdout and
-the data session go through spools, so that a slow stage of the transfer
-does not stop the others.
-With `--stdin`, the receiver's stdin goes to the command's stdin,
-compressed as the data stream is, through an input spool on each side
-(DESIGN.md §6.6). The output and the input reach their destinations at
-each idle point of their sources, once the link can carry them, unless
-`--batch-stdout` or `--batch-stdin` asks for batch delivery (DESIGN.md
-§6.2).
+files by identity, size, and ctime, and recover interrupted work; `ssh`
+(with `--no-update`, `--ssh`, `--hashsync-path`, and the run options),
+`serve`, and `attach` run a remote command as ssh does, over two SSH
+sessions. The client's stdin is the forward stream, and the command's
+stdout the backward stream; `-n` sends an empty forward stream. The
+backward stream is deduplicated against the client's index by default,
+the forward stream against the server's with `--dedup-stdin`, and both
+with `--dedup-stdin --dedup-stdout`, in which the client releases its
+index between its update and the server's (DESIGN.md §4.4). A
+deduplicated stream has the hash-list exchange, account identities, and
+durable list caches, replaces indexed blocks with references verified
+through the receiver's pins, and sends constant-byte runs compactly. Both
+streams and both directions of the control session are compressed with
+zstd. The list exchange reuses cached lists: an unchanged list costs no
+list bytes, and a changed one is sent as a direct delta from a list both
+sides have whenever that is smaller than the full list, which remains the
+fallback (DESIGN.md §5.6). Every stream goes through a spool on each
+host, so that a slow stage of the transfer does not stop the others, and
+reaches its destination at each idle point of its source, once the link
+can carry it, unless `--batch-stdout` or `--batch-stdin` asks for batch
+delivery (DESIGN.md §6.2). Either stream stops once no process reads its
+destination, and the run then ends with the command's status; the summary
+shows what each stream read, decoded, dropped, and wrote (DESIGN.md §6.6
+and §8). The server marks its lines with `hashsync (server): `.
 Step 7 is the next milestone.
 
 ## 1. Build and inspect a local index
@@ -89,23 +95,28 @@ Design coverage: §§4.2–4.6, 7–8.
 
 ## 3. Run remote commands and reproduce their output
 
-Deliver `hashsync run [--no-update] [--ssh CMD] [USER@]HOST -- COMMAND ARGS...`.
+Deliver `hashsync ssh [OPTIONS] [-l USER] [USER@]HOST [--] COMMAND [ARGS...]`.
 
 At this stage, send command stdout as literals and negotiate compression
 disabled. Block references and compressed output follow in steps 4 and 5.
 
 - Reproduce stdout byte for byte and forward stderr promptly, including
   empty output, large output, and output from commands that fail.
-- Preserve command arguments as bytes, run them without an implicit shell,
-  and return the specified exit or startup-failure status.
-- Support the configured SSH command, host overrides, `sender_command`,
-  and CLI precedence. Preserve SSH aliases and the user's authentication
-  and host configuration, with the session options required by the design.
+- Preserve command arguments as bytes, run the command line with the
+  user's shell as sshd does, or with `-s` its words without a shell, and
+  return the specified exit or startup-failure status.
+- Support `--ssh` and `--hashsync-path`; per-host SSH options belong in
+  the user's SSH configuration. Preserve SSH aliases and the user's
+  authentication and host configuration, with the session options required
+  by the design.
 - Allow the same installed binary to serve both receiver and sender roles.
   Reject incompatible peers before starting the command.
-- Update before normal runs and retain exclusive index access throughout
-  transfer. Support concurrent read-only `--no-update` runs, resolving
-  current roots and reporting missing or incompatible indexes clearly.
+- Update before normal runs, then keep a shared lock until the run's
+  lookups end, so that no modifying process comes between the update and
+  the transfer; with both streams deduplicated, the client releases its
+  lock between its update and its list exchange (DESIGN.md §4.4). Support
+  concurrent read-only `--no-update` runs, resolving current roots and
+  reporting missing or incompatible indexes clearly.
 - Export the full canonical hash list from one index snapshot. Complete
   HELLO, full-list verification, table construction, and `CACHE_RESULT`
   before command startup. The sender advertises its listed lists, but the
@@ -119,7 +130,7 @@ disabled. Block references and compressed output follow in steps 4 and 5.
   listed file.
   Preserve correct behavior across concurrent transfers, interrupted
   publication, missing acknowledgements, database restore, and rebuild.
-- Support `sender_cache = false`, with which neither side keeps a list for
+- Support `--no-sender-cache`, with which neither side keeps a list for
   that peer and index, and `hashlist_max_age` expiry of lists, abandoned
   temporaries, and empty peer/index directories. Cache directory and file
   operation failures on either role are fatal, with the absence,
@@ -153,17 +164,15 @@ Design coverage: §§3, 5.4–5.6, 6.1–6.2, 6.7–6.9, 7–8.
 - Support `tmp_data_dir`, its segments, and their closure as output
   advances. Pin storage failures or corruption fail the run without
   emitting the affected block.
-- Spool the command's stdout on the sender, up to
-  `sender_output_spool_limit`, and the data session on the receiver, up to
-  `receiver_output_spool_limit`, so that neither the command nor the
-  transfer waits for a slower stage until a spool is full (DESIGN.md
-  §6.5).
+- Spool each stream on both hosts, up to `--spool-limit`, so that neither
+  the command nor the transfer waits for a slower stage until a spool is
+  full (DESIGN.md §6.5).
 - Preserve ordered output with slow consumers, concurrent lookups, and
-  out-of-order, late, or obsolete answers. Honor `lookahead` and
-  `negative_cache`, along with the design's limits on retained payloads;
-  obsolete lookups must not delay END_ACK. At the normal end, the receiver
-  skips the queued lookups and waits only for the lookups in progress
-  (DESIGN.md §6.9).
+  out-of-order, late, or obsolete answers. Honor `--lookahead` and
+  `--negative-cache`, along with the design's limits on retained payloads;
+  obsolete lookups must not delay END. The lookups end at Completing, once
+  the stream has ended or stopped, and the index closes then (DESIGN.md
+  §6.4).
 - Include reference byte counts in the summary.
 
 Result: transfers save network traffic by using verified local content,
@@ -175,12 +184,14 @@ Design coverage: §§3, 4.5, 5.1–5.3, 5.5, 6.2–6.9, 7–8.
 
 - Represent constant-byte runs compactly, including runs spanning input
   boundaries and the end-of-stream behavior specified in the design.
-- Support zstd compression with the configured level and thread count,
-  including the option to disable compression.
+- Support zstd compression with `--compression-level` and
+  `--compression-threads`, including the option to disable compression.
 - Flush the compression stream before the sender waits for a reply and,
-  in eager delivery, after each idle point of command stdout once the data
-  writer has nothing left to write; finish it after END. Keep query
-  progress independent of compression and output backpressure.
+  in eager delivery, after each idle point of the stream's source once the
+  data writer has nothing left to write, and in either delivery, every
+  `lookahead` bytes of a deduplicated stream; end each stream's zstd frame
+  before its STREAM_END. Keep query progress independent of compression
+  and output backpressure.
 - Compress both directions of the control session at the same level, and
   flush each one whenever its writer's queue becomes empty.
 - Detect truncated or invalid compressed streams before declaring success.
@@ -270,7 +281,7 @@ Design coverage: §§4.2, 4.4, 8.
 - Provide the Nix package specified in the design, including cross and
   static build support.
 - Make the completed command set available from the installed binary, usable
-  locally and remotely through PATH or a configured `sender_command`.
+  locally and remotely through PATH or `--hashsync-path`.
 - Build the package from the committed lockfile and verify the required
   bundled dependencies and capabilities in the installed binaries.
 

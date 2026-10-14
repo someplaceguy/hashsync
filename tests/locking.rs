@@ -80,18 +80,35 @@ fn indexed_env() -> Env {
     env
 }
 
+/// The note of a process that waits for the lock of the index of `env`.
+fn waiting_note(env: &Env) -> String {
+    format!(
+        "hashsync: waiting for the lock of index {}\n",
+        env.index_path().display()
+    )
+}
+
 #[test]
 fn update_waits_for_a_read_only_process() {
+    // The update says that it waits, and for which index, so that a long
+    // wait does not look like a hang.
     let env = indexed_env();
     let reader = lock(&env, FlockOperation::LockShared);
 
-    let mut child = env.command(&["update"]).spawn().unwrap();
+    let mut child = env
+        .command(&["update"])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
     wait_for_waiter(&mut child, &reader);
 
     drop(reader);
-    let status = child.wait().unwrap();
-    assert!(status.success());
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
     assert_eq!(env.count("paths"), 1);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.starts_with(&waiting_note(&env)), "{stderr}");
+    assert_eq!(stderr.matches("waiting").count(), 1, "{stderr}");
 }
 
 #[test]
@@ -99,12 +116,51 @@ fn stats_waits_for_a_modifying_process() {
     let env = indexed_env();
     let writer = lock(&env, FlockOperation::LockExclusive);
 
-    let mut child = env.command(&["stats"]).spawn().unwrap();
+    let mut child = env
+        .command(&["stats"])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
     wait_for_waiter(&mut child, &writer);
 
     drop(writer);
-    let status = child.wait().unwrap();
-    assert!(status.success());
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(stderr, waiting_note(&env));
+}
+
+#[test]
+fn a_quiet_process_waits_for_the_lock_without_a_note() {
+    // The note of a lock wait is a progress message, which `--quiet` keeps
+    // off stderr (DESIGN.md §4.4 and §8).
+    let env = indexed_env();
+    let reader = lock(&env, FlockOperation::LockShared);
+
+    let mut child = env
+        .command(&["update", "--quiet"])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_waiter(&mut child, &reader);
+
+    drop(reader);
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8(output.stderr).unwrap(), "");
+}
+
+#[test]
+fn a_lock_taken_without_a_wait_takes_no_note() {
+    // Only a wait takes the note (DESIGN.md §4.4): `stats` shares the lock
+    // with a reader, and `update` finds no holder.
+    let env = indexed_env();
+    let reader = lock(&env, FlockOperation::LockShared);
+    let output = env.run(&["stats"]);
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8(output.stderr).unwrap(), "");
+    drop(reader);
+    assert!(!env.update().contains("waiting"));
 }
 
 #[test]

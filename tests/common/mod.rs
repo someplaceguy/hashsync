@@ -9,6 +9,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output};
+use std::time::Duration;
 
 use rocksdb::{ColumnFamily, DB, IteratorMode, Options, WriteBatch};
 use tempfile::TempDir;
@@ -297,7 +298,7 @@ pub fn u64_at(bytes: &[u8], at: usize) -> u64 {
 }
 
 impl IndexView {
-    fn open(path: &Path, writable: bool) -> Self {
+    pub fn open(path: &Path, writable: bool) -> Self {
         let options = Options::default();
         let db = if writable {
             DB::open_cf(&options, path, COLUMN_FAMILIES)
@@ -537,19 +538,23 @@ pub fn namespaces_available() -> bool {
 pub const PROTOCOL_VERSION: u32 = 1;
 /// The features that hashsync sends: it supports none yet.
 pub const FEATURES: u64 = 0;
-pub const HELLO: u8 = 1;
-pub const HASHLIST: u8 = 2;
-pub const CACHE_RESULT: u8 = 6;
-pub const LIT: u8 = 7;
-pub const REF: u8 = 8;
+// Session frames: the data session, never compressed.
+pub const REQUEST: u8 = 1;
+pub const HELLO: u8 = 2;
+pub const HASHLIST: u8 = 3;
+pub const HASHDELTA: u8 = 4;
+pub const CACHE_RESULT: u8 = 7;
+pub const CHUNK: u8 = 8;
+pub const STREAM_END: u8 = 9;
 pub const END: u8 = 10;
-pub const END_ACK: u8 = 11;
-pub const QUERY: u8 = 12;
-pub const ANSWER: u8 = 13;
-pub const DONE: u8 = 14;
-pub const INPUT: u8 = 15;
-pub const INPUT_END: u8 = 16;
-pub const INPUT_STOP: u8 = 17;
+// Stream frames: inside the zstd frame of a stream.
+pub const LIT: u8 = 11;
+pub const REF: u8 = 12;
+pub const RLE: u8 = 13;
+// Control frames.
+pub const QUERY: u8 = 14;
+pub const ANSWER: u8 = 15;
+pub const STOP: u8 = 16;
 
 /// The first bytes of each session, in both directions: the protocol
 /// version, then `features`. hashsync sends `FEATURES`, but a later peer
@@ -606,4 +611,87 @@ impl Drop for KillOnDrop {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
+}
+
+/// Wait until the main thread of `pid` sleeps in a wait for the lock of an
+/// index: `fcntl` with `F_OFD_SETLKW`, its second argument in the `syscall`
+/// file (DESIGN.md §4.4); no deadline. Reading that file needs the ptrace
+/// access that a parent has. Fail when the process has ended.
+pub fn wait_for_lock_wait(pid: u32) {
+    let path = format!("/proc/{pid}/syscall");
+    loop {
+        assert_ne!(
+            proc_state(format!("/proc/{pid}")),
+            Some('Z'),
+            "the process ended"
+        );
+        let syscall = std::fs::read_to_string(&path).unwrap();
+        let fields: Vec<&str> = syscall.split_whitespace().collect();
+        let argument = |i: usize| {
+            fields
+                .get(i)
+                .and_then(|field| u64::from_str_radix(field.trim_start_matches("0x"), 16).ok())
+        };
+        // A running thread has no number; one that sleeps outside a
+        // system call has -1.
+        if fields.first().is_some_and(|nr| nr.parse::<u64>().is_ok())
+            && argument(2) == Some(libc::F_OFD_SETLKW as u64)
+        {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// The lock file of the index at `index`, with a shared lock that this
+/// process holds until the drop of the file: an `update` of that index
+/// then waits (DESIGN.md §4.4). The index takes OFD locks; this is a
+/// classic POSIX lock of the whole file, which conflicts with them all the
+/// same. Such a lock goes when this process closes any descriptor of the
+/// file, so a test that holds it must open the file nowhere else.
+pub fn shared_lock(index: &Path) -> std::fs::File {
+    let file = std::fs::File::open(index.join("hashsync.lock")).unwrap();
+    rustix::fs::fcntl_lock(&file, rustix::fs::FlockOperation::NonBlockingLockShared)
+        .unwrap_or_else(|e| panic!("cannot lock {}: {e}", index.display()));
+    file
+}
+
+/// The OFD lock that the process `pid` holds on the file at `path`, as the
+/// `fdinfo` of its descriptors of that file shows it: `"WRITE"` or
+/// `"READ"`, or `None`. An index takes one on its lock file while it is
+/// open (DESIGN.md §4.4). The descriptors of the process name the file, so
+/// no lock of another process counts, and no device number has to match
+/// the one that `/proc/locks` shows, which differs from the one of `stat`
+/// on btrfs. The descriptors of another process need the ptrace access
+/// that its ancestors have.
+pub fn ofd_lock(pid: u32, path: &Path) -> Option<&'static str> {
+    use std::os::unix::fs::MetadataExt;
+    let file = std::fs::metadata(path).unwrap();
+    // A process that has ended has no descriptors.
+    let fds = std::fs::read_dir(format!("/proc/{pid}/fd")).ok()?;
+    for fd in fds.flatten() {
+        // A descriptor that closes meanwhile has no metadata or fdinfo.
+        let Ok(open) = std::fs::metadata(fd.path()) else {
+            continue;
+        };
+        if (open.dev(), open.ino()) != (file.dev(), file.ino()) {
+            continue;
+        }
+        let info = format!("/proc/{pid}/fdinfo/{}", fd.file_name().to_string_lossy());
+        let Ok(info) = std::fs::read_to_string(info) else {
+            continue;
+        };
+        // Such as `lock:\t1: OFDLCK ADVISORY  WRITE -1 00:2d:4242 0 EOF`.
+        for line in info.lines() {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.first() == Some(&"lock:") && fields.get(2) == Some(&"OFDLCK") {
+                match fields.get(4) {
+                    Some(&"WRITE") => return Some("WRITE"),
+                    Some(&"READ") => return Some("READ"),
+                    _ => {}
+                }
+            }
+        }
+    }
+    None
 }

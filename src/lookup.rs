@@ -10,8 +10,12 @@
 //! including one without a usable location, so stale rows cannot make a
 //! lookup unbounded. Filesystem failures only reject a candidate.
 //!
-//! A worker ends when the query queue is closed and empty. In Completing,
-//! the queries left in the queue cost no reads: the pins skip them.
+//! The workers own the run's index: each one has a reader, and the index
+//! closes, with its lock, when the last of them ends. They end at
+//! Completing, when the receiver's stream has ended or stopped, and the
+//! queries that still arrive then have no use any more (DESIGN.md §6.4). So
+//! the index closes then, also while the run goes on, and an update of the
+//! index can begin.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -20,7 +24,7 @@ use std::os::unix::fs::FileExt;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
-use crossbeam_channel::{Receiver, Sender, unbounded};
+use crossbeam_channel::{Receiver, select};
 use rustix::fs::FileType;
 
 use crate::config::Config;
@@ -31,16 +35,18 @@ use crate::pins::{Block, Pins};
 use crate::protocol::Query;
 use crate::roots::Location;
 
-/// Start the lookup workers. `locations` are the current root locations
-/// from this run's root resolution; an indexed root without one has no
-/// usable location. Returns the queue of the queries to answer, and the
-/// workers, which end once that queue is closed and empty.
+/// Start the lookup workers, which take over `index`, and answer the
+/// queries of `queue`. `locations` are the current root locations from
+/// this run's root resolution; an indexed root without one has no usable
+/// location. Returns the workers, which end at the Completing of `pins`, or
+/// once the queue is closed and empty.
 pub fn start(
-    index: &Index,
+    index: Index,
     locations: Vec<Location>,
     pins: &Arc<Pins>,
     config: &Config,
-) -> (Sender<Query>, Vec<JoinHandle<()>>) {
+    queue: Receiver<Query>,
+) -> Vec<JoinHandle<()>> {
     let mut by_path: HashMap<Vec<u8>, Location> = locations
         .into_iter()
         .map(|location| (location.path.clone(), location))
@@ -51,7 +57,6 @@ pub fn start(
         .filter_map(|(root_id, path)| Some((root_id, by_path.remove(&path)?)))
         .collect();
     let sources = Arc::new(by_root);
-    let (queries, queue) = unbounded();
     // A pool of 4 to 8 workers (DESIGN.md §6.4).
     let workers = std::thread::available_parallelism().map_or(4, |n| n.get().clamp(4, 8));
     let mut threads = Vec::with_capacity(workers);
@@ -65,18 +70,31 @@ pub fn start(
             buffer: vec![0; config.block_size as usize],
         };
         let pins = Arc::clone(pins);
-        let queue: Receiver<Query> = queue.clone();
+        let (queue, completing) = (queue.clone(), pins.completing());
         let thread = std::thread::Builder::new()
             .name(format!("lookup{i}"))
             .spawn(move || {
-                while let Ok(query) = queue.recv() {
-                    pins.answer(query.offset, &query.strong, || worker.find(&query.strong));
+                // When a query waits at Completing, either can come
+                // first: in Completing, the pins skip a query without a
+                // read. No timeout (DESIGN.md §3).
+                loop {
+                    select! {
+                        recv(completing) -> _ => return,
+                        recv(queue) -> query => match query {
+                            Ok(query) => pins.answer(query.offset, &query.strong, || {
+                                worker.find(&query.strong)
+                            }),
+                            Err(_) => return,
+                        },
+                    }
                 }
             })
             .expect("cannot start a lookup worker");
         threads.push(thread);
     }
-    (queries, threads)
+    // The readers of the workers keep the database open.
+    drop(index);
+    threads
 }
 
 struct Worker {

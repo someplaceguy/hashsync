@@ -1,43 +1,44 @@
-//! The sender's scanner (DESIGN.md §6.3): the single owner of all output
-//! decisions.
+//! The sender's scanner (DESIGN.md §6.3): the single owner of the decisions
+//! about the frames of a deduplicated stream.
 //!
-//! The scanner rolls the weak hash over the command's output. A window of
-//! equal bytes becomes part of a run. A window whose weak hash is in the
+//! The scanner rolls the weak hash over the bytes of the stream. A window
+//! of equal bytes becomes part of a run. A window whose weak hash is in the
 //! receiver's list becomes a query for the window's full strong hash; a
 //! yes answer turns it into a reference, and everything else is literal.
-//! Output leaves strictly in order: a query blocks the records behind it
+//! The frames leave strictly in order: a query blocks the records behind it
 //! until its answer arrives, and a no answer discards every record after
 //! the rejected window, which is scanned again from its next byte.
 //!
-//! The scanner does no I/O and starts no threads. Its driver (`serve`)
-//! feeds it command output and answers, sends the queries that it makes,
+//! The scanner does no I/O and starts no threads. Its driver
+//! (`dedup::transfer`, on the host that sends the stream) feeds it the
+//! bytes of the stream and the answers, sends the queries that it makes,
 //! and takes its data frames while the data queue has room. The driver can
 //! lend it a pool of probe threads, which probe the parts of a long stretch
 //! of windows at once.
 //!
-//! In eager delivery of the output (DESIGN.md §6.2), the driver also passes
-//! the idle points of the command's stdout (`idle`). The bytes before the
-//! last idle point leave without waiting for more output once they can
-//! leave at once: the driver records their tail, which fills no window,
-//! only while the data writer has nothing left to write (`tail_waits`,
-//! `send_tail`). On a slow link, the tail waits instead, and output that
-//! arrives meanwhile can fill its windows. A flush of the data stream
-//! follows the frames of those bytes.
+//! In eager delivery (DESIGN.md §6.2), the driver also passes the idle
+//! points of the stream's source (`idle`). The bytes before the last idle
+//! point leave without waiting for more bytes once they can leave at once:
+//! the driver records their tail, which fills no window, only while the
+//! data writer has nothing left to write (`tail_waits`, `send_tail`). On a
+//! slow link, the tail waits instead, and bytes that arrive meanwhile can
+//! fill its windows. A flush of the stream follows the frames of those
+//! bytes.
 //!
-//! Offsets count output bytes from zero. `e` is the next byte to emit, `p`
-//! the next byte to scan, and `r` the end of the bytes read, with
+//! Offsets count the bytes of the stream from zero. `e` is the next byte to
+//! emit, `p` the next byte to scan, and `r` the end of the bytes read, with
 //! `e <= p <= r`:
 //!
-//! - The buffer holds the bytes `[e, r)`. It accepts command output while
-//!   it holds less than `lookahead + B` bytes, and a scan step starts only
-//!   while `p - e < lookahead`.
+//! - The buffer holds the bytes `[e, r)`. It accepts more bytes of the
+//!   stream while it holds less than `lookahead + B` bytes, and a scan step
+//!   starts only while `p - e < lookahead`.
 //! - The records cover `[e, p)` in order, without gaps or overlaps.
 //! - `f`, the end of the bytes before the last idle point, is at most `r`.
 //! - The query states hold every offset at or above `e` that was a weak
 //!   hit, also when no record refers to it any more. Each offset is queried
 //!   at most once.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, TryReserveError, VecDeque};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
@@ -70,13 +71,14 @@ pub enum Frame {
     Reference,
     /// RLE: `length` copies of `byte`.
     Run { byte: u8, length: u64 },
-    /// No frame: the frames of the bytes before an idle point are out, so
-    /// the data writer flushes the data stream once it has nothing left to
-    /// write (DESIGN.md §6.2 and §6.3).
+    /// Not a frame: the data writer flushes the stream once it has nothing
+    /// left to write (DESIGN.md §6.2 and §6.3). The scanner asks for a flush
+    /// once the frames of the bytes before an idle point are out, and after
+    /// every `lookahead` bytes of output.
     Flush,
 }
 
-/// Scanned output that is not emitted yet (DESIGN.md §6.3).
+/// Scanned bytes of the stream that are not emitted yet (DESIGN.md §6.3).
 #[derive(Clone, Copy, Debug)]
 enum Record {
     Literal {
@@ -168,6 +170,36 @@ struct Known {
     rolling: Rolling,
 }
 
+/// The lookahead of a scanner (DESIGN.md §6.3): the bytes that it scans
+/// ahead of its output at most, with its buffer, reserved whole before the
+/// stream starts. The buffer is twice as large as the bytes that it
+/// accepts, `lookahead + B` (`Scanner::push`). This type exists so that
+/// the reservation comes before the stream: the client sets the lookahead
+/// to any size, and a host that cannot hold its buffer must end the run
+/// before the command starts, not abort in the middle of the stream.
+pub struct Lookahead {
+    bytes: u64,
+    buffer: Vec<u8>,
+}
+
+impl Lookahead {
+    /// Reserve the buffer of a lookahead of `bytes`, for windows of
+    /// `block_size` bytes. The reservation fails when the allocator
+    /// refuses it, or when its size does not fit the address space.
+    pub fn reserve(bytes: u64, block_size: u32) -> Result<Lookahead, TryReserveError> {
+        let mut buffer = Vec::new();
+        buffer.try_reserve_exact(buffer_size(bytes, block_size.into()))?;
+        Ok(Lookahead { bytes, buffer })
+    }
+}
+
+/// The bytes that the buffer of a scanner reserves: twice the bytes that it
+/// accepts.
+fn buffer_size(lookahead: u64, block_size: u64) -> usize {
+    let accepted = lookahead.saturating_add(block_size);
+    usize::try_from(accepted.saturating_mul(2)).unwrap_or(usize::MAX)
+}
+
 pub struct Scanner<'a> {
     /// `B`.
     block_size: u64,
@@ -180,13 +212,14 @@ pub struct Scanner<'a> {
     base: u64,
     e: u64,
     p: u64,
-    /// `f`: the end of the bytes before the last idle point of the
-    /// command's stdout. The bytes before it leave without waiting for more
-    /// output (DESIGN.md §6.3).
+    /// `f`: the end of the bytes before the last idle point of the stream's
+    /// source. The bytes before it leave without waiting for more bytes
+    /// (DESIGN.md §6.3).
     flush: u64,
-    /// The `f` of the last `Frame::Flush`.
+    /// The output offset `e` at the last `Frame::Flush`. The frames of the
+    /// bytes before it need no other flush.
     flushed: u64,
-    /// The command's stdout reached EOF.
+    /// The stream's source reached EOF.
     ended: bool,
     /// The rolling state of a recent window: the window at `p` uses it,
     /// or rolls it on from the window before.
@@ -216,17 +249,21 @@ pub struct Scanner<'a> {
 
 impl<'a> Scanner<'a> {
     /// A scanner for windows of `block_size` bytes, which probes `table`,
-    /// scans at most `lookahead` bytes ahead of its output, and remembers
-    /// up to `negative_cache` bytes of rejected hashes. `pool` probes long
-    /// stretches in parts.
+    /// scans at most `lookahead` bytes ahead of its output, in the buffer
+    /// that the lookahead reserved, and remembers up to `negative_cache`
+    /// bytes of rejected hashes. `pool` probes long stretches in parts.
     pub fn new(
         table: HashTable,
         block_size: u32,
         strong: StrongHash,
-        lookahead: u64,
+        lookahead: Lookahead,
         negative_cache: u64,
         pool: Option<&'a ThreadPool>,
     ) -> Self {
+        let Lookahead {
+            bytes: lookahead,
+            buffer,
+        } = lookahead;
         assert!(block_size > 0 && lookahead >= u64::from(block_size));
         let negative_hashes =
             usize::try_from(negative_cache / NEGATIVE_ENTRY_BYTES).unwrap_or(usize::MAX);
@@ -241,7 +278,7 @@ impl<'a> Scanner<'a> {
             weak: WeakHasher::new(block_size as usize),
             table,
             strong,
-            buffer: Vec::new(),
+            buffer,
             base: 0,
             e: 0,
             p: 0,
@@ -275,16 +312,16 @@ impl<'a> Scanner<'a> {
         self.buffer[(offset - self.base) as usize]
     }
 
-    /// True while the buffer accepts more command output.
+    /// True while the buffer accepts more bytes of the stream.
     pub fn has_room(&self) -> bool {
         self.end() - self.e < self.lookahead.saturating_add(self.block_size)
     }
 
-    /// Append command output.
+    /// Append bytes of the stream.
     pub fn push(&mut self, bytes: &[u8]) {
-        assert!(!self.ended, "command output after its end");
+        assert!(!self.ended, "bytes of the stream after its end");
         // A buffer that grows copies itself to a larger allocation, and for
-        // a moment both copies use memory. So the first push reserves the
+        // a moment both copies use memory. So the lookahead reserved the
         // whole buffer, twice as large as the bytes that it accepts,
         // `lookahead + B`, and the emitted bytes stay until a push finds the
         // buffer full. Then they fill about half of it, so moving the bytes
@@ -296,26 +333,21 @@ impl<'a> Scanner<'a> {
         if bytes.len() > self.buffer.capacity() - self.buffer.len() {
             self.buffer.drain(..(self.e - self.base) as usize);
             self.base = self.e;
-            let size = self.buffer_size().max(self.buffer.len() + bytes.len());
+            let size =
+                buffer_size(self.lookahead, self.block_size).max(self.buffer.len() + bytes.len());
             self.buffer.reserve_exact(size - self.buffer.len());
         }
         self.buffer.extend_from_slice(bytes);
     }
 
-    /// The bytes that the buffer reserves: twice the bytes that it accepts.
-    fn buffer_size(&self) -> usize {
-        let accepted = self.lookahead.saturating_add(self.block_size);
-        usize::try_from(accepted.saturating_mul(2)).unwrap_or(usize::MAX)
-    }
-
-    /// The command's stdout reached EOF.
+    /// The stream's source reached EOF.
     pub fn end_input(&mut self) {
         self.ended = true;
     }
 
-    /// An idle point of the command's stdout, in eager delivery: it has no
+    /// An idle point of the stream's source, in eager delivery: it has no
     /// byte ready, and the scanner has every byte that it gave. These bytes
-    /// leave without waiting for more output once the data writer is idle
+    /// leave without waiting for more bytes once the data writer is idle
     /// (`tail_waits`), and `next_frame` gives a flush once their frames are
     /// out (DESIGN.md §6.3).
     pub fn idle(&mut self) {
@@ -328,7 +360,7 @@ impl<'a> Scanner<'a> {
     /// than `B`, which the tail extends. The driver calls `send_tail` once
     /// the data writer is idle. This function exists so that the tail
     /// leaves only when it can leave at once: while the writer is busy, on a
-    /// slow link, the tail waits, and output that arrives meanwhile can fill
+    /// slow link, the tail waits, and bytes that arrive meanwhile can fill
     /// its windows, which then need not become literal.
     pub fn tail_waits(&self) -> bool {
         let held = match (self.records.len(), self.records.front()) {
@@ -379,7 +411,7 @@ impl<'a> Scanner<'a> {
             let available = self.end() - self.p;
             if available < self.block_size {
                 // At EOF, the bytes that fill no window are a tail. Before
-                // EOF, they wait for more output, or, before an idle point,
+                // EOF, they wait for more bytes, or, before an idle point,
                 // for `send_tail` (DESIGN.md §6.3).
                 if self.ended && available > 0 {
                     self.scan_tail(self.end());
@@ -406,7 +438,7 @@ impl<'a> Scanner<'a> {
                     .min(next_entry.unwrap_or(u64::MAX));
                 match self.skip_misses(limit) {
                     // Lookups compare only the low 32 bits of each value, so
-                    // about 3 windows in each GiB of new output hit the table
+                    // about 3 windows in each GiB of new bytes hit the table
                     // without being in the list. The check of the whole weak
                     // hash makes such a window a miss, which costs no strong
                     // hash, no query, and no rescan after the answer
@@ -664,13 +696,21 @@ impl<'a> Scanner<'a> {
 
     /// The next data frame, if the first record is ready (DESIGN.md §6.3):
     /// a Ref, a Run for its known length, or up to `B` literal bytes. A
-    /// last Literal shorter than `B` waits to grow until the output is
+    /// last Literal shorter than `B` waits to grow until the stream is
     /// complete, except for its bytes before `f` once `p` has reached `f`.
-    /// A Query blocks everything behind it. Once the frames before a new `f`
-    /// are out, a flush comes first.
+    /// A Query blocks everything behind it. A flush comes first once the
+    /// frames before an `f` past the last flush are out, and once
+    /// `lookahead` bytes have left since the last flush.
     pub fn next_frame(&mut self) -> Option<Frame> {
-        if self.flushed < self.flush && self.e >= self.flush {
-            self.flushed = self.flush;
+        // The second flush exists for sources that never pause, such as a
+        // file, and for batch delivery, where no idle point flushes the
+        // stream. References and runs stand for far more bytes than their
+        // frames, so without it, the data writer's buffers could hold them
+        // until the end of the stream, and the receiver would get nothing
+        // before then (DESIGN.md §6.3).
+        let idle_point = self.flush > self.flushed && self.e >= self.flush;
+        if idle_point || self.e - self.flushed >= self.lookahead {
+            self.flushed = self.e;
             return Some(Frame::Flush);
         }
         let (frame, length) = match *self.records.front()? {
@@ -718,12 +758,11 @@ impl<'a> Scanner<'a> {
         Some(frame)
     }
 
-    /// All output is emitted: stdout reached EOF, `e = p = r`, and the flush
-    /// of the last idle point is out too. Else a driver that stops at the
-    /// last frame, while the data queue is full, would leave the bytes
-    /// before that idle point to wait for END (DESIGN.md §6.3).
+    /// All of the stream is emitted: its source reached EOF, and `e = p =
+    /// r`. A flush that has not gone out has no use then: the end of the
+    /// stream sends every byte.
     pub fn finished(&self) -> bool {
-        self.ended && self.e == self.end() && self.flushed == self.flush
+        self.ended && self.e == self.end()
     }
 }
 
@@ -1058,7 +1097,7 @@ pub(crate) mod tests {
                 receiver.table(),
                 BS,
                 StrongHash::Blake3,
-                lookahead,
+                Lookahead::reserve(lookahead, BS).unwrap(),
                 negative_cache,
                 part.map(|_| probe_pool()),
             );
@@ -1240,7 +1279,7 @@ pub(crate) mod tests {
             receiver.table(),
             BS,
             StrongHash::Blake3,
-            1 << 20,
+            lookahead(1 << 20),
             1 << 20,
             None,
         );
@@ -1269,7 +1308,14 @@ pub(crate) mod tests {
         let table = HashTable::build(&[weak ^ 1 << 63]);
         assert!(table.finish_lookup(table.start_lookup(weak)));
         let input = [noise(10, 61), window, noise(10, 62)].concat();
-        let mut scanner = Scanner::new(table, BS, StrongHash::Blake3, 1 << 20, 1 << 20, None);
+        let mut scanner = Scanner::new(
+            table,
+            BS,
+            StrongHash::Blake3,
+            lookahead(1 << 20),
+            1 << 20,
+            None,
+        );
         scanner.push(&input);
         scanner.end_input();
         while scanner.scan(&mut |offset, _| panic!("a query at {offset}")) {}
@@ -1290,9 +1336,21 @@ pub(crate) mod tests {
         std::iter::from_fn(|| scanner.next_frame()).collect()
     }
 
+    /// A lookahead of `bytes`, for windows of `BS` bytes.
+    fn lookahead(bytes: u64) -> Lookahead {
+        Lookahead::reserve(bytes, BS).unwrap()
+    }
+
     fn scanner_without_a_list() -> Scanner<'static> {
         let table = Receiver::new(&[], &[]).table();
-        Scanner::new(table, BS, StrongHash::Blake3, 1 << 20, 1 << 20, None)
+        Scanner::new(
+            table,
+            BS,
+            StrongHash::Blake3,
+            lookahead(1 << 20),
+            1 << 20,
+            None,
+        )
     }
 
     #[test]
@@ -1484,6 +1542,102 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn without_idle_points_a_flush_follows_every_lookahead_of_output() {
+        // No idle point comes, as in batch delivery, or with a source that
+        // never pauses. Once `lookahead` bytes of output have left since the
+        // last flush, the next item is a flush, and no flush comes sooner. A
+        // reference counts its whole block, and a run its whole length, as
+        // the bytes that they stand for (DESIGN.md §6.3).
+        let b = BS as usize;
+        let blocks: Vec<Vec<u8>> = (0..3).map(|i| noise(b, 80 + i)).collect();
+        let mut input = Vec::new();
+        for i in 0..30 {
+            input.extend_from_slice(&blocks[i % blocks.len()]);
+            input.extend(std::iter::repeat_n(9, b + i));
+            input.extend_from_slice(&noise(i % 7 + 1, 90 + i as u64));
+        }
+        let lookahead = 4 * u64::from(BS);
+        let receiver = Receiver::new(&blocks, &[]);
+        let mut run = Run::new(&input, receiver, lookahead, 1 << 20, None);
+        // The output since the last flush, and the items so far.
+        let mut since = 0;
+        let (mut flushes, mut references, mut runs) = (0, 0, 0);
+        while !run.scanner.finished() {
+            let pushed = run.push(8);
+            loop {
+                let mut progress = run.scan();
+                while !run.receiver.pending.is_empty() {
+                    run.receiver.answer(0, &mut run.scanner);
+                    progress = true;
+                }
+                while let Some(frame) = run.scanner.next_frame() {
+                    let before = run.receiver.output.len() as u64;
+                    let flush = frame == Frame::Flush;
+                    references += usize::from(frame == Frame::Reference);
+                    runs += usize::from(matches!(frame, Frame::Run { .. }));
+                    run.receiver.take(frame);
+                    if flush {
+                        assert!(since >= lookahead, "a flush after {since} bytes");
+                        since = 0;
+                        flushes += 1;
+                    } else {
+                        assert!(since < lookahead, "no flush after {since} bytes");
+                        since += run.receiver.output.len() as u64 - before;
+                    }
+                    progress = true;
+                }
+                if !progress {
+                    break;
+                }
+            }
+            assert!(pushed || run.scanner.finished(), "the scanner stalled");
+        }
+        assert_eq!(run.receiver.output, input);
+        assert_eq!((references, runs), (30, 30));
+        assert!(flushes > 0, "no flush");
+    }
+
+    #[test]
+    fn the_flush_of_an_idle_point_starts_the_count_of_the_lookahead_again() {
+        // After the flush of an idle point at 3 blocks, the next flush comes
+        // only once `lookahead` bytes, 4 blocks, have left after it: at 7
+        // blocks, and not at 4 or 8, as it would if only those flushes counted
+        // (DESIGN.md §6.3).
+        let b = BS as usize;
+        let table = Receiver::new(&[], &[]).table();
+        let mut scanner = Scanner::new(
+            table,
+            BS,
+            StrongHash::Blake3,
+            lookahead(4 * u64::from(BS)),
+            1 << 20,
+            None,
+        );
+        let input = noise(9 * b, 85);
+        scanner.push(&input[..3 * b]);
+        scanner.idle();
+        let frames = frames_with_an_idle_writer(&mut scanner);
+        assert_eq!(frames.last(), Some(&Frame::Flush));
+        scanner.push(&input[3 * b..]);
+        scanner.end_input();
+        let mut frames = Vec::new();
+        while !scanner.finished() {
+            frames.extend(frames_without_a_list(&mut scanner));
+        }
+        let mut offset = 3 * b;
+        let mut flushes = Vec::new();
+        for frame in frames {
+            match frame {
+                Frame::Literal(bytes) => offset += bytes.len(),
+                Frame::Flush => flushes.push(offset),
+                frame => panic!("{frame:?} without a list"),
+            }
+        }
+        assert_eq!(offset, input.len());
+        assert_eq!(flushes, [7 * b]);
+    }
+
+    #[test]
     fn a_tail_that_waits_for_the_data_writer_keeps_its_block() {
         // An idle point comes 10 bytes into a listed block. While the data
         // writer is busy, as on a slow link, the tail before the idle point
@@ -1509,27 +1663,6 @@ pub(crate) mod tests {
             let expected: &[u64] = if writer_idle { &[] } else { &[5] };
             assert_eq!(queries, expected, "writer idle: {writer_idle}");
         }
-    }
-
-    #[test]
-    fn the_output_is_finished_only_once_the_last_flush_is_out() {
-        // An idle point, then EOF. After the last frame, the flush of the
-        // idle point must still come: a driver that stopped at the last
-        // frame, while the data queue was full, would leave the bytes before
-        // the idle point to wait for END (DESIGN.md §6.3).
-        let mut scanner = scanner_without_a_list();
-        scanner.push(b"question");
-        scanner.idle();
-        scanner.end_input();
-        while scanner.scan(&mut |_, _| panic!("no query without a list")) {}
-        assert_eq!(
-            scanner.next_frame(),
-            Some(Frame::Literal(b"question".to_vec()))
-        );
-        assert!(!scanner.finished(), "finished before the flush");
-        assert_eq!(scanner.next_frame(), Some(Frame::Flush));
-        assert!(scanner.finished());
-        assert_eq!(scanner.next_frame(), None);
     }
 
     #[test]

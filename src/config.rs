@@ -1,8 +1,9 @@
 //! Configuration (DESIGN.md §7).
 //!
-//! This milestone accepts the options that control indexing, transfers,
-//! block references, and compression. Options of later milestones are
-//! unknown fields and are rejected.
+//! A configuration file describes only its own host: its roots and its
+//! index, and where it keeps temporary data and cached lists. Everything
+//! about a run is an option of `hashsync ssh` (`settings.rs`). Keys of
+//! later milestones are unknown fields and are rejected.
 
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
@@ -15,8 +16,6 @@ use crate::fsops;
 use crate::glob;
 use crate::hash::StrongHash;
 use crate::names;
-use crate::protocol::COMPRESSION_LEVELS;
-use crate::ssh;
 
 pub const MIN_BLOCK_SIZE: u64 = 512;
 pub const DEFAULT_BLOCK_SIZE: u32 = 16 * 1024;
@@ -24,11 +23,7 @@ pub const DEFAULT_BLOCK_SIZE: u32 = 16 * 1024;
 /// 30 days (DESIGN.md §5.6), in seconds.
 pub const DEFAULT_HASHLIST_MAX_AGE: u64 = 30 * 24 * 3600;
 
-const DEFAULT_LOOKAHEAD: u64 = 256 << 20;
-const DEFAULT_NEGATIVE_CACHE: u64 = 128 << 20;
-const DEFAULT_SPOOL_LIMIT: u64 = 2 << 30;
 const DEFAULT_CANDIDATE_ATTEMPTS: u32 = 128;
-const DEFAULT_COMPRESSION_LEVEL: i32 = 9;
 
 #[derive(Debug)]
 pub struct Config {
@@ -38,105 +33,15 @@ pub struct Config {
     pub index_path: Vec<u8>,
     /// Scan threads; 0 selects the default count (DESIGN.md §4.6).
     pub threads: u32,
-    /// Hash-list cache expiry, in seconds (DESIGN.md §5.6).
+    /// The age after which this host's list cache drops a list, in
+    /// seconds (DESIGN.md §5.6).
     pub hashlist_max_age: u64,
-    /// How far the sender scans ahead of its output, in bytes; at least
-    /// `block_size` (DESIGN.md §6.3). The default is the larger of 256 MiB
-    /// and 3 × `block_size`, so that the probe threads can work.
-    pub lookahead: u64,
-    /// The sender's cache of hashes answered no, in bytes.
-    pub negative_cache: u64,
-    /// The most bytes of command output that wait in the sender's spool
-    /// before the command waits (DESIGN.md §6.5); `u64::MAX` for
-    /// `unlimited`.
-    pub sender_output_spool_limit: u64,
-    /// The most bytes of the data session that wait in the receiver's
-    /// spool before the receiver stops reading the session (DESIGN.md
-    /// §6.5); `u64::MAX` for `unlimited`.
-    pub receiver_output_spool_limit: u64,
-    /// The most bytes of the input stream that wait in the receiver's
-    /// input spool before the receiver stops reading its stdin (DESIGN.md
-    /// §6.6); `u64::MAX` for `unlimited`.
-    pub receiver_input_spool_limit: u64,
-    /// The most bytes of the input stream that wait in the sender's input
-    /// spool before the sender stops reading the data session (DESIGN.md
-    /// §6.6); `u64::MAX` for `unlimited`.
-    pub sender_input_spool_limit: u64,
-    /// The sender's weak-table probe threads; 0 selects half the sender's
-    /// cores, at least one (DESIGN.md §6.3).
-    pub probe_threads: u32,
     /// Candidates tried per query; at least 1 (DESIGN.md §6.4).
     pub candidate_attempts: u32,
-    /// The zstd level of the sender's data stream, of the control session,
-    /// and of the receiver's input stream; 0 disables compression
-    /// (DESIGN.md §6.2 and §6.6).
-    pub compression_level: i32,
-    /// zstd long-distance matching in a 128 MiB window, for repeats
-    /// farther back than the window of the level, in the data stream and
-    /// the input stream (DESIGN.md §7).
-    pub compression_long: bool,
-    /// The zstd worker threads of the sender's data stream, and of the
-    /// receiver's input stream; 0 selects half the cores of the host that
-    /// compresses, at least one (DESIGN.md §6.6 and §7).
-    pub compression_threads: u32,
-    /// Path bytes of the receiver's tmp_data directory, which holds the
+    /// Path bytes of this host's tmp_data directory, which holds the
     /// segments of the pins and of the spools (DESIGN.md §6.5).
     pub tmp_data_dir: Vec<u8>,
-    /// The transfer options a host override can replace; read them
-    /// through `transfer_options`.
-    ssh: Vec<Vec<u8>>,
-    sender_command: Vec<u8>,
-    sender_cache: bool,
-    hosts: Vec<HostConfig>,
     pub roots: Vec<RootConfig>,
-}
-
-/// `[hosts.NAME]`: overrides keyed by the run command's HOST argument.
-#[derive(Debug)]
-struct HostConfig {
-    name: String,
-    ssh: Option<Vec<Vec<u8>>>,
-    sender_command: Option<Vec<u8>>,
-    sender_cache: Option<bool>,
-}
-
-/// The transfer options of one run, after host overrides and CLI
-/// precedence (DESIGN.md §8).
-#[derive(Debug)]
-pub struct TransferOptions {
-    /// The shell-split SSH command; the first word is the executable.
-    pub ssh: Vec<Vec<u8>>,
-    /// One executable name or path, not a shell fragment.
-    pub sender_command: Vec<u8>,
-    pub sender_cache: bool,
-}
-
-impl Config {
-    /// Resolve the transfer options for `host`. `cli_ssh` is `--ssh`,
-    /// which takes precedence over a host override, which takes
-    /// precedence over the global options. CLI arguments get no byte
-    /// escapes (DESIGN.md §7).
-    pub fn transfer_options(&self, host: &[u8], cli_ssh: Option<&[u8]>) -> TransferOptions {
-        let overrides = self.hosts.iter().find(|h| h.name.as_bytes() == host);
-        let ssh = match cli_ssh {
-            Some(text) => match split_ssh_words(text) {
-                Ok(words) => words,
-                Err(e) => die(format!("--ssh: {e}")),
-            },
-            None => overrides
-                .and_then(|h| h.ssh.clone())
-                .unwrap_or_else(|| self.ssh.clone()),
-        };
-        TransferOptions {
-            ssh,
-            sender_command: overrides
-                .and_then(|h| h.sender_command.clone())
-                .unwrap_or_else(|| self.sender_command.clone()),
-            sender_cache: overrides
-                .and_then(|h| h.sender_cache)
-                .unwrap_or(self.sender_cache),
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -178,33 +83,10 @@ struct RawConfig {
     index_path: Option<String>,
     threads: Option<u32>,
     hashlist_max_age: Option<String>,
-    lookahead: Option<Size>,
-    negative_cache: Option<Size>,
-    sender_output_spool_limit: Option<Size>,
-    receiver_output_spool_limit: Option<Size>,
-    receiver_input_spool_limit: Option<Size>,
-    sender_input_spool_limit: Option<Size>,
-    probe_threads: Option<u32>,
     candidate_attempts: Option<u32>,
-    compression_level: Option<i32>,
-    compression_long: Option<bool>,
-    compression_threads: Option<u32>,
     tmp_data_dir: Option<String>,
-    ssh: Option<String>,
-    sender_command: Option<String>,
-    sender_cache: Option<bool>,
-    #[serde(default)]
-    hosts: std::collections::BTreeMap<String, RawHost>,
     #[serde(default)]
     roots: Vec<RawRoot>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawHost {
-    ssh: Option<String>,
-    sender_command: Option<String>,
-    sender_cache: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -227,15 +109,31 @@ enum Size {
     Text(String),
 }
 
-/// Load the configuration file, or die with a message.
+/// Load the configuration file, `path` or the default one, or die with a
+/// message. The commands that use the index need the file, for the roots
+/// and the index.
 pub fn load(path: Option<&OsStr>) -> Config {
-    let path = match path {
-        Some(p) => p.as_bytes().to_vec(),
-        None => default_config_path(),
+    load_from(path, false)
+}
+
+/// Load the configuration of one host of `hashsync ssh` (DESIGN.md §7), as
+/// `load` does, unless the host `receives` no deduplicated stream: such a
+/// host uses only `tmp_data_dir` and `hashlist_max_age`, which have
+/// defaults, so a missing default file gives the default configuration. A
+/// file that `--config` names must exist.
+pub fn load_for_run(path: Option<&OsStr>, receives: bool) -> Config {
+    load_from(path, !receives)
+}
+
+fn load_from(path: Option<&OsStr>, optional: bool) -> Config {
+    let (path, default) = match path {
+        Some(p) => (p.as_bytes().to_vec(), false),
+        None => (default_config_path(), true),
     };
     let shown = path.as_bstr();
     let text = match fsops::retry_interrupted(|| std::fs::read(OsStr::from_bytes(&path))) {
         Ok(bytes) => bytes,
+        Err(e) if optional && default && e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(e) => die(format!("cannot read configuration file {shown}: {e}")),
     };
     let text = match String::from_utf8(text) {
@@ -268,43 +166,9 @@ pub fn parse(text: &str) -> Result<Config, String> {
         None => default_index_path(),
         Some(text) => parse_path(&text).map_err(|e| format!("index_path: {e}"))?,
     };
-    let lookahead = match raw.lookahead {
-        // The default leaves room for the probe threads: a stretch of
-        // windows splits among them only when it has two parts of `B`
-        // windows, after up to `B` literal bytes that wait for a whole LIT
-        // frame (DESIGN.md §6.3).
-        None => DEFAULT_LOOKAHEAD.max(3 * u64::from(block_size)),
-        Some(size) => size.bytes().map_err(|e| format!("lookahead: {e}"))?,
-    };
-    // A scan step needs a whole window of lookahead (DESIGN.md §6.3).
-    if lookahead < u64::from(block_size) {
-        return Err(format!(
-            "lookahead must be at least block_size ({block_size} bytes)"
-        ));
-    }
-    let negative_cache = match raw.negative_cache {
-        None => DEFAULT_NEGATIVE_CACHE,
-        Some(size) => size.bytes().map_err(|e| format!("negative_cache: {e}"))?,
-    };
-    let sender_output_spool_limit = parse_spool_limit(raw.sender_output_spool_limit)
-        .map_err(|e| format!("sender_output_spool_limit: {e}"))?;
-    let receiver_output_spool_limit = parse_spool_limit(raw.receiver_output_spool_limit)
-        .map_err(|e| format!("receiver_output_spool_limit: {e}"))?;
-    let receiver_input_spool_limit = parse_spool_limit(raw.receiver_input_spool_limit)
-        .map_err(|e| format!("receiver_input_spool_limit: {e}"))?;
-    let sender_input_spool_limit = parse_spool_limit(raw.sender_input_spool_limit)
-        .map_err(|e| format!("sender_input_spool_limit: {e}"))?;
     let candidate_attempts = raw.candidate_attempts.unwrap_or(DEFAULT_CANDIDATE_ATTEMPTS);
     if candidate_attempts == 0 {
         return Err("candidate_attempts must be at least 1".into());
-    }
-    let compression_level = raw.compression_level.unwrap_or(DEFAULT_COMPRESSION_LEVEL);
-    if !COMPRESSION_LEVELS.contains(&compression_level) {
-        return Err(format!(
-            "compression_level must be from {} to {}",
-            COMPRESSION_LEVELS.start(),
-            COMPRESSION_LEVELS.end()
-        ));
     }
     let tmp_data_dir = match raw.tmp_data_dir {
         None => default_tmp_data_dir(),
@@ -314,32 +178,6 @@ pub fn parse(text: &str) -> Result<Config, String> {
         None => DEFAULT_HASHLIST_MAX_AGE,
         Some(text) => parse_duration(&text).map_err(|e| format!("hashlist_max_age: {e}"))?,
     };
-    let ssh = match raw.ssh {
-        None => vec![b"ssh".to_vec()],
-        Some(text) => parse_ssh(&text).map_err(|e| format!("ssh: {e}"))?,
-    };
-    let sender_command = match raw.sender_command {
-        None => b"hashsync".to_vec(),
-        Some(text) => parse_sender_command(&text).map_err(|e| format!("sender_command: {e}"))?,
-    };
-    let mut hosts = Vec::with_capacity(raw.hosts.len());
-    for (name, host) in raw.hosts {
-        let parsed = HostConfig {
-            ssh: host
-                .ssh
-                .map(|text| parse_ssh(&text))
-                .transpose()
-                .map_err(|e| format!("hosts.{name}.ssh: {e}"))?,
-            sender_command: host
-                .sender_command
-                .map(|text| parse_sender_command(&text))
-                .transpose()
-                .map_err(|e| format!("hosts.{name}.sender_command: {e}"))?,
-            sender_cache: host.sender_cache,
-            name,
-        };
-        hosts.push(parsed);
-    }
     let mut roots = Vec::with_capacity(raw.roots.len());
     for (i, root) in raw.roots.into_iter().enumerate() {
         roots.push(parse_root(root).map_err(|e| format!("roots[{i}]: {e}"))?);
@@ -350,22 +188,8 @@ pub fn parse(text: &str) -> Result<Config, String> {
         index_path,
         threads: raw.threads.unwrap_or(0),
         hashlist_max_age,
-        lookahead,
-        negative_cache,
-        sender_output_spool_limit,
-        receiver_output_spool_limit,
-        receiver_input_spool_limit,
-        sender_input_spool_limit,
-        probe_threads: raw.probe_threads.unwrap_or(0),
         candidate_attempts,
-        compression_level,
-        compression_long: raw.compression_long.unwrap_or(true),
-        compression_threads: raw.compression_threads.unwrap_or(0),
         tmp_data_dir,
-        ssh,
-        sender_command,
-        sender_cache: raw.sender_cache.unwrap_or(true),
-        hosts,
         roots,
     })
 }
@@ -378,17 +202,6 @@ pub fn thread_count(requested: u32) -> u32 {
         0 => std::thread::available_parallelism()
             .map_or(1, |n| u32::try_from(n.get() / 2).unwrap_or(u32::MAX).max(1)),
         n => n,
-    }
-}
-
-/// A spool limit: a size, or `unlimited` for none. No limit is `u64::MAX`
-/// bytes, which no spool reaches, so the spools need no special case for
-/// it (DESIGN.md §6.5).
-fn parse_spool_limit(size: Option<Size>) -> Result<u64, String> {
-    match size {
-        None => Ok(DEFAULT_SPOOL_LIMIT),
-        Some(Size::Text(text)) if text.trim().eq_ignore_ascii_case("unlimited") => Ok(u64::MAX),
-        Some(size) => size.bytes().map_err(|e| format!("{e} (or \"unlimited\")")),
     }
 }
 
@@ -406,47 +219,6 @@ fn parse_path(text: &str) -> Result<Vec<u8>, String> {
     let decoded = decode_escapes(text, Escapes::Plain)?;
     check_no_nul(&decoded)?;
     Ok(expand_tilde(decoded))
-}
-
-/// A configured `ssh` command: shell-split first, then decode the byte
-/// escapes of each argv word (DESIGN.md §7).
-fn parse_ssh(text: &str) -> Result<Vec<Vec<u8>>, String> {
-    let words = ssh::shell_split(text.as_bytes())?;
-    words
-        .into_iter()
-        .map(|word| {
-            // Splitting UTF-8 text at ASCII delimiters keeps every word
-            // UTF-8.
-            let word = decode_escapes(std::str::from_utf8(&word).unwrap(), Escapes::Plain)?;
-            check_no_nul(&word)?;
-            Ok(word)
-        })
-        .collect::<Result<Vec<_>, String>>()
-        .and_then(require_command)
-}
-
-/// `--ssh` from the command line: shell-split without byte escapes
-/// (DESIGN.md §7: no configuration escapes for CLI arguments).
-fn split_ssh_words(text: &[u8]) -> Result<Vec<Vec<u8>>, String> {
-    ssh::shell_split(text).and_then(require_command)
-}
-
-fn require_command(words: Vec<Vec<u8>>) -> Result<Vec<Vec<u8>>, String> {
-    if words.is_empty() {
-        return Err("empty command".into());
-    }
-    Ok(words)
-}
-
-/// `sender_command` is one executable name or path, not a shell fragment
-/// (DESIGN.md §6.1).
-fn parse_sender_command(text: &str) -> Result<Vec<u8>, String> {
-    let decoded = decode_escapes(text, Escapes::Plain)?;
-    check_no_nul(&decoded)?;
-    if decoded.is_empty() {
-        return Err("empty command".into());
-    }
-    Ok(decoded)
 }
 
 /// Parse a duration such as `90d`, `12h`, `30m`, or `3600` (seconds).
@@ -640,9 +412,9 @@ pub fn default_index_path() -> Vec<u8> {
     path
 }
 
-/// `$XDG_CACHE_HOME/hashsync/tmp-data`: the receiver's default tmp_data
-/// directory, and the sender's only one (DESIGN.md §6.5).
-pub fn default_tmp_data_dir() -> Vec<u8> {
+/// `$XDG_CACHE_HOME/hashsync/tmp-data`: the default tmp_data directory
+/// (DESIGN.md §6.5).
+fn default_tmp_data_dir() -> Vec<u8> {
     let mut path = xdg_dir("XDG_CACHE_HOME", ".cache");
     path.extend_from_slice(b"/hashsync/tmp-data");
     path
@@ -747,17 +519,8 @@ block_size = "64KiB"
 strong_hash = "sha256"
 index_path = '/tmp/\xFF/default.db'
 threads = 24
-lookahead = "1MiB"
-negative_cache = 0
-sender_output_spool_limit = "64MiB"
-receiver_output_spool_limit = "unlimited"
-receiver_input_spool_limit = "1MiB"
-sender_input_spool_limit = "unlimited"
-probe_threads = 5
+hashlist_max_age = "1d"
 candidate_attempts = 3
-compression_level = 19
-compression_long = false
-compression_threads = 2
 tmp_data_dir = '/var/\xFE/tmp'
 
 [[roots]]
@@ -774,17 +537,8 @@ one_filesystem = true
         assert_eq!(config.strong_hash, StrongHash::Sha256);
         assert_eq!(config.index_path, b"/tmp/\xff/default.db");
         assert_eq!(config.threads, 24);
-        assert_eq!(config.lookahead, 1 << 20);
-        assert_eq!(config.negative_cache, 0);
-        assert_eq!(config.sender_output_spool_limit, 64 << 20);
-        assert_eq!(config.receiver_output_spool_limit, u64::MAX);
-        assert_eq!(config.receiver_input_spool_limit, 1 << 20);
-        assert_eq!(config.sender_input_spool_limit, u64::MAX);
-        assert_eq!(config.probe_threads, 5);
+        assert_eq!(config.hashlist_max_age, 24 * 3600);
         assert_eq!(config.candidate_attempts, 3);
-        assert_eq!(config.compression_level, 19);
-        assert!(!config.compression_long);
-        assert_eq!(config.compression_threads, 2);
         assert_eq!(config.tmp_data_dir, b"/var/\xfe/tmp");
         assert_eq!(config.roots.len(), 2);
         assert_eq!(config.roots[0].pattern, b"/srv/archive-\xff");
@@ -813,42 +567,15 @@ one_filesystem = true
         assert_eq!(config.block_size, DEFAULT_BLOCK_SIZE);
         assert_eq!(config.strong_hash, StrongHash::Blake3);
         assert_eq!(config.threads, 0);
-        assert_eq!(config.lookahead, 256 << 20);
-        assert_eq!(config.negative_cache, 128 << 20);
-        assert_eq!(config.sender_output_spool_limit, 2 << 30);
-        assert_eq!(config.receiver_output_spool_limit, 2 << 30);
-        assert_eq!(config.receiver_input_spool_limit, 2 << 30);
-        assert_eq!(config.sender_input_spool_limit, 2 << 30);
-        assert_eq!(config.probe_threads, 0);
+        assert_eq!(config.hashlist_max_age, DEFAULT_HASHLIST_MAX_AGE);
         assert_eq!(config.candidate_attempts, 128);
-        assert_eq!(config.compression_level, 9);
-        assert!(config.compression_long);
-        assert_eq!(config.compression_threads, 0);
         assert!(config.tmp_data_dir.ends_with(b"/hashsync/tmp-data"));
-        let limits =
-            parse("sender_output_spool_limit = 0\nreceiver_output_spool_limit = \" Unlimited \"")
-                .unwrap();
-        assert_eq!(limits.sender_output_spool_limit, 0);
-        assert_eq!(limits.receiver_output_spool_limit, u64::MAX);
-        assert_eq!(parse("compression_level = 0").unwrap().compression_level, 0);
         assert_eq!(config.roots[0].pattern, b"/srv/\xff/*");
         let config = parse("[[roots]]\npath = '/srv/\\xFF/*'\n").unwrap();
         assert_eq!(config.roots[0].pattern, b"/srv/\xff/*");
         assert!(parse("").unwrap().roots.is_empty());
         assert_eq!(parse("block_size = 8192").unwrap().block_size, 8192);
         assert_eq!(parse("block_size = 512").unwrap().block_size, 512);
-    }
-
-    #[test]
-    fn the_default_lookahead_has_room_for_three_blocks() {
-        let lookahead = |text: &str| parse(text).unwrap().lookahead;
-        assert_eq!(lookahead("block_size = \"64MiB\""), 256 << 20);
-        assert_eq!(lookahead("block_size = \"128MiB\""), 384 << 20);
-        let largest = u64::from(u32::MAX);
-        assert_eq!(lookahead("block_size = 4294967295"), 3 * largest);
-        // A configured lookahead stays as it is.
-        let explicit = "block_size = \"512MiB\"\nlookahead = \"1GiB\"";
-        assert_eq!(lookahead(explicit), 1 << 30);
     }
 
     #[test]
@@ -866,42 +593,20 @@ one_filesystem = true
         assert!(parse("strong_hash = \"md5\"").is_err());
         assert!(parse("threads = -1").is_err());
         assert!(
-            parse("lookahead = \"4095\"")
-                .unwrap_err()
-                .contains("lookahead must be at least block_size")
-        );
-        assert!(
-            parse("block_size = \"64KiB\"\nlookahead = \"32KiB\"")
-                .unwrap_err()
-                .contains("at least block_size")
-        );
-        assert!(
             parse("candidate_attempts = 0")
                 .unwrap_err()
                 .contains("at least 1")
         );
-        assert!(parse("negative_cache = \"lots\"").is_err());
-        assert!(
-            parse("sender_output_spool_limit = \"lots\"")
-                .unwrap_err()
-                .contains(
-                    "sender_output_spool_limit: expected a number: \"lots\" (or \"unlimited\")"
-                )
-        );
-        assert!(parse("probe_threads = -1").is_err());
         assert!(
             parse("tmp_data_dir = '/a\\x00b'")
                 .unwrap_err()
                 .contains("tmp_data_dir: NUL byte is not allowed")
         );
-        for level in ["-1", "20"] {
-            assert!(
-                parse(&format!("compression_level = {level}"))
-                    .unwrap_err()
-                    .contains("compression_level must be from 0 to 19")
-            );
-        }
-        assert!(parse("compression_threads = -1").is_err());
+        assert!(
+            parse("hashlist_max_age = \"soon\"")
+                .unwrap_err()
+                .contains("hashlist_max_age")
+        );
         assert!(
             parse("[[roots]]\npath = \"relative\"")
                 .unwrap_err()
@@ -923,6 +628,16 @@ one_filesystem = true
                 .contains("immutable")
         );
         assert!(parse("[[roots]]\npath = \"/a\"\nbogus = 1").is_err());
+        assert!(parse("bogus = 1").unwrap_err().contains("unknown field"));
+        // Every setting of a run is an option of `hashsync ssh`, never a key
+        // (DESIGN.md §7), so a file that holds one fails like any other
+        // unknown key.
+        for setting in ["compression_level = 3", "lookahead = \"1MiB\""] {
+            assert!(
+                parse(setting).unwrap_err().contains("unknown field"),
+                "{setting}"
+            );
+        }
         assert!(
             parse("[[roots]]\npath = '/a\\x00b'")
                 .unwrap_err()
@@ -956,88 +671,5 @@ one_filesystem = true
         assert!(parse_duration("d").is_err());
         assert!(parse_duration("5w").is_err());
         assert!(parse_duration("99999999999999999999d").is_err());
-    }
-
-    #[test]
-    fn transfer_defaults() {
-        let config = parse("").unwrap();
-        assert_eq!(config.hashlist_max_age, DEFAULT_HASHLIST_MAX_AGE);
-        let options = config.transfer_options(b"anyhost", None);
-        assert_eq!(options.ssh, vec![b"ssh".to_vec()]);
-        assert_eq!(options.sender_command, b"hashsync");
-        assert!(options.sender_cache);
-    }
-
-    #[test]
-    fn host_overrides_and_cli_precedence() {
-        let config = parse(
-            r#"
-ssh = "ssh -i '/key file'"
-sender_command = 'hashsync'
-sender_cache = true
-hashlist_max_age = "1d"
-
-[hosts.builder]
-ssh = 'ssh -p 2222'
-sender_command = '/opt/bin\x20dir/hashsync'
-sender_cache = false
-"#,
-        )
-        .unwrap();
-        assert_eq!(config.hashlist_max_age, 24 * 3600);
-
-        let global = config.transfer_options(b"other", None);
-        assert_eq!(
-            global.ssh,
-            vec![b"ssh".to_vec(), b"-i".to_vec(), b"/key file".to_vec()]
-        );
-        assert_eq!(global.sender_command, b"hashsync");
-        assert!(global.sender_cache);
-
-        // The override table is keyed by the HOST argument as given.
-        let host = config.transfer_options(b"builder", None);
-        assert_eq!(
-            host.ssh,
-            vec![b"ssh".to_vec(), b"-p".to_vec(), b"2222".to_vec()]
-        );
-        assert_eq!(host.sender_command, b"/opt/bin dir/hashsync");
-        assert!(!host.sender_cache);
-        assert!(
-            config.transfer_options(b"user@builder", None).sender_cache,
-            "the key must match the whole HOST argument"
-        );
-
-        // `--ssh` wins over the override, without byte escapes.
-        let cli = config.transfer_options(b"builder", Some(br"ssh -o 'X\x41'"));
-        assert_eq!(
-            cli.ssh,
-            vec![b"ssh".to_vec(), b"-o".to_vec(), br"X\x41".to_vec()]
-        );
-        assert!(!cli.sender_cache, "--ssh replaces only the SSH command");
-    }
-
-    #[test]
-    fn rejected_transfer_configurations() {
-        assert!(parse("ssh = \"\"").unwrap_err().contains("empty"));
-        assert!(parse("ssh = \"ssh 'x\"").unwrap_err().contains("quote"));
-        assert!(parse("sender_command = ''").unwrap_err().contains("empty"));
-        assert!(
-            parse("sender_command = 'a\\x00b'")
-                .unwrap_err()
-                .contains("NUL")
-        );
-        assert!(
-            parse("hashlist_max_age = \"soon\"")
-                .unwrap_err()
-                .contains("hashlist_max_age")
-        );
-        assert!(parse("[hosts.h]\nbogus = 1").is_err());
-        // Inside shell double quotes the backslash survives splitting
-        // and reaches the byte-escape decoder, which rejects `\q`.
-        assert!(
-            parse("[hosts.h]\nssh = 'x \"\\q\"'")
-                .unwrap_err()
-                .contains("hosts.h.ssh")
-        );
     }
 }

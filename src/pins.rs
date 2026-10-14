@@ -10,23 +10,23 @@
 //! pins of the block.
 //!
 //! One lock protects the output offset `c`, the published pins, the pinned
-//! blocks, the open segments of the pins, the cache of verified blocks,
-//! and the queue of answers, whose closure marks Completing. So a lookup
-//! either publishes its pin before the output passes the pin's offset, and
-//! the output detaches the pin later, or it sees the obsolete offset and
-//! releases its extent at once. An extent is released after the write of
-//! its lookup, when the output detaches the last pin of its block, or when
-//! a copy replaces it. A read of a released extent, for REF or for a copy,
-//! still gets its bytes: the read holds the file of the segment open, and
-//! the bytes of an extent never change.
+//! blocks, the open segments of the pins, the cache of verified blocks, and
+//! the receiver's sender of the control queue, whose drop marks Completing.
+//! So a lookup either publishes its pin before the output passes the pin's
+//! offset, and the output detaches the pin later, or it sees the obsolete
+//! offset and releases its extent at once. An extent is released after the
+//! write of its lookup, when the output detaches the last pin of its block,
+//! or when a copy replaces it. A read of a released extent, for REF or for
+//! a copy, still gets its bytes: the read holds the file of the segment
+//! open, and the bytes of an extent never change.
 //!
 //! The release of the last extent in use of a sealed segment gives its
 //! file back, and the thread that released the extent closes it, unless a
 //! read still holds the file: then the file closes at the end of the read.
-//! Source reads, segment reads, writes, and closes, and stdout writes
-//! happen outside the lock. The one exception is the creation of a
-//! segment, which happens under the lock, once per segment. Answers are
-//! queued under the lock, until Completing closes the queue.
+//! Source reads, segment reads, writes, and closes, and the writes of the
+//! destination happen outside the lock. The one exception is the creation
+//! of a segment, which happens under the lock, once per segment. Answers
+//! are queued under the lock, until Completing.
 //!
 //! At the normal end, after the lookups have ended, `close` closes all
 //! open segments of the pins, which frees their storage (DESIGN.md §6.9).
@@ -41,11 +41,11 @@ use std::num::NonZeroUsize;
 use std::os::unix::fs::FileExt;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Receiver, Sender, bounded};
 use lru::LruCache;
 
 use crate::hash::{Strong, StrongHash};
-use crate::protocol::Answer;
+use crate::protocol::{Answer, ControlFrame};
 use crate::segments::{Directory, Extent, SEGMENT_MINIMUM, Segments};
 
 /// A verified block: exactly the buffer whose digest was checked. The
@@ -101,7 +101,7 @@ enum Source {
 }
 
 struct State {
-    /// `c`: reconstruction has written the output up to here.
+    /// `c`: the decoder has written the stream up to here.
     output: u64,
     /// The published pins, by query offset: the full strong hash of the
     /// block of each.
@@ -112,13 +112,16 @@ struct State {
     segments: Segments,
     /// Verified blocks by full strong hash. Pins never hold them.
     cache: LruCache<Strong, Block>,
-    /// The queue of answers for the control writer; `None` in Completing.
-    answers: Option<Sender<Answer>>,
+    /// The queue of the control writer, for answers; `None` in Completing.
+    answers: Option<Sender<ControlFrame>>,
+    /// The sending end of `Pins::completing`, which nothing sends to; `None`
+    /// in Completing.
+    completing: Option<Sender<()>>,
 }
 
 impl State {
-    /// Completing (DESIGN.md §6.9): the answer queue is closed, and lookups
-    /// neither append, publish, nor answer.
+    /// Completing (DESIGN.md §6.4): the lookups neither append, publish,
+    /// nor answer.
     fn completing(&self) -> bool {
         self.answers.is_none()
     }
@@ -126,9 +129,9 @@ impl State {
     /// Queue an answer; in Completing, nothing is answered.
     fn answer(&self, offset: u64, found: bool) {
         if let Some(answers) = &self.answers {
-            // Before the queue closes, the control writer ends only with
-            // the process.
-            let _ = answers.send(Answer { offset, found });
+            // The control writer ends only once every producer has dropped
+            // its sender, and this one is still here.
+            let _ = answers.send(ControlFrame::Answer(Answer { offset, found }));
         }
     }
 
@@ -170,25 +173,29 @@ impl State {
     }
 }
 
-/// The pins and the state that they share with reconstruction.
+/// The pins and the state that they share with the decoder.
 pub struct Pins {
-    /// The tmp_data directory, which the pins share with the spool of the
-    /// data session.
+    /// The tmp_data directory, which the pins share with the spools of this
+    /// host.
     dir: Arc<Directory>,
     strong: StrongHash,
     /// The bytes of a block, for the buffer of a copy.
     block_size: usize,
     state: Mutex<State>,
+    /// Disconnected at Completing, so that a lookup worker that waits for a
+    /// query wakes up then.
+    completing: Receiver<()>,
 }
 
 impl Pins {
     /// Pins of `block_size` bytes in segments of the tmp_data directory
-    /// `dir` (DESIGN.md §6.4). Answers go to `answers`.
+    /// `dir` (DESIGN.md §6.4). Answers go to `answers`, the queue of the
+    /// control writer.
     pub fn new(
         dir: Arc<Directory>,
         strong: StrongHash,
         block_size: u32,
-        answers: Sender<Answer>,
+        answers: Sender<ControlFrame>,
     ) -> Self {
         Self::with_minimum(dir, strong, block_size, answers, SEGMENT_MINIMUM)
     }
@@ -199,10 +206,11 @@ impl Pins {
         dir: Arc<Directory>,
         strong: StrongHash,
         block_size: u32,
-        answers: Sender<Answer>,
+        answers: Sender<ControlFrame>,
         minimum: u64,
     ) -> Self {
         let blocks = usize::try_from(CACHE_BYTES / u64::from(block_size)).unwrap_or(usize::MAX);
+        let (completing_tx, completing) = bounded(0);
         Pins {
             dir,
             strong,
@@ -214,8 +222,15 @@ impl Pins {
                 segments: Segments::new(u64::from(block_size), minimum),
                 cache: LruCache::sparse(NonZeroUsize::new(blocks).unwrap_or(NonZeroUsize::MIN)),
                 answers: Some(answers),
+                completing: Some(completing_tx),
             }),
+            completing,
         }
+    }
+
+    /// The bytes of a block.
+    pub fn block_size(&self) -> usize {
+        self.block_size
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -367,7 +382,7 @@ impl Pins {
         }
     }
 
-    /// Reconstruction wrote the output up to `offset`: publish it, and
+    /// The decoder wrote the stream up to `offset`: publish it, and
     /// detach the pins below it, in batches. A detached pin at `last` of
     /// its block releases the extent of the block. After each batch, close
     /// the segments that it removed from the open segments, outside the
@@ -402,15 +417,21 @@ impl Pins {
         }
     }
 
-    /// Enter Completing (DESIGN.md §6.9), and close the answer queue: the
-    /// control writer ends after it has sent the answers that the queue
-    /// holds.
+    /// Enter Completing (DESIGN.md §6.4), once the stream has ended or
+    /// stopped: no lookup reads, publishes, or answers any more. The pins
+    /// drop their sender of the control queue, so the control writer can
+    /// end once the other producers are gone, and the lookup workers that
+    /// wait for a query wake up and end. A second call does nothing.
     pub fn complete(&self) {
-        self.lock().answers = None;
+        let mut state = self.lock();
+        state.answers = None;
+        state.completing = None;
     }
 
-    pub fn is_completing(&self) -> bool {
-        self.lock().completing()
+    /// A receiver that disconnects at Completing, for a lookup worker that
+    /// waits for its next query.
+    pub fn completing(&self) -> Receiver<()> {
+        self.completing.clone()
     }
 
     /// The normal end of the pins, after the lookups have ended
@@ -444,7 +465,7 @@ mod tests {
 
     struct Setup {
         pins: Pins,
-        answers: Receiver<Answer>,
+        answers: Receiver<ControlFrame>,
         /// The tmp_data directory of the pins.
         tmp_data: PathBuf,
         _dir: tempfile::TempDir,
@@ -465,7 +486,7 @@ mod tests {
 
     /// The pins that `new` makes in a new tmp_data directory, which only
     /// the pins use.
-    fn setup_with(new: impl FnOnce(Arc<Directory>, Sender<Answer>) -> Pins) -> Setup {
+    fn setup_with(new: impl FnOnce(Arc<Directory>, Sender<ControlFrame>) -> Pins) -> Setup {
         let dir = tempfile::tempdir().unwrap();
         let tmp_data = dir.path().join("tmp-data");
         let (tx, answers) = unbounded();
@@ -507,11 +528,15 @@ mod tests {
     }
 
     fn answers(setup: &Setup) -> Vec<(u64, bool)> {
-        setup
-            .answers
-            .try_iter()
-            .map(|a| (a.offset, a.found))
-            .collect()
+        setup.answers.try_iter().map(answer).collect()
+    }
+
+    /// The offset and the result of the answer `frame`.
+    fn answer(frame: ControlFrame) -> (u64, bool) {
+        let ControlFrame::Answer(answer) = frame else {
+            panic!("the pins queued another frame than ANSWER");
+        };
+        (answer.offset, answer.found)
     }
 
     fn read_back(setup: &Setup, block_size: u32) -> Vec<u8> {
@@ -793,20 +818,25 @@ mod tests {
     }
 
     #[test]
-    fn completing_closes_the_answer_queue() {
+    fn completing_drops_the_sender_of_the_pins_and_wakes_the_workers() {
         // The control writer takes the answers that the queue holds, and
-        // then finds the queue closed: it ends (DESIGN.md §6.9).
+        // then finds that the pins have dropped their sender. A lookup
+        // worker that waits for a query wakes up (DESIGN.md §6.4).
         let setup = setup(BS);
         let (strong, data) = block(6, BS);
         setup.pins.answer(0, &strong, || Some(Arc::clone(&data)));
-        assert!(!setup.pins.is_completing());
+        let completing = setup.pins.completing();
+        assert!(matches!(completing.try_recv(), Err(TryRecvError::Empty)));
+        assert!(!setup.pins.lock().completing());
         setup.pins.complete();
-        assert!(setup.pins.is_completing());
+        setup.pins.complete();
+        assert!(setup.pins.lock().completing());
         assert_eq!(answers(&setup), vec![(0, true)]);
         assert!(
             matches!(setup.answers.try_recv(), Err(TryRecvError::Disconnected)),
-            "the queue is still open"
+            "the pins kept their sender"
         );
+        assert!(completing.recv().is_err(), "the workers were not woken");
     }
 
     #[test]
@@ -1075,8 +1105,8 @@ mod tests {
                     }
                     if i % 2 == 0 {
                         while !found.contains_key(&(i * size)) {
-                            let answer = setup.answers.recv().unwrap();
-                            found.insert(answer.offset, answer.found);
+                            let (offset, yes) = answer(setup.answers.recv().unwrap());
+                            found.insert(offset, yes);
                         }
                         assert!(found[&(i * size)], "a query at the output is obsolete");
                         assert_eq!(read_back(&setup, block_size), *block_of(i).1);
@@ -1086,7 +1116,7 @@ mod tests {
                 // The workers end.
                 drop(queries);
             });
-            found.extend(setup.answers.try_iter().map(|a| (a.offset, a.found)));
+            found.extend(setup.answers.try_iter().map(answer));
             assert_eq!(found.len() as u64, QUERIES, "one answer for each query");
             assert!(setup.pins.lock().pins.is_empty());
             assert!(setup.pins.lock().pinned.is_empty());

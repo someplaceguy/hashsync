@@ -20,12 +20,13 @@ pub fn run(config: &Config, rebuild: bool, jobs: Option<u32>) {
 }
 
 /// Update the index and return it still open, with the current root
-/// locations that the update resolved. A normal `run` keeps this index
-/// open through the transfer, so there is no gap in exclusion between
-/// update and use (DESIGN.md §4.4), and it reads candidate blocks through
-/// these locations.
+/// locations that the update resolved. The receiver of a run turns it into
+/// a read-only index on the same lock (`Index::into_read_only`), so no
+/// modifying process comes between the update and its use, or, as the
+/// client of a run with both streams deduplicated, closes it until its
+/// HELLO (DESIGN.md §4.4). Its lookups read candidate blocks through these
+/// locations.
 pub fn perform(config: &Config, rebuild: bool, jobs: Option<u32>) -> (index::Index, Vec<Location>) {
-    let start = Instant::now();
     fsops::raise_descriptor_limit();
 
     // Resolve and validate the roots before the index is opened: a rejected
@@ -34,6 +35,9 @@ pub fn perform(config: &Config, rebuild: bool, jobs: Option<u32>) -> (index::Ind
     let locations = roots::expand(config, &fs_cache);
 
     let index = index::open_modifying(&config.index_path);
+    // The time of the update, in its note, starts once the index is
+    // locked: a wait for the lock of another process is no update work.
+    let start = Instant::now();
     let settings = Settings::from_config(config);
     let rebuild = rebuild
         || match index.read_meta() {

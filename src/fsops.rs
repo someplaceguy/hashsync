@@ -8,13 +8,15 @@
 //! Every wrapper retries a call that a signal interrupts, so callers never
 //! see `EINTR`.
 
+use std::io::IoSlice;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::path::Path;
+use std::sync::OnceLock;
 
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::fs::{AtFlags, Dir, DirEntry, FileType, Mode, OFlags, ResolveFlags, StatxFlags};
 use rustix::io::{Errno, retry_on_intr};
-use rustix::process::{Resource, getrlimit, setrlimit};
+use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
 
 /// Flags for the initial open of any entry.
 pub const PATH_FLAGS: OFlags = OFlags::PATH.union(OFlags::NOFOLLOW).union(OFlags::CLOEXEC);
@@ -158,11 +160,18 @@ pub fn create_dir_all(dir: &Path, mode: u32) -> std::io::Result<()> {
     }
 }
 
+/// The descriptor limit that this process had before the first
+/// `raise_descriptor_limit`.
+static ORIGINAL_DESCRIPTOR_LIMIT: OnceLock<Rlimit> = OnceLock::new();
+
 /// Raise the soft descriptor limit to the hard limit (DESIGN.md §4.6):
 /// traversal tasks hold their parents' descriptors, and root locations
-/// hold theirs for a whole run.
+/// hold theirs for a whole run. The children of this process start with
+/// the limit from before the first raise (`original_descriptor_limit`).
 pub fn raise_descriptor_limit() {
     let mut limit = getrlimit(Resource::Nofile);
+    // A later raise finds the limit raised, and keeps the first one.
+    let _ = ORIGINAL_DESCRIPTOR_LIMIT.set(limit);
     if limit.current != limit.maximum {
         limit.current = limit.maximum;
         // Failure only means fewer descriptors; opens report it later.
@@ -170,11 +179,22 @@ pub fn raise_descriptor_limit() {
     }
 }
 
+/// The descriptor limit from before the first `raise_descriptor_limit`,
+/// or `None` if it never ran. This function exists so that a child, such
+/// as the command of a run whose server updated its index for a
+/// deduplicated forward stream, starts with the limit that it would have
+/// under SSH alone (`die::spawn_guarded`):
+/// a program that takes the soft limit as a hint, such as one that sizes
+/// a table by it, must not see this process's need.
+pub fn original_descriptor_limit() -> Option<Rlimit> {
+    ORIGINAL_DESCRIPTOR_LIMIT.get().copied()
+}
+
 /// A standard descriptor as an `io::Read` that never reports `EINTR` or
 /// `EAGAIN` (`blocking_read`). The standard library's `Stdin` cannot be
 /// used instead: it takes a process-wide reentrant lock whose guard cannot
-/// move to another thread, and the transfer roles hand their standard
-/// streams between threads.
+/// move to another thread, and the client and the server hand their
+/// standard streams between threads.
 pub struct FdReader(BorrowedFd<'static>);
 
 impl std::io::Read for FdReader {
@@ -186,73 +206,25 @@ impl std::io::Read for FdReader {
 /// A standard descriptor as an `io::Write` that never reports `EINTR` or
 /// `EAGAIN` (`blocking_write`). Writes are unbuffered, so `flush` has
 /// nothing to do; `Stdout` is unsuitable because it inserts a line buffer.
-pub struct FdWriter(BorrowedFd<'static>);
+/// The descriptor is generic so that a test can give it a socket that
+/// keeps the bytes of each write call apart.
+pub struct FdWriter<F: AsFd = BorrowedFd<'static>>(F);
 
-impl std::io::Write for FdWriter {
+impl<F: AsFd> std::io::Write for FdWriter<F> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        Ok(blocking_write(self.0, buf)?)
+        Ok(blocking_write(self.0.as_fd(), buf)?)
+    }
+
+    /// One `writev` of all of `bufs`, which `FrameWriter::send` needs: the
+    /// default would write only the first buffer, so the server's data
+    /// session would send the header of each frame alone, which can cost
+    /// an SSH packet of its own (DESIGN.md §6.2).
+    fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> std::io::Result<usize> {
+        Ok(blocking_writev(self.0.as_fd(), bufs)?)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
-    }
-}
-
-/// A pipe that only this process reads, as the source of a spool that marks
-/// its idle points (DESIGN.md §6.5): the command's stdout in eager delivery
-/// of the output. The pipe is non-blocking, so a read that finds no byte
-/// fails with `EAGAIN`. Then the read fails once with `WouldBlock`, which
-/// tells the idle point, and the next read waits for a byte or EOF. EOF is
-/// the last idle point: a read that finds EOF also fails once with
-/// `WouldBlock`, unless the read before it told an idle point, so that the
-/// bytes before EOF do not wait for the end of the command, which can come
-/// much later. This type exists so that the idle points cost no system call
-/// for a read that finds bytes, and only two more calls at each idle point.
-pub struct IdlePointReader<F: AsFd> {
-    fd: F,
-    /// The last read failed with `WouldBlock`.
-    told: bool,
-}
-
-impl<F: AsFd> IdlePointReader<F> {
-    /// Make `fd` non-blocking. Only the read end changes: the writer of
-    /// the pipe has an open file description of its own.
-    pub fn new(fd: F) -> Self {
-        let flags = rustix::fs::fcntl_getfl(&fd).expect("fcntl F_GETFL on a pipe failed");
-        rustix::fs::fcntl_setfl(&fd, flags | OFlags::NONBLOCK)
-            .expect("fcntl F_SETFL on a pipe failed");
-        IdlePointReader { fd, told: false }
-    }
-}
-
-impl<F: AsFd> std::io::Read for IdlePointReader<F> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        // A read into an empty buffer also returns 0, which is not EOF, so
-        // it must not tell an idle point.
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        loop {
-            // After the read that told the idle point, wait for a byte or
-            // EOF; no timeout (DESIGN.md §3).
-            if self.told {
-                wait_until_ready(self.fd.as_fd(), PollFlags::IN);
-            }
-            match retry_on_intr(|| rustix::io::read(&self.fd, &mut *buf)) {
-                // Only a spurious wakeup can leave no byte after the wait.
-                Err(Errno::AGAIN) if self.told => {}
-                // No byte is ready, or EOF comes without an idle point
-                // before it.
-                Err(Errno::AGAIN) | Ok(0) if !self.told => {
-                    self.told = true;
-                    return Err(std::io::ErrorKind::WouldBlock.into());
-                }
-                result => {
-                    self.told = false;
-                    return Ok(result?);
-                }
-            }
-        }
     }
 }
 
@@ -281,6 +253,16 @@ fn blocking_write(fd: BorrowedFd<'_>, buf: &[u8]) -> Result<usize, Errno> {
     }
 }
 
+/// `blocking_write` for several buffers in one `writev`.
+fn blocking_writev(fd: BorrowedFd<'_>, bufs: &[IoSlice<'_>]) -> Result<usize, Errno> {
+    loop {
+        match retry_on_intr(|| rustix::io::writev(fd, bufs)) {
+            Err(Errno::AGAIN) => wait_until_ready(fd, PollFlags::OUT),
+            result => return result,
+        }
+    }
+}
+
 /// Wait until `fd` is ready for `events`, or until a hangup or an error,
 /// which the next read or write reports; no timeout (DESIGN.md §3).
 fn wait_until_ready(fd: BorrowedFd<'_>, events: PollFlags) {
@@ -300,6 +282,29 @@ pub fn poll_fds(fds: &mut [PollFd<'_>]) {
 pub fn any_ready(fds: &mut [PollFd<'_>]) -> bool {
     let ready = retry_on_intr(|| poll(fds, Some(&Timespec::default())));
     ready.unwrap_or_else(|e| panic!("poll: {e}")) > 0
+}
+
+/// True when a read of `fd` would find its EOF now. This function finds out
+/// without a read, so that the bytes of `fd` stay for its next reader. A
+/// descriptor that can seek, such as a file, a block device or `/dev/null`,
+/// is at its EOF when a `pread` at its offset, which leaves the offset where
+/// it is, finds no byte. One that cannot seek, such as a pipe, a socket or a
+/// terminal, is at its EOF when its other end has hung up and `FIONREAD`
+/// shows that it holds no byte. So a terminal never is: Ctrl-D is no
+/// hangup, and `FIONREAD` fails on a terminal that has hung up.
+pub fn at_eof(fd: BorrowedFd<'_>) -> bool {
+    match rustix::fs::tell(fd) {
+        Ok(offset) => retry_on_intr(|| rustix::io::pread(fd, &mut [0u8; 1], offset)) == Ok(0),
+        Err(Errno::SPIPE) => {
+            let hung_up = PollFlags::HUP | PollFlags::RDHUP;
+            let mut fds = [PollFd::new(&fd, PollFlags::IN | PollFlags::RDHUP)];
+            any_ready(&mut fds)
+                && fds[0].revents().intersects(hung_up)
+                && rustix::io::ioctl_fionread(fd) == Ok(0)
+        }
+        // A descriptor that it cannot look at, such as a closed one.
+        Err(_) => false,
+    }
 }
 
 pub fn stdin() -> FdReader {
@@ -478,41 +483,94 @@ mod tests {
     }
 
     #[test]
-    fn idle_points_are_told_once_and_eof_is_the_last_one() {
-        // A read that finds no byte fails once with `WouldBlock`, and the
-        // next read waits for a byte. EOF right after bytes is the last
-        // idle point: a read fails once with `WouldBlock` before EOF comes.
-        // EOF right after an idle point needs no second one (DESIGN.md
-        // §6.5).
-        use std::io::{Read, Write};
+    fn at_eof_finds_the_eof_without_a_read() {
+        // The client looks at stdin this way when the stop of the forward
+        // stream ends its reads (DESIGN.md §6.6). The look takes none of
+        // the bytes: each descriptor here still gives them after its looks.
+        use std::io::{Read, Seek, SeekFrom, Write};
+        use std::net::Shutdown;
+        use std::os::unix::net::UnixStream;
 
-        fn would_block(result: std::io::Result<usize>) -> bool {
-            result.is_err_and(|e| e.kind() == ErrorKind::WouldBlock)
-        }
-        let mut buf = [0u8; 8];
-        let (reader, mut writer) = std::io::pipe().unwrap();
-        let mut idle = IdlePointReader::new(reader);
-        assert!(would_block(idle.read(&mut buf)), "no idle point");
-        let (mut idle, read) = unblock_when_asleep(
-            move || {
-                let mut buf = [0u8; 8];
-                let n = idle.read(&mut buf).unwrap();
-                (idle, buf[..n].to_vec())
-            },
-            || writer.write_all(b"ab").unwrap(),
-        );
-        assert_eq!(read, b"ab");
-        writer.write_all(b"cd").unwrap();
-        drop(writer);
-        assert!(matches!(idle.read(&mut buf), Ok(2)));
-        assert!(would_block(idle.read(&mut buf)), "no idle point before EOF");
-        assert!(matches!(idle.read(&mut buf), Ok(0)), "no EOF");
+        use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
 
-        let (reader, writer) = std::io::pipe().unwrap();
-        let mut idle = IdlePointReader::new(reader);
-        assert!(would_block(idle.read(&mut buf)), "no idle point");
+        // A file is at its EOF only at its end, and the look leaves its
+        // offset where it was.
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(b"ab").unwrap();
+        file.seek(SeekFrom::Start(1)).unwrap();
+        assert!(!at_eof(file.as_fd()));
+        let mut rest = Vec::new();
+        file.read_to_end(&mut rest).unwrap();
+        assert_eq!(rest, b"b");
+        assert!(at_eof(file.as_fd()));
+        // `/dev/null` always is, `/dev/zero` never.
+        assert!(at_eof(std::fs::File::open("/dev/null").unwrap().as_fd()));
+        assert!(!at_eof(std::fs::File::open("/dev/zero").unwrap().as_fd()));
+
+        // A pipe is at its EOF once its writer has closed it and it holds
+        // no byte.
+        let (mut reader, mut writer) = std::io::pipe().unwrap();
+        assert!(!at_eof(reader.as_fd()));
+        writer.write_all(b"x").unwrap();
         drop(writer);
-        assert!(matches!(idle.read(&mut buf), Ok(0)), "a second idle point");
+        assert!(!at_eof(reader.as_fd()));
+        let mut rest = Vec::new();
+        reader.read_to_end(&mut rest).unwrap();
+        assert_eq!(rest, b"x");
+        assert!(at_eof(reader.as_fd()));
+
+        // A socket is at its EOF once its peer has shut down its writes,
+        // with `POLLRDHUP` and no `POLLHUP`, and it holds no byte.
+        let (mut socket, mut peer) = UnixStream::pair().unwrap();
+        assert!(!at_eof(socket.as_fd()));
+        peer.write_all(b"y").unwrap();
+        peer.shutdown(Shutdown::Write).unwrap();
+        assert!(!at_eof(socket.as_fd()));
+        let mut rest = Vec::new();
+        socket.read_to_end(&mut rest).unwrap();
+        assert_eq!(rest, b"y");
+        assert!(at_eof(socket.as_fd()));
+
+        // A terminal never is, also once its user typed Ctrl-D, which the
+        // next read would find.
+        let master = match openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC) {
+            Ok(master) => master,
+            Err(e) => {
+                eprintln!("skipped the terminal: no pseudo-terminals: {e}");
+                return;
+            }
+        };
+        grantpt(&master).unwrap();
+        unlockpt(&master).unwrap();
+        let path = ptsname(&master, Vec::new()).unwrap();
+        let flags = OFlags::RDWR | OFlags::NOCTTY | OFlags::CLOEXEC;
+        let terminal = rustix::fs::open(path.as_c_str(), flags, Mode::empty()).unwrap();
+        assert!(!at_eof(terminal.as_fd()));
+        assert_eq!(rustix::io::write(&master, b"\x04"), Ok(1));
+        // The line discipline takes the Ctrl-D in on its own time.
+        poll_fds(&mut [PollFd::new(&terminal, PollFlags::IN)]);
+        assert!(!at_eof(terminal.as_fd()));
+        assert_eq!(rustix::io::read(&terminal, &mut [0u8; 8]), Ok(0));
+    }
+
+    #[test]
+    fn a_frame_is_one_write_call_of_a_standard_descriptor() {
+        // The server writes its data session to its stdout through this
+        // writer. A datagram socket keeps the bytes of each write call
+        // apart, and here each frame must arrive as one datagram: header
+        // and payload together (DESIGN.md §6.2).
+        use crate::protocol::{FrameWriter, frame};
+
+        let (writer, reader) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        let mut frames = FrameWriter::new(FdWriter(writer));
+        frames.send(frame::CHUNK, &[7; 1000]).unwrap();
+        frames.send(frame::STREAM_END, b"").unwrap();
+        let mut buf = vec![0u8; 4096];
+        let n = reader.recv(&mut buf).unwrap();
+        assert_eq!(buf[..5], [frame::CHUNK, 0xe8, 3, 0, 0]);
+        assert_eq!(n, 1005, "the header went out alone");
+        let n = reader.recv(&mut buf).unwrap();
+        assert_eq!(buf[..n], [frame::STREAM_END, 0, 0, 0, 0]);
     }
 
     #[test]

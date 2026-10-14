@@ -1,17 +1,24 @@
-//! `hashsync` copies a remote command's stdout, replacing blocks that the
-//! receiver already holds with verified local content. See `DESIGN.md`.
+//! `hashsync` runs a remote command through SSH, as ssh does, and
+//! deduplicates one or both of its streams: the command's stdout, replacing
+//! blocks that the client already holds with verified local content, and
+//! the client's stdin, replacing blocks that the server holds. See
+//! `DESIGN.md`.
 //!
 //! This build implements PLAN.md steps 1–6: `update` and `stats` for
-//! mutable roots, and `run`. A transfer reuses the hash lists of earlier
-//! transfers, replaces indexed blocks with verified references, sends runs
-//! of one byte compactly, compresses the data stream, spools the command's
-//! output and the data session, and with `--stdin` sends the receiver's
-//! stdin to the command. Output and input each use eager or batch delivery.
+//! mutable roots, and `ssh`, which deduplicates stdout by default, stdin
+//! with `--dedup-stdin`, and both with `--dedup-stdin --dedup-stdout`. A
+//! transfer reuses the hash lists of earlier transfers, replaces indexed
+//! blocks with verified references, sends runs of one byte compactly,
+//! compresses both streams, and spools both ends of each. Stdout and stdin
+//! each use eager or batch delivery.
 
 mod attach;
 mod blocks;
 mod cache;
+mod client;
 mod config;
+mod control;
+mod dedup;
 mod die;
 mod fsid;
 mod fsops;
@@ -20,7 +27,7 @@ mod hash;
 mod hashlist;
 mod hashtable;
 mod index;
-mod input;
+mod list_exchange;
 mod lookup;
 mod names;
 mod pins;
@@ -28,23 +35,27 @@ mod pool;
 mod protocol;
 mod rendezvous;
 mod roots;
-mod run;
 mod scan;
 mod scanner;
 mod segments;
-mod serve;
+mod server;
+mod settings;
 mod spool;
 mod ssh;
 mod stats;
+mod stream;
 mod sys;
 mod units;
 mod update;
 
 use std::ffi::OsString;
+use std::os::unix::ffi::OsStrExt;
 
 use clap::{Parser, Subcommand};
 
-use crate::protocol::Delivery;
+use crate::die::die;
+use crate::protocol::Request;
+use crate::settings::{Deduplicated, RemoteCommand, RunSettings};
 
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
@@ -54,7 +65,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[command(
     name = "hashsync",
     version,
-    about = "Block-level deduplicating transfer of a command's output"
+    about = "Run a command through SSH, deduplicating its stdout, its stdin, or both against indexed blocks"
 )]
 struct Cli {
     /// Configuration file [default: $XDG_CONFIG_HOME/hashsync/config.toml]
@@ -87,34 +98,17 @@ enum Command {
     },
     /// Report index statistics
     Stats,
-    /// Run a remote command and reproduce its output locally
-    Run {
-        #[command(flatten)]
-        deliveries: Deliveries,
-
-        /// Share read-only index access instead of updating first
-        #[arg(long)]
-        no_update: bool,
-
-        /// Override the configured SSH command for this run
-        #[arg(long, value_name = "CMD")]
-        ssh: Option<OsString>,
-
-        /// The SSH destination, passed to SSH unchanged
-        #[arg(value_name = "[USER@]HOST")]
-        host: OsString,
-
-        /// The remote command and its arguments, after `--`
-        #[arg(value_name = "COMMAND", last = true, required = true)]
-        command: Vec<OsString>,
-    },
-    /// Internal sender entry point: serve one transfer (DESIGN.md §6.1)
+    /// Run a remote command through SSH, as ssh does, deduplicating its
+    /// stdout against the local index, or with --dedup-stdin, stdin against
+    /// the remote one, or both
+    Ssh(SshArgs),
+    /// Internal server entry point: serve one transfer (DESIGN.md §6.1)
     #[command(hide = true)]
     Serve {
         #[arg(long)]
         token: String,
     },
-    /// Internal sender entry point: relay the control session
+    /// Internal server entry point: relay the control session
     #[command(hide = true)]
     Attach {
         #[arg(long)]
@@ -122,47 +116,96 @@ enum Command {
     },
 }
 
-/// The options of `run` that decide whether the command reads this
-/// process's stdin, and the delivery of that input and of the command's
-/// output (DESIGN.md §6.2 and §8).
+/// `hashsync ssh [OPTIONS] [-l USER] [USER@]HOST [--] COMMAND [ARGS...]`
+/// takes the arguments that rsync gives its remote shell (DESIGN.md §8).
+/// As with ssh, options can also follow HOST: the command starts at the
+/// first argument after HOST that is neither an option nor the value of
+/// one, or right after `--`. So a command that starts with `-` needs `--`.
 #[derive(clap::Args)]
-struct Deliveries {
-    /// Send stdin to the command's stdin, as `ssh` does; without this
-    /// option or --batch-stdin, the command reads EOF at once, as with
-    /// `ssh -n`
-    #[arg(long)]
-    stdin: bool,
+struct SshArgs {
+    /// Log in as USER on the remote host; goes to SSH as it is
+    #[arg(short = 'l', value_name = "USER")]
+    login: Option<OsString>,
 
-    /// Send stdin to the command as --stdin does, but in batch delivery:
-    /// only from a full buffer and at its end, not each time it waits,
-    /// which compresses better
-    #[arg(long)]
-    batch_stdin: bool,
+    /// Run the command without a shell: send COMMAND and ARGS as they are,
+    /// not joined into one line for the remote user's shell. With rsync,
+    /// use it only together with rsync's own -s, which keeps the paths off
+    /// the command line: without it, rsync escapes them for a shell
+    #[arg(short = 's', long)]
+    no_shell: bool,
 
-    /// Send the command's stdout in batch delivery: only from full buffers
-    /// and at its end, not each time it waits, which keeps more references
-    /// and compresses better
+    /// Send the command an empty stdin, as ssh -n does with /dev/null: the
+    /// command reads EOF at once, and nothing is read from stdin
+    #[arg(short = 'n', long, conflicts_with_all = ["batch_stdin", "dedup_stdin"])]
+    no_stdin: bool,
+
+    /// Deduplicate stdin against the index of the remote host, which then
+    /// needs a configuration file; without --dedup-stdout, the command's
+    /// stdout comes back plain, and the local host needs no index
     #[arg(long)]
-    batch_stdout: bool,
+    dedup_stdin: bool,
+
+    /// Deduplicate the command's stdout against the index of the local
+    /// host, the default without --dedup-stdin; with it, both streams are
+    /// deduplicated
+    #[arg(long)]
+    dedup_stdout: bool,
+
+    /// The SSH command, shell-split; the first word is the executable
+    /// [default: ssh]
+    #[arg(long, value_name = "CMD")]
+    ssh: Option<OsString>,
+
+    /// The hashsync executable on the remote host, a name or a path; a
+    /// wrapper script there can pass it options or set its environment
+    /// [default: hashsync]
+    #[arg(long, value_name = "PATH")]
+    hashsync_path: Option<OsString>,
+
+    #[command(flatten)]
+    settings: RunSettings,
+
+    /// The SSH destination, passed to SSH unchanged
+    #[arg(value_name = "[USER@]HOST")]
+    host: OsString,
+
+    /// The remote command and its arguments
+    #[arg(value_name = "COMMAND", required = true, trailing_var_arg = true)]
+    command: Vec<OsString>,
 }
 
-impl Deliveries {
-    /// The delivery of this process's stdin to the command; `None` when the
-    /// command reads no input. `--batch-stdin` sends stdin too.
-    fn input(&self) -> Option<Delivery> {
-        match (self.stdin, self.batch_stdin) {
-            (_, true) => Some(Delivery::Batch),
-            (true, false) => Some(Delivery::Eager),
-            (false, false) => None,
+impl SshArgs {
+    /// What the client sends to the server in REQUEST: the command and the
+    /// settings of the run, with the global `-q` and `--no-human-readable`,
+    /// which the server applies to its own notes.
+    fn request(&self, quiet: bool, no_human_readable: bool) -> Request {
+        Request {
+            command: RemoteCommand::from_words(&self.command, self.no_shell),
+            deduplicated: match (self.dedup_stdin, self.dedup_stdout) {
+                (true, true) => Deduplicated::Both,
+                (true, false) => Deduplicated::Stdin,
+                (false, _) => Deduplicated::Stdout,
+            },
+            settings: self.settings.clone(),
+            quiet,
+            human_readable: !no_human_readable,
         }
     }
 
-    /// The delivery of the command's stdout.
-    fn output(&self) -> Delivery {
-        match self.batch_stdout {
-            true => Delivery::Batch,
-            false => Delivery::Eager,
-        }
+    fn remote(&self) -> ssh::Remote {
+        let bytes = |arg: &Option<OsString>| arg.as_ref().map(|arg| arg.as_bytes().to_vec());
+        let (ssh, login, path) = (
+            bytes(&self.ssh),
+            bytes(&self.login),
+            bytes(&self.hashsync_path),
+        );
+        ssh::Remote::new(
+            ssh.as_deref(),
+            login.as_deref(),
+            self.host.as_bytes(),
+            path.as_deref(),
+        )
+        .unwrap_or_else(|e| die(e))
     }
 }
 
@@ -179,29 +222,23 @@ fn main() {
     if cli.no_human_readable {
         units::disable_human_readable();
     }
-    // The sender entry points run on the remote host, which needs no
-    // configuration file.
-    let load_config = || config::load(cli.config.as_deref());
-    match cli.command {
-        Command::Update { rebuild, jobs } => update::run(&load_config(), rebuild, jobs),
+    let config_path = cli.config.as_deref();
+    let load_config = || config::load(config_path);
+    match &cli.command {
+        Command::Update { rebuild, jobs } => update::run(&load_config(), *rebuild, *jobs),
         Command::Stats => stats::run(&load_config()),
-        Command::Run {
-            deliveries,
-            no_update,
-            ssh,
-            host,
-            command,
-        } => run::run(
-            &load_config(),
-            no_update,
-            deliveries.input(),
-            deliveries.output(),
-            ssh.as_deref(),
-            &host,
-            &command,
-        ),
-        Command::Serve { token } => serve::run(&token),
-        Command::Attach { token } => attach::run(&token),
+        // The client receives the backward stream: it needs its
+        // configuration file when that stream is deduplicated, for its index
+        // (DESIGN.md §7).
+        Command::Ssh(args) => {
+            let request = args.request(cli.quiet, cli.no_human_readable);
+            let config = config::load_for_run(config_path, request.deduplicated.stdout());
+            client::run(&config, &args.remote(), &request, args.no_stdin)
+        }
+        // The server reads its configuration once REQUEST has told it its
+        // roles.
+        Command::Serve { token } => server::run(config_path, token),
+        Command::Attach { token } => attach::run(token),
     }
 }
 
@@ -209,34 +246,167 @@ fn main() {
 mod tests {
     use super::*;
 
-    /// The deliveries of `hashsync run` with `options`.
-    fn deliveries(options: &[&str]) -> (Option<Delivery>, Delivery) {
-        let words = ["hashsync", "run"]
-            .iter()
-            .chain(options)
-            .chain(&["host", "--", "true"]);
-        let Command::Run { deliveries, .. } = Cli::try_parse_from(words).unwrap().command else {
-            panic!("not a run");
+    /// The parsed arguments of `hashsync WORDS...`, or the usage error.
+    fn parse(words: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(["hashsync"].iter().chain(words))
+    }
+
+    /// The `ssh` arguments of `hashsync ssh WORDS...`.
+    fn ssh(words: &[&str]) -> SshArgs {
+        let words = ["ssh"].iter().chain(words).copied().collect::<Vec<_>>();
+        let Command::Ssh(args) = parse(&words).unwrap().command else {
+            panic!("not ssh");
         };
-        (deliveries.input(), deliveries.output())
+        args
+    }
+
+    fn words(args: &SshArgs) -> Vec<&str> {
+        args.command.iter().map(|w| w.to_str().unwrap()).collect()
+    }
+
+    /// rsync gives its remote shell `[-l USER] HOST COMMAND...`, with no
+    /// `--`, and the command's own options follow (DESIGN.md §8).
+    #[test]
+    fn the_command_starts_at_the_first_word_after_host() {
+        let args = ssh(&[
+            "-l",
+            "backup",
+            "nas",
+            "rsync",
+            "--server",
+            "-logDtpre.iLsfxCIvu",
+            "--no-update",
+            ".",
+            "dst dir/",
+        ]);
+        assert_eq!(args.login.unwrap(), "backup");
+        assert_eq!(args.host, "nas");
+        assert_eq!(
+            words(&ssh(&["nas", "rsync", "--server", "-l", "x"])),
+            ["rsync", "--server", "-l", "x"]
+        );
+        assert!(!args.settings.no_update, "an option of the command");
+        assert_eq!(
+            args.command,
+            [
+                "rsync",
+                "--server",
+                "-logDtpre.iLsfxCIvu",
+                "--no-update",
+                ".",
+                "dst dir/"
+            ]
+        );
+    }
+
+    /// As with ssh, options can also follow HOST, until the first word of
+    /// the command.
+    #[test]
+    fn options_can_follow_host() {
+        let args = ssh(&["nas", "--no-update", "-l", "backup", "-n", "true", "-n"]);
+        assert!(args.settings.no_update);
+        assert!(args.no_stdin);
+        assert_eq!(args.login.unwrap(), "backup");
+        assert_eq!(words(&ssh(&["nas", "-s", "true", "-n"])), ["true", "-n"]);
+        // The global options too.
+        let cli = parse(&["ssh", "nas", "-q", "--config", "/c", "true"]).unwrap();
+        assert!(cli.quiet);
+        assert_eq!(cli.config.unwrap(), "/c");
+    }
+
+    /// `--` ends the options, so a command can start with `-`; without it,
+    /// such a word is an option, here an unknown one.
+    #[test]
+    fn a_command_that_starts_with_a_dash_needs_two_dashes() {
+        assert_eq!(words(&ssh(&["nas", "--", "-x", "y"])), ["-x", "y"]);
+        assert_eq!(words(&ssh(&["--", "nas", "-x"])), ["-x"]);
+        assert!(parse(&["ssh", "nas", "-x"]).is_err());
+        assert!(parse(&["ssh", "nas"]).is_err(), "a command is required");
+    }
+
+    /// The command is one line for the remote user's shell, COMMAND and
+    /// ARGS joined with single spaces as ssh joins them, unless `-s` keeps
+    /// the words as they are (DESIGN.md §8).
+    #[test]
+    fn s_keeps_the_words_of_the_command() {
+        let line = ssh(&["nas", "printf", "%s\\n", "a b"]).request(false, false);
+        assert_eq!(
+            line.command,
+            RemoteCommand::Shell(b"printf %s\\n a b".to_vec())
+        );
+        let argv = ssh(&["-s", "nas", "printf", "%s\\n", "a b"]).request(false, false);
+        assert_eq!(
+            argv.command,
+            RemoteCommand::Argv(vec![b"printf".to_vec(), b"%s\\n".to_vec(), b"a b".to_vec()])
+        );
+    }
+
+    /// The global `-q` and `--no-human-readable` travel in REQUEST.
+    #[test]
+    fn the_request_carries_the_global_options() {
+        let args = ssh(&["--batch-stdout", "nas", "true"]);
+        let request = args.request(true, true);
+        assert!(request.quiet);
+        assert!(!request.human_readable);
+        assert!(request.settings.batch_stdout);
+        let request = args.request(false, false);
+        assert!(!request.quiet);
+        assert!(request.human_readable);
+    }
+
+    /// `-n` makes the command read EOF at once, so neither a delivery nor
+    /// the deduplication of stdin can apply: `-n` with `--batch-stdin` or
+    /// `--dedup-stdin` is a usage error (DESIGN.md §8).
+    #[test]
+    fn no_stdin_excludes_the_options_of_stdin() {
+        for option in ["--batch-stdin", "--dedup-stdin"] {
+            assert!(parse(&["ssh", "-n", option, "nas", "true"]).is_err());
+            assert!(parse(&["ssh", "nas", option, "--no-stdin", "true"]).is_err());
+        }
+        assert!(ssh(&["-n", "--batch-stdout", "nas", "true"]).no_stdin);
+        let push = ssh(&["--dedup-stdin", "--batch-stdin", "nas", "true"]);
+        assert!(push.settings.batch_stdin);
+    }
+
+    /// The stdout of the command is deduplicated, unless `--dedup-stdin`
+    /// asks for stdin instead, or `--dedup-stdin --dedup-stdout` for both
+    /// streams, and REQUEST tells the server which (DESIGN.md §8).
+    #[test]
+    fn the_dedup_options_choose_the_deduplicated_streams() {
+        let deduplicated = |words: &[&str]| {
+            let words = [&["nas"], words, &["true"]].concat();
+            ssh(&words).request(false, false).deduplicated
+        };
+        assert_eq!(deduplicated(&[]), Deduplicated::Stdout);
+        assert_eq!(deduplicated(&["--dedup-stdout"]), Deduplicated::Stdout);
+        assert_eq!(deduplicated(&["--dedup-stdin"]), Deduplicated::Stdin);
+        let both = ["--dedup-stdin", "--dedup-stdout"];
+        assert_eq!(deduplicated(&both), Deduplicated::Both);
+        // `-n` excludes the deduplication of stdin, also of both streams.
+        assert!(parse(&[&["ssh", "-n"], &both[..], &["nas", "true"]].concat()).is_err());
+        assert!(ssh(&["-n", "--dedup-stdout", "nas", "true"]).no_stdin);
     }
 
     #[test]
-    fn the_deliveries_are_eager_unless_an_option_asks_for_batches() {
-        // `--batch-stdin` also sends stdin, as `--stdin` does (DESIGN.md
-        // §8).
-        use Delivery::{Batch, Eager};
-        assert_eq!(deliveries(&[]), (None, Eager));
-        assert_eq!(deliveries(&["--stdin"]), (Some(Eager), Eager));
-        assert_eq!(deliveries(&["--batch-stdin"]), (Some(Batch), Eager));
+    fn the_remote_takes_the_ssh_options() {
+        let args = ssh(&[
+            "--ssh",
+            "ssh -p 2222",
+            "--hashsync-path",
+            "/opt/hashsync",
+            "-l",
+            "u",
+            "nas",
+            "true",
+        ]);
         assert_eq!(
-            deliveries(&["--stdin", "--batch-stdin"]),
-            (Some(Batch), Eager)
-        );
-        assert_eq!(deliveries(&["--batch-stdout"]), (None, Batch));
-        assert_eq!(
-            deliveries(&["--batch-stdin", "--batch-stdout"]),
-            (Some(Batch), Batch)
+            args.remote(),
+            ssh::Remote {
+                ssh: vec![b"ssh".to_vec(), b"-p".to_vec(), b"2222".to_vec()],
+                login: Some(b"u".to_vec()),
+                host: b"nas".to_vec(),
+                hashsync_path: b"/opt/hashsync".to_vec(),
+            }
         );
     }
 }

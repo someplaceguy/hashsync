@@ -5,30 +5,61 @@ the design changes. `PLAN.md` orders the implementation.
 
 ## 1. Purpose
 
-`hashsync` copies a remote command's stdout to the local host, replacing
-data already held in local files with block references. The receiver reads
-and verifies those blocks before inserting them into the output. This is
-useful for package trees and archive streams that repeat existing content
-at different positions and alignments. With `--stdin`, the command reads
-the receiver's stdin.
+`hashsync ssh` runs a remote command as ssh does: the command reads the
+client's stdin, its stdout comes back to the client, and the client
+returns its exit status. One or both of the two streams are
+deduplicated: data that the receiving host already holds in its files
+travels as block references, which that host reads and verifies before it
+inserts them into the stream. By default, this is the command's stdout,
+against the client's files; with `--dedup-stdin`, the client's stdin,
+against the server's; and with `--dedup-stdin --dedup-stdout`, both.
+This is useful for package trees and archive streams that repeat existing
+content at different positions and alignments.
 
-One Rust binary contains both roles. The receiver starts the sender through
-SSH. Parallelism uses threads and blocking system calls, with no
-asynchronous runtime or event loop.
+One Rust binary contains both the client and the server. The client
+starts the server through SSH. Parallelism uses threads and blocking
+system calls, with no asynchronous runtime or event loop.
 
 ## 2. Terminology
 
-- **Receiver**: the host running `hashsync run`; it holds the index and
-  reconstructs the command's output.
-- **Sender**: the remote host; it runs the command and scans its output.
+- **Client**: the host that runs `hashsync ssh`. It starts both SSH
+  sessions, and has the user's stdin, stdout, and exit status.
+- **Server**: the host where SSH starts `hashsync serve` and `hashsync
+  attach`. It runs the command.
+- **Forward stream** and **backward stream**: the two streams of a run
+  (section 6.6). The forward stream carries the client's stdin to the
+  command's stdin, and the backward stream the command's stdout to the
+  client's stdout.
+- **Sending end** and **receiving end**: the parts of a stream on the host
+  that reads its source and on the host that writes its destination.
+- **Deduplicated stream** and **plain stream**: a deduplicated stream
+  replaces the blocks that its receiving host holds with references, and a
+  plain stream carries all its bytes. A run deduplicates one stream or
+  both.
+- **Pull** and **push**: a run whose backward stream alone is
+  deduplicated, the default, and a run whose forward stream alone is, with
+  `--dedup-stdin`. A run with `--dedup-stdin --dedup-stdout` deduplicates
+  both streams, and is neither.
+- **Receiver** and **sender**: the two roles in a deduplicated stream. The
+  receiver has the index: it sends the hash list, answers queries, keeps
+  the pins, and decodes the stream. The sender scans the stream against
+  the list. In a pull, the client is the receiver and the server the
+  sender; in a push, the other way around. With both streams
+  deduplicated, each host is the receiver of the stream that it receives,
+  and the sender of the other.
+- **Session frames** and **stream frames**: the two levels of frames of the
+  data session (section 6.2). The stream frames, LIT, REF and RLE, carry
+  the bytes of a stream inside its zstd frame, and the session frames
+  carry everything else, among them the pieces of that zstd frame.
 - **Block**: `block_size` bytes (default 16 KiB) at an aligned offset in an
   indexed file. Only complete blocks are indexed.
-- **Window**: `block_size` bytes at any offset in the command's output.
-  All protocol offsets count output bytes from zero.
+- **Window**: `block_size` bytes at any offset of a deduplicated stream.
+  All protocol offsets count the bytes of the stream from zero.
 - **Root**: a configured file or directory to index. An **immutable root**
   promises unchanging content; copies sharing an **identifier** are indexed
   as one group.
-- **Index**: the receiver's RocksDB database of block hashes and locations.
+- **Index**: a host's RocksDB database of block hashes and locations,
+  which the receiver of a deduplicated stream uses.
 - **Weak hash**: a 64-bit rolling hash used to select possible matches.
   A **strong hash** is the configured cryptographic digest used to verify them.
 - **Hash list**: the canonical encoded set of indexed weak hashes.
@@ -47,65 +78,82 @@ asynchronous runtime or event loop.
   (section 6.5).
 - **Spool**: a pipe whose bytes wait in segments, so that the producer of
   the bytes waits for their consumer only at the limit of the spool.
-- **Input**: the bytes that the command reads as its stdin: the receiver's
-  stdin when the run has `--stdin` or `--batch-stdin`, else none. The
-  **input stream** carries them from the receiver to the sender,
-  compressed (section 6.6).
-- **Idle point**: a moment when the source of the output, command stdout,
-  or the source of the input, the stdin that the stdin reader reads, has no
-  byte ready.
-- **Delivery**: when the bytes of the output, or of the input, go on from
-  the buffers on their way. **Eager** delivery, the default, sends them on
-  at each idle point of their source, once the writer of their session is
-  idle, and when a buffer is full; **batch** delivery only when a buffer
-  is full and at the end of the stream (section 6.2).
+- **Stop**: the end of a stream before the end of its source, once no
+  process reads its destination any more, or for the forward stream, once
+  the command has exited (section 6.6).
+- **Idle point**: a moment when the source of a stream has no byte ready:
+  command stdout for the backward stream, and the stdin that the client
+  reads for the forward stream.
+- **Delivery**: when the bytes of a stream go on from the buffers on their
+  way. **Eager** delivery, the default, sends them on at each idle point of
+  the stream's source, once the data writer of the stream is idle, and
+  when a buffer is full; **batch** delivery only when a buffer is full and
+  at the end of the stream (section 6.2). In both, a deduplicated stream
+  also goes on after every `lookahead` bytes of it (section 6.3).
 
 ## 3. One run, step by step
 
-1. The receiver resolves configured roots and updates the index.
-   `--no-update` skips the update and acquires read-only access. Index access
-   is held throughout the run.
-2. It exports the hash list from one database snapshot, opens its
-   tmp_data directory (section 6.5), and starts data and control SSH
-   sessions to the sender. It reads the data session through a spool.
-3. After both sides exchange protocol versions, HELLO negotiates parameters
-   and cached lists. With sender caching enabled, the receiver durably
-   publishes its target list. It sends a full list, a delta, or
-   confirmation that the sender's list is current. The sender verifies it,
-   builds its table, and durably publishes it when caching is enabled.
-   Then it removes its other cached lists for this peer and index,
-   expires old cache files, and acknowledges the accepted target. On the
+1. The receiver opens its tmp_data directory (section 6.5), resolves its
+   configured roots, updates its index, and then holds it read-only
+   (section 4.4). `--no-update` skips the update and opens the index
+   read-only. It exports the hash list from one database snapshot, and
+   starts its lookup workers. In a pull, the client does this before step
+   2, so a failed update starts no remote process. In a push, the client
+   needs no index, and the server does this after step 2, before its
+   HELLO. With both streams deduplicated, each host does this for the
+   stream that it receives, but the client releases its index after its
+   update, and opens it again, exports its list, and starts its lookup
+   workers only once the server's update is done (section 4.4).
+2. The client starts data and control SSH sessions to the server. Each
+   side sends its protocol version at once, and the client follows its
+   own with REQUEST, with the command and the settings of the run, without
+   waiting for the server's. The server reads its own configuration file:
+   it needs one when it receives a deduplicated stream, and otherwise uses
+   one only if it has one (section 7).
+3. Each deduplicated stream has a list exchange, the forward stream's
+   first. HELLO negotiates the hashes and the cached lists. With sender
+   caching enabled, the receiver durably publishes its target list. It
+   sends a full list, a delta, or confirmation that the sender's list is
+   current.
+   The sender verifies it, builds its table, and durably publishes it when
+   caching is enabled.
+   Then it removes its other cached lists for this peer and index, expires
+   old cache files, and acknowledges the accepted target. On the
    acknowledgement, the receiver does the same cleanup (section 5.6).
-4. The sender starts the command, whose stdout goes through a spool: the
-   command waits for the transfer only when `sender_output_spool_limit`
-   bytes wait in the spool. The scanner sends literals for misses, runs for
-   repeated bytes, and queries for possible block matches. From the
-   acknowledgement on, the receiver sends the input to the command's
-   stdin, until the sender stops the input (section 6.6). In eager
-   delivery, the bytes of the output and of the input reach their
+4. After the last acknowledgement, the server starts the command, and both
+   streams start (section 6.6). The source of each stream, the command's
+   stdout or the client's stdin, goes through a spool: it waits for the
+   transfer only when `--spool-limit` bytes wait in the spool. The
+   sender's scanner sends literals for misses, runs for repeated bytes, and
+   queries for possible block matches. The client sends its stdin to the
+   command's stdin, until the forward stream ends, or the server stops it,
+   and the server sends the command's stdout to the client's stdout, until
+   the backward stream ends, or the client stops it once no process reads
+   its stdout. In eager delivery, the bytes of both streams reach their
    destinations at each idle point of their sources, once the link can
    carry them (section 6.2).
 5. The receiver reads and verifies candidates, and writes each verified
    block to a pin before it answers yes; a block that a pin already holds
    needs no lookup. The sender emits references for yes answers and
-   rescans rejected windows from the next byte. Output is always emitted
-   in order.
-6. The receiver reconstructs stdout from its spool of the data session.
-   Until `receiver_output_spool_limit` bytes wait in the spool, a blocked
-   stdout stops only the reconstruction. After all command stdout is
-   processed, and the command's exit status is available, the sender sends
-   END. The receiver validates stream completion and flushes stdout before
-   sending END_ACK. When the sender needs neither session any more, it
-   sends DONE, and the receiver closes both session stdin pipes. Both SSH
-   sessions must exit successfully before the receiver returns the
-   command's status.
+   rescans rejected windows from the next byte. The stream is always
+   emitted in order. Once a deduplicated stream has ended or stopped, its
+   receiver's lookups end, and its index closes (section 6.4).
+6. Each receiving end decodes its stream from its spool: the client to
+   its stdout, the server to the command's stdin. Until `--spool-limit`
+   bytes wait in the spool, a blocked destination stops only the
+   decoding. Once the command has exited, both streams have ended or
+   stopped, and command stderr has reached its end, the server sends END
+   with the command's status. The client then closes both session stdin
+   pipes, writes the rest of the backward stream, checks its end, and
+   flushes stdout. Both SSH sessions must exit successfully before the
+   client returns the command's status (section 6.9).
 
 **Verification is authoritative.** The index, hash lists, caches, and weak
 hash table are hints. Verify the exact buffer of a candidate before writing
 it to a pin, and the exact buffer read back from a pin before writing it to
-stdout or to a copy (section 6.4). Both checks use the query's full strong
-hash. Stale files and collisions can reduce deduplication, never change the
-reconstructed output.
+the stream's destination or to a copy (section 6.4). Both checks use the
+query's full strong hash. Stale files and collisions can reduce
+deduplication, never change the reconstructed output.
 
 **No timeouts.** Waits end when the expected event occurs or a peer,
 descriptor, or process goes away. Slow systems must not fail because of a
@@ -137,14 +185,14 @@ than 2 GiB, and a block can be larger.
 **Wait on non-blocking standard descriptors.** A standard descriptor
 shares its open file description with other processes, and one of them
 can make it non-blocking. Then a read or a write that would wait fails
-with `EAGAIN` instead. Each role reads and writes its standard
+with `EAGAIN` instead. Each host reads and writes its standard
 descriptors as blocking ones: after `EAGAIN`, it waits with `poll` until
 the descriptor is ready, and tries again. A wait that also watches other
-descriptors, such as that of the receiver's stdin reader (section 6.6),
+descriptors, such as that of the client's stdin reader (section 6.6),
 goes back to its own `poll`.
 
 **Join threads at the normal end.** At a normal end, every thread that
-`hashsync` starts has ended and has been joined, except the receiver's
+`hashsync` starts has ended and has been joined, except the client's
 signal thread (section 6.8). A fatal end joins nothing (section 6.9).
 
 ## 4. The receiver's index
@@ -386,30 +434,90 @@ modifying process opens the index. Then it waits for the compactions that
 RocksDB has scheduled: closing the database would cancel them
 (section 10). RocksDB keeps all files of the database open, so a process
 raises its soft descriptor limit to the hard limit before it opens the
-index.
+index. Its children, such as the command of a run whose forward stream is
+deduplicated, start with the limit from before the raise, as they would
+under SSH alone.
 
 **Process access.** A lock on the file `hashsync.lock` in the index
 directory excludes other processes:
 
-- A modifying process (`update`, `prune`, or normal `run`) creates the
-  directory and the lock file if necessary, opens the lock file
-  read/write, and takes an exclusive lock before it opens the database
-  read/write.
-- A read-only process (`run --no-update`, `stats`) opens the lock file
-  read-only and takes a shared lock, then opens the database read-only. It
-  sees the database as it was when it opened it. Read-only processes can
-  coexist but exclude a modifying process. Without the lock file, there is
-  no index.
+- A modifying process (`update`, `prune`, or the receiver of a run
+  without `--no-update`, for its update) creates the directory and the
+  lock file if necessary, opens the lock file read/write, and takes an
+  exclusive lock before it opens the database read/write.
+- A read-only process (the receiver of a run with `--no-update`, `stats`)
+  opens the lock file read-only and takes a shared lock, then opens the
+  database read-only. It sees the database as it was when it opened it.
+  Read-only processes can coexist but exclude a modifying process. Without
+  the lock file, there is no index.
+- After its update, a run closes the read/write database, turns its
+  exclusive lock into a shared one on the same open file description,
+  which never leaves the index unlocked, and opens the database read-only.
+  So no modifying process can come between the update and the use of the
+  index, and read-only processes can use the index during the rest of the
+  run. A shared lock needs the lock file open for reading, so a modifying
+  process opens it read/write, not write-only. The client of a run with
+  both streams deduplicated is the exception: it releases its lock after
+  its update (steps L1 to L4 below).
 - The lock is an open file description lock (`F_OFD_SETLKW`) on the whole
   file, on a close-on-exec descriptor. Unlike a classic POSIX lock, it
   stays when another descriptor of the file closes, and at exit it goes
   only after RocksDB's own lock of its `LOCK` file, so a second read/write
-  open never fails on `LOCK` (section 10). Wait indefinitely on contention.
+  open never fails on `LOCK` (section 10). Wait indefinitely on
+  contention. A process first tries the lock without a wait
+  (`F_OFD_SETLK`), and when another process holds it, says in a note that
+  it waits for the lock of the index, which it names, before it waits: a
+  long wait must not look like a hang. An update's time counts from the
+  moment it holds the lock.
 - All threads of a process share one database handle. Reads of a
   modifying process see its latest committed transaction.
-- Keep the lock until the database handle has closed, and keep both until
-  index use ends. A normal `run` keeps the update's database open through
-  the transfer, so there is no gap in exclusion between update and use.
+- Keep the lock until the database handle has closed. A run uses an index
+  until the lookups of the stream that it deduplicates end, once that
+  stream has ended or stopped (section 6.4): then the database and the
+  lock close, while the run can go on. A process never opens an index a
+  second time while it has it open: the locks of two open file
+  descriptions conflict also within one process, so the second open would
+  wait forever.
+
+**Lock waits.** A lock wait has no timeout, so no run may take part in a
+cycle of waits. A run waits for an exclusive lock only while it holds no
+other index lock, and it waits for no other lock while it holds an
+exclusive one. Then the locks that runs take for themselves form no
+cycle: a shared lock waits only for an exclusive holder, which waits for
+nothing, and nobody waits for a run that waits for an exclusive lock,
+since that run holds no lock. A run with one deduplicated stream follows
+the rule as it is. With both streams deduplicated, both hosts update
+their index, the server once the sessions are up, so the client follows
+these steps:
+
+- **L1.** Before SSH starts, update the index, then close it, which
+  releases the lock.
+- **L2.** Once the forward stream's list exchange is done, which comes
+  after the server's update, open the index again, read-only with a
+  shared lock.
+- **L3.** Check that the index still matches the configuration, as a run
+  with `--no-update` does. Between steps L1 and L2, another process can
+  change the index, and a process with another configuration of the same
+  `index_path` can rebuild it with other settings. If it no longer
+  matches, end the run with `die`: the server then ends when the sessions
+  close, before the command starts. The client cannot update the index
+  again here: it would wait for an exclusive lock while the run holds the
+  server's.
+- **L4.** Export the hash list, start the lookup workers, and send HELLO.
+
+With `--no-update`, both hosts take only shared locks, and the client
+opens its index before SSH starts, as in a pull.
+
+The rule cannot cover the commands. A command that waits for an
+exclusive lock waits for every run that holds a lock of that index, and
+a run keeps each lock until the stream that the index deduplicates has
+ended or stopped. So when the forward stream is deduplicated, a command
+that waits for the lock before it has read all its stdin hangs its own
+run once the spools are full. And two runs in opposite directions between
+the same hosts, whose commands update the index of their host after they
+have read their stdin, hang each other: each update waits for the client
+of the other run, which keeps its lock until its own command, the other
+update, has exited.
 
 ### 4.5 Traversal and hashing
 
@@ -499,8 +607,8 @@ One dedicated work-stealing `rayon` pool walks and hashes, by default with
 directories; local depth-first scheduling keeps pending work and open
 parent descriptors small, while stealing distributes subtrees. Tasks retain
 a shared parent descriptor and open their entry only when scheduled. Raise
-the soft descriptor limit to the hard limit at startup. The database
-handle and the directory and file visited sets are shared.
+the soft descriptor limit to the hard limit at startup (section 4.4). The
+database handle and the directory and file visited sets are shared.
 
 The scan tasks write their index changes themselves. Each thread of the
 pool collects the changes of its tasks in a transaction of its own, which
@@ -663,7 +771,7 @@ Each UNIX account has one random 128-bit `account_id` in
 `~/.config/hashsync/account-id`), independent of `--config`. Initialize it
 durably with atomic no-replace publication; concurrent initializers use the
 winner's ID. Never overwrite an existing ID. HELLO exchanges account IDs
-and the receiver's index ID; `serve` does not open its own index.
+and the receiver's index ID; the sender needs no index for the exchange.
 
 Let `A` be the receiver account, `B` the sender account, and `I` the
 receiver index, encoded as fixed-width lowercase hex. Under
@@ -722,7 +830,7 @@ while the file is open.
    persist the receiver's target ends setup.
 2. Before it sends HELLO, the sender lists its peer/index directory. With
    sender caching enabled, it advertises the IDs of all listed lists of
-   the run's strong hash, usually one; otherwise none.
+   the stream's strong hash, usually one; otherwise none.
 3. If the target is one of the advertised lists, the receiver uses
    HASHKEEP. Otherwise it searches all its `local-hashlists/*/*.cache`
    directories for the advertised lists, in their order, and verifies the
@@ -747,10 +855,10 @@ also the base that it used. It removes the files of its listing except
 its published target, and then expires the cache (below). The removal of
 listed files touches no other peer/index directory.
 
-`sender_cache = false` advertises no list, and neither side publishes one,
-so the end of the exchange removes every listed file. The negotiated
-setting determines whether each side publishes; no storage-success flag is
-needed.
+With `--no-sender-cache`, the sender advertises no list, and neither side
+publishes one, so the end of the exchange removes every listed file.
+REQUEST carries the setting to the server, so both sides know whether
+they publish; no storage-success flag is needed.
 
 **Publication, concurrency, and expiry.**
 
@@ -779,19 +887,25 @@ the published file just after publication. With sender caching enabled,
 acknowledgement promises completed publication, not immunity from later
 deletion.
 
-A run with another target starts only after this run's receiver has ended
-(section 4.4). The sender lists its directory before it sends HELLO, and
-ends its exchange only after HASHLIST, HASHDELTA, or HASHKEEP, which its
-receiver sends only after it received that HELLO. So no exchange that ends
-has a listing that holds the target of a later run, also when a sender
-outlives its failed receiver. A later run can still publish a listed list
-again under the same name, when its index has returned to an earlier
-state. So a side removes a listed list only if its name still names the
-listed file: it moves the name to a new temporary name, compares the file
-there with its open file, removes it if they are the same, and moves any
-other file back. A listed temporary belongs to an earlier run, or to a
-concurrent run with the same target, which then publishes nothing: normal
-absence.
+A run with another target needs a modifying process first, which needs the
+exclusive lock of the index (section 4.4). The receiver takes its lock
+before it exports its list and sends HELLO, and keeps it, exclusive or
+shared, until after the list exchange. The client of a run with both
+streams deduplicated releases its lock after its update, and takes it
+again before its export (section 4.4, steps L1 to L4). The sender lists
+its directory only after the receiver's HELLO, and before its own HELLO.
+So a run with another target starts only after this run's listing. The
+sender ends its exchange only after HASHLIST, HASHDELTA, or HASHKEEP,
+which its receiver sends only after it received the sender's HELLO. So no
+exchange that ends has a listing that holds the target of a later run,
+also when a sender outlives its failed receiver. A later run can still
+publish a listed list again under the same name, when its index has
+returned to an earlier state. So a side removes a listed list only if its
+name still names the listed file: it moves the name to a new temporary
+name, compares the file there with its open file, removes it if they are
+the same, and moves any other file back. A listed temporary belongs to an
+earlier run, or to a concurrent run with the same target, which then
+publishes nothing: normal absence.
 
 The end of an exchange and expiry can remove the base of a concurrent
 exchange at any time. So each side reads its base once, through one open
@@ -802,9 +916,9 @@ listing. Neither side opens a list by name a second time.
 Touch verified files through their open descriptors after successful use.
 Use `ctime` as the renewal marker. To expire the cache, a side removes
 every file in every peer/index directory of both cache trees whose `ctime`
-is older than `hashlist_max_age` (default 30 days, sent in HELLO): lists
-and abandoned hidden temporaries. Then it removes every peer/index
-directory that is empty.
+is older than the `hashlist_max_age` of its host (default 30 days, section
+7): lists and abandoned hidden temporaries. Then it removes every
+peer/index directory that is empty.
 
 A lost acknowledgement or a failed run can leave extra files until the
 next exchange of that peer and index, or until expiry. Database restore or
@@ -820,38 +934,42 @@ literal output. SSH multiplexing or forwarding over one TCP connection
 cannot provide that separation. If the user's ControlMaster configuration
 shares a connection, the program still works but loses the latency benefit.
 
-Use the configured SSH subprocess, preserving its agent, host configuration,
-ProxyJump, and host-key handling. Shell-split `ssh` from configuration,
-a host override, or `--ssh`; the first word is the executable and the rest
-are its options. For both sessions, insert `-o ClearAllForwardings=yes` and
-`-o RemoteCommand=none` before the configured options, then append
-`-T -x -o Compression=no`, the unchanged HOST, and the remote command string.
-The leading options take precedence under SSH's first-value rule; the final
-`-T` and `-x` disable PTYs and X11 forwarding even if configured options
-requested them. An explicit compression option in the configured command
-still takes precedence. SSH options must keep the sessions in the
-foreground, preserve their stdin and stdout, and execute the specified
-remote command.
+Use the SSH command of `--ssh`, `ssh` by default, preserving its agent,
+host configuration, ProxyJump, and host-key handling; per-host SSH options
+belong in `~/.ssh/config`. Shell-split `--ssh`; the first word is the
+executable and the rest are its options. For both sessions, insert
+`-o ClearAllForwardings=yes` and `-o RemoteCommand=none` before those
+options, then append `-T -x -o Compression=no`, `-l USER` when the run has
+it, the unchanged HOST, and the remote command string. The leading options
+take precedence under SSH's first-value rule; the final `-T` and `-x`
+disable PTYs and X11 forwarding even if the `--ssh` options requested
+them. An explicit compression option in `--ssh` still takes precedence.
+SSH options must keep the sessions in the foreground, preserve their stdin
+and stdout, and execute the specified remote command.
 
 SSH executes its remote command through the remote login shell, which must
-support POSIX shell quoting for this bootstrap. Treat `sender_command` as
-one executable name or path, not a shell fragment. Construct a remote
-`exec` command by single-quoting each argument, replacing embedded single
-quotes with `'\''`, and preserving all other bytes, including non-UTF-8
-bytes. Passing separate local argv elements to SSH does not quote them for
-the remote shell. The sender needs a compatible `hashsync` in PATH or at
-`sender_command`.
+support POSIX shell quoting for this bootstrap. Treat `--hashsync-path` as
+one executable name or path, not a shell fragment: a wrapper script there
+does what a fragment would, such as passing `--config` to the server or
+setting its environment. Construct a remote `exec` command by
+single-quoting each argument, replacing embedded single quotes with
+`'\''`, and preserving all other bytes, including non-UTF-8 bytes. Passing
+separate local argv elements to SSH does not quote them for the remote
+shell. The server needs a compatible `hashsync` in PATH or at
+`--hashsync-path`.
 
-The receiver generates token `T` and starts both sessions together, with
-the signal mask that the receiver started with (section 6.9):
+The client generates token `T` and starts both sessions together, with
+the signal mask that the client started with (section 6.9):
 
 - Data: `SSH HOST hashsync serve --token T`.
 - Control: `SSH HOST hashsync attach --token T`.
 
 `serve` first listens on `$XDG_RUNTIME_DIR/hashsync/T.sock` (fallback: a
-private directory under `/tmp`), mode 0600. It exchanges protocol versions
-and data HELLOs, accepts `attach`, and completes the list exchange and
-CACHE_RESULT before starting the command.
+private directory under `/tmp`), mode 0600. It exchanges protocol
+versions, reads REQUEST and then its configuration file (section 7),
+updates its index when it receives a deduplicated stream (section 3),
+sends its first data HELLO, accepts `attach`, and completes the list
+exchanges before starting the command.
 
 `attach` retries a not-yet-listening socket while its stdin remains open,
 with no deadline. It relays stdin to the socket and the socket to stdout,
@@ -860,28 +978,39 @@ error (`EPIPE` or `ECONNRESET`) on a read ends the relay from the socket.
 `attach` then waits until stdin EOF ends the relay from stdin, joins that
 thread, and exits zero. After a peer-closed error on a write, the relay
 from stdin writes nothing more to the socket, but reads stdin to EOF and
-discards the bytes. This prevents a deadlock: the receiver closes the
+discards the bytes. This prevents a deadlock: the client closes the
 control session's stdin only after its control writer has ended (section
 6.9), and that writer could otherwise block on a full pipe. Either
-direction may observe closure first. The receiver decides from its
-completion state whether a closure was expected; other relay failures end
-the relay unsuccessfully. Rendezvous waits must also observe receiver
-disappearance (section 6.9).
+direction may observe closure first. Each host decides from END whether a
+closure was expected; other relay failures end the relay unsuccessfully.
+Rendezvous waits must also observe the client's disappearance (section
+6.9).
 
-The command's argv travels in HELLO, not on the SSH command line. Find
-`argv[0]` in PATH and start the command without a shell, so a shell
-requires an explicit `sh -c`. Start it with piped stdin, stdout, and
-stderr, its own process group for cleanup, and the signal mask that
-`serve` started with (section 6.9).
+The command travels in REQUEST, not on the SSH command line, in one of
+two forms (section 8):
 
-The **stderr relay**, a sender thread, copies command stderr to `serve`'s
+- By default, as ssh sends it: COMMAND and ARGS joined with single spaces
+  into one line. The server runs it as sshd does, with `$SHELL -c LINE`:
+  sshd sets `$SHELL` to the user's shell from the password database. When
+  `$SHELL` is unset or empty, the server uses `/bin/sh`, as sshd does for
+  an empty shell field.
+- With `-s`, the words as they are. The server finds the first one in
+  PATH and starts it without a shell, so the command's arguments do not
+  depend on the remote user's shell. Starting `serve` and `attach` still
+  does: the bootstrap above goes through the login shell.
+
+Start the command with piped stdin, stdout, and stderr, its own process
+group for cleanup, and the signal mask (section 6.9) and the descriptor
+limit (section 4.4) that `serve` started with.
+
+The **stderr relay**, a server thread, copies command stderr to `serve`'s
 stderr with bounded buffering and prompt writes, independently of stdout
 scanning and control traffic. SSH forwards these bytes through its stderr
-channel; both local SSH subprocesses inherit the receiver's stderr. Stderr
+channel; both local SSH subprocesses inherit the client's stderr. Stderr
 is outside the hashsync protocol and its compression streams. The relay
 finishes only after command stderr reaches EOF and all copied bytes have
-been written and flushed to SSH; successful sender exit requires that
-(section 6.9).
+been written and flushed to SSH; a successful exit of the server requires
+that (section 6.9).
 
 ### 6.2 Protocol version, features, and frames
 
@@ -889,7 +1018,7 @@ Each side sends `protocol_version u32`, little endian, as the first bytes of
 each session. It does not wait for the peer's version before it sends its
 own. It reads the peer's version before anything else, and it ends the run
 with `die` if the versions are different; the message names both versions.
-The sender starts the command only after it has checked the receiver's
+The server starts the command only after it has checked the client's
 version on both sessions. The remote commands of section 6.1 and this
 version exchange never change. Everything after the exchange belongs to one
 protocol version (section 11).
@@ -906,29 +1035,68 @@ Every frame is `type u8, length u32, payload`. Integers are little endian.
 Strings and byte strings have a `u32` byte length; lists have a `u32` item
 count. Output offsets and lengths are `u64`; overflow is a protocol error.
 
-`S` is the negotiated strong algorithm's full digest length. Every digest of
-the run uses that algorithm, including all list IDs, so a list ID travels
-as its digest alone, `[u8; S]`. A run has one target and at most one base:
-the receiver's HELLO names the target, and HASHDELTA names the base, one of
-the lists that the sender's HELLO advertises.
+`S` is the full digest length of the strong algorithm that the list
+exchange of a deduplicated stream negotiates. Every digest of the stream
+uses that algorithm, including all list IDs of its exchange, so a list ID
+travels as its digest alone, `[u8; S]`. A list exchange has one target and
+at most one base: the receiver's HELLO names the target, and HASHDELTA
+names the base, one of the lists that the sender's HELLO advertises.
 
-| Session | Direction | Types |
+The data session has two levels of frames:
+
+- **Session frames** are never compressed: REQUEST, HELLO, HASHLIST,
+  HASHDELTA, HASHKEEP, HASHFULL, CACHE_RESULT, CHUNK, STREAM_END, and END.
+  They are everything that a reader must find without decoding a stream.
+- **Stream frames** are LIT, REF, and RLE. The stream frames of one stream
+  form one zstd frame, unless compression is disabled, and the payloads of
+  the stream's CHUNK frames are consecutive pieces of it. So the frames
+  compress together across chunks, and runs of REF stay cheap. With
+  compression disabled, the CHUNK payloads are the stream frames as they
+  are.
+
+Each direction of the data session carries one stream: the forward stream
+goes from the client to the server, and the backward stream from the
+server to the client. So CHUNK and STREAM_END name no stream. The control
+session carries QUERY, ANSWER, and STOP. In each of its directions, QUERY
+belongs to the stream that the sending host scans, and ANSWER and STOP to
+the stream that it receives, so none of them names a stream either.
+
+| Level | Types |
+|---|---|
+| Session | 1 REQUEST, 2 HELLO, 3 HASHLIST, 4 HASHDELTA, 5 HASHKEEP, 6 HASHFULL, 7 CACHE_RESULT, 8 CHUNK, 9 STREAM_END, 10 END |
+| Stream | 11 LIT, 12 REF, 13 RLE |
+| Control | 14 QUERY, 15 ANSWER, 16 STOP |
+
+| Session | Direction | Frames |
 |---|---|---|
-| data | receiver to sender | HELLO, HASHLIST, HASHDELTA, HASHKEEP, INPUT, INPUT_END, END_ACK |
-| data | sender to receiver | HELLO, HASHFULL, CACHE_RESULT, LIT, REF, RLE, END, DONE |
-| control | sender to receiver | QUERY, INPUT_STOP |
+| data | client to server | REQUEST; the list exchange frames of its roles; the forward stream: CHUNK, STREAM_END |
+| data | server to client | The list exchange frames of its roles; the backward stream: CHUNK, STREAM_END; END |
+| data | receiver to sender | List exchange: HELLO, HASHLIST, HASHDELTA, HASHKEEP |
+| data | sender to receiver | List exchange: HELLO, HASHFULL, CACHE_RESULT |
+| control | sender to receiver | QUERY |
 | control | receiver to sender | ANSWER |
+| control | receiving host to sending host | STOP |
 
 Payloads:
 
+- REQUEST, the first frame of the client after the features: `command_kind
+  u8`, 0 for a command line and 1 for the words of `-s` (section 6.1), and
+  `command`, a list of byte strings: one for a command line, at least one
+  for the words of `-s`. Then `deduplicated u8`, the deduplicated streams,
+  as a set of bits: 1 for the forward stream and 2 for the backward
+  stream, so 1 in a push, 2 in a pull, and 3 with both; at least one is
+  set. Then the settings of the run (section 8): `no_update u8`,
+  `sender_cache u8`, `compression_level i32`, `compression_long u8`,
+  `compression_threads u32`, `probe_threads u32`, `lookahead u64` (bytes;
+  0 for the default), `negative_cache u64` (bytes), `spool_limit u64`
+  (bytes; `2^64 − 1` for `unlimited`), and `stdin_delivery u8` and
+  `stdout_delivery u8` (0 for eager, 1 for batch). Each host applies the
+  settings that concern its roles. Last, `quiet u8` and `human_readable
+  u8`: the client's `-q`, and the opposite of its `--no-human-readable`,
+  which the server applies to its own notes.
 - HELLO, receiver to sender: `block_size u32`, `weak_hash_id string`,
-  `strong_hash_id string`, `target [u8; S]`, `account_id [u8; 16]`,
-  `index_id [u8; 16]`, `sender_cache u8`, `hashlist_max_age u64` (seconds),
-  `compression_level i32`, `compression_long u8`, `compression_threads u32`,
-  `probe_threads u32`, `lookahead u64`, `negative_cache u64` (bytes),
-  `sender_output_spool_limit u64` and `sender_input_spool_limit u64` (bytes;
-  `2^64 − 1` for `unlimited`), `output_delivery u8` (0 for eager, 1 for
-  batch), and `command`, a list of argv byte strings.
+  `strong_hash_id string`, `target [u8; S]`, `account_id [u8; 16]`, and
+  `index_id [u8; 16]`.
 - HELLO, sender to receiver: `account_id [u8; 16]`, and `lists`, a list of
   the IDs `[u8; S]` of the advertised lists (section 5.6).
 - HASHLIST: `length u64`. That many encoded bytes of the target follow the
@@ -942,103 +1110,104 @@ Payloads:
   lengths and canonical encoding, including ordering and padding.
 - HASHFULL: empty. Request a full list once when the listed list that
   HASHDELTA or HASHKEEP names is invalid, or after a delta digest
-  mismatch, before command output (section 5.6). The response is HASHLIST.
+  mismatch, before the streams start (section 5.6). The response is
+  HASHLIST.
 - CACHE_RESULT: empty. The sender's single acknowledgement of the target
-  (section 5.6). A repeated one is a protocol error. The receiver sends the
-  input only after it.
-- LIT: literal bytes.
+  of its exchange (section 5.6). A second one in the same exchange is a
+  protocol error. Both streams start after the CACHE_RESULT of the last
+  exchange.
+- CHUNK: the next bytes of the stream's zstd frame, or of its stream frames
+  when compression is disabled, at least one. A CHUNK goes out when it
+  holds 256 KiB, and at each flush of the stream: the idle points of eager
+  delivery, every `lookahead` bytes of a deduplicated stream, and the end
+  of the stream.
+- STREAM_END: empty. The end of the stream: its zstd frame ended exactly
+  with the last CHUNK. An empty stream is an empty zstd frame and
+  STREAM_END; without compression, STREAM_END alone. A stopped stream has
+  none, but a STREAM_END that the sending host sent before it learned of
+  the stop is normal (section 6.6).
+- LIT: literal bytes, at least one.
 - REF: empty; use the pin at the current output offset.
-- RLE: `byte u8, length u64`.
-- END: `status i32, error string`. Status is the command's exit status,
-  `128 + signal`, or 127 plus error text if startup failed. Of the
-  sender-to-receiver data frames, only DONE follows.
-- INPUT: the next bytes of the input stream, at least one (section 6.6).
-- INPUT_END: empty. The input ended, at the EOF of what the stdin reader
-  reads (section 6.6), and the input stream ended with the last INPUT:
-  with compression, its zstd frame ended there. At most once; no INPUT
-  follows it.
-- END_ACK: empty. The receiver has validated END and compression completion
-  and flushed reconstructed stdout. Sent exactly once; it is the receiver's
-  last data-session frame.
-- DONE: empty. The completion conditions of section 6.9 hold, and the
-  sender needs neither session any more, so the receiver can close both
-  session stdin pipes. The sender sends it once, after it has received
-  END_ACK. It directly follows the compression stream, outside it. Nothing
-  follows DONE: a byte after it is a protocol error.
+- RLE: `byte u8, length u64`, with a length of at least 1.
+- END: `status i32, error string`, then the server's counts of its ends
+  of both streams (section 8). Of the forward stream, whose decoder it
+  runs: `bytes u64, literal u64, reference u64, run u64, wire u64`.
+  `bytes` are the bytes that the command's stdin took, and `literal`,
+  `reference` and `run` their parts by stream frame; `wire` the CHUNK
+  bytes that the decoder decoded. Of the backward stream, whose source
+  reader it runs: `read u64, eof u8`, the bytes that it read from command
+  stdout, and 1 if it read command stdout to its EOF. Status is the
+  command's exit status, `128 + signal`, or 127 plus error text if startup
+  failed. END is the server's last data-session frame: nothing follows it
+  (section 6.9).
 - QUERY: `offset u64, strong [u8; S]`. At most one per offset; offsets may
   go backwards after rescanning.
-- INPUT_STOP: empty. The sender stopped the input, and the receiver stops
-  it too when it has not stopped it at END yet (section 6.6). At most
-  once, after CACHE_RESULT; the receiver can read it before it reads
-  CACHE_RESULT on the data session, and also in Completing.
 - ANSWER: `offset u64, found u8` (0 or 1). Answers may arrive out of order.
+- STOP: empty. The host that receives a stream stopped it (section 6.6):
+  from the server, the forward stream; from the client, the backward
+  stream. At most once in each direction.
 
-The receiver's HELLO sets the block size, weak hash, and strong hash of the
-run. The sender uses them, or it ends the run with `die` before command
-startup if it does not support them. It checks the strong hash before it
-reads the target, whose length depends on it. Its HELLO does not repeat
-them.
+The receiver's HELLO sets the block size, weak hash, and strong hash of
+its stream. The sender uses them, or it ends the run with `die` before
+command startup if it does not support them. It checks the strong hash
+before it reads the target, whose length depends on it. Its HELLO does not
+repeat them. In the same way, the server ends the run before command
+startup if it does not support a setting of REQUEST, such as a compression
+level. And the sender of a deduplicated stream reserves the scanner's
+lookahead buffer and starts its probe threads before its HELLO. The
+client sets their sizes to any value, so a host that cannot provide them
+ends the run there (section 6.3).
 
-The data handshake is the version exchange, the features, receiver HELLO,
-sender HELLO, durable receiver publication with sender caching, then
-HASHLIST/HASHDELTA/HASHKEEP and its data. The sender replies with
-CACHE_RESULT, possibly after one HASHFULL fallback. The receiver handles the
-result and cache cleanup before entering its output loop. Its remaining
-data-session frames are the input, in INPUT frames and INPUT_END, until the
-stop of the input, and then END_ACK.
+The data handshake is the version exchange, the features, REQUEST, and
+the list exchange of each deduplicated stream, the forward stream's
+first, so that their frames need no stream ID. A list exchange is
+receiver HELLO, sender HELLO, durable receiver publication with sender
+caching, then HASHLIST/HASHDELTA/HASHKEEP and its data. The sender replies
+with CACHE_RESULT, possibly after one HASHFULL fallback. The receiver
+handles the result and cache cleanup. Then both streams start: the server
+starts the command, and the client starts the forward stream. In a pull,
+the client sends its HELLO right after REQUEST, without waiting for the
+server. The server, as the receiver of the forward stream, sends its
+HELLO after its update. With both streams deduplicated, the client sends
+its HELLO after the forward stream's CACHE_RESULT, and after an update,
+only once it has opened its index again (section 4.4).
 
-After HELLO, all sender-to-receiver data-session frames through END share one
-zstd stream, unless compression is disabled. This includes HASHFULL and
-CACHE_RESULT. DONE follows the stream, outside it. The sender flushes the
-stream before it waits for a reply, after HASHFULL, and after
-CACHE_RESULT, which the input waits for: the command can wait for its
-input before it writes output. In eager delivery of the output, the data
-writer also flushes the stream after each idle point of command stdout,
-once it has written the frames of the bytes before the idle point and
-has nothing left to write (section 6.3): before that, the bytes could not
-leave sooner, and the flush would only cost compression. It finishes the
-stream after END.
-Other frames can stay in the compressor and the transport buffer until
-more output fills them or the stream ends. No wait of `hashsync` depends
-on them: queries and answers use the control session. Compression
-settings are in section 7.
+Each session frame goes to SSH in a single write, together with any list
+bytes that follow HASHLIST or HASHDELTA. SSH puts the bytes of each read
+of its stdin into packets of their own, so a header that arrived ahead of
+its payload could cost an extra packet. A side flushes before it waits for
+a reply. The session frames of the handshake are not compressed: zstd
+cannot make the hash list smaller (section 10).
 
-**Delivery.** The run gives the output and the input each a delivery
-(section 8). Eager delivery, the default, works as SSH does: a command
-that waits for its next input before it writes more output, and a
-consumer of the output that writes the next input only after it has read
-that output, such as the two ends of `rsync -e`, never wait for bytes that
-a buffer of `hashsync` holds. It sends the bytes of an idle point on only
-when they can leave at once: when the writer of their session has nothing
-left to write. On a slow link, that writer is busy, so the bytes wait,
-and the bytes that follow join them: the output keeps its matches, and the
-streams compress better. So the link decides how much eager delivery
-costs. Batch delivery keeps the bytes until a buffer is full or the
-stream ends: it costs fewer bytes and less CPU also on a fast link, and
-keeps the matches that eager delivery loses at idle points there (section
-10). The receiver's HELLO names the delivery of the output, whose idle
-points are those of command stdout (sections 6.3 and 6.5). The receiver
-applies the delivery of the input alone, at the idle points of its stdin
-(section 6.6).
+**Delivery.** The run gives each stream a delivery (section 8). Eager
+delivery, the default, works as SSH does: a command that waits for its
+next input before it writes more output, and a consumer of the output that
+writes the next input only after it has read that output, such as the two
+ends of `rsync -e`, never wait for bytes that a buffer of `hashsync`
+holds. It sends the bytes of an idle point on only when they can leave at
+once: when the data writer of their stream has nothing left to write. On a
+slow link, that writer is busy, so the bytes wait, and the bytes that
+follow join them: a deduplicated stream keeps its matches, and the streams
+compress better. So the link decides how much eager delivery costs. Batch
+delivery keeps the bytes until a buffer is full or the stream ends: it
+costs fewer bytes and less CPU also on a fast link, and keeps the matches
+that eager delivery loses at idle points there (section 10). REQUEST names
+the delivery of both streams, and the sending end of each applies it at
+the idle points of its source (sections 6.3, 6.5, and 6.6). In both
+deliveries, the scanner of a deduplicated stream also asks for a flush
+after every `lookahead` bytes, so that the references and runs of a source
+that never pauses, such as a file, do not wait in the buffers until the
+end of the stream (section 6.3).
 
 After the features, each direction of the control session is also one
 zstd stream at the same level, unless compression is disabled. The
 frames are small, so the stream uses no long-distance matching and no
 worker threads. A control writer flushes its stream each time its queue
-becomes empty, because the scanner waits for answers, and the receiver
-must stop sending the input as soon as the sender has stopped it. When a
-slow link makes the writer wait, more frames share each flush and
-compress better. No frame ends the stream: the closure of the session ends
-it (section 6.9).
-
-The frames of the receiver-to-sender direction of the data session are not
-compressed: zstd cannot make the hash list smaller (section 10), and the
-input stream has a zstd stream of its own, in the payloads of INPUT frames,
-so the sender can find END_ACK after input that it discards without
-decompressing it (section 6.6). Each frame goes to SSH in a single write,
-together with any list bytes that follow HASHLIST or HASHDELTA. SSH puts the
-bytes of each read of its stdin into packets of their own, so a header that
-arrived ahead of its payload could cost an extra packet.
+becomes empty, because the scanner waits for answers, and the sending host
+of a stream must stop it as soon as the receiving host has stopped it.
+When a slow link makes the writer wait, more frames share each flush and
+compress better. No frame ends the stream: the closure of the session ends it
+(section 6.9).
 
 ### 6.3 The sender's scanner
 
@@ -1049,22 +1218,24 @@ for the scanner. Let `B = block_size`.
 **State and invariants.**
 
 - `e`: next output byte to emit; `p`: next byte to scan; `r`: end of
-  command bytes read. Initially all are zero, with `e <= p <= r`.
+  the bytes of the stream read so far. Initially all are zero, with
+  `e <= p <= r`.
 - The lookahead buffer retains immutable bytes `[e, r)`, including scanned
-  bytes that a rejection may require again. Its capacity is `lookahead + B`;
-  the output reader, which takes command stdout from its spool
-  (section 6.5), pauses when the buffer is full. Scanning starts a step
-  only while `p - e < lookahead`; a full-window step may advance `p` by
-  `B`.
-- `f`: in eager delivery of the output (section 6.2), the end of the
-  bytes before the last idle point of command stdout, initially zero, with
-  `f <= r`. The output reader passes each idle point that the spool
-  reports after the bytes before it, and the scanner then sets `f = r`.
-  The bytes before `f` leave without waiting for more output, once they
-  can leave at once.
+  bytes that a rejection may require again. Its capacity is `lookahead +
+  B`; the lookahead reader, which takes the stream's bytes from the spool
+  of its source (section 6.5), the command's stdout for the backward stream
+  and the client's stdin for the forward stream, pauses when the buffer is
+  full. The sender reserves the buffer whole, at twice its capacity, before
+  its HELLO (section 6.2). Scanning starts a step only while `p - e <
+  lookahead`; a full-window step may advance `p` by `B`.
+- `f`: in eager delivery (section 6.2), the end of the bytes before the
+  last idle point of the source, initially zero, with `f <= r`. The
+  lookahead reader passes each idle point that the spool reports after the
+  bytes before it, and the scanner then sets `f = r`. The bytes before `f`
+  leave without waiting for more bytes, once they can leave at once.
 - The data writer is **idle** when it waits for frames, after it has
-  written every frame that the scanner queued, and made the flush that an
-  idle point asked for. It tells the scanner when it becomes idle.
+  written every frame that the scanner queued, and made the flushes that
+  the scanner queued. It tells the scanner when it becomes idle.
 - **Records** describe scanned output that is not emitted yet. Ordered
   records cover exactly `[e, p)`, without gaps or overlaps:
   `Literal { offset, length }`, `Run { offset, length, byte }`,
@@ -1073,7 +1244,7 @@ for the scanner. Let `B = block_size`.
 - The query-state map is keyed by offset and stores the full digest with
   state Not_sent, Waiting, Yes, or No. Keep entries until their offsets
   fall below `e`, even when their records are discarded.
-- A byte-bounded negative LRU cache (`negative_cache`) holds full strong
+- A byte-bounded negative LRU cache (`--negative-cache`) holds full strong
   hashes answered no. It suppresses queries for the same content at other
   offsets, but does not avoid hashing a new window.
 
@@ -1126,20 +1297,20 @@ as on a slow link, output that arrives meanwhile can fill their windows.
 
 A weak-table probe depends only on the bytes of its window. When the
 scanner looks for the next hit or constant window, it can split a long
-stretch of windows into consecutive parts and probe them on
-`probe_threads` threads at once. Every part but the first initializes the
-rolling hash and the constant-window check from the bytes of its first
-window. The first hit or constant window in offset order ends the stretch,
-and parts after it may stop early, so the result equals checking each
-window in order. After each weak hit, new or known, the scanner scans at
-most a short stretch on its own thread before it processes answers again.
-With more than one probe thread, each following stretch without a hit or
-a constant window doubles the next one, up to a bound per thread. A
-constant window, or a hit that the check rejects, neither doubles nor
-shortens the next stretch. Short gaps between matches thus stay on one
-thread, and a long run of misses soon uses all probe threads. HELLO's
-`probe_threads` sets the thread count; 0 selects half the sender's cores,
-at least one.
+stretch of windows into consecutive parts and probe them on the probe
+threads at once. Every part but the first initializes the rolling hash and
+the constant-window check from the bytes of its first window. The first
+hit or constant window in offset order ends the stretch, and parts after
+it may stop early, so the result equals checking each window in order.
+After each weak hit, new or known, the scanner scans at most a short
+stretch on its own thread before it processes answers again. With more
+than one probe thread, each following stretch without a hit or a constant
+window doubles the next one, up to a bound per thread. A constant window,
+or a hit that the check rejects, neither doubles nor shortens the next
+stretch. Short gaps between matches thus stay on one thread, and a long
+run of misses soon uses all probe threads. `--probe-threads` sets the
+thread count; 0 selects half the sender's cores, at least one. The sender
+starts them before its HELLO (section 6.2).
 
 **Answers and rescanning.**
 
@@ -1172,9 +1343,14 @@ Emit from the front until blocked by a Query or a full data queue:
 - Literal emits up to `B` bytes per LIT. Emit a short Literal when another
   record follows, at EOF, or, once `p >= f`, for its bytes before `f`;
   otherwise let it grow.
-- After a change of `f`, once `e >= f`, queue a flush of the data stream
-  for the data writer, behind the frames before `f`. The data writer makes
-  it once it has nothing left to write (section 6.2).
+- Queue a flush of the stream for the data writer, behind the frames
+  before it, once `e` reaches an `f` past the last flush, and, in both
+  deliveries, once `e` is `lookahead` bytes past the last flush. References
+  and runs stand for far more bytes than their frames, so without the
+  second flush, those of a source that never pauses, such as a file, would
+  wait in the buffers after the scanner until the end of the stream. That
+  flush records no tail, so it makes no block literal. The data writer
+  makes each flush once it has nothing left to write (section 6.2).
 
 Advance `e` only after the data writer accepts the frame. LIT owns a copy
 before those buffer bytes are released. Remove emitted record portions and
@@ -1186,26 +1362,31 @@ queue and remain ordered even when offsets go backwards. Discarded records
 can leave obsolete requests; lookahead is not a bound on all outstanding
 queries or receiver pins.
 
-When progress requires command output, answers, data-queue space, or, while
-a tail before `f` waits, an idle data writer, wait on notifications for
-those events, continuing to prioritize answers.
+When progress requires more bytes of the stream, answers, data-queue
+space, or, while a tail before `f` waits, an idle data writer, wait on
+notifications for those events, continuing to prioritize answers.
 Backpressure propagates from the data writer through the lookahead buffer
-to the spool of command stdout (section 6.5).
+to the spool of the source (section 6.5).
 
-Finish only after stdout EOF, `p = r`, and no Query records remain. Drain all
-records so `e = p = r`, and queue the flush of the last idle point, which
-can come after the last frame: END can come much later than stdout EOF,
-and the bytes before that idle point must not wait for it. END can be
-queued once the command's exit status is also available (section 6.9).
-Flush queued data before waiting for further completion conditions.
-Obsolete unanswered requests do not delay completion.
+Finish only after the EOF of the source, `p = r`, and no Query records
+remain. Drain all records so `e = p = r`. Then the data writer ends the
+stream: it ends the zstd frame, and sends the last CHUNK and STREAM_END
+(section 6.6). So the bytes before the EOF of the source never wait for
+the exit of the command, which END waits for (section 6.9). Obsolete
+unanswered requests do not delay the end of the stream.
 
-### 6.4 The receiver's answering and reconstruction
+The stream can stop (section 6.6). Its receiver then sends no answer, so
+a query that waits for one would keep the scanner from ending: every wait
+of the scanner also waits for the stop. At the stop, the scanner ends at
+once, without the end of the stream, and so does the data writer, which
+takes none of the frames that the data queue still holds (section 6.6).
+
+### 6.4 The receiver's answering and decoding
 
 Let `B = block_size`. The pins are one user of segments, with extents of
 `B` bytes (section 6.5). The receiver keeps:
 
-- `c`: the output offset of reconstruction.
+- `c`: the output offset of the decoder.
 - The pin map, from the query offset of each pin to the full strong hash
   of its block.
 - The pinned blocks, by full strong hash: the blocks of the pins. Each
@@ -1218,10 +1399,10 @@ Let `B = block_size`. The pins are one user of segments, with extents of
   eviction is independent of pin lifetimes, and pins never retain its
   buffers.
 
-One lock protects this state and the completion state. Source reads,
-segment I/O, and stdout writes occur outside the lock; the file creation
+One lock protects this state and Completing. Source reads, segment I/O,
+and writes of the destination occur outside the lock; the file creation
 of step A1 is the one exception, and it occurs once per segment. In-memory
-payload storage is limited to the cache and worker/reconstruction buffers;
+payload storage is limited to the cache and worker and decoder buffers;
 pin metadata and queued requests still scale with outstanding work. The
 receiver releases an extent when nothing uses it any more: the output has
 passed `last` of its block, a copy has replaced it, or its lookup worker
@@ -1251,9 +1432,16 @@ block, which replaces the old extent for all pins of the block.
 
 A pool of 4–8 lookup workers, which share the database handle, answers
 queries out of order. Queue all answers nonblockingly under the lock,
-checking the completion state before publication. Completing (section 6.9)
-suppresses new lookups, extents, pin publication, and answers, including no
-answers from obsolete lookups.
+checking Completing before publication. The receiver enters
+**Completing** once its stream has ended, at STREAM_END, or has stopped
+(section 6.6): the sender emits a frame only after its answer, so the
+queries that still arrive then are obsolete. Completing suppresses new
+lookups, extents, pin publication, and answers, including no answers from
+obsolete lookups. It happens under the lock of pin allocation and answer
+publication, so that a late lookup cannot prolong the run. The lookup
+workers end at Completing, also a worker that waits for its next query; a
+lookup in progress finishes first. The index closes with the last worker
+(section 4.4). The pins stay until the decoder has ended.
 
 For `QUERY { offset: x, strong: h }`:
 
@@ -1308,20 +1496,22 @@ verified bytes in a segment. A later source-file change cannot affect
 REF. Output may pass `x` before the answer is sent; the sender then
 discards that obsolete answer.
 
-Reconstruction reads the data session from its spool (section 6.5). Until
-`receiver_output_spool_limit` bytes of the compressed session wait there,
-a blocked stdout stops only the reconstruction: the sender keeps scanning
-and querying, and the spool and the pins hold the output until stdout
-takes it. The limit does not bound the pins. Reconstruction processes the
-data frames in order at `c`:
+The decoder reads the stream from its spool (section 6.5), and writes it
+to the stream's destination: the client's stdout for the backward stream,
+the command's stdin for the forward stream. Until `--spool-limit` bytes of
+the stream wait there, a blocked destination stops only the decoder: the
+sender keeps scanning and querying, and the spool and the pins hold the
+stream until the destination takes it. The limit does not bound the pins.
+The decoder processes the stream frames in order at `c` (section 6.6,
+steps C1 to C3):
 
 - LIT writes its payload; RLE writes the repeated byte. Accept any positive
   RLE length, though the sender emits runs of at least `B`.
 - REF obtains the pin at `c` and the extent of its block under the lock.
   Outside it, read exactly `B` bytes from that extent with `pread`, and
   verify the full digest against the pin's hash before writing that
-  buffer to stdout. The pin stays until the write completes and `c`
-  advances. A missing pin is a protocol error; segment EOF, read errors,
+  buffer to the destination. The pin stays until the write completes and
+  `c` advances. A missing pin is a protocol error; segment EOF, read errors,
   or a digest mismatch end the run with `die` without emitting that block
   or attempting to reread the source file.
 - After each frame's output is written, advance `c` under the lock. In
@@ -1331,8 +1521,7 @@ data frames in order at `c`:
   released (section 6.5, steps R1 to R3). After each batch, release the
   lock and close the files of the segments that the batch removed from the
   open segments.
-- END carries the command status into shutdown (section 6.9). EOF without
-  END or before the compressed stream is complete is failure.
+- The end of the stream follows the end contract of section 6.6.
 
 The shared lock makes pin publication and output advancement atomic relative
 to each other: a lookup either publishes before the offset passes, and the
@@ -1346,8 +1535,8 @@ change.
 
 ### 6.5 Segments and spools
 
-Both roles keep temporary data in segments: the receiver its pins
-(section 6.4), and both roles the bytes of their spools. Closing an
+Both hosts keep temporary data in segments: the receiver its pins
+(section 6.4), and both hosts the bytes of their spools. Closing an
 unlinked file frees its storage without hole punching, so any filesystem
 that can hold files can hold the tmp_data directory.
 
@@ -1362,20 +1551,17 @@ bytes a segment holds before it is full, so the open files stay few.
 
 Data structures:
 
-- **tmp_data directory**: `tmp_data_dir` on the receiver. The sender
-  always uses the default, `$XDG_CACHE_HOME/hashsync/tmp-data/` (fallback
-  `~/.cache/hashsync/tmp-data/`) in its own environment; a
-  `sender_command` script that runs
-  `export XDG_CACHE_HOME=DIR; exec hashsync "$@"` moves it, with the
-  sender's list cache (section 5.6). Use a private directory (0700). A
-  role creates it if necessary and keeps it open through the run. When it
-  opens it, it creates a segment and closes it at once, to make sure that
-  segments can be created: the receiver before the SSH sessions start, and
-  the sender when it has accepted HELLO, before the list exchange. So an
-  unusable directory ends the run before command startup. A disk-backed
-  directory moves the data out of RAM, where tmpfs would keep it in memory
-  or swap. Avoid NFS: its client writes the data of a file to the server
-  before it closes the file (section 10).
+- **tmp_data directory**: the `tmp_data_dir` of each host (section 7), by
+  default `$XDG_CACHE_HOME/hashsync/tmp-data/` (fallback
+  `~/.cache/hashsync/tmp-data/`). Use a private directory (0700). A host
+  creates it if necessary and keeps it open through the run. When it opens
+  it, it creates a segment and closes it at once, to make sure that
+  segments can be created: the client before the SSH sessions start, and
+  the server once it has read REQUEST and its configuration, before the
+  list exchanges. So an unusable directory ends the run before command
+  startup. A disk-backed directory moves the data out of RAM, where tmpfs
+  would keep it in memory or swap. Avoid NFS: its client writes the data
+  of a file to the server before it closes the file (section 10).
 - **Segment**: one open, unlinked file in the tmp_data directory, with its
   size and its count of extents in use. The size is the bytes of the
   extents appended to the segment. The file is read/write (0600) and
@@ -1455,22 +1641,21 @@ Properties, for each user:
 The **writer** of a spool takes the bytes from the **source** of the spool
 as they arrive, and appends them; it waits for the reader only at the
 **limit** of the spool. The reader takes the bytes in order, and waits
-only while no byte waits for it. For command stdout and the data session,
-the writer is a thread of its own, the **thread of the spool**, which
-reads the source; for the input spools, it is a thread of the input
-(section 6.6).
+only while no byte waits for it. The writer is the source reader of the
+stream, the stdout reader or the stdin reader, or the data reader of the
+receiving end (section 6.6).
 
-| Role | Source | Writer | Reader | Limit |
+| Stream | Host | Source | Writer | Reader |
 |---|---|---|---|---|
-| Sender | Command stdout | The thread of the spool | The output reader, for the lookahead buffer (section 6.3) | `sender_output_spool_limit`, from HELLO |
-| Receiver | Data-session stdout | The thread of the spool | Reconstruction (section 6.4) | `receiver_output_spool_limit` |
-| Receiver | The input stream, from stdin | The stdin reader | The input writer | `receiver_input_spool_limit` |
-| Sender | The input stream, from INPUT frames | The data reader | The stdin writer | `sender_input_spool_limit`, from HELLO |
+| Backward | Server | Command stdout | The stdout reader | Deduplicated: the lookahead reader, for the lookahead buffer (section 6.3); plain: the data writer |
+| Backward | Client | The CHUNK frames of the stream | The data reader | The decoder (section 6.4) |
+| Forward | Client | stdin | The stdin reader | Deduplicated: the lookahead reader; plain: the data writer |
+| Forward | Server | The CHUNK frames of the stream | The data reader | The decoder |
 
-Each limit is 2 GiB by default. `unlimited` (`2^64 − 1`, which no spool
-reaches) removes it; a spool can then grow to almost the whole output, or
-the whole input, when its reader stays slower than its source
-(section 10).
+Each spool holds at most `--spool-limit` bytes, which the server takes
+from REQUEST: 2 GiB by default. `unlimited` (`2^64 − 1`, which no spool
+reaches) removes the limit; a spool can then grow to almost the whole
+stream when its reader stays slower than its source (section 10).
 
 Data structures:
 
@@ -1480,14 +1665,12 @@ Data structures:
 - **Written** and **read**: the bytes that the writer has appended, and
   that the reader has taken. The bytes between them **wait**.
 - **End**: the source ended, and the writer has appended all its bytes.
-- **Stopped**: a role stopped the spool, before or after its end, because
-  its bytes have no use any more. Only the input spools stop
-  (section 6.6).
-- **Idle point**: the thread of the spool of command stdout, in eager
-  delivery of the output (section 6.2), marks one when its source has no
-  byte ready. The end of the source is the last idle point. The next
-  append removes it, so the reader reports an idle point only when no byte
-  follows it.
+- **Stopped**: a host stopped the spool, before or after its end, because
+  its bytes have no use any more (section 6.6).
+- **Idle point**: in eager delivery (section 6.2), the source reader of a
+  stream marks one in its spool when the source has no byte ready
+  (section 6.6). The next append removes it, so the reader reports an idle
+  point only when no byte follows it.
 
 The writer:
 
@@ -1495,14 +1678,11 @@ The writer:
   the spool is stopped. The reader wakes the writer when it takes bytes.
   With a limit of 0, the writer takes bytes from its source when no byte
   waits.
-- **W2.** Take the next bytes from the source. For command stdout in
-  eager delivery, when the source has no byte ready, first mark an idle
-  point and wake the reader under the lock, then wait for the source. Do
-  this also at the end of the source, unless the last read found no byte
-  ready: the bytes before the end must not wait for the end of the
-  command, which can come much later. At the end of the source, mark the
-  end, wake the reader, and stop. A thread of a spool reads its source; a
-  read error ends the run with `die`.
+- **W2.** Take the next bytes from the source. In eager delivery, when
+  the source has no byte ready, a source reader first marks an idle point
+  and wakes the reader under the lock, then waits for the source. At the
+  end of the source, mark the end, wake the reader, and stop. A read error
+  of a source reader ends the run with `die`.
 - **W3.** Append the bytes, one extent at a time. If there is no extent,
   or the last extent is full, allocate an extent (steps A1 to A3) under
   the lock. Write the bytes that fit in the last extent with `pwrite`
@@ -1527,7 +1707,7 @@ The reader:
   the files of the segments that this removes after the lock is released.
   If the spool was stopped meanwhile, report EOF instead of the bytes.
 
-A role stops a spool under its lock: it marks the spool stopped, and
+A host stops a spool under its lock: it marks the spool stopped, and
 wakes the writer and the reader. A stop is final, so the spool needs its
 extents no more, nor the full rule: the stop takes all its extents and
 open segments at once, without steps R1 to R3, which discards the bytes
@@ -1536,8 +1716,10 @@ I/O of the writer or the reader that still uses one of them. The reader
 can tell the EOF of a stopped spool from the end.
 
 The reader releases the extents in allocation order, so the retention
-property holds: with a limit, at most the limit plus one append (256 KiB)
-wait, and the files hold less than twice the limit plus 40 MiB.
+property holds: with a limit, at most the limit plus one append wait, and
+the files hold less than twice the limit plus 40 MiB. An append is at most
+256 KiB for a source reader, and one CHUNK payload for the data reader of
+a receiving end: at most 256 KiB from a hashsync peer.
 
 Cost: on XFS, a spool passed 1 GiB in 0.36 s, about the cost of the two
 copies in memory of a channel of chunks. While the reader keeps up, a
@@ -1546,166 +1728,273 @@ by default after 30 s, and nothing reaches the disk. A slow source, such
 as the data session, keeps its current segment open longer, and the
 kernel then writes its dirty pages to the disk.
 
-### 6.6 The input
+### 6.6 Streams
 
-The receiver sends the input in INPUT frames on the data session, from
-CACHE_RESULT until the stop of the input. Each role keeps it in an
-**input spool** on the way (section 6.5). So the producer of the
-receiver's stdin waits for a command that reads slowly, or late, only when
-both input spools hold their limits.
+Every run has two streams: the **forward stream** carries the client's
+stdin to the command's stdin, and the **backward stream** the command's
+stdout to the client's stdout. One or both of them are deduplicated, each
+against the index of the host that receives it, and a stream that is not
+is plain: in a pull, the default, the backward stream is deduplicated,
+with the client as its receiver; in a push, with `--dedup-stdin`, the
+forward stream is, with the server as its receiver; and with
+`--dedup-stdin --dedup-stdout`, both are (section 8). A stream always uses
+the same directions of both sessions: the data session from its sending
+end to its receiving end, for its CHUNK frames, and for a deduplicated
+stream, the control session in both directions, for QUERY and ANSWER.
 
-The input stream is one zstd frame at the level and long-distance matching
-of the data stream, or the input itself when compression is disabled. The
-input spools hold the input stream, and their limits count its bytes. On
-its way to the input spool, the stream passes a buffer of 256 KiB, which
-goes on when the next bytes do not fit in it, or at a flush. In eager
-delivery (section 6.2), the stdin reader flushes the stream at each idle
-point of stdin, once the input writer is idle: the command can wait for
-its input before it writes output. In batch delivery, it flushes
-nothing. In both, it compresses with `compression_threads` worker threads
-(section 7), as the sender's data stream does; in eager delivery, each
-flush then ends a zstd job, which costs more bytes than the end of a
-block (section 10). The EOF of stdin ends the zstd frame. The frames that
-carry the stream are not compressed (section 6.2): a role can stop the
-input after any frame, and the zstd frame then stays incomplete.
+Both streams are built from the same blocks. Deduplication is one more
+block, which a deduplicated stream has and a plain stream does not: the
+hash table, the scanner and its queries on the sender (section 6.3), and
+the index, the lookup workers, and the pins on the receiver (section 6.4).
+
+The sending end:
+
+- The **source reader** copies the stream's source into the stream's
+  spool on its host (section 6.5), and in eager delivery marks the idle
+  points of the source: for command stdout, the server's **stdout reader**
+  (steps O1 to O3), and for the client's stdin, the client's **stdin
+  reader** (steps I1 to I3).
+- The **encoder** turns the bytes of the spool into stream frames: the
+  scanner in a deduplicated stream. A plain stream has no encoder of its
+  own: its data writer takes the spool directly, one LIT frame for each
+  take of at most 256 KiB, and a flush at each idle point that the spool
+  reports. The spool reports an idle point only once its reader has taken
+  every byte before it and no byte follows (section 6.5), so the data
+  writer then has nothing left to write.
+- The **data writer** compresses the stream frames into the stream's zstd
+  frame, and sends it in CHUNK frames, then STREAM_END (steps D1 to D3).
+
+The receiving end:
+
+- The **data reader** of the session reads the session frames, and
+  appends the payload of each CHUNK to the stream's spool on its host,
+  which waits while the spool holds its limit. At STREAM_END, the receiver
+  of a deduplicated stream enters Completing (section 6.4), and then the
+  data reader ends the spool: so the lookups begin to end before the
+  destination can see the end of the stream, and a command that updates
+  the index once its stdin has ended waits at most for the lookups under
+  way.
+- The **decoder** decompresses the spool, reads the stream frames, and
+  writes their bytes to the stream's destination: the client's stdout, or
+  the command's stdin (steps C1 to C3).
+
+A plain stream has no lookahead buffer, no hash table, no index, and no
+pins. Runs of one byte are literals in it: zstd stores them as RLE blocks
+of about 4 bytes per 128 KiB, and with compression disabled they travel
+as they are. Its decoder takes REF as a protocol error, and accepts RLE,
+which needs no state.
 
 Data structures:
 
-- **Input spool**: on the receiver, with the limit
-  `receiver_input_spool_limit`; on the sender, with the limit
-  `sender_input_spool_limit` from HELLO. The receiver's exists before the
-  sessions start, so that INPUT_STOP can stop it at any time; the
-  sender's exists from the sender's HELLO, before the command starts.
-- **Sent**: the bytes of the receiver's input spool that the input writer
-  has sent. The input writer is **idle** when it has sent every byte that
-  the stdin reader appended to the input spool.
-- **Wake-up**: an eventfd of the receiver, which the input writer signals
-  after each INPUT frame, so that the stdin reader can wait for an idle
-  input writer.
-- **Stop pipe**: a pipe of each role. At the stop of the input, the role
-  closes its write end, and the EOF that follows ends a wait of `poll`:
-  that of the receiver's stdin reader for stdin, and that of the sender's
-  session watcher for the hangup of the data session.
-- **Stopped**: the input of the role stopped. Each role stops its input
-  once; a later stop does nothing.
+- **Spools of a stream**: one on each host (section 6.5). The spool of
+  the sending end holds the bytes of the source, and that of the
+  receiving end the payloads of the CHUNK frames.
+- **Stop**: the stop of a stream on one host, which happens at most
+  once. It stops the stream's spool on that host, puts the receiver of a
+  deduplicated stream into Completing on the host that receives it, and
+  ends the waits for the stop: it closes the write end of the host's
+  **stop pipe**, whose EOF ends the waits in `poll`, and disconnects a
+  channel that ends the waits of the scanner. Each host creates the stops
+  of both streams before anything can raise them: the client before the
+  sessions start, and the server at REQUEST, each with the pins of the
+  deduplicated stream that it receives.
 
-The receiver's **stdin reader**, from CACHE_RESULT, reads stdin when the
-run has `--stdin` or `--batch-stdin`, else `/dev/null` (section 8). As
-`ssh` does, it makes a stdin that is not a terminal non-blocking while it
-reads it, unless it is non-blocking already, so that no read waits. A
-terminal stays as it is, because the shell of the user shares it. Other
-processes can share stdin too, so the stdin reader restores the flags of
-stdin at the EOF of stdin and at the stop of the input, and every end of
-the process restores them, also a fatal one (section 6.9).
+The client's **stdin reader**, once the list exchanges are done, reads
+stdin. With `-n` (section 8), the forward stream is empty: its spool ends
+before the sessions start, so before any stop, and no stdin reader runs. As
+`ssh` does, the stdin reader makes a stdin that is not a terminal
+non-blocking while it reads it, unless it is non-blocking already, so that
+no read waits. A terminal stays as it is, because the shell of the user
+shares it. Other processes can share stdin too, so the stdin reader
+restores the flags of stdin at the EOF of stdin and at the stop, and every
+end of the process restores them, also a fatal one (section 6.9).
 
 - **I1.** In eager delivery, if neither stdin nor the stop pipe is ready,
-  which `poll` shows without a wait, an idle point waits. While one waits
-  and the input writer is idle, flush the stream, and append the buffer to
-  the input spool: the idle point waits no more. Wait until stdin or the
-  stop pipe is ready, or, while an idle point waits, until the wake-up is
-  signaled; after the wake-up alone, do this step again. At the EOF of the
-  stop pipe, end. So in eager delivery, every wait for stdin follows a
-  flush, or waits for the input writer, also when another process that
-  shares stdin took the bytes that `poll` reported.
+  which `poll` shows without a wait, mark an idle point in the spool. Wait
+  until stdin or the stop pipe is ready. At the EOF of the stop pipe, look
+  at whether stdin is at its EOF, without a read, and end.
 - **I2.** Read stdin. If the read finds no bytes, because another process
   that shares stdin took them first (`EAGAIN`, section 3), go to step I1.
-  At the EOF of stdin, end the zstd frame, append the buffer to the input
-  spool, mark the end of the spool, and end. A read error ends the run
+  At the EOF of stdin, end the spool, and end. A read error ends the run
   with `die`.
-- **I3.** Compress the bytes into the buffer. When the next bytes do not
-  fit in the buffer, the buffer goes to the input spool first, which waits
-  while the spool holds its limit (section 6.5, steps W1 and W3). An idle
-  point that waits gives way to the next one. Go to step I1.
+- **I3.** Append the bytes to the spool, which waits while the spool holds
+  its limit, until the stop (section 6.5, steps W1 and W3). Go to step I1.
 
-The receiver's **input writer**, from CACHE_RESULT:
+The look at the stop keeps the summary from depending on whether STOP or
+the EOF of stdin came first (section 8). It reads nothing, so the bytes of
+stdin stay for its next reader: a stdin that can seek is at its EOF when a
+`pread` at its offset finds no byte, and a pipe or a socket when its other
+end has hung up and `FIONREAD` shows no byte. A terminal never is: Ctrl-D
+is no hangup.
 
-- **S1.** Take the next bytes of the input spool, at most 256 KiB, and
-  send them in one INPUT frame. Add them to sent, and signal the wake-up.
-  Go to step S1.
-- **S2.** At the end of the spool, send INPUT_END, and end. At the EOF of
-  a stopped spool, end without INPUT_END.
+The server's **stdout reader**, from command startup, reads command
+stdout. No other process has hashsync's end of that pipe, so it is
+non-blocking: a read takes what the pipe holds, and costs no other system
+call.
 
-The sender's data reader appends the payload of each INPUT frame to the
-input spool, and waits while the spool holds its limit (section 6.5,
-steps W1 and W3). INPUT_END marks the end of the spool. While the data
-reader waits, it reads nothing from the data session, so it cannot see
-the EOF that the loss of the session causes (section 6.9).
+- **O1.** At the stop, end. Else read command stdout.
+- **O2.** If the read finds no bytes (`EAGAIN`), in eager delivery mark an
+  idle point in the spool, unless no byte came since the last one. Wait
+  until command stdout or the stop pipe is ready, and go to step O1. At the
+  EOF of command stdout, end the spool, and end. A read error ends the run
+  with `die`.
+- **O3.** Append the bytes to the spool, which waits while the spool holds
+  its limit, until the stop (section 6.5, steps W1 and W3). Go to step O1.
 
-The sender's **session watcher**, from the sender's HELLO:
+At its end, the stdout reader closes its end of command stdout. After the
+stop, the command's next write to its stdout then fails with `EPIPE`, or
+SIGPIPE ends the command, as at the end of the reader of a local
+pipeline. The command starts with the default action of SIGPIPE.
+
+The **data writer** of a stream:
+
+- **D1.** Unless the stream has stopped, take the next stream frame from
+  the encoder, and compress it into the stream's zstd frame at the level
+  and long-distance matching of the run, with `--compression-threads`
+  worker threads (section 8). Send each 256 KiB of compressed bytes in a
+  CHUNK.
+- **D2.** At a flush that the encoder asks for, make every byte so far
+  decodable, and send the CHUNK that holds the last bytes.
+- **D3.** At the end of the stream, end the zstd frame, send the last CHUNK
+  and STREAM_END, and flush the session. At the stop, end at once,
+  without STREAM_END: take no more frames, however many the encoder holds,
+  and send nothing more, also while zstd ends a job or the zstd frame. Only
+  a CHUNK that is on its way when the stop comes still goes out. A failure
+  to send is the loss of the session, which ends the run.
+
+With compression disabled, D1 to D3 send the stream frames as they are.
+
+The **decoder** of a stream:
+
+- **C1.** Read the next stream frame from the spool, decompressed. At the
+  normal end of the stream, end; on the server, the end of the decoder
+  closes the command's stdin. The normal end is the end of the zstd frame,
+  with its checksum, where a stream frame ends, with the end of the spool
+  right after it; without compression, the end of the spool where a
+  stream frame ends. A spool that ends inside the zstd frame or inside a
+  stream frame, a zstd frame without its checksum, and bytes after the
+  zstd frame, are protocol errors.
+- **C2.** Write the bytes of the frame to the destination: the payload of
+  LIT, the block of the pin at the output offset for REF (section 6.4), or
+  the repeated byte of RLE. Only RLE is written in pieces, of at most
+  256 KiB each: its 14 bytes can stand for terabytes.
+- **C3.** In a deduplicated stream, advance the output offset of the pins
+  (section 6.4). Go to step C1.
+
+After the stop, the decoder writes nothing more and checks nothing: the
+stopped spool gives EOF at once. On the server, the destination is the
+command's stdin, and the decoder writes it without blocking. Hashsync's
+end of that pipe is non-blocking, which no other process shares, so a
+write takes at most the room in the pipe. The decoder looks at the stop
+before each write, and while the pipe is full, it waits with `poll` for
+room or for the stop pipe. So neither a descendant of the command that
+holds the command's stdin without reading it, nor an RLE frame of 14
+bytes that stands for terabytes, keeps it writing after the stop. A
+failed write with `EPIPE` means that no process reads the command's stdin
+any more: the decoder raises the stop, closes the command's stdin, and
+ends. Other write failures end the run with `die`. On the client, the
+destination is stdout, which the decoder writes as `ssh` does: a write
+waits while stdout is full, so a consumer that pauses holds the stream
+back, and the spool takes the stream meanwhile. A failed write with
+`EPIPE` means that no process reads stdout any more: the decoder raises
+the stop of the backward stream, and ends. Other write failures end the
+run with `die`. Neither host watches an idle destination: the client
+learns that its stdout is broken only at its next write to it.
+
+**The stop.** Either stream can stop, and the host that receives it
+decides: the server stops the forward stream once no process reads the
+command's stdin, or once the command has exited, and the client stops the
+backward stream once no process reads its stdout. The first raise of a
+host's stop of a stream does this, under a lock that a raise on another
+thread at the same time waits for:
+
+- **S1.** Stop the stream's spool on this host (section 6.5): its reader
+  reads the EOF of the stop, its writer discards what it appends, and the
+  bytes that wait in it are dropped.
+- **S2.** On the host that receives a deduplicated stream, put the
+  receiver into Completing (section 6.4): its lookups end, and its index
+  closes, while the run goes on.
+- **S3.** Close the write end of the stop pipe, and disconnect the
+  channel of the stop.
+- **S4.** On the host that receives the stream, queue STOP for the control
+  writer, which sends it at once (section 6.2), so that the sending host
+  stops the stream too.
+
+The server raises the stop of the forward stream when a write of the
+decoder fails with `EPIPE`, at the exit of the command (step E1), and after
+a startup failure. The client raises it at STOP, or at END when END comes
+first: the two sessions are independent. The client raises the stop of the
+backward stream when a write of the decoder fails with `EPIPE`, and the
+server raises it at STOP. A later STOP, or one that comes after the stream
+has ended, changes nothing. STOP can come before the client starts its
+forward stream: the server starts the command right after the list
+exchange, the command can exit at once, and STOP travels on the other
+session. So the client's stops exist from before the sessions start. After
+END, the server needs no STOP: the client's stop of the backward stream
+then gives up its place in the queue of the control writer (section 6.9,
+step N1), and a later raise stops the stream on the client alone.
+
+A stopped end gives up at once. Every wait of its threads also waits for
+the stop: the waits of the source readers for their sources and for room in
+the spool, the takes of the spool by the data writer or the lookahead
+reader, the scanner's waits (section 6.3), the data reader's waits for room
+in the spool, and the decoder's waits for the spool and for room in the
+command's stdin. The sending end sends nothing more after the stop: no
+frame that its encoder still holds, nothing more of its zstd frame, and no
+STREAM_END; only a CHUNK that is on its way still goes out (step D3). The
+spool of the receiving host discards what arrives after its stop: its data
+reader takes CHUNK and STREAM_END the same way before and after the stop,
+since the sending host can send them before STOP reaches it. Between the
+two stops, the receiving host discards about what the link carries in one
+round trip. STOP travels on the control session, so it does not wait behind
+the stream of the other direction of the data session, which its host may
+still be taking at a slow consumer's pace (section 10).
+
+The server's **exit watcher**, from command startup:
+
+- **E1.** Wait until the command exits, without reaping it (section 6.8).
+  Then raise the stop, and end. The exit can come long before the EOF of
+  the command's stdout, which a descendant can hold. A descendant that
+  reads the command's stdin then reads EOF, as under SSH, where `sshd`
+  closes the stdin of a command that exited.
+
+The server's **session watcher**, from REQUEST:
 
 - **M1.** Wait until the data session hangs up, or the stop pipe reaches
   EOF. At the EOF of the stop pipe, end. A hangup ends the run with `die`:
-  the receiver disappeared. A pipe tells its hangup with `POLLHUP`, and a
+  the client disappeared. A pipe tells its hangup with `POLLHUP`, and a
   socket whose peer shut down its writes with `POLLRDHUP`; bytes that
   arrive do not end the wait.
 
-The sender's **stdin writer**, from command startup:
+The watcher exists because, until the stop, long stretches pass in which
+no thread of the server reads the data session: while its main thread
+updates its index, waits for `attach`, builds the table and ends its
+exchanges, and while the data reader waits at the limit of the forward
+stream's spool, where it reads nothing, and so would not see the EOF that
+the loss of the session causes. After the stop, the spool discards what
+arrives, and the data reader does not wait any more. The client needs no
+watcher: it sees the loss of the server on the control session.
 
-- **C1.** Take the next bytes of the input spool. At the end of the spool,
-  require that the zstd frame ended with the last byte, if the stream is
-  compressed. Then close the command's stdin, and end. At the EOF of a
-  stopped spool, close the command's stdin, and end.
-- **C2.** Decompress the bytes, and write the output to the command's
-  stdin, at most 256 KiB in each write. A failed write with `EPIPE` means
-  that no process reads the command's stdin any more: stop the input
-  (below), close the command's stdin, and end. Other write failures end the
-  run with `die`. When the input is stopped after a write, close the
-  command's stdin, and end: a few bytes of the input stream can decompress
-  to gigabytes, which have no use any more. Else go to step C1 once all the
-  output is written.
-
-The sender's **exit watcher**, from command startup:
-
-- **E1.** Wait until the command exits, without reaping it (section 6.8).
-  Then stop the input (below), and end. The exit can come long before the
-  EOF of the command's stdout, which a descendant can hold. A descendant
-  that reads the command's stdin then reads EOF, as under SSH, where
-  `sshd` closes the stdin of a command that exited.
-
-The input has no use any more once no process reads the command's stdin,
-or once the command has exited. Then each role stops it, once:
-
-1. The sender stops the input at `EPIPE` (step C2), at the exit of the
-   command (step E1), or after a startup failure, whichever comes first.
-   It stops its input spool (section 6.5), closes the write end of its
-   stop pipe, and sends INPUT_STOP on the control session, which the
-   control writer flushes at once (section 6.2). Before it sends END, the
-   sender stops the input too. A stop waits until a stop in progress on
-   another thread is done, so END always follows the stop. From then on,
-   the data reader discards the payloads of INPUT frames, until END_ACK.
-2. The receiver stops the input at INPUT_STOP, or at END when END comes
-   first: the two sessions are independent. It stops its input spool, and
-   closes the write end of its stop pipe. The input spool stops first, so
-   the input writer reads the EOF of a stopped spool, and sends no
-   INPUT_END. At END, before END_ACK, it joins the stdin reader and the
-   input writer.
-
-Between the two stops, the sender discards the input that arrives: about
-what the link carries in one round trip. INPUT_STOP travels on the
-control session, so it does not wait behind the output that the receiver
-must write before it reads END (section 10). As with SSH, the input that
-the receiver has read and not sent is lost, a command that neither reads
-nor closes its stdin makes a run with `--stdin` or `--batch-stdin` send
-up to the sender's limit of input for nothing, and such a run in the
-background of an interactive shell stops at its first read of the
-terminal.
+As with SSH, the bytes of a source that its sending host has read and not
+sent are lost at the stop, a command that neither reads nor closes its
+stdin makes a run send up to the server's spool limit of its stdin for
+nothing, and a run in the background of an interactive shell stops at its
+first read of the terminal, unless it has `-n`.
 
 Three waits can delay the end. When another program that reads the same
 terminal, such as a pager in the same pipeline, takes the bytes that
 `poll` reported, the stdin reader's read of the terminal waits for its
-next bytes or its EOF, and so does the receiver's join of the stdin
-reader at END, as `ssh` waits in its read; until then, the stream holds
-the input compressed after the last flush. A descendant of the command
-that holds the command's stdin without reading it keeps the stdin writer
-in a write, which otherwise fails with `EPIPE` at once after the
-command's exit. The sender joins the stdin writer after END_ACK, as it
-joins the stderr relay, so such a descendant delays DONE but not END
-(section 6.9). And zstd cannot cancel a job of its worker threads: after
-a stop before the EOF of stdin, the stdin reader ends only once they have
-compressed the jobs that zstd holds, about one for each worker thread,
-and the receiver's join of the stdin reader at END waits until then. For
-a producer that never pauses, with 12 worker threads, this took less
-than 0.1 s at level 9, 2.4 s at level 15, and about a minute at level 19.
+next bytes or its EOF, and so does the client's join of the stdin reader
+after END, as `ssh` waits in its read. zstd cannot cancel a job of its
+worker threads: after a stop, the data writer of the stream ends only once
+the workers have finished the jobs that zstd holds, about one for each
+worker thread; the client closes the data session only after that, and the
+server sends END only after that (section 6.9). For a producer that never
+pauses, with 12 worker threads, this took less than 0.1 s at level 9,
+2.4 s at level 15, and about a minute at level 19. And after the stop of
+the backward stream, the server sends END only once the command has
+exited: a command that ignores SIGPIPE and does not write again keeps the
+run open, as it keeps a local pipeline open.
 
 ### 6.7 Failures and trust
 
@@ -1715,63 +2004,66 @@ than 0.1 s at level 9, 2.4 s at level 15, and about a minute at level 19.
   failed command still transfers all its output and returns its status in
   END; a startup failure returns status 127 and error text.
 - External failures end the run without a core dump (section 6.9).
-  Receiver SIGINT/SIGTERM give status `128 + signal` (section 6.8). These
+  Client SIGINT/SIGTERM give status `128 + signal` (section 6.8). These
   end the run with `die`: different protocol versions, features that the
   run needs and the peer does not have, and unsupported HELLO parameters,
-  before command startup; truncated streams; broken sessions or receiver
-  stdout; stderr relay read, write, or flush failures; failed reads of the
-  receiver's stdin, and failed writes to the command's stdin other than
-  `EPIPE` (section 6.6); configuration errors, including conflicting
-  immutable-copy policies and duplicate or nested root paths; repeated
-  directory identities detected during expansion or traversal; failures of
-  the tmp_data directory setup, segment creation, segment I/O, or pin
-  verification, because a yes answer cannot be retracted; and cache
-  operation failures (section 5.6).
-- Bugs panic and abort: invalid frames, a compressed stream that ends
-  before END or on the control session, invalid compressed input, an
-  input stream that does not end with its zstd frame, unexpected answers,
-  missing pins, protocol arithmetic overflow, database errors, and
-  invariant violations.
+  before command startup; sessions that end or break before END; stderr
+  relay read, write, or flush failures; failed reads of the client's stdin
+  and of command stdout; failed writes to the command's stdin or to the
+  client's stdout other than `EPIPE`, which stops the stream (section 6.6);
+  configuration errors, including conflicting immutable-copy policies and
+  duplicate or nested root paths; repeated directory identities detected
+  during expansion or traversal; failures of the tmp_data directory setup,
+  segment creation, segment I/O, or pin verification, because a yes answer
+  cannot be retracted; and cache operation failures (section 5.6).
+- Bugs panic and abort: invalid frames, a stream that does not end as
+  section 6.6 says, the end of a zstd frame on the control session,
+  invalid compressed data, unexpected answers, missing pins, protocol
+  arithmetic overflow, database errors, and invariant violations.
 
 Use trusted peers: the sender learns hashes of all indexed content.
-`sender_cache = false` disables their retention and removes earlier caches
+`--no-sender-cache` disables their retention and removes earlier caches
 for that receiver/index (section 5.6).
 
 ### 6.8 Threads at run time
 
-Both roles use blocking threads and channels, with the threads of the table
-below. At the normal end, a thread ends when its work ends: what it reads
-reaches EOF or END, its queue closes because no thread can send to it any
-more, a write fails at an expected closure (section 6.9), the command
-exits, or a role stops the input (section 6.6). Then the main thread
-joins it, in the order of section 6.9; the reader of a spool joins the
-thread of the spool when it closes the spool. One thread is the
-exception: the receiver's signal thread stays until the process exits,
-and no thread joins it, so that SIGINT and SIGTERM during the end still
-give `128 + signal`.
+Both hosts use blocking threads and channels, with the threads of the
+table below. At the normal end, a thread ends when its work ends: what it
+reads reaches EOF or END, its queue closes because no thread can send to
+it any more, a write fails at an expected closure (section 6.9), the
+command exits, the stream stops (section 6.6), or the lookups reach
+Completing (section 6.4). Then the main thread joins it, in the order of
+section 6.9. One thread is the exception: the client's signal thread
+stays until the process exits, and no thread joins it, so that SIGINT and
+SIGTERM during the end still give `128 + signal`.
 
-| Role | Responsibilities |
-|---|---|
-| Sender main | Run the handshake, reading the data session itself until the list exchange is done, and start the command. Then obtain the command's exit status without reaping, wait for the completion conditions of section 6.9, and send DONE. |
-| Sender data reader | Read the data session once the list exchange is done: the input, END_ACK, and EOF. EOF before DONE means that the receiver disappeared. Append the input to the input spool (section 6.6). |
-| Sender spool thread | Copy command stdout into its spool until EOF, and in eager delivery mark its idle points (section 6.5). |
-| Sender output reader | Fill lookahead from the spool of command stdout, and pass its idle points to the scanner, until its EOF; then close the spool. |
-| Sender stderr relay | Copy command stderr to sender stderr through EOF and flush (section 6.1). |
-| Sender session watcher | Until the stop of the input, end the run at the hangup of the data session (section 6.6). |
-| Sender stdin writer | Decompress the input spool into the command's stdin (section 6.6). |
-| Sender exit watcher | Stop the input when the command exits (section 6.6). |
-| Sender scanner | Own records and query states; queue queries and output (section 6.3). |
-| Sender probe threads | Probe the parts of long stretches of windows for the scanner (section 6.3). |
-| Sender data writer | Drain output in order and compress; make the flush that the scanner queues once nothing is left to write, then tell the scanner that it is idle; finish and flush the stream after END. |
-| Sender control reader/writer | Receive answers, and send queries and INPUT_STOP promptly, independently of data output. |
-| Receiver main | Start SSH sessions, reconstruct stdout from the spool of the data session, validate completion, send END_ACK, and close both session stdin pipes after DONE (section 6.9). |
-| Receiver spool thread | Copy data-session stdout into its spool until EOF (section 6.5). |
-| Receiver stdin reader | Compress stdin into the input spool (section 6.6). |
-| Receiver input writer | Send the input spool in INPUT frames, and signal each one to the stdin reader (section 6.6). |
-| Receiver control reader/writer | Dispatch queries to lookup workers, stop the input at INPUT_STOP, and send answers promptly. |
-| Receiver lookup workers | Answer queries out of order (section 6.4). |
-| Receiver signal thread | Handle SIGINT/SIGTERM with status `128 + signal`. |
-| Attach relay | Copy both directions (section 6.1). |
+| Host | Thread | Responsibilities |
+|---|---|---|
+| Server | main | Run the handshake, reading the data session itself, and start the command. Then send the backward stream as its data writer, obtain the command's exit status without reaping, wait for the END conditions of section 6.9, and send END. |
+| Server | data reader | Read the data session once the handshake is done: the forward stream's CHUNK and STREAM_END, and EOF after END. |
+| Server | session watcher | Until the stop of the forward stream, end the run at the hangup of the data session (section 6.6). |
+| Server | stdout reader | Copy command stdout into its spool until its EOF or the stop of the backward stream, in eager delivery with its idle points, then close command stdout (section 6.6). |
+| Server | decoder | Decode the forward stream into the command's stdin, with the pins when it is deduplicated, and raise its stop at `EPIPE` (section 6.6). |
+| Server | exit watcher | Raise the stop of the forward stream when the command exits (section 6.6). |
+| Server | stderr relay | Copy command stderr to server stderr through EOF and flush (section 6.1). |
+| Server | control reader/writer | Pass the queries for a deduplicated forward stream to its lookup workers, and the answers for a deduplicated backward stream to its scanner, and raise the stop of the backward stream at STOP; send answers, queries, and STOP promptly, independently of the streams. |
+| Client | main | Start SSH sessions, run the handshake, then wait for END, and end the run (section 6.9). |
+| Client | data reader | Read the data session once the handshake is done: the backward stream's CHUNK and STREAM_END, END, and EOF. |
+| Client | decoder | Decode the backward stream into stdout, with the pins when it is deduplicated, and raise its stop at `EPIPE` (section 6.6). |
+| Client | stdin reader | Copy stdin into the forward stream's spool (section 6.6). |
+| Client | data writer | Send the forward stream (section 6.6). |
+| Client | control reader/writer | Pass the queries for a deduplicated backward stream to its lookup workers, and the answers for a deduplicated forward stream to its scanner, and raise the stop of the forward stream at STOP; send answers, queries, and STOP promptly. |
+| Client | signal thread | Handle SIGINT/SIGTERM with status `128 + signal`. |
+| Sender | lookahead reader | Fill the lookahead from the spool of the stream's source, and pass its idle points to the scanner, until its EOF or the stop; then close the spool at its end. |
+| Sender | scanner | Own records and query states; queue queries and frames (section 6.3). |
+| Sender | probe threads | Probe the parts of long stretches of windows for the scanner (section 6.3). |
+| Receiver | lookup workers | Answer queries out of order, until Completing (section 6.4). |
+| Attach | relay | Copy both directions (section 6.1). |
+
+The sender of a deduplicated stream is its sending host, and the receiver
+its receiving host: in a pull the server and the client, in a push the
+other way around. With both streams deduplicated, each host runs the
+threads of both roles, one for each stream.
 
 Blocking output provides backpressure, which the spools absorb up to their
 limits (section 6.5); it must not prevent independent control traffic.
@@ -1791,19 +2083,19 @@ or join blocked threads. Persistent state is recoverable: RocksDB recovers
 from its write-ahead log, and cache publication is atomic. Kernel
 descriptor closure propagates EOF or errors to peers.
 
-Each role has a `die(message)` callable from any thread. It reports the
+Each host has a `die(message)` callable from any thread. It reports the
 error, performs cleanup once, and exits without unwinding and without a
-core dump, with status 1, or `128 + signal` when the receiver has received
+core dump, with status 1, or `128 + signal` when the client has received
 SIGINT or SIGTERM (section 6.8). Concurrent callers wait for that cleanup
 rather than exiting ahead of it:
 
-- Sender: SIGKILL the command's process group and remove the rendezvous
+- Server: SIGKILL the command's process group and remove the rendezvous
   socket.
-- Receiver: SIGKILL both SSH processes, causing sender stdin EOF and
+- Client: SIGKILL both SSH processes, causing the server's stdin EOF and
   cleanup, and restore the flags of stdin, when the stdin reader made it
   non-blocking (section 6.6). Unlike `ssh`, which leaves them changed at
   a fatal exit, every end restores them, also the normal end.
-- Process exit closes the unlinked segments of both roles, which frees all
+- Process exit closes the unlinked segments of both hosts, which frees all
   their storage.
 - Abandoned cache temporaries remain until the next exchange of that peer
   and index, or until expiry (section 5.6).
@@ -1812,12 +2104,12 @@ Build with `panic = "abort"`; install a panic hook that performs the same
 cleanup before aborting. External failures use `die`; bugs and database
 errors abort with a core dump (section 6.7).
 
-Both roles block SIGXFSZ in every thread, so that a write past the
+Both hosts block SIGXFSZ in every thread, so that a write past the
 file-size limit fails with `EFBIG` and the run ends through `die`, with its
 cleanup; the default action of the signal would end the process without
-it. The receiver also blocks SIGINT and SIGTERM in every thread, for its
+it. The client also blocks SIGINT and SIGTERM in every thread, for its
 signal thread (section 6.8). A blocked signal stays blocked across
-`exec`, so each role starts its children with the signal mask that it
+`exec`, so each host starts its children with the signal mask that it
 started with.
 
 Only the normal end runs the C library's exit handlers, after the
@@ -1828,151 +2120,129 @@ must neither wait for a background job nor destroy RocksDB's static
 objects under them. The index recovers from its write-ahead log, as after
 a crash.
 
-The receiver monitors both sessions and termination signals. The sender
-monitors stdin and the control socket. Its main thread reads stdin during
-the list exchange and the data reader reads it afterwards, but stdin can
-still go unread for a long time: while the main thread waits for `attach`,
-while it builds the table, publishes the target and ends its exchange
-before it starts the data reader, and while the data reader waits at the
-limit of the input spool (section 6.6). So until the input stops, the
-session watcher monitors stdin as well. Unexpected EOF or session loss is fatal, also during rendezvous and setup,
-when no command output is flowing. A broken stdout is detected when a write
-to it fails; neither role watches an idle stdout. As under plain SSH, a
-consumer that exits after it reads all output does not fail the run. Normal
-shutdown uses END_ACK, not stdin EOF, to establish receiver completion, and
-DONE, not stdout EOF, to establish sender completion.
+The client monitors both sessions and termination signals. The server
+monitors stdin and the control socket: its main thread reads stdin during
+the list exchanges, the data reader reads it afterwards, and the session
+watcher covers the stretches in which neither reads it (section 6.6).
+Before END, EOF or the closure of a session means that the other host
+disappeared, which is fatal on both hosts, also during rendezvous and
+setup, when no stream flows. The server's fatal end then kills the
+command's process group, also while a descendant still holds the command's
+stderr. A broken stdout of the client is no failure: it stops the backward
+stream (section 6.6), and the run ends with END and the command's status,
+as the producer of a local pipeline ends with its own status. A consumer
+that exits after it reads all output changes nothing.
 
-Successful sender completion requires:
+**END.** The run ends with END, which the server sends, with the
+command's status, once it needs nothing more from the client:
 
-- Command stdout has reached EOF and all its bytes have been represented by
-  data frames followed by END with the command's exit status. The compression
-  stream, if enabled, is finished and data-session output is flushed.
-- Command stderr has reached EOF and the relay has forwarded and flushed
+- the command has exited, or failed to start;
+- the backward stream has ended or stopped: its STREAM_END goes out
+  before END, unless the client stopped it. A command that failed to start
+  has an empty backward stream;
+- the forward stream has ended or stopped, and its decoder has ended;
+- command stderr has reached EOF, and the relay has forwarded and flushed
   all its bytes to SSH.
-- One valid END_ACK has been received in response to END. An unsolicited or
-  duplicate acknowledgement is a protocol error.
 
-The implementation chooses the ordering and synchronization of these
-conditions; no particular event ordering or state machine is required.
-Startup failure has no command streams to drain.
+Before END, the server joins the threads whose work ends with these
+conditions. Its main thread is the backward stream's data writer. The exit
+watcher and the main thread both wait for the exit of the command, so only
+the join of the exit watcher, which raises the stop of the forward stream,
+puts STOP before END in the control writer's queue; the control writer can
+still hold it when END goes out. The decoder ends at the end of the forward
+stream or at that stop. The stdout reader ends at the EOF of command stdout
+or at the stop of the backward stream, and its counts go into END. The
+scanner joins its probe threads.
 
-Keep sender stdout open until process exit. Join the threads whose work
-ends with the command's streams or with END: the output reader after the
-EOF of the spool of command stdout, which it closes, so that it joins the
-spool's thread; the data writer after END; and after END_ACK, the session
-watcher, which ends at the stop of the input, the exit watcher, which
-ends at the exit of the command, the stdin writer, which can wait for a
-descendant that holds the command's stdin (section 6.6), and the stderr
-relay for its completion condition. Once the completion conditions hold,
-perform normal cleanup once:
+The server, after END:
 
-1. Shut down the control socket. `attach` then relays the rest of the
-   socket to its stdout, and discards its stdin until EOF (section 6.1).
-   Join the control reader, which then reads EOF, and the control writer,
-   which ends when its queue is closed and empty or a write fails. Socket
-   EOF and a failed write are expected closure then.
-2. End the probe threads and join them.
-3. Send DONE and flush the data session: the sender needs neither session
-   any more.
-4. Join the data reader. It reads stdin to EOF, which the receiver causes
-   after DONE. Before DONE, EOF or a read error remains the receiver's
-   disappearance and is fatal. A read error is fatal also after DONE. A
-   byte after END_ACK is a protocol error.
-5. Remove the rendezvous socket and exit zero.
+- **F1.** Join the data reader, which reads stdin to EOF; the client causes
+  the EOF after END.
+- **F2.** Shut down the control socket, only after the EOF of the data
+  session, so the client never sees the control session close before
+  END. `attach` then relays the rest of the socket to its stdout, and
+  discards its stdin until EOF (section 6.1). Join the control reader,
+  which reads EOF, and the control writer, which ends once its producers
+  are gone, or when a write fails.
+- **F3.** Join the session watcher, which ended at the stop of the forward
+  stream. With a deduplicated forward stream, join its lookup workers,
+  which ended at Completing, and close its pins. Remove the rendezvous
+  socket, and exit zero.
 
-Receiver completion:
+The client, at END:
 
-1. After END, the receiver stops the input, unless INPUT_STOP has stopped
-   it, and joins the stdin reader and the input writer (section 6.6). It
-   consumes the rest of that zstd frame, checking its trailer and
-   rejecting any further decoded bytes. Stop at frame completion without
-   waiting for transport EOF; when compression is disabled END is
-   sufficient framing. Flush reconstructed stdout.
-2. The receiver enters Completing before sending and flushing END_ACK on
-   the data session. It stops admitting lookups and publishing control
-   replies, and closes the queue of replies. Late control traffic can be
-   discarded. Workers returning later discard their results, including
-   results of unfinished segment writes, and release the extents of those
-   writes.
-   Control EOF, broken pipes, and a partial final control frame or
-   compressed block in Completing are expected closure, not failures.
-3. The receiver reads DONE, which directly follows the zstd frame. EOF or
-   another frame before DONE fails the run.
-4. The receiver closes both session stdin pipes, in this order:
-   1. Close the data session's stdin.
-   2. Join the control writer. It ends when its queue is closed and empty,
-      after it has sent the queued replies, or when a write fails.
-   3. Close the control session's stdin.
+- **N1.** Raise the stop of the forward stream, unless STOP has raised
+  it. Let the stop of the backward stream give up its place in the queue
+  of the control writer: the server needs no STOP any more.
+- **N2.** Close the data session's stdin once the forward data writer has
+  ended, then the control session's once the control writer has ended:
+  that writer ends once its producers have dropped their senders of its
+  queue, the pins of a deduplicated backward stream at Completing (section
+  6.4), the scanner of a deduplicated forward stream at the end of its
+  scan or at the stop (section 6.3), and the stop of the backward stream
+  at its raise or at step N1. Neither close waits for the EOF of a stdout
+  pipe (section 10).
+- **N3.** Join the decoder, which writes the rest of the backward stream
+  from its spool to stdout, and checks the end of the stream, or ends at
+  the stop of the backward stream, also when stdout breaks after END; the
+  data reader, which reads the data session to its EOF, and takes any
+  byte after END as a protocol error; the control reader, which reads the
+  control session to its EOF, so that SSH never fails with a broken pipe;
+  the stdin reader; and with a deduplicated forward stream, the output
+  reader and the scanner.
+- **N4.** Observe both SSH exits without reaping. Both must exit zero;
+  otherwise the run failed even though END arrived. A failure in steps N2
+  to N4 ends the client with `die`, also after END.
+- **N5.** With a deduplicated backward stream, join its lookup workers,
+  which ended at Completing, and close its pins: all their open segments,
+  which frees all their storage. The tmp_data directory closes with its
+  last user. The index closed when the lookups ended.
+- **N6.** Print the summary (section 8) and exit with END's command
+  status.
 
-   Neither close waits for the EOF of a stdout pipe (section 10).
-5. The receiver drains the spool of the data session to its EOF, which
-   follows transport EOF, rejecting any bytes after DONE. It closes the
-   spool, which joins the spool's thread. Then it ends its other threads,
-   in this order:
-   1. Join the control reader. It reads control-session stdout to EOF, also
-      in Completing, so it does not close the pipe while SSH can still
-      write to it: SSH would fail with a broken pipe. Its end closes the
-      query queue.
-   2. Join the lookup workers. In Completing, a worker skips the queries
-      that are still in the queue and reads no candidates for them; a
-      lookup in progress finishes first.
-6. The receiver observes both SSH exits without reaping. Both must exit
-   zero; otherwise the transfer failed even if END was received. Then it
-   closes what the threads used, in this order:
-   1. Close the pins: close all their open segments, which frees all their
-      storage. The tmp_data directory closes with its last user, the
-      pins.
-   2. Close the index: first the database, then its lock (section 4.4).
-7. The receiver prints the summary (section 8) and exits with END's command
-   status.
-
-The receiver's Completing transition uses the same lock as pin allocation
-and answer publication, so that a late lookup cannot prolong the exchange.
-Sender stdin EOF before DONE remains a failure, and so does control EOF
-before the sender shuts down the control socket: the receiver closes those
-pipes only after DONE. Failures during stream validation, stdout flushing,
-sending END_ACK, or reading DONE take the fatal cleanup path.
+After END, EOF, also inside a frame, and failed writes on either session
+are the normal end. The implementation chooses the ordering and
+synchronization of the END conditions; no particular event ordering or
+state machine is required.
 
 A descendant retaining command stdout or stderr keeps the run open, as
-under plain SSH; this is expected behavior. A descendant that holds the
-command's stdin, and does not read it, delays DONE too, but not END
-(section 6.6). In the same way, a process that inherited a session's stdout
-pipe from SSH delays the receiver's end until it closes the pipe, but not
-the sender's. A lookup or segment I/O that stalls, for example on an
-unresponsive NFS mount, delays the receiver's end until the I/O completes.
+under plain SSH; this is expected behavior, until the client stops the
+backward stream, when no process reads its stdout any more: the stdout
+reader then closes command stdout. A descendant that holds the command's
+stdin delays nothing: the stop ends the decoder (section 6.6). A process
+that inherited a session's stdout pipe from SSH delays the client's end
+until it closes the pipe, but not the server's. A lookup or segment I/O
+that stalls, for example on an unresponsive NFS mount, delays the end of
+its host until the I/O completes. After a client fails after END, the
+server ends normally: by then, the only processes left in the command's
+group are descendants that have closed the command's stdout and stderr.
 After fatal cleanup, a descendant that left the process group can survive
 and will get a broken pipe on its next write to either closed output pipe.
 
 ## 7. Configuration
 
-Use `$XDG_CONFIG_HOME/hashsync/config.toml`, or `--config PATH`:
+Use `$XDG_CONFIG_HOME/hashsync/config.toml`, or `--config PATH`. A
+configuration file describes only its own host, whatever roles the host
+plays in a run. Each host reads its own file: the client when it starts,
+and `serve` once REQUEST has told it its roles. The receiver needs a file,
+for its roots and its index. A sender uses only `tmp_data_dir`, where its
+spools go, and `hashlist_max_age`, how long its list cache keeps lists;
+without a file, it uses their defaults. So the server of a pull and the
+client of a push need no file, and with both streams deduplicated, both
+hosts need one. A file that `--config` names must exist.
+
+Everything about a run is an option of `hashsync ssh` (section 8), which
+the client sends to the server in REQUEST, so it is never ambiguous which
+settings apply.
 
 ```toml
 block_size     = "16KiB"   # at least 512 bytes; changes rebuild the index
 strong_hash    = "blake3"  # blake3 or sha256
 candidate_attempts = 128  # candidates tried per query, at least 1
-hashlist_max_age = "30d"
+hashlist_max_age = "30d"   # how long this host's list cache keeps a list
 index_path     = "~/.local/state/hashsync/default.db"  # a directory
 threads        = 0         # 0 = 4 × cores, clamped to 16–64
-lookahead      = "256MiB"  # at least block_size; default max(256 MiB, 3 × block_size), for the probe threads
-sender_output_spool_limit   = "2GiB"  # command stdout that can wait on the sender, or "unlimited"
-receiver_output_spool_limit = "2GiB"  # data session that can wait on the receiver, or "unlimited"
-receiver_input_spool_limit  = "2GiB"  # input stream that can wait on the receiver, or "unlimited"
-sender_input_spool_limit    = "2GiB"  # input stream that can wait on the sender, or "unlimited"
-tmp_data_dir   = "~/.cache/hashsync/tmp-data"  # receiver segments; any filesystem
-negative_cache = "128MiB"
-probe_threads  = 0         # 0 = half the sender's cores, at least one
-compression_level   = 9    # zstd 1–19; 0 disables
-compression_long    = true # zstd long-distance matching, 128 MiB window
-compression_threads = 0    # data and input streams; 0 = half the cores, at least one
-ssh            = "ssh"     # shell-split command; appends -o Compression=no
-sender_command = "hashsync"
-sender_cache   = true
-
-[hosts.builder]            # overrides keyed by the run command's HOST argument
-ssh            = "ssh -p 2222 -i ~/.ssh/builder"
-sender_command = "/run/current-system/sw/bin/hashsync"
-sender_cache   = false
+tmp_data_dir   = "~/.cache/hashsync/tmp-data"  # segments of pins and spools; any filesystem
 
 [[roots]]
 path = "/nix/store/*"      # each match is a root; includes dot names
@@ -1999,9 +2269,8 @@ these are TOML options.
 **Byte strings.** TOML strings contain Unicode characters, not arbitrary
 bytes. Even TOML 1.1's `"\xFF"` denotes U+00FF, whose UTF-8 bytes are
 `C3 BF`, not the single byte `FF`. After TOML parsing, `hashsync` interprets
-the following syntax in `index_path`, `tmp_data_dir`, `sender_command`,
-root `path` and `exclude` values, and identifier `literal` and `strip_prefix`
-values. For `ssh`, shell-split first, then decode each argv word.
+the following syntax in `index_path`, `tmp_data_dir`, root `path` and
+`exclude` values, and identifier `literal` and `strip_prefix` values.
 
 | Text after TOML parsing | Meaning |
 |---|---|
@@ -2042,32 +2311,101 @@ exclude = ['*.tmp', 'literal\x2Aname', 'back\\slash']
 
 - `hashsync update [--rebuild] [-j N]`: update or rebuild the index;
   `-j` overrides the configured thread count.
-- `hashsync run [--stdin] [--batch-stdin] [--batch-stdout] [--no-update]
-  [--ssh CMD] [USER@]HOST -- COMMAND ARGS...`: run the remote command,
-  reproduce stdout, and return its status. The command reads EOF from its
-  stdin at once, as with `ssh -n`: the run reads `/dev/null` in place of
-  its stdin, and nothing from its stdin. `--stdin` gives the command this
-  process's stdin instead: as `ssh` does, the run then reads its stdin
-  while the command runs (section 6.6). The output and the input have
-  eager delivery (section 6.2). `--batch-stdout` gives the output batch
-  delivery, and `--batch-stdin` gives the input batch delivery, and also
-  gives the command this process's stdin, as `--stdin` does.
-  `--no-update` skips the index update, takes read-only index access
-  (section 4.4), and still resolves current roots (section 4.2). After a
-  successful transfer, also when the command fails, print a summary of two
-  lines to stderr:
-  1. The output bytes, as literal, reference, and run bytes; the wire
-     bytes, which the receiver read from the data session; and the
-     hash-list and delta bytes.
-  2. As rsync does, the bytes that the receiver sent and received on both
+- `hashsync ssh [OPTIONS] [-l USER] [USER@]HOST [--] COMMAND [ARGS...]`:
+  run the remote command as ssh does, reproduce its stdout, and return its
+  status. It takes the arguments that rsync gives its remote shell
+  (`do_cmd` in rsync's `main.c`), so `rsync -e 'hashsync ssh'` works:
+  - By default, the run deduplicates the command's stdout against the
+    client's index: a pull. With `--dedup-stdin`, it deduplicates its
+    stdin against the server's index instead, and the command's stdout
+    comes back plain: a push (section 6.6). So `rsync -e 'hashsync ssh'`
+    pulls with deduplication, and `rsync -e 'hashsync ssh --dedup-stdin'`
+    pushes with it. `--dedup-stdout` deduplicates the command's stdout,
+    which is the default without `--dedup-stdin`; with both options, the
+    run deduplicates both streams, and both hosts update their index
+    (section 4.4).
+  - Options can also follow HOST, as with ssh, which goes on parsing
+    options after the destination. The command starts at the first
+    argument after HOST that is neither an option nor the value of one,
+    or right after `--`, so a command that starts with `-` needs `--`.
+  - `-l USER` gives the remote user, and goes to SSH as it is.
+  - By default, the client joins COMMAND and ARGS with single spaces, as
+    ssh does, and the server runs that line with the user's shell
+    (section 6.1). rsync escapes its arguments for that shell (`safe_arg`
+    in `options.c`), so a path with spaces arrives intact.
+  - `-s` (`--no-shell`) sends the words as they are, and the server runs
+    them without a shell. With rsync, use it only together with rsync's
+    own `-s`, which sends the paths inside rsync's protocol: without it,
+    rsync puts a backslash before the spaces and the other shell
+    characters of each path, which only a shell removes. So `rsync -e
+    'hashsync ssh -s' src/ nas:'dst dir/'` would write into a new
+    directory named `dst\ dir` and report success. An `--rsync-path` with
+    shell syntax, such as `sudo rsync`, also needs the default mode.
+  - As ssh does, the run sends its stdin to the command (section 6.6). `-n`
+    (`--no-stdin`) sends an empty forward stream, as `ssh -n` reads
+    `/dev/null` in place of stdin: the command reads EOF at once, and the
+    run reads nothing from its stdin; `-n` with `--dedup-stdin` is a usage
+    error. As with ssh, a run in the background of an interactive shell
+    stops at its first read of the terminal, so such a run needs `-n`.
+    Under `nohup`, which replaces a terminal stdin with `/dev/null` opened
+    for writing, the read of stdin fails and ends the run with `die`, where
+    ssh reads EOF, so `-n` is needed there too.
+  - Both streams have eager delivery (section 6.2). `--batch-stdout`
+    gives the backward stream batch delivery, and `--batch-stdin` the
+    forward stream; `-n` with `--batch-stdin` is a usage error.
+  - `--no-update` skips the update of each receiver's index, takes
+    read-only index access (section 4.4), and still resolves current roots
+    (section 4.2).
+  - `--ssh CMD` (default `ssh`) and `--hashsync-path PATH` (default
+    `hashsync`) say how the client starts the server (section 6.1).
+  - The other options set the transfer: `--lookahead SIZE` (section 6.3),
+    `--negative-cache SIZE` (128 MiB), `--probe-threads N` (0 for half the
+    cores of the sender), `--compression-level N` (9; from 1 to 19, and 0
+    disables compression), `--no-compression-long`,
+    `--compression-threads N` (0 for half the cores of the host that
+    compresses, at least one), `--spool-limit SIZE` (2 GiB, or
+    `unlimited`, for every spool on both hosts; section 6.5), and
+    `--no-sender-cache` (section 5.6). The default lookahead is the larger
+    of 256 MiB and three blocks of the receiver, which leaves room for the
+    probe threads. A `--lookahead` below one block of the receiver is a
+    user error, which the client reports: for a deduplicated backward
+    stream before SSH starts, and for a deduplicated forward stream after
+    the server's HELLO, before the command starts. A lookahead buffer or
+    probe threads that the sender's host cannot provide end the run before
+    the sender's HELLO (section 6.2).
+
+  After a successful transfer, also when the command fails, the client
+  prints a summary to stderr:
+  1. One line for each stream, `stdout` first, then `stdin`. A stream is
+     whole when its source reader reached the EOF of its source and its
+     destination took every byte that the source reader read, whether or
+     not a stop came. The stdin reader also reaches the EOF when it finds
+     stdin at its EOF at the stop (section 6.6). A whole stream shows the
+     bytes of the stream, and its wire bytes: the bytes of its CHUNK
+     payloads. The line of a deduplicated stream also gives its literal,
+     reference, and run bytes, and the hash-list and delta bytes of its
+     list exchange: `stdout -- 10.00 MiB (2.00 MiB literal, 8.00 MiB
+     reference, 0 B run), 1.10 MiB wire, 12.00 KiB hash list, 0 B delta`,
+     and for a plain stream, `stdin -- 0 B, 13 B wire`. Any other stream
+     stopped, and shows the bytes that its sender read from its source,
+     `pipe closed`, the CHUNK bytes that its receiver decoded, and those
+     that it dropped undecoded, which together are all the CHUNK bytes of
+     the stream, and the bytes that its destination took: `stdin -- 2.09
+     MiB read, pipe closed, 1.01 MiB wire, 36.00 KiB dropped, 1.05 MiB
+     written`. The server counts what its decoder of the forward stream
+     decoded and wrote, and what its stdout reader read, which END carries
+     (section 6.2); the client counts the rest.
+  2. As rsync does, the bytes that the client sent and received on both
      sessions, the elapsed time of the run, including its index update,
      the rate of the sent and received bytes in that time, and the
-     speedup: the output bytes divided by the sent and received bytes.
-     These counts do not include the bytes that SSH adds or the command's
-     stderr. They are exact: the receiver prints the summary after the
-     threads that count the bytes have ended (section 6.9).
+     speedup: the bytes that the destinations of both streams took,
+     divided by the sent and received bytes. The CHUNK bytes of a stopped
+     stream that its receiver dropped count as traffic. These counts do
+     not include the bytes that SSH adds or the command's stderr. They are
+     exact: the client prints the summary after the threads that count
+     the bytes have ended (section 6.9).
 - `hashsync serve --token T` and `hashsync attach --token T`: internal
-  sender entry points.
+  server entry points.
 - `hashsync stats`: report index statistics.
 - `hashsync prune`: remove the paths and roots that no configured copy
   holds any more (section 4.2).
@@ -2079,6 +2417,17 @@ Every command also accepts these options, besides `--config PATH`
   stderr. Warnings and errors stay.
 - `--no-human-readable`: show all amounts of bytes as whole bytes.
 
+`hashsync ssh` sends both to the server in REQUEST, and the server applies
+them to its own notes.
+
+SSH carries the server's stderr to the client's, where its lines mix with
+the client's own. So once `serve` and `attach` run, every line that they
+write, notes, warnings, errors, and panic reports alike, starts with
+`hashsync (server): ` in place of `hashsync: `, and the user can tell on
+which host to act on it. Only a usage error of their command line, which
+comes before either runs, has no marker. The command's stderr passes
+through unchanged.
+
 Summaries and statistics show an amount of bytes below 1 KiB as whole
 bytes, such as `512 B`, and a larger one with two decimal digits, rounded
 half up, such as `1.50 KiB`, in the first of KiB, MiB, GiB, TiB, and PiB
@@ -2088,7 +2437,9 @@ and messages that help to debug show exact byte counts, because rounding
 could make them unclear.
 
 ```sh
-hashsync run backup@nas -- tar -C /srv/data -cf - . | tar -C /srv/data -xf -
+hashsync ssh -n backup@nas tar -C /srv/data -cf - . | tar -C /srv/data -xf -
+tar -C /srv/data -cf - . |
+    hashsync ssh --dedup-stdin backup@nas tar -C /srv/data -xf -
 ```
 
 ## 9. Libraries
@@ -2254,13 +2605,13 @@ decision history, including fuller measurements, is in version control.
 - **Spooling the reconstructed output:** it would write every referenced
   block a second time, and every run in full. For 3.29 GB of `/nix/store`
   files, 97% references at 4 KiB blocks, the data session took 6.3 MB, and
-  such a spool would take 3.29 GB. The spool of the data session keeps the
-  transfer going instead; only the local reconstruction waits for stdout.
+  such a spool would take 3.29 GB. The spool of the receiving end keeps
+  the transfer going instead; only the decoder waits for the destination.
 - **Spools without a limit:** with a slow link, the sender's spool would
   grow to almost the whole output: about 1.9 TB for `tar` of 2 TB at
   200 MB/s over 10 MB/s. Only the command would end sooner, not the
-  transfer. On the receiver, a stopped consumer would let almost the whole
-  data session wait on the disk that the consumer may be writing to.
+  transfer. On the client, a stopped consumer would let almost the whole
+  backward stream wait on the disk that the consumer may be writing to.
 - **A lookahead mapped from the spool:** it would allow a much larger
   `lookahead`, but a rejection makes the scanner scan again up to
   `lookahead` bytes (section 6.3), 6–44 min for 128 GiB, and the query
@@ -2268,22 +2619,22 @@ decision history, including fuller measurements, is in version control.
   command run ahead of the scanner. It would save 0.15–0.35 s per GiB of
   copies, at the cost of unsafe slices over mappings and SIGBUS in place
   of `die`.
-- **The scanner reading the spool of command stdout itself:** the read
-  from the segments would move to the scanner thread, which limits the
-  sender on new output: up to 12% of a scan.
+- **The scanner reading the spool of its source itself:** the read from
+  the segments would move to the scanner thread, which limits the sender
+  on new bytes: up to 12% of a scan.
 - **Truncating a segment before it closes:** the NFS and SMB clients write
   all dirty data to the server before they send a truncation
   (`nfs_setattr`, Linux 6.18), and on local filesystems, the close of an
   unlinked file already discards its pages.
 - **Batch delivery only:** the scanner keeps the last `B − 1` bytes and a
-  short last literal until EOF, and the data stream keeps frames until
-  END, so a command that writes its next output only after the consumer
-  has answered the last, such as the remote end of `rsync -e`, waits
-  forever. Eager delivery costs bytes and CPU instead, where the link has
-  room for them: each flush ends a zstd block or job early, and a block or
-  a run whose window spans an idle point becomes literal. For a 72 MB
-  text tar without matches, at level 9, paced at 2 MB/s and 20 MB/s,
-  eager delivery sent 4.0% and 1.0% more bytes than batch delivery, with
+  short last literal until EOF, and each stream keeps its last frames until
+  its STREAM_END, so a command that writes its next output only after the
+  consumer has answered the last, such as the remote end of `rsync -e`,
+  waits forever. Eager delivery costs bytes and CPU instead, where the link
+  has room for them: each flush ends a zstd block or job early, and a block
+  or a run whose window spans an idle point becomes literal. For a 72 MB
+  text tar without matches, at level 9, paced at 2 MB/s and 20 MB/s, eager
+  delivery sent 4.0% and 1.0% more bytes than batch delivery, with
   40% and 5% more sender CPU; over a link of 200 KB/s, 0.4% more. For a
   tar of 631 MB of indexed files at 16 KiB blocks, paced at 20 MB/s and
   100 MB/s, it made 300 and 52 blocks literal, and sent 3.04 MB and
@@ -2291,56 +2642,95 @@ decision history, including fuller measurements, is in version control.
   312 and 106 blocks literal, and ended after 31 s and 36 s, where batch
   delivery took 32 s and 49 s: batch delivery sends its last buffers only
   at the end.
-- **Sending the bytes of every idle point at once:** the first eager
-  design recorded the tail and flushed at each idle point that the
-  scanner saw. The scanner scans up to `lookahead` ahead of emission, so
-  it still saw idle points while the data queue was full behind a slow
-  link, and the literal tails then waited in the queue. For the tar of
-  indexed files above, it made 2,281 and 1,515 blocks literal over links
-  of 200 KB/s and 50 KB/s, and took 63 s and 180 s; on a local link, 1,753
-  blocks at 20 MB/s. For the input, the stdin reader flushed while the
-  input writer waited on a link of 200 KB/s, and sent 0.2–0.3% more bytes.
-- **No worker threads for the data stream in eager delivery:** each flush
-  then ends only a zstd block. For the paced text above, eager delivery
-  then sent 0.4–0.6% fewer bytes than batch delivery with worker threads,
-  at about the same CPU. But a command that is faster than the scanner
-  gives no idle points, and its output compressed 2.0–3.7 times slower:
-  the unpaced text took 3.0–3.8 s instead of 1.0–1.5 s.
-- **No worker threads for the input stream in eager delivery:** each
-  flush would then end only a zstd block. For 72 MB of text paced at
-  2 MB/s, eager delivery with 12 worker threads sent 5.4% more bytes than
-  without them, and 8.3% more in writes of 4 KiB, with about 50% more CPU;
-  over an input link of 200 KB/s, which holds most flushes back, 0.6%
-  more. But without worker threads, a producer that never pauses waits for
-  one compressing thread: 72 MB of text took 2.3–3.0 s instead of
-  1.2–1.7 s, and 631 MB of binaries 21.9–22.8 s instead of 8.4–9.9 s.
-  Batch delivery, which flushes nothing, took 0.9–1.1 s and 3.4–3.5 s: in
-  eager delivery, the stdin reader empties the pipe sooner than the
-  producer fills it, so idle points still end zstd jobs.
-- **One zstd stream for the frames from the receiver to the sender:**
-  END_ACK would follow all the compressed input, so at END, the receiver
-  would send its whole input spool for a command that has exited, and the
-  sender would decompress all of it to find END_ACK.
-- **Discarding the input after `EPIPE`:** `sshd` discards the data of a
-  channel whose stdin is closed, and goes on reading it, so the receiver
-  would read and send all its stdin while the command runs. A first design
-  stopped reading the sender's input spool instead, which hid the loss of
-  the data session from the data reader. INPUT_STOP stops the receiver at
-  once; the cost is that the producer of stdin waits until the run ends,
-  where with SSH it could finish.
-- **Stopping the receiver's input only at END:** END can wait behind
-  `receiver_output_spool_limit` bytes for a slow consumer of stdout, and
-  the receiver would send its stdin for nothing until then: 3.54 GB in
-  6.4 s over local pipes, in a test.
-- **Joining the stdin writer before END:** END would wait for a descendant
-  that holds the command's stdin without reading it. Before INPUT_STOP
-  existed, the receiver also sent its stdin for nothing all that time:
-  2.73 GB in 4 s over local pipes.
-- **Credits for the input:** the receiver could send only the input that
-  the sender has room for, as an SSH channel window does, so that the data
+- **Sending the bytes of every idle point at once:** recording the tail,
+  and flushing, at each idle point that the scanner sees. The scanner
+  scans up to `lookahead` ahead of emission, so it still sees idle points
+  while the data queue is full behind a slow link, and the literal tails
+  then wait in the queue. For the tar of indexed files above, this made
+  2,281 and 1,515 blocks literal over links of 200 KB/s and 50 KB/s, and
+  took 63 s and 180 s; on a local link, 1,753 blocks at 20 MB/s. For a
+  plain forward stream, flushes at the idle points of stdin while the link
+  of 200 KB/s held the data writer back sent 0.2–0.3% more bytes.
+- **No worker threads for a deduplicated stream in eager delivery:** each
+  flush then ends only a zstd block. For the paced text above, eager
+  delivery then sent 0.4–0.6% fewer bytes than batch delivery with worker
+  threads, at about the same CPU. But a command that is faster than the
+  scanner gives no idle points, and its output compressed 2.0–3.7 times
+  slower: the unpaced text took 3.0–3.8 s instead of 1.0–1.5 s.
+- **No worker threads for a plain forward stream in eager delivery:**
+  each flush would then end only a zstd block. For 16 MiB of text paced at
+  2 MB/s, eager delivery with 12 worker threads sent 4.2% more bytes than
+  without them, and 5.2% more in writes of 4 KiB, with 64–70% more client
+  CPU; over a link of 200 KB/s, which holds most flushes back, 1.2% more.
+  But without worker threads, a producer that never pauses waits for one
+  compressing thread, in either delivery: 72 MB of text took 2.7 s instead
+  of 1.3 s, and 631 MB of binaries 24.7 s instead of 4.4 s.
+- **Compressing a plain forward stream before its spool:** the stdin reader
+  would compress stdin into the client's spool, and flush at an idle point
+  only once the data writer had sent every byte of the spool, which a count
+  of the bytes sent and an eventfd would tell it. With raw stdin in the
+  spool, and the compression in the data writer, the forward stream has the
+  flush rule of every stream. Against that design, with 12 zstd worker
+  threads at level 9, medians of five or six runs: 631 MB of binaries
+  through a pipe took 4.3–4.4 s instead of 8.9–11.0 s in eager delivery,
+  because stdin arrives faster than the data writer takes it, so no idle
+  point reaches the data writer, and no flush ends a zstd job early. 16 MiB
+  of text paced at 2 MB/s sent 1.6% fewer bytes in eager delivery, and 0.3%
+  fewer over a link of 200 KB/s. Batch delivery of the binaries took 2–3%
+  longer, with 2–4% more client CPU: the spool holds raw bytes, 3.7 times
+  as many as the compressed stream. The text took no longer.
+- **A flush every `lookahead` bytes for every stream, in the data
+  writer:** a plain stream holds back at most what makes 256 KiB of zstd
+  output, about 8 GiB of zeros at level 9, and 256 KiB without
+  compression, so the flush would cost it CPU and bytes for nothing: each
+  flush ends a zstd job early, and waits for the jobs that zstd holds. A
+  flush made at once, and not when the data writer has nothing left to
+  write, would cost the same on a busy writer, whose CHUNKs flow anyway.
+- **One zstd stream for all the frames of a direction of the data
+  session:** the receiving end would have to decode the stream, or skip
+  through it, to find the frames after it, such as END, also after a stop,
+  when the stream has no use any more.
+- **END as the end of the backward stream, in place of its STREAM_END:**
+  the backward stream's receiving end would need a special case, and the
+  client's lookups would run until END, with the index open.
+- **A plain stream as the scanner with an empty table,** with a fast path
+  that finds runs by checking one byte in every `B`: the scanner's buffer
+  grows to 2 × (lookahead + B), about 512 MiB with the defaults, for a
+  stream without queries, and its only gain over zstd is cheaper runs.
+- **Discarding the forward stream after `EPIPE`:** `sshd` discards the data
+  of a channel whose stdin is closed, and goes on reading it, so the client
+  would read and send all its stdin while the command runs. Stopping the
+  reads of the server's spool instead would hide the loss of the data
+  session from the data reader. STOP stops the client at once; the cost is
+  that the producer of stdin waits until the run ends, where with SSH it
+  could finish.
+- **Stopping the forward stream only at END:** END can wait behind
+  `--spool-limit` bytes of the backward stream for a slow consumer of
+  stdout, and the client would send its stdin for nothing until then:
+  3.54 GB in 6.4 s over local pipes, in a test.
+- **Credits for the forward stream:** the client could send only what the
+  server has room for, as an SSH channel window does, so that the data
   reader never waits at its limit. That needs a report on the control
-  session for each part of the input that the stdin writer takes; the
-  session watcher only watches for the hangup.
+  session for each part of the stream that the decoder takes; the session
+  watcher only watches for the hangup.
+- **Ending the run at a broken stdout of the client:** the client would
+  end with `die` at `EPIPE` on its stdout, and the server, which then sees
+  the client disappear before END, would kill the command's process group.
+  The command and its descendants would get SIGKILL where the end of the
+  reader of a local pipeline gives them SIGPIPE at their next write, the
+  run would print no summary, and the two streams would end in two ways.
+  The stop of the backward stream ends the run with END and the command's
+  status instead.
+- **Watching an idle stdout of the client:** a client thread could wait in
+  `poll` for `POLLERR` on a stdout pipe, which Linux reports once the
+  pipe's last reader has closed, and stop the backward stream right away.
+  Instead, the client learns that its stdout is broken only at its next
+  write, as `ssh` does, so the stop waits for the next CHUNK. For output
+  that compresses as well as that of `yes`, the next CHUNK can be far off:
+  with a release build over a local link, `hashsync ssh localhost yes |
+  head -c 1M` ended 0.49 to 12.5 s after `head` exited in a pull, and 0.35
+  to 2.6 s in a push, while the server read up to 4.5 GB of `yes`; a debug
+  build took up to 146 s.
 - **Compressing the hash list:** the weak hashes are uniform 64-bit
   values. For all of `/nix/store` at 4 KiB blocks, 14.0M values, the Rice
   code of section 5.4 is only 0.16% larger than the smallest encoding of a
@@ -2362,22 +2752,51 @@ decision history, including fuller measurements, is in version control.
   compressor while the scanner fills its lookahead with literal bytes
   would stop the output until its answer; answers kept until the lookup
   workers are idle would stop the scanner in the same way.
-- **Stdout EOF as the end of the sender:** the receiver could close each
+- **Stdout EOF as the end of the server:** the client could close each
   session's stdin at the EOF of that session's stdout, after `serve`
   closes it. With SSH multiplexing, this is a deadlock: the OpenSSH mux
   client (ControlMaster) keeps its stdout open until the session ends
   (`mux.c`, `mux_client_request_session`), and `serve` waits for stdin EOF
-  before it exits. A wrapper script that waits
-  for SSH holds the pipe in the same way. DONE needs no stdout EOF, and
-  stdin EOF always arrives: the receiver is the only writer of each stdin
-  pipe.
+  before it exits. A wrapper script that waits for SSH holds the pipe in
+  the same way. END needs no stdout EOF, and stdin EOF always arrives: the
+  client is the only writer of each stdin pipe.
+- **A push mode, or a second command such as `push` or `copy`:** the two
+  directions mirror each other, so the streams to deduplicate are options
+  of `hashsync ssh` (`--dedup-stdin`, `--dedup-stdout`), and the rest of
+  the run is the same for all of them. `copy` also suggests source and
+  destination paths.
+- **Run settings in configuration files:** a key would apply to some runs
+  and be ignored in others, and with a file on each host it would not be
+  obvious whose file decides. Every setting of a run is an option of
+  `hashsync ssh`, which REQUEST carries to the server (section 7).
+- **Sending stdin to the command only with an option:** rsync and other
+  programs that use `hashsync ssh` as their remote shell talk both ways and
+  expect ssh's default, so a pull through `rsync -e 'hashsync ssh'` would
+  fail at once.
+- **A limit for each spool:** separate limits for the spools of the two
+  hosts would need names after the roles, which are hard to tell apart;
+  one `--spool-limit` sets every spool.
+- **Keeping the client's lock through the server's update, with both
+  streams deduplicated:** two such runs in opposite directions between the
+  same hosts would each hold one index and wait for the other (section
+  4.4).
+- **Taking the two exclusive locks in the order of the indexes' IDs:** it
+  avoids that deadlock without releasing the client's lock, but both IDs
+  would have to be known before either update, so a message before the
+  server's update would carry the server's. `index_id` is stored in the
+  database, so reading it takes a lock; a rebuild renews it, so it can
+  change between the read and the lock; an index has none before its
+  first update; and copies of an index directory share it, so two runs
+  between such copies could not agree on an order.
+- **A lock attempt that fails at once instead of waiting:** contention
+  would then fail runs.
 
 ## 11. Repository conventions
 
 - One crate, one binary, committed `Cargo.lock`. All profiles use
   `panic = "abort"`; install cleanup hooks before starting threads.
 - Isolate unsafe syscall wrappers and SIMD code; deny unsafe code elsewhere.
-- Share protocol definitions between both roles. Until the first release,
+- Share protocol definitions between both hosts. Until the first release,
   the protocol version stays 1, and no change adds a feature. After that,
   any change that a peer can observe after the version exchange requires a
   protocol version bump or a new feature (section 6.2), for example a
@@ -2410,25 +2829,51 @@ decision history, including fuller measurements, is in version control.
     reads nothing, and a producer that waits when both spools of its
     stream are full;
   - delivery: in eager delivery, idle points that the reader of a spool
-    reports only when no byte follows them, the end of command stdout as
-    the last one, also when the end follows at once, the tail and the
-    short literal before an idle point, one flush after their frames, also
-    when the data queue is full at the last frame, a tail and flushes that
-    wait while the data writer or the input writer is busy and leave once
-    it is idle, a block that spans an idle point while the data session is
-    full, and a command and a consumer that answer each other through both
-    sessions, also after the command closed its stdout; in batch delivery,
-    a full buffer and the end of the stream as the only flushes;
-  - the input: with and without compression, `--stdin`, and
-    `--batch-stdin`; a run that ends with its command while stdin stays
-    open; a command that reads a part of its input, closes its stdin, or
-    exits while a descendant holds stdout or reads its stdin;
-    INPUT_STOP before CACHE_RESULT; END that does not wait for a
-    descendant that holds the command's stdin; the loss of the data
-    session while the data reader waits at its limit; a stop inside the
-    output of one read of the input spool; input streams that do not end
-    with their zstd frame; and a non-blocking stdin, unless it is a
-    terminal, with its flags restored at its EOF and at a fatal end;
+    reports only when no byte follows them, the tail and the short literal
+    before an idle point, one flush after their frames, a tail and flushes
+    that wait while the data writer is busy and leave once it is idle, a
+    block that spans an idle point while the data session is full, and a
+    command and a consumer that answer each other through both streams,
+    also after the command closed its stdout; in batch delivery, a full
+    buffer, the flush every `lookahead` bytes of a deduplicated stream, and
+    the end of the stream as the only flushes; in both, that flush,
+    counted from the last flush of any kind, and a deduplicated stream
+    whose source never pauses, which reaches its destination before its
+    end, in both directions;
+  - pushes: the tests of what deduplication does, of the list caches, of
+    the forward stream, and of `rsync -e`, in both directions; a client
+    without a configuration file; a command that updates the server's index
+    once its stdin has ended; a `--lookahead` below the block size of the
+    server's index; the loss of the client during the server's update; the
+    scanner's wait for an answer at the stop; and the descriptor limit of
+    the command;
+  - both streams deduplicated: end to end, with updates on both hosts and
+    with `--no-update`; a stop of the forward stream while the backward
+    one goes on; different block sizes and strong hashes on the two
+    hosts; two runs in opposite directions whose servers wait until both
+    clients have updated, which must both end; a rebuild of the client's
+    index before its HELLO, which ends the run before the command; a
+    command and a consumer that answer each other; and `rsync -e` both
+    ways;
+  - the streams: the forward stream with and without compression, in eager
+    and batch delivery, and `-n`; a run that ends with its command while
+    stdin stays open; a command that reads a part of its stdin, closes its
+    stdin, or exits while a descendant holds stdout or reads its stdin; a
+    consumer of the client's stdout that exits, which stops the backward
+    stream, also with both streams deduplicated; the summary line of a
+    stopped stream, with bytes that its receiver dropped, in both
+    directions; STOP before the client starts its forward stream, which
+    leaves stdin unread, and STREAM_END after STOP, on either host; the
+    look at whether stdin is at its EOF, for a file, `/dev/null`, a pipe, a
+    socket, and a terminal; a stop inside one RLE frame,
+    and while a descendant holds the command's stdin without reading it;
+    the loss of the client while the server's data reader waits at its
+    limit; the ends of a stream: a zstd frame cut short, bytes after it, a
+    cut inside a stream frame, and a stop inside it; a lookahead whose
+    buffer the sender cannot reserve, which ends the run before the
+    command; a client whose stdout is slow after END; and a non-blocking
+    stdin, unless it is a terminal, with its flags restored at its EOF and
+    at a fatal end;
   - one write call per frame, and non-blocking standard descriptors;
   - filesystem races and sparse files; reopening files and directories
     after rename or unlink; symlinks and special files, never opened for
@@ -2441,23 +2886,32 @@ decision history, including fuller measurements, is in version control.
     directory conflict; conflicting copy policies; a pruned immutable root
     that returns;
   - configuration byte escapes, TOML quoting, literal glob metacharacters,
-    and non-UTF-8 values;
+    and non-UTF-8 values; the server's own configuration file, and none;
+  - the command line of `hashsync ssh`: options after HOST, a command
+    without `--`, `-l`, a command line for the user's shell and the words
+    of `-s`, and `rsync -e 'hashsync ssh'` with a path with spaces, also
+    with rsync's own `-s` and with `-s` on both sides;
   - SSH option precedence; bootstrap quoting of executable paths with
     whitespace, quotes, shell metacharacters, and non-UTF-8 bytes; a
     different protocol version on either side, detected before the
     features; feature bits that a side does not know, on either side;
-  - crash recovery, process exclusion, and reads of later commits; cache
+  - crash recovery, process exclusion, the note of a process that waits for
+    a lock, and reads of later commits; the shared lock of a run after its
+    update, and the index closed at Completing while the run goes on; cache
     races, also a publication whose directory is gone and a listed name
     that a later run published again; fatal cache I/O failures, and a
     warning for an empty directory that stays; the advertisement and
-    removal of listed files, hidden names that are not temporaries, and
-    the removal of empty directories; and invalid cached lists;
+    removal of listed files, hidden names that are not temporaries, and the
+    removal of empty directories; and invalid cached lists;
   - completion without truncation or premature exit; complete stderr
     forwarding with backpressure and late stderr EOF from descendants;
-    truncated compression trailers; compressed control traffic that the
-    closure ends; late lookups; relay closure with control writes in
-    flight; shutdown on session loss; and fatal cleanup after a child's
-    exit status was collected without reaping.
+    compressed control traffic that the closure ends; late lookups; relay
+    closure with control writes in flight; EOF or a closed session before
+    END on either host, also while a descendant holds the command's stderr
+    and after the receiver entered Completing, and the normal end after
+    END, also when the data session ends inside a frame; END before STOP;
+    and fatal cleanup after a child's exit status was collected without
+    reaping.
 - Tests wait for events, also to check that something does not happen.
   Only when no event can show it can a test wait a fixed time, and then
   the end of that wait must be the success of the test: a slow machine

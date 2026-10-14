@@ -31,7 +31,7 @@ use rustix::fs::{Mode, OFlags};
 use rustix::io::Errno;
 
 use crate::config::Config;
-use crate::die::die;
+use crate::die::{self, die};
 use crate::fsops;
 use crate::hash::{PREFIX_LEN, weak};
 use crate::pool::Pool;
@@ -117,7 +117,8 @@ struct Shared {
 }
 
 /// The index of a process: read/write in a modifying process (`update`,
-/// `prune`, normal `run`), read-only in the others.
+/// `prune`, and the receiver of a run for its update), read-only in the
+/// others, and in that receiver after its update (`into_read_only`).
 pub struct Index {
     shared: Arc<Shared>,
 }
@@ -131,7 +132,9 @@ pub struct Reader {
 /// Open the lock file of the index at `path` and lock it, waiting forever
 /// on contention (DESIGN.md §4.4): exclusive and read/write for a
 /// modifying process, which creates the file, shared and read-only for the
-/// others.
+/// others. A lock that another process holds makes this process say, in a
+/// note, that it waits, and for which index: a wait can be long, and
+/// without the note it looks like a hang.
 ///
 /// The lock belongs to the open file description (`F_OFD_SETLKW`), not to
 /// the process as a classic POSIX lock does. Closing another descriptor of
@@ -142,6 +145,10 @@ pub struct Reader {
 /// that gets this lock never finds `LOCK` held. Close-on-exec keeps
 /// children from inheriting the descriptor, and so the lock.
 fn lock(path: &[u8], exclusive: bool) -> Result<OwnedFd, Errno> {
+    // An exclusive lock needs the file open for writing. Read/write and not
+    // write-only: `into_read_only` turns that lock into a shared one on the
+    // same descriptor, and a shared lock needs it open for reading, else
+    // the change fails with `EBADF`.
     let flags = if exclusive {
         OFlags::RDWR | OFlags::CREATE
     } else {
@@ -154,7 +161,13 @@ fn lock(path: &[u8], exclusive: bool) -> Result<OwnedFd, Errno> {
             Mode::from_raw_mode(0o666),
         )
     })?;
-    sys::lock_file(file.as_fd(), exclusive)?;
+    if !sys::try_lock_file(file.as_fd(), exclusive)? {
+        die::note(format_args!(
+            "waiting for the lock of index {}",
+            path.as_bstr()
+        ));
+        sys::lock_file(file.as_fd(), exclusive)?;
+    }
     Ok(file)
 }
 
@@ -624,6 +637,33 @@ impl Index {
     pub fn close(self) {
         let shared = Arc::into_inner(self.shared).expect("a reader outlives the index");
         drop(shared);
+    }
+
+    /// The index of a finished update as a read-only index, for the
+    /// receiver of a run (DESIGN.md §4.4). This function exists so that
+    /// other read-only processes, such as `stats`, can use the index while
+    /// the run goes on, and no modifying process can come between the
+    /// update and the run. It closes the read/write database, turns the
+    /// exclusive lock into a shared one on the same open file description,
+    /// which never releases it, and opens the database of `path` read-only.
+    /// `finish_update` has already waited for RocksDB's background work, so
+    /// the close does not wait.
+    pub fn into_read_only(self, path: &[u8]) -> Index {
+        let Shared { db, _lock: lock } =
+            Arc::into_inner(self.shared).expect("a reader outlives the index");
+        drop(db);
+        sys::lock_file(lock.as_fd(), false)
+            .unwrap_or_else(|e| die(format!("cannot lock index {}: {e}", path.as_bstr())));
+        let db = DB::open_cf_descriptors_read_only(
+            &db_options(),
+            os_path(path),
+            column_families(),
+            false,
+        )
+        .unwrap_or_else(|e| die(format!("cannot open index {}: {e}", path.as_bstr())));
+        Index {
+            shared: Arc::new(Shared { db, _lock: lock }),
+        }
     }
 
     /// An empty transaction.

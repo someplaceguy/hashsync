@@ -47,8 +47,12 @@ rustPlatform.buildRustPackage {
 
   doCheck = stdenv.buildPlatform.canExecute stdenv.hostPlatform;
 
+  # The transfer tests run rsync with `hashsync ssh` as its remote shell.
+  # The development shell gets it too, since it builds with checks.
+  nativeCheckInputs = [ rsync ];
+
   meta = {
-    description = "Copy a remote command's output, replacing indexed local blocks";
+    description = "Run a command through SSH, deduplicating its stdout or its stdin against indexed blocks";
     mainProgram = "hashsync";
     platforms = lib.platforms.linux;
   };

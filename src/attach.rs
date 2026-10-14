@@ -6,10 +6,10 @@
 //! the relay from the socket; the main thread then waits until stdin EOF
 //! ends the relay from stdin, joins that thread, and exits successfully.
 //! After a write finds the socket closed by `serve`, the relay from stdin
-//! reads stdin to EOF and discards it: the receiver closes the session's
+//! reads stdin to EOF and discards it: the client closes the session's
 //! stdin only after its control writer has ended, and that writer must
-//! not block on a full pipe. The receiver decides whether a closure was
-//! expected. Either direction may observe closure first. Nothing is
+//! not block on a full pipe. Each host decides from END whether a closure
+//! was expected. Either direction may observe closure first. Nothing is
 //! buffered: both directions write straight to their descriptors, so the
 //! successful end has nothing to flush.
 
@@ -30,6 +30,9 @@ fn peer_closed(e: &std::io::Error) -> bool {
 }
 
 pub fn run(token: &str) -> ! {
+    // SSH carries this process's stderr to the client's: mark its lines as
+    // the server's before anything can report one (DESIGN.md §8).
+    die::report_as_server();
     let socket = rendezvous::connect(token);
     let socket_in = match socket.try_clone() {
         Ok(clone) => clone,

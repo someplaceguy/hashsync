@@ -7,59 +7,47 @@
 //! Once the reader has passed an extent, the extent is released, so a
 //! sealed segment closes once the reader has passed its last byte. With a
 //! limit, the writer waits while that many bytes wait for the reader;
-//! without one, it never waits for the reader. The writer is the thread
-//! of the spool, which copies a source such as the command's stdout until
-//! EOF (`Spool::start`), or another thread, which writes through a
-//! `SpoolWriter` (`Spool::pipe`).
+//! without one, it never waits for the reader. The writer is a thread that
+//! writes through the spool's `SpoolWriter`, such as the source reader of a
+//! stream, which copies the stream's source into its spool, or the data
+//! reader of a session, which appends the stream's CHUNK payloads.
 //!
 //! The writer and the reader share one lock. Segment writes, reads, and
 //! closes happen outside it; the creation of a segment happens under it,
 //! once per segment, as for the pins.
 //!
-//! The source of the thread of a spool can tell when it has no byte ready:
-//! a read then fails with `WouldBlock`, and the next read waits. The
-//! command's stdout does that in eager delivery of the output, also right
-//! before its EOF (DESIGN.md §6.2). The thread then marks an idle point,
-//! which the reader reports (`take_next`) once it has taken every byte
-//! before it, unless more bytes arrive first, and before the end of the
-//! stream.
+//! The writer marks an idle point when its source has no byte ready, in
+//! eager delivery (DESIGN.md §6.2). The reader reports the idle point
+//! (`take_next`) once it has taken every byte before it, unless more bytes
+//! arrive first.
 //!
-//! At the normal end, after the reader has read EOF, `close` joins the
-//! thread of the spool and closes the spool's segments (DESIGN.md §6.9). A
-//! role can also stop a spool, from any thread, when its bytes have no use
-//! any more (DESIGN.md §6.6). The stop closes all the segments of the
-//! spool, which discards the bytes that wait, and the writer discards the
-//! bytes that it appends later. Spool failures end the run with `die`
-//! (DESIGN.md §6.7).
+//! At the normal end, after the reader has read EOF, `close` closes the
+//! spool's segments (DESIGN.md §6.9). A host can also stop a spool, from
+//! any thread, when its bytes have no use any more (DESIGN.md §6.6). The
+//! stop closes all the segments of the spool, which discards the bytes that
+//! wait, and the writer discards the bytes that it appends later. A
+//! stopped spool is dropped, not closed. Spool failures end the run with
+//! `die` (DESIGN.md §6.7).
 
 use std::collections::VecDeque;
 use std::fs::File;
-use std::io::{ErrorKind, Read, Write};
+use std::io::{Read, Write};
 use std::os::unix::fs::FileExt;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::thread::JoinHandle;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 
-use crate::die::die;
-use crate::fsops::retry_interrupted;
 use crate::segments::{Directory, Extent, SEGMENT_MINIMUM, Segments};
 
 /// The bytes of one extent of a spool.
 const EXTENT: u64 = 1 << 20;
-
-/// The most bytes of one read of the thread of a spool from its source.
-const READ_SIZE: usize = 256 << 10;
 
 /// The reading end of a pipe whose bytes wait in segments (DESIGN.md
 /// §6.5). Reads wait for bytes or for EOF, without a timeout, and never
 /// fail. After a stop, a read gives EOF at once.
 pub struct Spool {
     shared: Arc<Shared>,
-    /// The thread that fills the spool from its source, if it has one.
-    thread: Option<JoinHandle<()>>,
 }
 
-/// The writing end of a spool: the caller's, from `Spool::pipe`, or that
-/// of the thread of a spool, from `Spool::start`. A write appends all its
+/// The writing end of a spool, from `Spool::pipe`. A write appends all its
 /// bytes, then waits while `limit` bytes, and at least one, wait for the
 /// reader. After a stop, a write discards its bytes and does not wait.
 /// Writes never fail. The drop of the writer ends the stream: the reader
@@ -68,8 +56,11 @@ pub struct SpoolWriter {
     shared: Arc<Shared>,
 }
 
-/// Stops a spool from any thread (`Stopper::stop`).
-pub struct Stopper(Arc<Shared>);
+/// Stops a spool from any thread (`Stopper::stop`). It does not keep the
+/// spool: once the reader and the writer are gone, the spool's segments
+/// close and free their storage, while a stop of the stream still holds
+/// its stopper, and a stop then has nothing left to do.
+pub struct Stopper(Weak<Shared>);
 
 /// What one `Spool::take_next` found.
 #[derive(Debug, PartialEq, Eq)]
@@ -110,7 +101,7 @@ struct State {
     read: u64,
     /// The writer appended all its bytes: the stream ended.
     ended: bool,
-    /// A role stopped the spool: it has no extents and no open segments
+    /// A host stopped the spool: it has no extents and no open segments
     /// any more, and every later byte is discarded.
     stopped: bool,
     /// An idle point: the source had no byte ready after the last append,
@@ -123,21 +114,6 @@ struct State {
 }
 
 impl Spool {
-    /// A spool in the tmp_data directory `dir`, that a new thread fills
-    /// from `source` until EOF. The thread stops reading `source` while
-    /// `limit` bytes, and at least one, wait for the reader; `u64::MAX` sets
-    /// no limit. A read of `source` that fails with `WouldBlock` tells an
-    /// idle point, and the next read must wait for bytes or EOF. `what`
-    /// names the source in failure messages.
-    pub fn start(
-        what: &'static str,
-        source: impl Read + Send + 'static,
-        dir: Arc<Directory>,
-        limit: u64,
-    ) -> Spool {
-        Self::with_sizes(what, source, dir, limit, EXTENT, SEGMENT_MINIMUM)
-    }
-
     /// A spool in the tmp_data directory `dir`, that the returned writer
     /// fills. The writer waits while `limit` bytes, and at least one, wait
     /// for the reader; `u64::MAX` sets no limit.
@@ -145,45 +121,8 @@ impl Spool {
         Self::pipe_with_sizes(dir, limit, EXTENT, SEGMENT_MINIMUM)
     }
 
-    /// `start`, with extents of `extent` bytes, and a current segment that
-    /// is full at `minimum` bytes while no sealed segment is open.
-    fn with_sizes(
-        what: &'static str,
-        mut source: impl Read + Send + 'static,
-        dir: Arc<Directory>,
-        limit: u64,
-        extent: u64,
-        minimum: u64,
-    ) -> Spool {
-        let (mut writer, mut spool) = Self::pipe_with_sizes(dir, limit, extent, minimum);
-        let thread = std::thread::Builder::new()
-            .name("spool".into())
-            .spawn(move || {
-                // A write returns once fewer than `limit` bytes wait, so
-                // the thread reads its source only then. The drop of the
-                // writer at EOF ends the stream.
-                let mut buf = vec![0u8; READ_SIZE];
-                loop {
-                    let n = match retry_interrupted(|| source.read(&mut buf)) {
-                        Ok(0) => break,
-                        Ok(n) => n,
-                        // The source has no byte ready, and its next read
-                        // waits (DESIGN.md §6.5, step W2).
-                        Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                            writer.shared.mark_idle();
-                            continue;
-                        }
-                        Err(e) => die(format!("cannot read {what}: {e}")),
-                    };
-                    writer.write_all(&buf[..n]).expect("a spool write failed");
-                }
-            })
-            .expect("cannot start a spool thread");
-        spool.thread = Some(thread);
-        spool
-    }
-
-    /// `pipe`, with the sizes of `with_sizes`.
+    /// `pipe`, with extents of `extent` bytes, and a current segment that is
+    /// full at `minimum` bytes while no sealed segment is open.
     fn pipe_with_sizes(
         dir: Arc<Directory>,
         limit: u64,
@@ -210,42 +149,33 @@ impl Spool {
         let writer = SpoolWriter {
             shared: Arc::clone(&shared),
         };
-        (
-            writer,
-            Spool {
-                shared,
-                thread: None,
-            },
-        )
+        (writer, Spool { shared })
     }
 
-    /// The normal end of the spool, after its reader has read EOF: join
-    /// the thread of the spool, if it has one, which ended at the EOF of
-    /// its source, and close the segments of the spool, which frees their
-    /// storage (DESIGN.md §6.9).
+    /// The normal end of the spool, after its reader has read EOF: close
+    /// the segments of the spool, which frees their storage (DESIGN.md
+    /// §6.9).
     pub fn close(self) {
-        // This function exists so that the normal end joins the thread of
-        // the spool, as it joins every other thread. Before EOF, the
-        // thread can still wait for its source or for room, so a join
-        // could wait forever: that is a bug of the caller. The check
-        // releases the lock before the assertion, so that a failed check
-        // does not poison the lock for the thread.
+        // This function exists so that a reader that ends the spool before
+        // its end, a bug, fails at once, while a stopped spool is dropped.
+        // A stop after the reader took the end changes nothing here, as
+        // when the end of the client's forward stream meets the stop at
+        // END: a stop moves neither `read` nor `written`. The check releases
+        // the lock before the assertion, so that a failed check does not
+        // poison the lock for the writer.
         let ended = {
             let state = self.shared.lock();
-            state.ended && state.read == state.written && !state.stopped
+            state.ended && state.read == state.written
         };
         assert!(ended, "a spool closed before its end");
-        if let Some(thread) = self.thread {
-            thread.join().expect("a spool thread panicked");
-        }
     }
 
     /// A handle that stops this spool from any thread.
     pub fn stopper(&self) -> Stopper {
-        Stopper(Arc::clone(&self.shared))
+        Stopper(Arc::downgrade(&self.shared))
     }
 
-    /// True once a role has stopped the spool. This function exists so
+    /// True once a host has stopped the spool. This function exists so
     /// that the reader can tell an EOF that the stop gave from the end of
     /// the stream.
     pub fn is_stopped(&self) -> bool {
@@ -270,8 +200,7 @@ impl Spool {
                     break next;
                 }
                 // No byte follows the idle point: an append would have
-                // removed it. The end can follow it at once, as at the EOF
-                // of the command's stdout, and must not hide it.
+                // removed it.
                 if state.idle {
                     state.idle = false;
                     return Taken::Idle;
@@ -324,9 +253,11 @@ impl Read for Spool {
 }
 
 impl SpoolWriter {
-    /// The bytes appended so far: the writer's `written` (DESIGN.md §6.5).
-    pub fn written(&self) -> u64 {
-        self.shared.lock().written
+    /// The source has no byte ready after the bytes appended so far: mark
+    /// an idle point, which the reader reports once it has taken them,
+    /// unless more bytes follow first (DESIGN.md §6.5, step W2).
+    pub fn mark_idle(&self) {
+        self.shared.mark_idle();
     }
 }
 
@@ -360,19 +291,32 @@ impl Drop for SpoolWriter {
 }
 
 impl Stopper {
+    /// True once the spool is stopped. This function exists so that the
+    /// reader of a spool, which wraps it in other readers, can tell an EOF
+    /// that the stop gave from the end of the stream. That reader holds the
+    /// spool, so the spool is there to ask.
+    pub fn is_stopped(&self) -> bool {
+        let shared = self.0.upgrade().expect("a look at a spool that is gone");
+        shared.lock().stopped
+    }
+
     /// Stop the spool, before or after its end (DESIGN.md §6.5): wake the
     /// writer and the reader, and close all the segments of the spool,
     /// which discards the bytes that wait. From then on, a read gives EOF
-    /// at once, and a write discards its bytes without a wait.
+    /// at once, and a write discards its bytes without a wait. A spool
+    /// whose reader and writer are gone has nothing to stop.
     pub fn stop(&self) {
+        let Some(shared) = self.0.upgrade() else {
+            return;
+        };
         let storage = {
-            let mut state = self.0.lock();
+            let mut state = shared.lock();
             state.stopped = true;
             if state.reader_waits {
-                self.0.appended.notify_one();
+                shared.appended.notify_one();
             }
             if state.writer_waits {
-                self.0.taken.notify_one();
+                shared.taken.notify_one();
             }
             // The spool uses no extent after a stop, so the extents need no
             // release one by one: the stop takes them, with the segments.
@@ -517,7 +461,7 @@ impl State {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Cursor, Write};
+    use std::io::{Cursor, ErrorKind, Write};
     use std::os::unix::ffi::OsStrExt;
     use std::path::PathBuf;
 
@@ -563,8 +507,40 @@ mod tests {
         }
     }
 
-    /// Spin until `done` holds for the state of `spool`. The thread of the
-    /// spool makes progress on its own, so this ends without a timeout.
+    /// The most bytes of one read of `fill` from its source, as a source
+    /// reader reads.
+    const READ_SIZE: usize = 256 << 10;
+
+    /// A spool in `dir` with `limit`, extents of `extent` bytes, and a
+    /// current segment that is full at `minimum` bytes, and the thread that
+    /// writes it, as the source reader of a stream does: it copies `source`
+    /// into the spool, in reads of at most `READ_SIZE` bytes, until EOF, and
+    /// a read that fails with `WouldBlock` marks an idle point.
+    fn fill(
+        mut source: impl Read + Send + 'static,
+        dir: &Arc<Directory>,
+        limit: u64,
+        extent: u64,
+        minimum: u64,
+    ) -> (Spool, std::thread::JoinHandle<()>) {
+        let (mut writer, spool) = Spool::pipe_with_sizes(Arc::clone(dir), limit, extent, minimum);
+        let thread = std::thread::spawn(move || {
+            let mut buf = vec![0u8; READ_SIZE];
+            loop {
+                match source.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => writer.write_all(&buf[..n]).unwrap(),
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => writer.mark_idle(),
+                    Err(e) => panic!("the test source failed: {e}"),
+                }
+            }
+        });
+        (spool, thread)
+    }
+
+    /// Spin until `done` holds for the state of `spool`. The thread that
+    /// fills the spool makes progress on its own, so this ends without a
+    /// timeout.
     fn wait_until(spool: &Spool, done: impl Fn(&State) -> bool) {
         while !done(&spool.shared.lock()) {
             std::thread::yield_now();
@@ -592,14 +568,7 @@ mod tests {
             sizes: vec![1, 999, 4000, 1700],
             next: 0,
         };
-        let mut spool = Spool::with_sizes(
-            "the test source",
-            source,
-            Arc::clone(&setup.dir),
-            u64::MAX,
-            1000,
-            2000,
-        );
+        let (mut spool, filler) = fill(source, &setup.dir, u64::MAX, 1000, 2000);
         wait_until(&spool, |state| state.ended);
         assert_eq!(open_segments(&spool, &setup), [2, 4, 8, 16]);
         let mut read = Vec::new();
@@ -621,6 +590,7 @@ mod tests {
         // the last segment closes before the spool does.
         assert_eq!(open, [4, 3, 2, 1, 0]);
         spool.close();
+        filler.join().unwrap();
         drop(setup.dir);
         assert_eq!(descriptors(&setup.path), (0, 0));
     }
@@ -637,14 +607,7 @@ mod tests {
         // segment, it would stay open until the next bytes.
         let setup = setup();
         let (source, mut input) = std::io::pipe().unwrap();
-        let mut spool = Spool::with_sizes(
-            "the test source",
-            source,
-            Arc::clone(&setup.dir),
-            u64::MAX,
-            1000,
-            2000,
-        );
+        let (mut spool, filler) = fill(source, &setup.dir, u64::MAX, 1000, 2000);
         let bytes = noise(5000, 5);
         input.write_all(&bytes).unwrap();
         wait_until(&spool, |state| state.written == 5000);
@@ -658,45 +621,39 @@ mod tests {
         drop(input);
         assert_eq!(spool.read(&mut read).unwrap(), 0);
         spool.close();
+        filler.join().unwrap();
     }
 
     #[test]
-    fn the_thread_does_not_wait_for_the_reader_without_a_limit() {
+    fn the_writer_does_not_wait_for_the_reader_without_a_limit() {
         // Five extents of the default size, read in one call each.
         let setup = setup();
         let bytes = noise(5 * EXTENT as usize, 2);
-        let mut spool = Spool::start(
-            "the test source",
-            Cursor::new(bytes.clone()),
-            Arc::clone(&setup.dir),
-            u64::MAX,
-        );
+        let source = Cursor::new(bytes.clone());
+        let (mut spool, filler) = fill(source, &setup.dir, u64::MAX, EXTENT, SEGMENT_MINIMUM);
         wait_until(&spool, |state| state.ended);
         assert_eq!(spool.shared.lock().written, bytes.len() as u64);
         let mut read = Vec::new();
         spool.read_to_end(&mut read).unwrap();
         assert!(read == bytes, "the bytes differ");
         spool.close();
+        filler.join().unwrap();
     }
 
     #[test]
-    fn the_thread_stops_reading_its_source_at_the_limit() {
+    fn the_writer_stops_reading_its_source_at_the_limit() {
         // The source gives 256 KiB per read. With a limit of 1 MiB, the
-        // thread reads four times, then waits for the reader, which takes
+        // writer reads four times, then waits for the reader, which takes
         // 300 KiB: two more reads fill the spool to 1236 KiB.
         let setup = setup();
         let bytes = noise(4 << 20, 3);
-        let mut spool = Spool::start(
-            "the test source",
-            Cursor::new(bytes.clone()),
-            Arc::clone(&setup.dir),
-            1 << 20,
-        );
+        let source = Cursor::new(bytes.clone());
+        let (mut spool, filler) = fill(source, &setup.dir, 1 << 20, EXTENT, SEGMENT_MINIMUM);
         let waiting = |state: &State| state.writer_waits || state.ended;
         wait_until(&spool, waiting);
         {
             let state = spool.shared.lock();
-            assert!(!state.ended, "the thread read past the limit");
+            assert!(!state.ended, "the writer read past the limit");
             assert_eq!(state.written, 1 << 20);
         }
         let mut read = vec![0u8; 300 << 10];
@@ -704,64 +661,55 @@ mod tests {
         wait_until(&spool, |state| state.written > 1 << 20 && waiting(state));
         {
             let state = spool.shared.lock();
-            assert!(!state.ended, "the thread read past the limit");
+            assert!(!state.ended, "the writer read past the limit");
             assert_eq!(state.written - state.read, 1236 << 10);
         }
         spool.read_to_end(&mut read).unwrap();
         assert!(read == bytes, "the bytes differ");
         spool.close();
+        filler.join().unwrap();
     }
 
     #[test]
     fn a_limit_of_zero_passes_one_read_at_a_time() {
-        // The thread reads its source when no byte waits for the reader.
+        // The writer reads its source when no byte waits for the reader.
         let setup = setup();
         let bytes = noise(3 * READ_SIZE + 5, 4);
-        let mut spool = Spool::start(
-            "the test source",
-            Cursor::new(bytes.clone()),
-            Arc::clone(&setup.dir),
-            0,
-        );
+        let source = Cursor::new(bytes.clone());
+        let (mut spool, filler) = fill(source, &setup.dir, 0, EXTENT, SEGMENT_MINIMUM);
         let mut read = Vec::new();
         spool.read_to_end(&mut read).unwrap();
         assert!(read == bytes, "the bytes differ");
         spool.close();
+        filler.join().unwrap();
     }
 
     #[test]
     fn an_empty_source_gives_eof() {
         let setup = setup();
-        let mut spool = Spool::start(
-            "the test source",
-            std::io::empty(),
-            Arc::clone(&setup.dir),
-            u64::MAX,
-        );
+        let source = std::io::empty();
+        let (mut spool, filler) = fill(source, &setup.dir, u64::MAX, EXTENT, SEGMENT_MINIMUM);
         let mut buf = [0u8; 16];
         assert_eq!(spool.read(&mut buf).unwrap(), 0);
         assert_eq!(spool.read(&mut buf).unwrap(), 0);
         spool.close();
+        filler.join().unwrap();
     }
 
     #[test]
     #[should_panic(expected = "a spool closed before its end")]
     fn a_spool_closes_only_after_its_end() {
         let setup = setup();
-        let spool = Spool::start(
-            "the test source",
-            Cursor::new(vec![1u8; 10]),
-            Arc::clone(&setup.dir),
-            u64::MAX,
-        );
+        let (mut writer, spool) = Spool::pipe(Arc::clone(&setup.dir), u64::MAX);
+        writer.write_all(&[1u8; 10]).unwrap();
+        drop(writer);
         spool.close();
     }
 
     #[test]
     fn a_writer_waits_at_the_limit_and_its_drop_ends_the_stream() {
-        // A spool without a thread: its writer waits once 3000 bytes wait,
-        // after its fourth write of 777 bytes, as the thread of a spool
-        // waits. The drop of the writer ends the stream, which is not a
+        // The writer waits once 3000 bytes wait, after its fourth write of
+        // 777 bytes. The drop of the writer ends the stream, which is not a
         // stop (DESIGN.md §6.5).
         let setup = setup();
         let (mut writer, mut spool) =
@@ -845,12 +793,8 @@ mod tests {
         // all five bytes, and no idle point (DESIGN.md §6.5).
         let setup = setup();
         let (steps, script) = crossbeam_channel::unbounded();
-        let mut spool = Spool::start(
-            "the test source",
-            Scripted(script),
-            Arc::clone(&setup.dir),
-            u64::MAX,
-        );
+        let source = Scripted(script);
+        let (mut spool, filler) = fill(source, &setup.dir, u64::MAX, EXTENT, SEGMENT_MINIMUM);
         let mut buf = [0u8; 16];
         steps.send(Some(b"abc".to_vec())).unwrap();
         steps.send(None).unwrap();
@@ -884,31 +828,35 @@ mod tests {
         drop(sends.join().unwrap());
         assert_eq!(spool.take_next(&mut buf), Taken::End);
         spool.close();
+        filler.join().unwrap();
     }
 
     #[test]
-    fn an_idle_point_right_before_the_end_comes_first() {
-        // The source has no byte ready after "abc", then ends, all before
-        // the reader looks. The reader takes the bytes, then reports the
-        // idle point, and only then the end, which must not hide it: at the
-        // EOF of the command's stdout, the bytes before it would wait for
-        // the end of the command (DESIGN.md §6.5, step T1).
+    fn a_stop_after_the_reader_took_the_end_lets_the_spool_close() {
+        // The client's forward stream can end at the moment when END
+        // raises the stop: the reader takes the end, then the stop comes,
+        // then the reader closes the spool (DESIGN.md §6.9).
         let setup = setup();
-        let (steps, script) = crossbeam_channel::unbounded();
-        let mut spool = Spool::start(
-            "the test source",
-            Scripted(script),
-            Arc::clone(&setup.dir),
-            u64::MAX,
-        );
-        steps.send(Some(b"abc".to_vec())).unwrap();
-        steps.send(None).unwrap();
-        drop(steps);
-        wait_until(&spool, |state| state.ended);
-        let mut buf = [0u8; 16];
-        assert_eq!(spool.take_next(&mut buf), Taken::Bytes(3));
-        assert_eq!(spool.take_next(&mut buf), Taken::Idle);
-        assert_eq!(spool.take_next(&mut buf), Taken::End);
+        let (mut writer, mut spool) = Spool::pipe(Arc::clone(&setup.dir), u64::MAX);
+        writer.write_all(b"all of it").unwrap();
+        drop(writer);
+        let mut read = Vec::new();
+        spool.read_to_end(&mut read).unwrap();
+        assert_eq!(read, b"all of it");
+        spool.stopper().stop();
+        spool.close();
+    }
+
+    #[test]
+    #[should_panic(expected = "a spool closed before its end")]
+    fn a_spool_that_a_stop_cut_short_does_not_close() {
+        // The stop discarded bytes that the reader never took: a reader
+        // that then closes the spool, as if it had ended, is a bug.
+        let setup = setup();
+        let (mut writer, spool) = Spool::pipe(Arc::clone(&setup.dir), u64::MAX);
+        writer.write_all(b"never read").unwrap();
+        spool.stopper().stop();
+        drop(writer);
         spool.close();
     }
 
@@ -923,11 +871,35 @@ mod tests {
             let n = spool.read(&mut [0u8; 10]).unwrap();
             (n, spool.is_stopped())
         });
-        while !stopper.0.lock().reader_waits {
+        // The writer keeps the spool.
+        while !stopper.0.upgrade().unwrap().lock().reader_waits {
             std::thread::yield_now();
         }
         stopper.stop();
         assert_eq!(reads.join().unwrap(), (0, true));
         drop(writer);
+    }
+
+    #[test]
+    fn a_stopper_does_not_keep_a_closed_spool() {
+        // The stop of a stream holds its spool's stopper for the whole run
+        // when nothing raises it. The normal end must still free the
+        // spool's storage: once the writer and the reader are gone, the
+        // spool, with its segments, is gone, and a stop has nothing to do
+        // (DESIGN.md §6.9).
+        let setup = setup();
+        let (mut writer, mut spool) =
+            Spool::pipe_with_sizes(Arc::clone(&setup.dir), u64::MAX, 4096, 1 << 20);
+        let stopper = spool.stopper();
+        writer.write_all(&[7; 10_000]).unwrap();
+        drop(writer);
+        let mut read = Vec::new();
+        spool.read_to_end(&mut read).unwrap();
+        assert_eq!(read.len(), 10_000);
+        // The current segment of the spool is still open.
+        assert_eq!(stopper.0.upgrade().unwrap().lock().segments.open().len(), 1);
+        spool.close();
+        assert!(stopper.0.upgrade().is_none(), "the stopper kept the spool");
+        stopper.stop();
     }
 }
