@@ -2383,9 +2383,9 @@ exclude = ['*.tmp', 'literal\x2Aname', 'back\\slash']
      stdin at its EOF at the stop (section 6.6). A whole stream shows the
      bytes of the stream, and its wire bytes: the bytes of its CHUNK
      payloads. The line of a deduplicated stream also gives its literal,
-     reference, and run bytes, and the hash-list and delta bytes of its
+     reference, and RLE bytes, and the hash-list and delta bytes of its
      list exchange: `stdout -- 10.00 MiB (2.00 MiB literal, 8.00 MiB
-     reference, 0 B run), 1.10 MiB wire, 12.00 KiB hash list, 0 B delta`,
+     reference, 0 B RLE), 1.10 MiB wire, 12.00 KiB hash list, 0 B delta`,
      and for a plain stream, `stdin -- 0 B, 13 B wire`. Any other stream
      stopped, and shows the bytes that its sender read from its source,
      `pipe closed`, the CHUNK bytes that its receiver decoded, and those

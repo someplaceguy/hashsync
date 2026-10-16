@@ -534,8 +534,8 @@ fn read_data<R: Read>(
 /// The summary on stderr (DESIGN.md §8). One line for each stream, which
 /// names it. A whole stream's line gives the bytes that it carried, and the
 /// bytes of its CHUNK payloads, its wire bytes; the line of the
-/// deduplicated stream also gives the bytes of its literals, references and
-/// runs, and the bytes of the full lists and of the delta that its list
+/// deduplicated stream also gives its literal, reference, and RLE bytes,
+/// and the bytes of the full lists and of the delta that its list
 /// exchange carried. A stopped stream's line gives the bytes that its
 /// sender read, the CHUNK bytes that its receiver decoded and that it
 /// dropped, and the bytes that its destination took. The last line gives,
@@ -548,7 +548,7 @@ fn print_summary(start: Instant, streams: &[(&str, Line)]) {
     for (name, line) in streams {
         match *line {
             Line::Whole(ref counts, Some(lists)) => die::note(format_args!(
-                "{name} -- {} ({} literal, {} reference, {} run), {} wire, \
+                "{name} -- {} ({} literal, {} reference, {} RLE), {} wire, \
                  {} hash list, {} delta",
                 Bytes(counts.bytes),
                 Bytes(counts.literal),

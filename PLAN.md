@@ -142,7 +142,7 @@ disabled. Block references and compressed output follow in steps 4 and 5.
   output, peer disappearance during setup or transfer, and termination
   signals with the specified failure status and child cleanup.
 - Print the specified transfer summary to stderr, including actual full
-  hash-list and wire byte counts. Reference, run, and delta counts are
+  hash-list and wire byte counts. Reference, RLE, and delta counts are
   initially zero.
 
 Result: users can pipe a remote command's output directly into a local
@@ -196,7 +196,7 @@ Design coverage: §§3, 4.5, 5.1–5.3, 5.5, 6.2–6.9, 7–8.
   flush each one whenever its writer's queue becomes empty.
 - Detect truncated or invalid compressed streams before declaring success.
   Preserve complete stderr forwarding and command-status handling.
-- Report run byte counts and account for compression in the summary's wire
+- Report RLE byte counts and account for compression in the summary's wire
   byte count.
 
 Result: zeros, repeated bytes, and other compressible content require less

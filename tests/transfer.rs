@@ -508,14 +508,14 @@ fn line_counts(line: &str) -> Vec<usize> {
 }
 
 /// The byte counts of the summary line of the deduplicated stream: its
-/// bytes, then its literal, reference, run, wire, hash-list, and delta
+/// bytes, then its literal, reference, RLE, wire, hash-list, and delta
 /// bytes.
 fn summary_counts(output: &Output) -> Vec<usize> {
     line_counts(&summary_line(output, DEDUPLICATED))
 }
 
 /// The first byte counts of the summary line of the deduplicated stream:
-/// its bytes, then its literal, reference, and run bytes.
+/// its bytes, then its literal, reference, and RLE bytes.
 fn summary(output: &Output) -> [usize; 4] {
     let counts = summary_counts(output);
     [counts[0], counts[1], counts[2], counts[3]]
@@ -691,7 +691,7 @@ fn output_reproduces_byte_for_byte_and_lists_are_cached() {
         };
         assert!(
             stderr.contains(&format!(
-                "hashsync: {stream} -- {payload_len} B ({payload_len} B literal, 0 B reference, 0 B run)"
+                "hashsync: {stream} -- {payload_len} B ({payload_len} B literal, 0 B reference, 0 B RLE)"
             )),
             "summary counts:\n{stderr}"
         );
@@ -1267,7 +1267,7 @@ fn summaries_show_scale_units() {
     let line = summary_line(&output, DEDUPLICATED);
     assert!(
         line.starts_with(
-            "hashsync: stdout -- 10.00 MiB (10.00 MiB literal, 0 B reference, 0 B run), "
+            "hashsync: stdout -- 10.00 MiB (10.00 MiB literal, 0 B reference, 0 B RLE), "
         ),
         "{line}"
     );
