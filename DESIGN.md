@@ -1130,16 +1130,21 @@ Payloads:
 - REF: empty; use the pin at the current output offset.
 - RLE: `byte u8, length u64`, with a length of at least 1.
 - END: `status i32, error string`, then the server's counts of its ends
-  of both streams (section 8). Of the forward stream, whose decoder it
-  runs: `bytes u64, literal u64, reference u64, run u64, wire u64`.
-  `bytes` are the bytes that the command's stdin took, and `literal`,
-  `reference` and `run` their parts by stream frame; `wire` the CHUNK
-  bytes that the decoder decoded. Of the backward stream, whose source
-  reader it runs: `read u64, eof u8`, the bytes that it read from command
-  stdout, and 1 if it read command stdout to its EOF. Status is the
-  command's exit status, `128 + signal`, or 127 plus error text if startup
-  failed. END is the server's last data-session frame: nothing follows it
-  (section 6.9).
+  of both streams (section 8). Of the forward stream, whose decoder and
+  lookups it runs: `bytes u64, literal u64, reference u64, run u64,
+  reference_frames u64, run_frames u64, wire u64, false_positives u64,
+  not_found u64`. `bytes` are the bytes that the command's stdin took, and
+  `literal`, `reference` and `run` their parts by stream frame;
+  `reference_frames` and `run_frames` are the bytes of the REF and RLE
+  frames that the decoder read, and `wire` the CHUNK bytes that it
+  decoded. `false_positives` and `not_found` are the queries that the
+  lookups answered no because the index has no candidate for their strong
+  hash, and because none of their candidates verified (section 6.4). Of the
+  backward stream, whose source reader it runs: `read u64, eof u8`, the
+  bytes that it read from command stdout, and 1 if it read command stdout
+  to its EOF. Status is the command's exit status, `128 + signal`, or 127
+  plus error text if startup failed. END is the server's last
+  data-session frame: nothing follows it (section 6.9).
 - QUERY: `offset u64, strong [u8; S]`. At most one per offset; offsets may
   go backwards after rescanning.
 - ANSWER: `offset u64, found u8` (0 or 1). Answers may arrive out of order.
@@ -2376,34 +2381,60 @@ exclude = ['*.tmp', 'literal\x2Aname', 'back\\slash']
 
   After a successful transfer, also when the command fails, the client
   prints a summary to stderr:
-  1. One line for each stream, `stdout` first, then `stdin`. A stream is
+  1. One line for each stream, `stdin` first, then `stdout`. A stream is
      whole when its source reader reached the EOF of its source and its
      destination took every byte that the source reader read, whether or
      not a stop came. The stdin reader also reaches the EOF when it finds
-     stdin at its EOF at the stop (section 6.6). A whole stream shows the
-     bytes of the stream, and its wire bytes: the bytes of its CHUNK
-     payloads. The line of a deduplicated stream also gives its literal,
-     reference, and RLE bytes, and the hash-list and delta bytes of its
-     list exchange: `stdout -- 10.00 MiB (2.00 MiB literal, 8.00 MiB
-     reference, 0 B RLE), 1.10 MiB wire, 12.00 KiB hash list, 0 B delta`,
-     and for a plain stream, `stdin -- 0 B, 13 B wire`. Any other stream
-     stopped, and shows the bytes that its sender read from its source,
-     `pipe closed`, the CHUNK bytes that its receiver decoded, and those
-     that it dropped undecoded, which together are all the CHUNK bytes of
-     the stream, and the bytes that its destination took: `stdin -- 2.09
-     MiB read, pipe closed, 1.01 MiB wire, 36.00 KiB dropped, 1.05 MiB
-     written`. The server counts what its decoder of the forward stream
-     decoded and wrote, and what its stdout reader read, which END carries
-     (section 6.2); the client counts the rest.
-  2. As rsync does, the bytes that the client sent and received on both
-     sessions, the elapsed time of the run, including its index update,
-     the rate of the sent and received bytes in that time, and the
-     speedup: the bytes that the destinations of both streams took,
-     divided by the sent and received bytes. The CHUNK bytes of a stopped
-     stream that its receiver dropped count as traffic. These counts do
-     not include the bytes that SSH adds or the command's stderr. They are
-     exact: the client prints the summary after the threads that count
-     the bytes have ended (section 6.9).
+     stdin at its EOF at the stop (section 6.6). A whole stream's line
+     shows its bytes, then `-->` and its wire bytes, and in parentheses
+     how it was sent: `deduplicated`, `compressed`, or both. A plain
+     stream without compression has no parentheses. A plain stream's wire
+     bytes are the bytes of its CHUNK payloads: `stdin -- 6.46 KiB -->
+     3.28 KiB wire (compressed)`.
+
+     A deduplicated stream's line splits its bytes into literal,
+     reference, and RLE bytes, and shows how many bytes the REF and RLE
+     frames that carried the last two took, before compression. Then it
+     gives the queries that the receiver answered no after it looked their
+     blocks up in its index. False positives: the index has no candidate
+     for the strong hash (section 6.4), so the window had the weak hash of
+     an indexed block, but other bytes. Not found: the index has
+     candidates, but none of those that the lookup tried verified, for
+     example because their files changed since the update. Then it adds
+     the lists that the exchange sent: the full list or a delta, both
+     when the sender could not use a delta and asked for the full list,
+     and none after HASHKEEP. The wire bytes count these lists too:
+     `stdout -- 10.00 MiB (2.00 MiB literal, 8.00 MiB -> 2.50 KiB refs,
+     0 B -> 0 B RLE, 0 false positives, 0 not found) + 12.00 KiB
+     hashlist --> 1.11 MiB wire (deduplicated, compressed)`.
+
+     Any other stream stopped, and shows the bytes that its sender read
+     from its source, `pipe closed`, the CHUNK bytes that its receiver
+     decoded, and those that it dropped undecoded, which together are all
+     the CHUNK bytes of the stream, and the bytes that its destination
+     took: `stdin -- 2.09 MiB read, pipe closed, 1.01 MiB wire, 36.00 KiB
+     dropped, 1.05 MiB written`. The server counts what its decoder of the
+     forward stream decoded and wrote, what its lookups found, and what
+     its stdout reader read, which END carries (section 6.2); the client
+     counts the rest.
+  2. The total. As rsync does, the bytes that the client sent and
+     received on both sessions, the elapsed time of the run, including its
+     index update, and the rate of the sent and received bytes in that
+     time. Then the data shrinkage factor, the bytes that the destinations
+     of both streams took divided by the sent and received bytes, and the
+     bytes saved, the first minus the second, which is negative when the
+     run sent more than it delivered: `total -- sent 1.08 MiB and received
+     394.82 MiB in 220.4s (1.80 MiB/s), data shrinkage factor: 6.88, saved
+     2.27 GiB of data transfer`. The CHUNK bytes of a stopped stream that
+     its receiver dropped count as traffic. These counts do not include
+     the bytes that SSH adds or the command's stderr.
+
+  The counts are exact: the client prints the summary after the threads
+  that count the bytes have ended (section 6.9). The lookups can still run
+  when the server sends END, but a lookup answers nothing from Completing
+  on (section 6.4), and only answered queries count as false positives or
+  not found, so these counts are final once the stream has ended or
+  stopped.
 - `hashsync serve --token T` and `hashsync attach --token T`: internal
   server entry points.
 - `hashsync stats`: report index statistics.
@@ -2862,7 +2893,12 @@ decision history, including fuller measurements, is in version control.
     consumer of the client's stdout that exits, which stops the backward
     stream, also with both streams deduplicated; the summary line of a
     stopped stream, with bytes that its receiver dropped, in both
-    directions; STOP before the client starts its forward stream, which
+    directions; the summary line of a deduplicated stream: the bytes of
+    its REF and RLE frames, a window with the weak hash of an indexed
+    block but other bytes, which counts as a false positive, stale and
+    unreadable candidates, and an intact copy beyond `candidate_attempts`,
+    which count as not found, and the lists that each kind of exchange
+    sent; STOP before the client starts its forward stream, which
     leaves stdin unread, and STREAM_END after STOP, on either host; the
     look at whether stdin is at its EOF, for a file, `/dev/null`, a pipe, a
     socket, and a terminal; a stop inside one RLE frame,

@@ -67,6 +67,7 @@ use crate::control::{self, Dispatch, EndFlag};
 use crate::dedup::{self, Receiving, Sending};
 use crate::die::{self, die};
 use crate::fsops::{self, poll_fds, retry_interrupted};
+use crate::pins::Pins;
 use crate::protocol::{
     COMPRESSION_LEVELS, ControlFrame, Counts, End, FrameReader, FrameWriter, Request, SourceRead,
     die_data, flush_data, frame, lost, send_data,
@@ -349,16 +350,25 @@ pub fn run(config_path: Option<&OsStr>, token: &str) -> ! {
                 // at the stop of the backward stream.
                 let status = sys::wait_exit_status(pid);
                 exit_watcher.join().expect("the exit watcher panicked");
-                let forward = decoder.join().expect("the decoder panicked");
+                let decoded = decoder.join().expect("the decoder panicked");
                 relay.join().expect("the stderr relay panicked");
                 if let Some(scanning) = scanning {
                     scanning.join();
                 }
                 let backward = stdout_reader.join().expect("the stdout reader panicked");
+                // The forward stream has ended or stopped, and either put
+                // its receiver into Completing before the decoder or the exit
+                // watcher ended. The lookups answer nothing from then on, so
+                // their counts of misses are final, although a lookup can
+                // still run.
+                let misses = forward_pins.as_deref().map(Pins::misses);
                 let end_frame = End {
                     status,
                     error: String::new(),
-                    forward,
+                    forward: Counts {
+                        misses: misses.unwrap_or_default(),
+                        ..decoded
+                    },
                     backward,
                 };
                 (end_frame, data_out)

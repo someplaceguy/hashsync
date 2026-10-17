@@ -493,9 +493,9 @@ fn whole_bytes(number: &str, line: &str) -> usize {
         .unwrap_or_else(|_| panic!("{number} is not whole bytes: {line}"))
 }
 
-/// A part of the summary line of the deduplicated stream, which only
-/// that line has: the plain stream's line gives no literal bytes
-/// (DESIGN.md §8).
+/// A part of the summary line of a deduplicated stream, which only such a
+/// line has: the plain stream's line gives no literal bytes (DESIGN.md
+/// §8).
 const DEDUPLICATED: &str = " literal, ";
 
 /// The byte counts of `line`, a summary line of a run with `EXACT`
@@ -507,24 +507,107 @@ fn line_counts(line: &str) -> Vec<usize> {
         .collect()
 }
 
-/// The byte counts of the summary line of the deduplicated stream: its
-/// bytes, then its literal, reference, RLE, wire, hash-list, and delta
-/// bytes.
-fn summary_counts(output: &Output) -> Vec<usize> {
-    line_counts(&summary_line(output, DEDUPLICATED))
+/// The summary line of a whole deduplicated stream in a run with `EXACT`
+/// amounts (DESIGN.md §8): `NAME -- B (L literal, R -> RF refs, N -> NF
+/// RLE, F false positives, M not found) + H hashlist + D hashlist delta
+/// --> W wire (deduplicated, compressed)`, where each list shows only when
+/// the exchange sent it.
+#[derive(Debug)]
+struct DeduplicatedLine {
+    /// The bytes of the stream, then its literal, reference, and RLE bytes.
+    bytes: [usize; 4],
+    /// The bytes of the REF frames and of the RLE frames.
+    frames: [usize; 2],
+    /// The false positives, and the blocks not found.
+    misses: [usize; 2],
+    /// The bytes of the full list, and of the delta.
+    hashlist: Option<usize>,
+    delta: Option<usize>,
+    /// The CHUNK bytes and the list bytes together.
+    wire: usize,
+    /// What follows the wire bytes: how the stream went over the wire.
+    how: String,
 }
 
-/// The first byte counts of the summary line of the deduplicated stream:
-/// its bytes, then its literal, reference, and RLE bytes.
+impl DeduplicatedLine {
+    fn parse(line: &str) -> Self {
+        let unexpected = || -> ! { panic!("unexpected summary line: {line}") };
+        let Some((data, wire)) = line.split_once(" --> ") else {
+            unexpected()
+        };
+        // The first `)` closes the parts of the stream's bytes, and the
+        // lists follow, each after ` + `.
+        let Some((data, lists)) = data.split_once(')') else {
+            unexpected()
+        };
+        let [
+            bytes,
+            literal,
+            reference,
+            reference_frames,
+            run,
+            run_frames,
+            false_positives,
+            not_found,
+        ] = line_counts(data)[..]
+        else {
+            unexpected()
+        };
+        let mut lists = lists.split(" + ");
+        if lists.next() != Some("") {
+            unexpected();
+        }
+        let (mut hashlist, mut delta) = (None, None);
+        for list in lists {
+            let [size] = line_counts(list)[..] else {
+                unexpected()
+            };
+            match list.strip_prefix(&format!("{size} B ")) {
+                Some("hashlist") if hashlist.is_none() && delta.is_none() => hashlist = Some(size),
+                Some("hashlist delta") if delta.is_none() => delta = Some(size),
+                _ => unexpected(),
+            }
+        }
+        let Some((wire, how)) = wire.split_once(" B wire") else {
+            unexpected()
+        };
+        let [wire] = line_counts(wire)[..] else {
+            unexpected()
+        };
+        DeduplicatedLine {
+            bytes: [bytes, literal, reference, run],
+            frames: [reference_frames, run_frames],
+            misses: [false_positives, not_found],
+            hashlist,
+            delta,
+            wire,
+            how: how.to_owned(),
+        }
+    }
+
+    /// The bytes of the stream's CHUNK payloads: its wire bytes without the
+    /// lists.
+    fn chunks(&self) -> usize {
+        self.wire - self.hashlist.unwrap_or(0) - self.delta.unwrap_or(0)
+    }
+}
+
+/// The summary line of the deduplicated stream of a run that deduplicates
+/// one stream.
+fn deduplicated(output: &Output) -> DeduplicatedLine {
+    DeduplicatedLine::parse(&summary_line(output, DEDUPLICATED))
+}
+
+/// The summary line of the deduplicated stream `stream`, `stdin` or
+/// `stdout`.
+fn deduplicated_stream(output: &Output, stream: &str) -> DeduplicatedLine {
+    DeduplicatedLine::parse(&summary_line(output, &format!("hashsync: {stream} -- ")))
+}
+
+/// The bytes of the deduplicated stream, then its literal, reference, and
+/// RLE bytes, from its summary line.
 fn summary(output: &Output) -> [usize; 4] {
-    let counts = summary_counts(output);
-    [counts[0], counts[1], counts[2], counts[3]]
-}
-
-/// The bytes of the CHUNK payloads of the deduplicated stream, from its
-/// summary line.
-fn wire_bytes(output: &Output) -> usize {
-    summary_counts(output)[4]
+    deduplicated(output).bytes
 }
 
 /// The bytes and the wire bytes of the plain stream, `stdin` or `stdout`,
@@ -541,30 +624,59 @@ fn plain_counts(output: &Output, stream: &str) -> [usize; 2] {
     [bytes, wire]
 }
 
-/// The second summary line, which reports the traffic as rsync does.
+/// The last summary line, which reports the traffic as rsync does.
 struct Traffic {
     sent: usize,
     received: usize,
     seconds: f64,
     /// Bytes per second.
     rate: usize,
-    speedup: f64,
+    /// The data shrinkage factor.
+    shrinkage: f64,
+    /// The bytes saved, negative when the run sent more than it delivered.
+    saved: i64,
 }
 
-/// The second summary line of a run with `EXACT` amounts, `sent S and
-/// received R in Ts (X/s), speedup Y`, whose numbers are S, R, T, X, and
-/// Y.
+impl Traffic {
+    /// Check the data shrinkage factor and the saved bytes of a run in
+    /// `direction` against `delivered`, the bytes that the destinations of
+    /// both streams took: they are those bytes over the traffic, and those
+    /// bytes minus the traffic (DESIGN.md §8). The line rounds the factor to
+    /// two decimals.
+    fn check_delivered(&self, delivered: usize, direction: Direction) {
+        let traffic = self.sent + self.received;
+        let shrinkage = delivered as f64 / traffic as f64;
+        assert!(
+            (self.shrinkage - shrinkage).abs() <= 0.005 + 1e-9,
+            "{direction:?}: data shrinkage factor {}, expected {shrinkage}",
+            self.shrinkage
+        );
+        let saved = delivered as i64 - traffic as i64;
+        assert_eq!(self.saved, saved, "{direction:?}: saved bytes");
+    }
+}
+
+/// The last summary line of a run with `EXACT` amounts, `total -- sent S
+/// and received R in Ts (X/s), data shrinkage factor: F, saved Z of data
+/// transfer`, whose numbers are S, R, T, X, F, and Z, with a sign before Z
+/// when it is negative.
 fn traffic(output: &Output) -> Traffic {
-    let line = summary_line(output, "hashsync: sent ");
-    let [sent, received, seconds, rate, speedup] = numbers(&line)[..] else {
+    let line = summary_line(output, "hashsync: total -- ");
+    let [sent, received, seconds, rate, shrinkage, saved] = numbers(&line)[..] else {
         panic!("unexpected traffic line: {line}");
     };
+    let saved = whole_bytes(saved, &line) as i64;
     Traffic {
         sent: whole_bytes(sent, &line),
         received: whole_bytes(received, &line),
         seconds: seconds.parse().unwrap(),
         rate: whole_bytes(rate, &line),
-        speedup: speedup.parse().unwrap(),
+        shrinkage: shrinkage.parse().unwrap(),
+        saved: if line.contains(" saved -") {
+            -saved
+        } else {
+            saved
+        },
     }
 }
 
@@ -691,14 +803,20 @@ fn output_reproduces_byte_for_byte_and_lists_are_cached() {
         };
         assert!(
             stderr.contains(&format!(
-                "hashsync: {stream} -- {payload_len} B ({payload_len} B literal, 0 B reference, 0 B RLE)"
+                "hashsync: {stream} -- {payload_len} B ({payload_len} B literal, \
+                 0 B -> 0 B refs, 0 B -> 0 B RLE, 0 false positives, 0 not found) + "
             )),
             "summary counts:\n{stderr}"
         );
+        let line = deduplicated(&output);
+        assert_eq!(line.how, " (deduplicated, compressed)", "{direction:?}");
         match direction {
-            // The empty stdin of the client goes as an empty zstd frame.
+            // The empty stdin of the client goes as an empty zstd frame,
+            // and its line comes first.
             Direction::Pull => assert!(
-                stderr.contains("hashsync: stdin -- 0 B, 13 B wire\n"),
+                stderr.contains(
+                    "hashsync: stdin -- 0 B --> 13 B wire (compressed)\nhashsync: stdout"
+                ),
                 "summary counts:\n{stderr}"
             ),
             Direction::Push => assert_eq!(plain_counts(&output, "stdout")[0], payload_len),
@@ -781,7 +899,10 @@ fn indexed_blocks_become_references_at_any_offset() {
 fn stale_and_unreadable_candidates_are_misses() {
     // A `--no-update` run reads candidates from a file that changed, then
     // became unreadable, after the update. Verification rejects those
-    // candidates, and the output stays exact (DESIGN.md §3).
+    // candidates, and the output stays exact (DESIGN.md §3). The index has
+    // their blocks, so the summary counts them as not found, and not as
+    // false positives: the changed block once, and with the unreadable
+    // file, each of the 8 blocks (DESIGN.md §8).
     for direction in DIRECTIONS {
         let transfer = Transfer::new(&[]);
         transfer.configure_receiver(direction, "");
@@ -799,15 +920,74 @@ fn stale_and_unreadable_candidates_are_misses() {
         std::fs::write(transfer.env.path(&indexed), &changed).unwrap();
         let output = succeeded(transfer.run_stream(direction, &flags, &script));
         assert_eq!(output.stdout, original);
-        let counts = [8 * BLOCK, BLOCK, 7 * BLOCK, 0];
-        assert_eq!(summary(&output), counts, "{direction:?}");
+        let line = deduplicated(&output);
+        assert_eq!(
+            line.bytes,
+            [8 * BLOCK, BLOCK, 7 * BLOCK, 0],
+            "{direction:?}"
+        );
+        assert_eq!(line.misses, [0, 1], "{direction:?}");
 
         transfer.env.chmod(&indexed, 0o000);
         let output = succeeded(transfer.run_stream(direction, &flags, &script));
         transfer.env.chmod(&indexed, 0o644);
         assert_eq!(output.stdout, original);
-        let counts = [8 * BLOCK, 8 * BLOCK, 0, 0];
-        assert_eq!(summary(&output), counts, "{direction:?}");
+        let line = deduplicated(&output);
+        assert_eq!(line.bytes, [8 * BLOCK, 8 * BLOCK, 0, 0], "{direction:?}");
+        assert_eq!(line.misses, [0, 8], "{direction:?}");
+    }
+}
+
+/// The weak-hash polynomial of `window`, `sum(w[i] * a^(B-1-i))` modulo
+/// 2^64 (DESIGN.md §5.1). The weak hash mixes it with a bijection, so
+/// windows with equal polynomials have equal weak hashes.
+fn weak_polynomial(window: &[u8]) -> u64 {
+    const MULTIPLIER: u64 = 0x9E37_79B9_7F4A_7C15;
+    window.iter().fold(0, |poly: u64, &byte| {
+        poly.wrapping_mul(MULTIPLIER).wrapping_add(byte.into())
+    })
+}
+
+/// Two different blocks with the same weak hash: the Thue-Morse string of
+/// 1024 bytes, and its complement, followed by the same bytes. A string of
+/// 2^n bytes differs from its complement by a product of the factors
+/// `a^(2^k) - 1` for `k < n`, whatever the bytes for 0 and 1. For an odd
+/// multiplier `a` that is 5 modulo 8, such a factor holds `k + 2` factors
+/// of 2, so for n = 10, the product holds 65, and vanishes modulo 2^64.
+fn weak_collision() -> (Vec<u8>, Vec<u8>) {
+    let tail = random(BLOCK - 1024, 81);
+    let block = |flip: u32| {
+        let thue_morse = (0..1024u32).map(|i| b"ab"[((i.count_ones() + flip) % 2) as usize]);
+        thue_morse.chain(tail.iter().copied()).collect::<Vec<u8>>()
+    };
+    let (indexed, other) = (block(0), block(1));
+    assert_ne!(indexed, other);
+    assert_eq!(weak_polynomial(&indexed), weak_polynomial(&other));
+    (indexed, other)
+}
+
+#[test]
+fn a_window_that_only_shares_its_weak_hash_is_a_false_positive() {
+    // The stream's only window has the weak hash of an indexed block, but
+    // other bytes (`weak_collision`). The scanner queries it, the
+    // receiver's index has no block with its strong hash, and the answer is
+    // no: the window goes as literal bytes, and the summary counts one false
+    // positive, and no block not found (DESIGN.md §3 and §8).
+    let (indexed, stream) = weak_collision();
+    for direction in DIRECTIONS {
+        let transfer = Transfer::new(&[]);
+        transfer.configure_receiver(direction, "");
+        transfer
+            .env
+            .write(transfer.indexed(direction, "block"), &indexed);
+        let payload = transfer.env.path("payload");
+        std::fs::write(&payload, &stream).unwrap();
+        let script = format!("cat '{}'", payload.display());
+        let output = succeeded(transfer.run_stream(direction, &[direction.batch()], &script));
+        assert!(output.stdout == stream, "{direction:?}: the output differs");
+        let line = deduplicated(&output);
+        assert_eq!(line.bytes, [BLOCK, BLOCK, 0, 0], "{direction:?}");
+        assert_eq!(line.misses, [1, 0], "{direction:?}");
     }
 }
 
@@ -816,8 +996,9 @@ fn candidate_attempts_bound_each_query() {
     // One file holds a block twice, and its first occurrence changes after
     // the update. Candidates follow the block numbers, an order that the
     // index fixes but DESIGN.md §6.4 does not: one attempt reaches only
-    // the stale occurrence, two reach the intact one. The receiver's
-    // configuration sets the attempts.
+    // the stale occurrence, and the summary counts the block as not found;
+    // two reach the intact one. The receiver's configuration sets the
+    // attempts.
     for direction in DIRECTIONS {
         let transfer = Transfer::new(&[]);
         transfer.configure_receiver(direction, "");
@@ -832,13 +1013,15 @@ fn candidate_attempts_bound_each_query() {
         std::fs::write(transfer.env.path(&indexed), &changed).unwrap();
 
         let script = format!("cat '{}'", payload.display());
-        for (attempts, reference) in [(1, 0), (2, BLOCK)] {
+        for (attempts, reference, not_found) in [(1, 0, 1), (2, BLOCK, 0)] {
             let attempts = format!("candidate_attempts = {attempts}\n");
             transfer.configure_receiver(direction, &attempts);
             let output = succeeded(transfer.run_stream(direction, &["--no-update"], &script));
             assert_eq!(output.stdout, block);
+            let line = deduplicated(&output);
             let counts = [BLOCK, BLOCK - reference, reference, 0];
-            assert_eq!(summary(&output), counts, "{direction:?}");
+            assert_eq!(line.bytes, counts, "{direction:?}");
+            assert_eq!(line.misses, [0, not_found], "{direction:?}");
         }
     }
 }
@@ -1105,7 +1288,8 @@ fn a_slow_consumer_and_a_one_window_lookahead_keep_the_output_exact() {
 fn runs_and_compression_shrink_the_wire() {
     // Zeros become runs of whole windows, and the zstd stream compresses
     // the repetitive text. Random bytes shrink neither way (DESIGN.md §6.2
-    // and §6.3).
+    // and §6.3). The summary lines say which streams were compressed and
+    // deduplicated (DESIGN.md §8).
     const ZEROS: usize = 4 << 20;
     for direction in DIRECTIONS {
         for (options, compressed) in [(&[][..], true), (&["--compression-level", "0"], false)] {
@@ -1125,15 +1309,33 @@ fn runs_and_compression_shrink_the_wire() {
             assert!(output.stdout == expected, "the output differs");
             let literal = text.len() + noise.len();
             let counts = [expected.len(), literal, 0, ZEROS];
-            assert_eq!(summary(&output), counts, "{direction:?}");
-            let wire = wire_bytes(&output);
+            let line = deduplicated(&output);
+            assert_eq!(line.bytes, counts, "{direction:?}");
+            // Each RLE frame takes 14 bytes. The scanner sends a run before
+            // it stops growing, so the number of frames that carry the
+            // zeros depends on its pace.
+            let [reference_frames, run_frames] = line.frames;
+            assert!(
+                reference_frames == 0 && run_frames > 0 && run_frames % 14 == 0,
+                "{direction:?}: {line:?}"
+            );
+            let wire = line.chunks();
+            let plain = match direction {
+                Direction::Pull => "hashsync: stdin -- ",
+                Direction::Push => "hashsync: stdout -- ",
+            };
+            let plain = summary_line(&output, plain);
             if compressed {
                 assert!(
                     (noise.len()..noise.len() + (64 << 10)).contains(&wire),
                     "{direction:?}: {wire} bytes wire"
                 );
+                assert_eq!(line.how, " (deduplicated, compressed)");
+                assert!(plain.ends_with(" B wire (compressed)"), "{plain}");
             } else {
                 assert!(wire > literal, "{direction:?}: {wire} bytes wire");
+                assert_eq!(line.how, " (deduplicated)");
+                assert!(plain.ends_with(" B wire"), "{plain}");
             }
         }
     }
@@ -1183,9 +1385,10 @@ fn empty_output_and_command_failure_status() {
 #[test]
 fn the_summary_counts_both_sessions() {
     // Each reference needs a QUERY on the control session and a yes
-    // ANSWER, which the data session does not carry. The second summary
-    // line counts both sessions in both directions (DESIGN.md §8). Without
-    // compression, the control session carries its frames as they are.
+    // ANSWER, which the data session does not carry. The last summary line
+    // counts both sessions in both directions (DESIGN.md §8). Without
+    // compression, the control session carries its frames as they are, and
+    // the CHUNK payloads are the stream frames as they are.
     let transfer = Transfer::new(&["--compression-level", "0"]);
     let blocks = tiled(64, 7);
     transfer.env.write("tree/blocks", &blocks);
@@ -1195,30 +1398,37 @@ fn the_summary_counts_both_sessions() {
     let command = args(&[&format!("cat >/dev/null; cat '{}'", path.display())]);
     let output = succeeded(transfer.run(&[BATCH], &refs(&command)));
     assert_eq!(output.stdout, blocks);
-    let counts = summary_counts(&output);
-    let (stdout_bytes, wire, hash_list) = (counts[0], counts[4], counts[5]);
-    assert_eq!(counts[2], blocks.len(), "every block is a reference");
+    let line = deduplicated(&output);
+    assert_eq!(line.bytes[2], blocks.len(), "every block is a reference");
+    // The first exchange sends the full list. The wire bytes of the stream
+    // are that list and its CHUNK bytes: 64 REF frames of 5 bytes, which
+    // fit one CHUNK.
+    let hash_list = line.hashlist.expect("no full list");
+    assert_eq!(line.delta, None);
+    assert_eq!(line.frames, [64 * 5, 0]);
+    assert_eq!(line.chunks(), 64 * 5, "64 REF frames");
+    assert_eq!(line.how, " (deduplicated)");
     // The stdin of the client is empty: without compression, its stream
     // is STREAM_END alone.
     assert_eq!(plain_counts(&output, "stdin"), [0, 0]);
 
     // On the data session, the client reads the server's version and
     // features, its HELLO with its account ID and no list, CACHE_RESULT,
-    // the backward stream, whose 64 REF frames fit one CHUNK, STREAM_END,
-    // and END with its status, an empty error, the server's five counts of
-    // the forward stream, and its count and EOF flag of the command's
-    // stdout. On the control session,
-    // it reads the version and features, one QUERY per block: a 5-byte
-    // frame header, the offset, and the full digest, and the STOP of the
-    // forward stream at the command's exit, a header alone. The server does
-    // not wait for its control writer at the end, so the closure of the
-    // session can cut STOP off (DESIGN.md §6.6 and §6.9). The client writes
-    // its versions and features on both sessions, the hash list, and one
-    // ANSWER per block: a header, the offset, and the flag.
+    // the backward stream in one CHUNK, STREAM_END, and END with its
+    // status, an empty error, the server's nine counts of the forward
+    // stream, and its count and EOF flag of the command's stdout. On the
+    // control session, it reads the version and features, one QUERY per
+    // block: a 5-byte frame header, the offset, and the full digest, and
+    // the STOP of the forward stream at the command's exit, a header alone.
+    // The server does not wait for its control writer at the end, so the
+    // closure of the session can cut STOP off (DESIGN.md §6.6 and §6.9).
+    // The client writes its versions and features on both sessions, the
+    // hash list, and one ANSWER per block: a header, the offset, and the
+    // flag.
     let traffic = traffic(&output);
     let start = version_and_features(FEATURES).len();
-    assert_eq!(wire, 64 * 5, "64 REF frames");
-    let data = start + (5 + 16 + 4) + 5 + (5 + wire) + 5 + (5 + 4 + 4 + 5 * 8 + 8 + 1);
+    let end = 5 + 4 + 4 + 9 * 8 + 8 + 1;
+    let data = start + (5 + 16 + 4) + 5 + (5 + line.chunks()) + 5 + end;
     let control = start + 64 * (5 + 8 + 32);
     assert!(
         [data + control, data + control + 5].contains(&traffic.received),
@@ -1227,18 +1437,14 @@ fn the_summary_counts_both_sessions() {
     );
     assert!(traffic.sent > hash_list + 2 * start + 64 * (5 + 8 + 1));
 
-    // The speedup is the bytes of both streams over the traffic. The rate
-    // is the traffic over the elapsed time. The line rounds the time to a
-    // tenth of a second and the rate to whole bytes per second. So the
-    // traffic is between the products of the smallest and of the largest
-    // time and rate that round to the shown values, however long the run
-    // takes.
+    // The data shrinkage factor and the saved bytes compare the bytes of
+    // both streams with the traffic. The rate is the traffic over the
+    // elapsed time. The line rounds the time to a tenth of a second and the
+    // rate to whole bytes per second. So the traffic is between the
+    // products of the smallest and of the largest time and rate that round
+    // to the shown values, however long the run takes.
+    traffic.check_delivered(blocks.len(), Direction::Pull);
     let total = traffic.sent + traffic.received;
-    let speedup = stdout_bytes as f64 / total as f64;
-    assert!(
-        (traffic.speedup - speedup).abs() <= 0.005 + 1e-9,
-        "speedup {speedup}"
-    );
     let (seconds, rate) = (traffic.seconds, traffic.rate as f64);
     let smallest = (seconds - 0.05).max(0.0) * (rate - 0.5).max(0.0);
     let largest = (seconds + 0.05) * (rate + 0.5);
@@ -1267,27 +1473,33 @@ fn summaries_show_scale_units() {
     let line = summary_line(&output, DEDUPLICATED);
     assert!(
         line.starts_with(
-            "hashsync: stdout -- 10.00 MiB (10.00 MiB literal, 0 B reference, 0 B RLE), "
+            "hashsync: stdout -- 10.00 MiB (10.00 MiB literal, 0 B -> 0 B refs, \
+             0 B -> 0 B RLE, 0 false positives, 0 not found) + "
         ),
         "{line}"
     );
     let line = summary_line(&output, "hashsync: stdin ");
     assert_eq!(
-        line, "hashsync: stdin -- 0 B, 13 B wire",
+        line, "hashsync: stdin -- 0 B --> 13 B wire (compressed)",
         "an empty zstd frame"
     );
 
-    // The sent and received bytes, and the rate, whose unit depends on
-    // the elapsed time.
-    let line = summary_line(&output, "hashsync: sent ");
+    // The sent and received bytes, the rate, whose unit depends on the
+    // elapsed time, and the saved bytes. Random bytes do not compress, and
+    // the hash list goes too, so the run saves a negative amount, which
+    // shows with its sign.
+    let line = summary_line(&output, "hashsync: total -- ");
     let amounts = amounts(&line);
     assert!(
         amounts
             .iter()
-            .all(|&(number, unit)| is_scaled_amount(number, unit)),
+            .all(|&(number, unit)| is_scaled_amount(number.trim_start_matches('-'), unit)),
         "{line}"
     );
-    assert!(matches!(amounts[..], [(_, "KiB"), (_, "MiB"), _]), "{line}");
+    assert!(
+        matches!(amounts[..], [(_, "KiB"), (_, "MiB"), _, (saved, _)] if saved.starts_with('-')),
+        "{line}"
+    );
 }
 
 #[test]
@@ -2408,7 +2620,7 @@ fn with_n_the_command_reads_an_empty_stdin() {
     assert_eq!(output.stdout, b"end\n");
     assert_eq!(
         summary_line(&output, "hashsync: stdin"),
-        "hashsync: stdin -- 0 B, 13 B wire"
+        "hashsync: stdin -- 0 B --> 13 B wire (compressed)"
     );
     let mut left = Vec::new();
     unread.read_to_end(&mut left).unwrap();
@@ -2790,7 +3002,10 @@ fn no_sender_cache_stores_nothing_and_removes_earlier_lists() {
         // the empty directories (DESIGN.md §5.6).
         let output = succeeded(transfer.run_stream(direction, &["--no-sender-cache"], "true"));
         let (full, delta) = list_bytes(&output);
-        assert!(full > 0 && delta == 0, "full {full}, delta {delta}");
+        assert!(
+            full.is_some() && delta.is_none(),
+            "full {full:?}, delta {delta:?}"
+        );
         let sender = transfer.peer_dir(direction.sender(), "remote-hashlists");
         assert_eq!(sender, None, "{direction:?}");
         let receiver = transfer.peer_dir(direction.receiver(), "local-hashlists");
@@ -2841,10 +3056,10 @@ fn each_side_keeps_only_its_latest_list() {
 }
 
 /// The full-list and delta bytes that a run with `EXACT` amounts sent, from
-/// its summary.
-fn list_bytes(output: &Output) -> (usize, usize) {
-    let counts = summary_counts(output);
-    (counts[5], counts[6])
+/// its summary, which shows only the lists that went out.
+fn list_bytes(output: &Output) -> (Option<usize>, Option<usize>) {
+    let line = deduplicated(output);
+    (line.hashlist, line.delta)
 }
 
 /// The script `cat` for the file `name` in the receiver's root.
@@ -2857,7 +3072,11 @@ fn cat(transfer: &Transfer, direction: Direction, name: &str) -> String {
 /// deduplicated stream of `direction`, in batch delivery, and check the
 /// run with `all_references`. Returns the list bytes that the run
 /// carried.
-fn cat_references(transfer: &Transfer, direction: Direction, name: &str) -> (usize, usize) {
+fn cat_references(
+    transfer: &Transfer,
+    direction: Direction,
+    name: &str,
+) -> (Option<usize>, Option<usize>) {
     let script = cat(transfer, direction, name);
     let output = transfer.run_stream(direction, &[direction.batch()], &script);
     all_references(transfer, direction, name, output)
@@ -2872,7 +3091,7 @@ fn all_references(
     direction: Direction,
     name: &str,
     output: Output,
-) -> (usize, usize) {
+) -> (Option<usize>, Option<usize>) {
     let output = succeeded(output);
     let expected = std::fs::read(transfer.env.path(transfer.indexed(direction, name))).unwrap();
     assert!(
@@ -2900,10 +3119,10 @@ fn kept_list(transfer: &Transfer, direction: Direction) -> String {
 fn an_unchanged_list_is_kept_and_a_changed_one_goes_as_a_delta() {
     // The first run sends the full list. With the index unchanged, the next
     // run sends no list bytes at all, because the sender already has the
-    // target. After a change, a run sends the delta from the list that both
-    // sides keep, which is smaller. However the sender gets the target, it
-    // builds its table from it, so the blocks of the files become references
-    // (DESIGN.md §5.6).
+    // target, and its summary line shows no list. After a change, a run
+    // sends the delta from the list that both sides keep, which is smaller.
+    // However the sender gets the target, it builds its table from it, so
+    // the blocks of the files become references (DESIGN.md §5.6 and §8).
     for direction in DIRECTIONS {
         let transfer = Transfer::new(&[]);
         transfer.configure_receiver(direction, "");
@@ -2911,18 +3130,20 @@ fn an_unchanged_list_is_kept_and_a_changed_one_goes_as_a_delta() {
             .env
             .write(transfer.indexed(direction, "first"), &tiled(64, 7));
         let (full, delta) = cat_references(&transfer, direction, "first");
-        assert!(full > 0 && delta == 0, "full {full}, delta {delta}");
+        assert_eq!(delta, None);
+        let full = full.expect("no full list");
         let first_list = kept_list(&transfer, direction);
 
-        assert_eq!(cat_references(&transfer, direction, "first"), (0, 0));
+        assert_eq!(cat_references(&transfer, direction, "first"), (None, None));
         assert_eq!(kept_list(&transfer, direction), first_list);
 
         transfer
             .env
             .write(transfer.indexed(direction, "second"), &tiled(4, 9));
         let (none, delta) = cat_references(&transfer, direction, "second");
-        assert_eq!(none, 0);
-        assert!(delta > 0 && delta < full, "delta {delta}, full {full}");
+        assert_eq!(none, None);
+        let delta = delta.expect("no delta");
+        assert!(delta < full, "delta {delta}, full {full}");
         assert_ne!(kept_list(&transfer, direction), first_list);
     }
 }
@@ -2969,8 +3190,10 @@ fn a_base_from_the_directory_of_another_peer_serves() {
             .env
             .write(transfer.indexed(direction, "second"), &tiled(4, 9));
         let (full, delta) = cat_references(&transfer, direction, "second");
-        assert_eq!(full, 0);
-        assert!(delta > 0);
+        assert!(
+            full.is_none() && delta.is_some(),
+            "full {full:?}, delta {delta:?}"
+        );
         assert!(
             ctime(&other.join(&base)) > before,
             "{direction:?}: the base must stay, renewed"
@@ -3008,17 +3231,24 @@ fn a_damaged_cached_list_gives_way_to_the_full_list_on_either_side() {
         damage(receiver);
         write("second", &tiled(4, 9));
         let (full, delta) = cat_references(&transfer, direction, "second");
-        assert!(full > 0 && delta == 0, "full {full}, delta {delta}");
+        assert_eq!(delta, None);
+        let full = full.expect("no full list");
 
         // HASHKEEP of the unchanged list, then the full list.
         damage(sender);
-        assert_eq!(cat_references(&transfer, direction, "second"), (full, 0));
+        let lists = cat_references(&transfer, direction, "second");
+        assert_eq!(lists, (Some(full), None));
 
-        // HASHDELTA from the previous run's list, then the full list.
+        // HASHDELTA from the previous run's list, then the full list: the
+        // summary line shows both (DESIGN.md §8).
         damage(sender);
         write("third", &tiled(4, 11));
         let (third, delta) = cat_references(&transfer, direction, "third");
-        assert!(third > full && delta > 0, "full {third}, delta {delta}");
+        let third = third.expect("no full list");
+        assert!(
+            third > full && delta.is_some(),
+            "full {third}, delta {delta:?}"
+        );
         for (side, tree) in [receiver, sender] {
             let dir = transfer.peer_dir(side, tree).unwrap();
             let bytes = std::fs::read(dir.join(kept_list(&transfer, direction))).unwrap();
@@ -3061,13 +3291,19 @@ fn lists_stay_usable_after_failed_runs_and_restores() {
         std::fs::remove_file(sender_dir.join(&second)).unwrap();
         write("third", &tiled(4, 11));
         let (full, delta) = cat_references(&transfer, direction, "third");
-        assert!(full == 0 && delta > 0, "full {full}, delta {delta}");
+        assert!(
+            full.is_none() && delta.is_some(),
+            "full {full:?}, delta {delta:?}"
+        );
         kept_list(&transfer, direction);
 
         let third = transfer.env.path(transfer.indexed(direction, "third"));
         std::fs::remove_file(third).unwrap();
         let (full, delta) = cat_references(&transfer, direction, "second");
-        assert!(full == 0 && delta > 0, "full {full}, delta {delta}");
+        assert!(
+            full.is_none() && delta.is_some(),
+            "full {full:?}, delta {delta:?}"
+        );
         assert_eq!(kept_list(&transfer, direction), second);
     }
 }
@@ -3090,7 +3326,7 @@ fn a_rebuilt_index_starts_its_lists_again() {
             .unwrap();
         let list = kept_list(&transfer, direction);
         transfer.update_receiver(direction, &["--rebuild"]);
-        assert_eq!(cat_references(&transfer, direction, "first"), (full, 0));
+        assert_eq!(cat_references(&transfer, direction, "first"), (full, None));
         for (side, tree) in [
             (direction.receiver(), "local-hashlists"),
             (direction.sender(), "remote-hashlists"),
@@ -3165,8 +3401,8 @@ exec "$ssh" "$@""#,
     let second = transfer.run(&[BATCH, "--no-update"], &refs(&args(&[&script])));
     let (full, delta) = all_references(&transfer, Direction::Pull, "second", second);
     assert!(
-        full == 0 && delta > 0,
-        "second run: full {full}, delta {delta}"
+        full.is_none() && delta.is_some(),
+        "second run: full {full:?}, delta {delta:?}"
     );
     let server_dir = transfer.peer_dir("server", "remote-hashlists").unwrap();
     assert!(!client_dir.join(&base).exists() && !server_dir.join(&base).exists());
@@ -3174,8 +3410,8 @@ exec "$ssh" "$@""#,
     gate_writer.write_all(b"go\n").unwrap();
     let (full, delta) = all_references(&transfer, Direction::Pull, "second", output_of(first));
     assert!(
-        full == 0 && delta > 0,
-        "first run: full {full}, delta {delta}"
+        full.is_none() && delta.is_some(),
+        "first run: full {full:?}, delta {delta:?}"
     );
     kept_list(&transfer, Direction::Pull);
 }
@@ -3191,9 +3427,15 @@ fn a_delta_larger_than_the_full_list_is_not_sent() {
         transfer.configure_receiver(direction, "");
         let one = transfer.indexed(direction, "one");
         transfer.env.write(&one, &tiled(1, 7));
-        assert_eq!(cat_references(&transfer, direction, "one"), (17, 0));
+        assert_eq!(
+            cat_references(&transfer, direction, "one"),
+            (Some(17), None)
+        );
         transfer.env.write(&one, &tiled(1, 8));
-        assert_eq!(cat_references(&transfer, direction, "one"), (17, 0));
+        assert_eq!(
+            cat_references(&transfer, direction, "one"),
+            (Some(17), None)
+        );
     }
 }
 
@@ -3353,9 +3595,10 @@ fn feature_bits_that_the_client_does_not_know_are_ignored() {
     // with none (DESIGN.md §6.2).
     let transfer = Transfer::new(&[]);
     let start = version_and_features(u64::MAX);
-    // END with status 0, no error text, counts of an empty forward stream,
-    // and the 6 bytes of the command's stdout, read to its EOF.
-    let end = [&[0; 48][..], &6u64.to_le_bytes(), &[1]].concat();
+    // END with status 0, no error text, the nine counts of an empty
+    // forward stream, and the 6 bytes of the command's stdout, read to its
+    // EOF.
+    let end = [&[0; 4 + 4 + 9 * 8][..], &6u64.to_le_bytes(), &[1]].concat();
     let data = [&start[..], &fake_frames(b"output"), &frame(END, &end)].concat();
     let server = fake_server(&transfer, "unknown-features", &data, &start);
     transfer.set_hashsync_path(server.as_os_str());
@@ -3650,7 +3893,7 @@ exit $status"#,
         control.ends_with(&late),
         "the run ended before the last QUERY"
     );
-    assert_eq!(wire_bytes(&output), chunk_payload_bytes(&data));
+    assert_eq!(deduplicated(&output).chunks(), chunk_payload_bytes(&data));
     assert_eq!(traffic(&output).received, data.len() + control.len());
 }
 
@@ -3683,7 +3926,8 @@ exit "$(cat '{0}'.$session.status)""#,
     assert_eq!(output.stdout, blocks);
     assert_eq!(summary(&output), [blocks.len(), BLOCK, 31 * BLOCK, 0]);
     let read = |name: &str| std::fs::read(format!("{}.{name}", captured.display())).unwrap();
-    assert_eq!(wire_bytes(&output), chunk_payload_bytes(&read("data.in")));
+    let line = deduplicated(&output);
+    assert_eq!(line.chunks(), chunk_payload_bytes(&read("data.in")));
     let traffic = traffic(&output);
     assert_eq!(
         traffic.sent,
@@ -3700,8 +3944,9 @@ fn the_summary_of_a_stopped_forward_stream_counts_what_reached_the_command() {
     // gives the bytes that the client read, `pipe closed`, the CHUNK bytes
     // that the server decoded and that it dropped, which together are every
     // CHUNK byte that the client sent, and the bytes that the command's
-    // stdin took, which a pipe holds while no process reads it. The speedup
-    // counts only the bytes that reached their destinations (DESIGN.md §8).
+    // stdin took, which a pipe holds while no process reads it. The data
+    // shrinkage factor and the saved bytes count only the bytes that
+    // reached their destinations (DESIGN.md §8).
     // `tee` copies what the client sends on the data session; the wrapper
     // ends only once its copy has ended, and the client waits for the exit
     // of both sessions before the summary.
@@ -3734,13 +3979,7 @@ fn the_summary_of_a_stopped_forward_stream_counts_what_reached_the_command() {
         );
         let data = std::fs::read(format!("{}.data", captured.display())).unwrap();
         assert_eq!(decoded + dropped, chunk_payload_bytes(&data), "{line}");
-        let traffic = traffic(&output);
-        let total = (traffic.sent + traffic.received) as f64;
-        let speedup = (output.stdout.len() + written) as f64 / total;
-        assert!(
-            (traffic.speedup - speedup).abs() <= 0.005 + 1e-9,
-            "{direction:?}: speedup {speedup}"
-        );
+        traffic(&output).check_delivered(output.stdout.len() + written, direction);
     }
 }
 
@@ -4076,12 +4315,7 @@ fn a_closed_stdout_stops_the_backward_stream_and_the_command_gets_sigpipe() {
             "{direction:?}"
         );
         // The stdout of the client took 10 bytes, and its stdin none.
-        let traffic = traffic(&output);
-        let speedup = 10.0 / (traffic.sent + traffic.received) as f64;
-        assert!(
-            (traffic.speedup - speedup).abs() <= 0.005 + 1e-9,
-            "{direction:?}: speedup {speedup}"
-        );
+        traffic(&output).check_delivered(10, direction);
         // The descendant has run on since the command started it, so no
         // other process can have its PID.
         let pid: u32 = std::fs::read_to_string(&descendant)
@@ -5281,12 +5515,12 @@ fn both_streams_are_deduplicated_against_the_indexes_of_their_receivers() {
         );
         let expected = [&b"abc"[..], &client_blocks].concat();
         assert!(output.stdout == expected, "{no_update}: the output differs");
-        let stdout = line_counts(&summary_line(&output, "hashsync: stdout -- "));
+        let stdout = deduplicated_stream(&output, "stdout");
         let counts = [expected.len(), 3, client_blocks.len(), 0];
-        assert_eq!(stdout[..4], counts, "{no_update}");
-        let stdin = line_counts(&summary_line(&output, "hashsync: stdin -- "));
+        assert_eq!(stdout.bytes, counts, "{no_update}");
+        let stdin = deduplicated_stream(&output, "stdin");
         let counts = [input.len(), 2, server_blocks.len(), 0];
-        assert_eq!(stdin[..4], counts, "{no_update}");
+        assert_eq!(stdin.bytes, counts, "{no_update}");
         // Both updates write a note, the first one "rebuilt index", a later
         // one "updated index". With `--no-update`, neither host updates.
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -5313,8 +5547,9 @@ fn both_streams_are_deduplicated_against_the_indexes_of_their_receivers() {
             list("server", &server_list[0]),
         ];
         assert_ne!(lists[0], lists[1]);
-        assert_eq!(stdout[5..], [lists[0], 0], "{no_update}");
-        assert_eq!(stdin[5..], [lists[1], 0], "{no_update}");
+        let full = |line: &DeduplicatedLine| (line.hashlist, line.delta);
+        assert_eq!(full(&stdout), (Some(lists[0]), None), "{no_update}");
+        assert_eq!(full(&stdin), (Some(lists[1]), None), "{no_update}");
         let sent = transfer.cache_files("server", "remote-hashlists");
         assert_eq!(sent, client_list);
         let sent = transfer.cache_files("client", "remote-hashlists");
@@ -5364,8 +5599,8 @@ fn the_forward_stream_stops_while_the_deduplicated_backward_stream_goes_on() {
     let output = succeeded(output_of(client));
     drop(producer);
     assert!(output.stdout == blocks, "the output differs");
-    let stdout = line_counts(&summary_line(&output, "hashsync: stdout -- "));
-    assert_eq!(stdout[..4], [blocks.len(), 0, blocks.len(), 0]);
+    let stdout = deduplicated_stream(&output, "stdout");
+    assert_eq!(stdout.bytes, [blocks.len(), 0, blocks.len(), 0]);
     let stdin = summary_line(&output, "hashsync: stdin -- ");
     assert!(stdin.contains(" read, pipe closed, "), "{stdin}");
 }
@@ -5406,10 +5641,13 @@ fn each_stream_uses_the_block_size_and_strong_hash_of_its_receiver() {
     let output = succeeded(output);
     let expected = [&b"abc"[..], &client_blocks].concat();
     assert!(output.stdout == expected, "the output differs");
-    let stdout = line_counts(&summary_line(&output, "hashsync: stdout -- "));
-    assert_eq!(stdout[..4], [expected.len(), 3, client_blocks.len(), 0]);
-    let stdin = line_counts(&summary_line(&output, "hashsync: stdin -- "));
-    assert_eq!(stdin[..4], [input.len(), 2, server_blocks.len(), 0]);
+    let stdout = deduplicated_stream(&output, "stdout");
+    assert_eq!(stdout.bytes, [expected.len(), 3, client_blocks.len(), 0]);
+    let stdin = deduplicated_stream(&output, "stdin");
+    assert_eq!(stdin.bytes, [input.len(), 2, server_blocks.len(), 0]);
+    // Each REF frame takes 5 bytes, for a block of its receiver.
+    assert_eq!(stdout.frames, [client_blocks.len() / 4096 * 5, 0]);
+    assert_eq!(stdin.frames, [server_blocks.len() / 16384 * 5, 0]);
     let lists = [
         transfer.cache_files("client", "local-hashlists"),
         transfer.cache_files("server", "local-hashlists"),

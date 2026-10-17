@@ -387,9 +387,10 @@ impl TargetList {
 
 /// END: the command's exit status, the error text of a startup failure,
 /// and the server's counts of its ends of both streams: of the forward
-/// stream, whose decoder it runs, and of the backward stream, whose source
-/// reader it runs. The client counts its own ends, so with END it has what
-/// the summary needs of a stream that stopped (DESIGN.md §8).
+/// stream, whose decoder it runs, and whose lookups too when the stream is
+/// deduplicated, and of the backward stream, whose source reader it runs.
+/// The client counts its own ends, so with END it has what the summary
+/// needs of both streams, also of a stream that stopped (DESIGN.md §8).
 pub struct End {
     pub status: i32,
     pub error: String,
@@ -446,10 +447,11 @@ impl SourceRead {
     }
 }
 
-/// The bytes of the receiving end of a stream, for the summary (DESIGN.md
-/// §8): those that its decoder wrote to the stream's destination, by the
-/// kind of stream frame that carried them, and the bytes of the CHUNK
-/// payloads that it decoded.
+/// What the receiving end of a stream counted, for the summary (DESIGN.md
+/// §8): the bytes that its decoder wrote to the stream's destination, by the
+/// kind of stream frame that carried them, the bytes of the REF and RLE
+/// frames and of the CHUNK payloads that it decoded, and in a deduplicated
+/// stream, the blocks that its lookups did not find.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Counts {
     /// All of them.
@@ -457,9 +459,32 @@ pub struct Counts {
     pub literal: u64,
     pub reference: u64,
     pub run: u64,
+    /// The bytes of the REF frames and of the RLE frames that the decoder
+    /// read, before compression: what the references and the runs cost in
+    /// the stream. A frame that a stop cut short counts whole.
+    pub reference_frames: u64,
+    pub run_frames: u64,
     /// The bytes of the CHUNK payloads that the decoder consumed: of the
     /// stream's zstd frame, or of its stream frames without compression.
     pub wire: u64,
+    pub misses: Misses,
+}
+
+/// The queries that the receiver of a stream answered no after it looked
+/// their blocks up in its index, by the reason, for the summary (DESIGN.md
+/// §8). A query that the receiver answered without the index, from its pins
+/// or its cache of verified blocks, or that it answered no because the
+/// output had passed it, counts in neither.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Misses {
+    /// The index has no candidate, no block whose strong hash starts with
+    /// the same 16 bytes (DESIGN.md §6.4): the window had the weak hash of
+    /// an indexed block, but other bytes.
+    pub false_positives: u64,
+    /// The index has candidates, but none of those that the lookup tried,
+    /// at most `candidate_attempts`, verified: their files changed or could
+    /// not be read, for example.
+    pub not_found: u64,
 }
 
 impl Counts {
@@ -469,7 +494,11 @@ impl Counts {
             self.literal,
             self.reference,
             self.run,
+            self.reference_frames,
+            self.run_frames,
             self.wire,
+            self.misses.false_positives,
+            self.misses.not_found,
         ] {
             enc.u64(count);
         }
@@ -481,7 +510,13 @@ impl Counts {
             literal: dec.u64(),
             reference: dec.u64(),
             run: dec.u64(),
+            reference_frames: dec.u64(),
+            run_frames: dec.u64(),
             wire: dec.u64(),
+            misses: Misses {
+                false_positives: dec.u64(),
+                not_found: dec.u64(),
+            },
         }
     }
 }
@@ -724,6 +759,14 @@ impl<'a> Dec<'a> {
 pub struct Frame<'a> {
     pub kind: u8,
     pub payload: &'a [u8],
+}
+
+impl Frame<'_> {
+    /// The number of bytes that the frame takes in its session or stream:
+    /// its header and its payload.
+    pub fn size(&self) -> usize {
+        FRAME_HEADER + self.payload.len()
+    }
 }
 
 /// Reads frames from a transport, reusing one payload buffer.
@@ -1794,13 +1837,20 @@ mod tests {
     fn end_carries_the_counts_of_both_streams() {
         // The server's counts of its end of the forward stream, then of its
         // end of the backward stream, follow the status and the error text
-        // (DESIGN.md §6.2).
+        // (DESIGN.md §6.2). Each count differs from the others, so that a
+        // decoder that reads them in another order fails.
         let forward = Counts {
             bytes: 7,
             literal: 1,
             reference: 4,
             run: 2,
+            reference_frames: 5,
+            run_frames: 14,
             wire: u64::MAX,
+            misses: Misses {
+                false_positives: 3,
+                not_found: 6,
+            },
         };
         for eof in [false, true] {
             let backward = SourceRead { bytes: 9, eof };
@@ -2312,11 +2362,21 @@ mod tests {
         let end = (
             any::<i32>(),
             "\\PC{0,12}",
-            any::<[u64; 5]>(),
+            any::<[u64; 9]>(),
             any::<(u64, bool)>(),
         )
             .prop_map(|(status, error, forward, (bytes, eof))| {
-                let [bytes_written, literal, reference, run, wire] = forward;
+                let [
+                    bytes_written,
+                    literal,
+                    reference,
+                    run,
+                    reference_frames,
+                    run_frames,
+                    wire,
+                    false_positives,
+                    not_found,
+                ] = forward;
                 let end = End {
                     status,
                     error,
@@ -2325,7 +2385,13 @@ mod tests {
                         literal,
                         reference,
                         run,
+                        reference_frames,
+                        run_frames,
                         wire,
+                        misses: Misses {
+                            false_positives,
+                            not_found,
+                        },
                     },
                     backward: SourceRead { bytes, eof },
                 };

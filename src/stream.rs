@@ -672,7 +672,9 @@ pub trait Destination {
 /// until a stop. A deduplicated stream's receiver gives its `pins`: REF
 /// reads the pin at the output offset, and after each frame the pins learn
 /// the new offset (DESIGN.md §6.4). Returns the counts of the bytes that
-/// the destination took, and of the bytes of the spool that it decoded.
+/// the destination took, of the REF and RLE frames, and of the bytes of the
+/// spool that it decoded. The false positives are left at 0: the lookups
+/// find them, not the decoder.
 ///
 /// The normal end is the end of the zstd frame, with its checksum, where a
 /// stream frame ends, with the end of the spool right after it; without
@@ -750,6 +752,7 @@ fn decode_frames<R: std::io::BufRead>(
                 length = block.len() as u64;
                 counts.bytes = advance(counts.bytes, length);
                 counts.reference += length;
+                counts.reference_frames += received.size() as u64;
                 pins.read_reference(block);
                 taken(destination.write(block))
             }
@@ -762,6 +765,7 @@ fn decode_frames<R: std::io::BufRead>(
                 length = rle.length;
                 counts.bytes = advance(counts.bytes, length);
                 counts.run += length;
+                counts.run_frames += received.size() as u64;
                 run.clear();
                 run.resize(rle.length.min(RUN_PIECE) as usize, rle.byte);
                 write_run(destination, &run, length)
@@ -1415,6 +1419,8 @@ pub(crate) mod tests {
                 (counts.bytes, counts.literal, counts.run),
                 (expected.len() as u64, 7, 600 << 10)
             );
+            // The RLE frame takes its header and its byte and length.
+            assert_eq!((counts.reference_frames, counts.run_frames), (0, 14));
             // The wire bytes are those of the spool.
             assert_eq!(counts.wire, encoded.len() as u64, "level {level}");
         }

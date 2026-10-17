@@ -917,10 +917,14 @@ struct EndFrame {
     /// The command's status, and the error text of a startup failure.
     outcome: (i32, Vec<u8>),
     /// The server's counts of the forward stream: the bytes that the
-    /// command's stdin took, by kind of stream frame, and the CHUNK bytes
-    /// that its decoder decoded.
+    /// command's stdin took, by kind of stream frame, the bytes of the REF
+    /// and RLE frames, the CHUNK bytes that its decoder decoded, and the
+    /// queries that its lookups answered no: false positives, and blocks
+    /// not found.
     written: [u64; 4],
+    frames: [u64; 2],
     decoded: u64,
+    misses: [u64; 2],
     /// The server's counts of the backward stream: the bytes that its
     /// stdout reader read from the command's stdout, and whether it read
     /// that stdout to its EOF.
@@ -932,9 +936,9 @@ impl EndFrame {
         let status = i32::from_le_bytes(payload[..4].try_into().unwrap());
         let length = u32::from_le_bytes(payload[4..8].try_into().unwrap()) as usize;
         let (error, counts) = payload[8..].split_at(length);
-        assert_eq!(counts.len(), 6 * 8 + 1, "END: {payload:?}");
+        assert_eq!(counts.len(), 10 * 8 + 1, "END: {payload:?}");
         let count = |i: usize| u64::from_le_bytes(counts[8 * i..8 * i + 8].try_into().unwrap());
-        let eof = match counts[6 * 8] {
+        let eof = match counts[10 * 8] {
             0 => false,
             1 => true,
             flag => panic!("END: the EOF flag is {flag}"),
@@ -942,8 +946,10 @@ impl EndFrame {
         EndFrame {
             outcome: (status, error.to_vec()),
             written: [count(0), count(1), count(2), count(3)],
-            decoded: count(4),
-            read: (count(5), eof),
+            frames: [count(4), count(5)],
+            decoded: count(6),
+            misses: [count(7), count(8)],
+            read: (count(9), eof),
         }
     }
 
@@ -1658,6 +1664,8 @@ fn a_stop_ends_the_writes_of_one_run_that_stands_for_terabytes() {
     std::fs::write(&go, b"go\n").unwrap();
     let (frames, end) = serve.stream_through_end(0);
     assert_eq!(end.outcome(), SUCCESS);
+    // The RLE frame that the stop cut short counts whole: 14 bytes.
+    assert_eq!(end.frames, [0, 14], "{end:?}");
     control.stop();
     serve.expect_success();
     // Nothing ends the descendant before this kill, so no other process
@@ -1839,15 +1847,29 @@ fn a_push_writes_the_blocks_of_the_servers_index_for_its_references() {
     // control session; `serve` pins it and answers yes, so the client sends
     // REF, and the decoder writes the pinned block to the command's stdin.
     // `cat` sends it all back in the backward stream, which is plain
-    // (DESIGN.md §6.4 and §6.6).
+    // (DESIGN.md §6.4 and §6.6). A query for a block that the index does not
+    // have, as the client sends when only the weak hash of its window is
+    // listed, gets a no, and so does a query for an indexed block whose
+    // file changed after the update. END counts the first as a false
+    // positive and the second as not found, and gives the bytes of the REF
+    // frame (DESIGN.md §8).
     let block = indexed_block();
+    let stale: Vec<u8> = block.iter().map(|byte| byte ^ 0x5a).collect();
     for level in [0, 3] {
         let mut serve = Serve::start();
-        serve.configure_push(&[("block", &block)]);
+        serve.configure_push(&[("block", &block), ("stale", &stale)]);
         let (list, mut control) = serve.push(&["cat"], level);
-        assert_eq!(list, encode_list(&[weak_hash(&block)]), "the target");
+        let mut listed = [weak_hash(&block), weak_hash(&stale)];
+        listed.sort_unstable();
+        assert_eq!(list, encode_list(&listed), "the target");
+        // The server sent its list after its update.
+        std::fs::write(serve.home.path().join("tree/stale"), b"changed").unwrap();
         control.send_query(4, blake3::hash(&block).as_bytes());
         assert_eq!(control.recv_answer(), (4, true));
+        control.send_query(8, blake3::hash(b"not indexed").as_bytes());
+        assert_eq!(control.recv_answer(), (8, false));
+        control.send_query(12, blake3::hash(&stale).as_bytes());
+        assert_eq!(control.recv_answer(), (12, false));
         let frames = [(LIT, &b"head"[..]), (REF, b""), (LIT, b"tail")];
         serve.send_raw(&stream_of(&frames, level));
         let output: Vec<u8> = serve
@@ -1863,7 +1885,12 @@ fn a_push_writes_the_blocks_of_the_servers_index_for_its_references() {
             output == [&b"head"[..], &block, b"tail"].concat(),
             "level {level}: the output differs"
         );
-        assert_eq!(serve.recv_end().outcome(), SUCCESS);
+        let end = serve.recv_end();
+        assert_eq!(end.outcome(), SUCCESS);
+        let length = block.len() as u64;
+        assert_eq!(end.written, [8 + length, 8, length, 0], "level {level}");
+        assert_eq!(end.frames, [5, 0], "level {level}: one REF frame");
+        assert_eq!(end.misses, [1, 1], "level {level}");
         control.stop();
         serve.expect_success();
     }

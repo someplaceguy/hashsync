@@ -31,7 +31,7 @@ use crate::config::Config;
 use crate::fsops;
 use crate::hash::{PREFIX_LEN, Strong, StrongHash};
 use crate::index::{Index, Reader};
-use crate::pins::{Block, Pins};
+use crate::pins::{Block, Miss, Pins};
 use crate::protocol::Query;
 use crate::roots::Location;
 
@@ -112,9 +112,16 @@ struct Worker {
 impl Worker {
     /// A verified block with the full digest `strong`, from the first of
     /// at most `attempts` candidates that verifies (DESIGN.md §6.4, steps
-    /// 2 to 5). The block is the very buffer that was verified.
-    fn find(&mut self, strong: &Strong) -> Option<Block> {
-        for candidate in self.reader.candidates(&strong[..PREFIX_LEN], self.attempts) {
+    /// 2 to 5). The block is the very buffer that was verified. Otherwise
+    /// the miss, which the summary counts: no candidate at all, so the
+    /// window of the query only shares its weak hash with a block of the
+    /// index, or candidates that did not verify.
+    fn find(&mut self, strong: &Strong) -> Result<Block, Miss> {
+        let candidates = self.reader.candidates(&strong[..PREFIX_LEN], self.attempts);
+        if candidates.is_empty() {
+            return Err(Miss::NotIndexed);
+        }
+        for candidate in candidates {
             let Some((root_id, rel_path)) = candidate.path else {
                 continue;
             };
@@ -128,10 +135,10 @@ impl Worker {
                 && self.strong.digest(&self.buffer) == *strong
             {
                 let fresh = vec![0; self.buffer.len()];
-                return Some(Arc::new(std::mem::replace(&mut self.buffer, fresh)));
+                return Ok(Arc::new(std::mem::replace(&mut self.buffer, fresh)));
             }
         }
-        None
+        Err(Miss::Unverified)
     }
 }
 

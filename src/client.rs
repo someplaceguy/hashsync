@@ -348,7 +348,7 @@ pub fn run(config: &Config, remote: &ssh::Remote, request: &Request, no_stdin: b
     // reader reads the data session to its EOF, and the control reader the
     // control session; the stdin reader and a scan ended at the stop or at
     // the EOF of stdin.
-    let stdout_counts = decoder.join().expect("the decoder panicked");
+    let mut stdout_counts = decoder.join().expect("the decoder panicked");
     let received = data_reader.join().expect("the data reader panicked");
     control_reader.join().expect("the control reader panicked");
     let stdin_read = match stdin_reader {
@@ -372,8 +372,10 @@ pub fn run(config: &Config, remote: &ssh::Remote, request: &Request, no_stdin: b
         }
     }
     // N5. Nothing uses the pins any more, and the index closed when the
-    // lookups ended.
+    // lookups ended. They answered nothing from Completing on, which came
+    // before the decoder ended, so their counts of misses are final.
     let backward_lists = backward.map(|(lookups, lists)| {
+        stdout_counts.misses = lookups.pins().misses();
         lookups.close();
         lists
     });
@@ -403,7 +405,11 @@ pub fn run(config: &Config, remote: &ssh::Remote, request: &Request, no_stdin: b
         received,
         backward_lists.as_ref(),
     );
-    print_summary(start, &[("stdout", backward), ("stdin", forward)]);
+    print_summary(
+        start,
+        compressed,
+        &[("stdin", forward), ("stdout", backward)],
+    );
     die::finish(end_frame.status)
 }
 
@@ -532,36 +538,47 @@ fn read_data<R: Read>(
 }
 
 /// The summary on stderr (DESIGN.md §8). One line for each stream, which
-/// names it. A whole stream's line gives the bytes that it carried, and the
-/// bytes of its CHUNK payloads, its wire bytes; the line of the
-/// deduplicated stream also gives its literal, reference, and RLE bytes,
-/// and the bytes of the full lists and of the delta that its list
-/// exchange carried. A stopped stream's line gives the bytes that its
-/// sender read, the CHUNK bytes that its receiver decoded and that it
-/// dropped, and the bytes that its destination took. The last line gives,
-/// as rsync does, the bytes sent and received on both sessions, the elapsed
-/// time of the run with the rate of that traffic, and the speedup: the
-/// bytes that reached the destinations of both streams over the traffic.
+/// names it. A whole stream's line gives the bytes that it carried, its
+/// wire bytes, and how it went over the wire: deduplicated, compressed,
+/// both, or neither, which shows nothing. The wire bytes are those of its
+/// CHUNK payloads, and in a deduplicated stream also those of the lists
+/// that its exchange sent, which the line shows before them. The line of a
+/// deduplicated stream also gives its literal bytes, its reference and RLE
+/// bytes with the bytes of the frames that carried them, and the queries
+/// that its receiver answered no after a lookup in its index: those without
+/// a candidate, false positives of the weak hash, and those whose
+/// candidates did not verify, not found. A stopped stream's line gives the
+/// bytes that its sender read, the CHUNK bytes that its receiver decoded
+/// and that it dropped, and the bytes that its destination took. The last
+/// line gives, as rsync does, the bytes sent and received on both
+/// sessions, and the elapsed time of the run with the rate of that traffic;
+/// then the data shrinkage factor, the bytes that reached the destinations
+/// of both streams over the traffic, and the bytes saved, the difference.
 /// The threads that count have ended, so the counts are exact.
-fn print_summary(start: Instant, streams: &[(&str, Line)]) {
+fn print_summary(start: Instant, compressed: bool, streams: &[(&str, Line)]) {
     let elapsed = start.elapsed().as_secs_f64();
     for (name, line) in streams {
         match *line {
             Line::Whole(ref counts, Some(lists)) => die::note(format_args!(
-                "{name} -- {} ({} literal, {} reference, {} RLE), {} wire, \
-                 {} hash list, {} delta",
+                "{name} -- {} ({} literal, {} -> {} refs, {} -> {} RLE, \
+                 {} false positives, {} not found){} --> {} wire{}",
                 Bytes(counts.bytes),
                 Bytes(counts.literal),
                 Bytes(counts.reference),
+                Bytes(counts.reference_frames),
                 Bytes(counts.run),
-                Bytes(counts.wire),
-                Bytes(lists.full),
-                Bytes(lists.delta),
+                Bytes(counts.run_frames),
+                counts.misses.false_positives,
+                counts.misses.not_found,
+                sent_lists(lists),
+                Bytes(counts.wire + lists.full + lists.delta),
+                how_sent(true, compressed),
             )),
             Line::Whole(ref counts, None) => die::note(format_args!(
-                "{name} -- {}, {} wire",
+                "{name} -- {} --> {} wire{}",
                 Bytes(counts.bytes),
-                Bytes(counts.wire)
+                Bytes(counts.wire),
+                how_sent(false, compressed),
             )),
             Line::Stopped {
                 read,
@@ -581,13 +598,48 @@ fn print_summary(start: Instant, streams: &[(&str, Line)]) {
     let received = RECEIVED.load(Relaxed);
     let traffic = sent + received;
     let carried: u64 = streams.iter().map(|(_, line)| line.written()).sum();
+    // A run that sends more than it delivers, such as a short one whose
+    // hash list outweighs its streams, saves a negative amount.
+    let saved = match carried.checked_sub(traffic) {
+        Some(saved) => Bytes(saved).to_string(),
+        None => format!("-{}", Bytes(traffic - carried)),
+    };
     die::note(format_args!(
-        "sent {} and received {} in {elapsed:.1}s ({}/s), speedup {:.2}",
+        "total -- sent {} and received {} in {elapsed:.1}s ({}/s), \
+         data shrinkage factor: {:.2}, saved {saved} of data transfer",
         Bytes(sent),
         Bytes(received),
         Bytes((traffic as f64 / elapsed).round() as u64),
         carried as f64 / traffic as f64,
     ));
+}
+
+/// The lists that the exchange of a deduplicated stream sent, as the
+/// stream's summary line adds them to its bytes: ` + 12.00 KiB hashlist` or
+/// ` + 1.50 KiB hashlist delta`, both when the sender could not use the
+/// delta and asked for the full list, and nothing after HASHKEEP. Every
+/// list that goes out takes at least the 8 bytes of its count (DESIGN.md
+/// §5.4), so the lists with bytes are those that the exchange sent.
+fn sent_lists(lists: &ListBytes) -> String {
+    let mut sent = String::new();
+    if lists.full > 0 {
+        sent += &format!(" + {} hashlist", Bytes(lists.full));
+    }
+    if lists.delta > 0 {
+        sent += &format!(" + {} hashlist delta", Bytes(lists.delta));
+    }
+    sent
+}
+
+/// How a whole stream went over the wire, after its wire bytes on its
+/// summary line.
+fn how_sent(deduplicated: bool, compressed: bool) -> &'static str {
+    match (deduplicated, compressed) {
+        (true, true) => " (deduplicated, compressed)",
+        (true, false) => " (deduplicated)",
+        (false, true) => " (compressed)",
+        (false, false) => "",
+    }
 }
 
 /// Counts the bytes that pass through one direction of a session, for
@@ -790,8 +842,9 @@ mod tests {
             bytes: 10,
             literal: 4,
             reference: 6,
-            run: 0,
+            reference_frames: 5,
             wire: 7,
+            ..Counts::default()
         };
         let line = Line::of(&read(10, true), &counts, 9, Some(&lists));
         let whole = Counts { wire: 9, ..counts };

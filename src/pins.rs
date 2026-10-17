@@ -45,12 +45,27 @@ use crossbeam_channel::{Receiver, Sender, bounded};
 use lru::LruCache;
 
 use crate::hash::{Strong, StrongHash};
-use crate::protocol::{Answer, ControlFrame};
+use crate::protocol::{Answer, ControlFrame, Misses};
 use crate::segments::{Directory, Extent, SEGMENT_MINIMUM, Segments};
 
 /// A verified block: exactly the buffer whose digest was checked. The
 /// cache and a lookup share it until the lookup has written it.
 pub type Block = Arc<Vec<u8>>;
+
+/// Why the lookup of a query's block in the index found no block that
+/// verified (DESIGN.md §6.4, steps 2 to 5). The summary counts the two
+/// apart (`Misses`), so that a stale index does not look like a weak hash
+/// with false positives.
+#[derive(Debug)]
+pub enum Miss {
+    /// No candidate: no block of the index has the strong hash, so the weak
+    /// hash of the query's window is in the list only by chance.
+    NotIndexed,
+    /// Candidates, but none of those that the lookup tried, at most
+    /// `candidate_attempts`, verified: their files changed or could not be
+    /// read, for example.
+    Unverified,
+}
 
 /// The bytes of verified blocks that the cache holds, or one block when a
 /// block is larger (DESIGN.md §6.4).
@@ -117,6 +132,9 @@ struct State {
     /// The sending end of `Pins::completing`, which nothing sends to; `None`
     /// in Completing.
     completing: Option<Sender<()>>,
+    /// The queries answered no after a lookup in the index, by the reason,
+    /// for the summary (DESIGN.md §8).
+    misses: Misses,
 }
 
 impl State {
@@ -132,6 +150,20 @@ impl State {
             // The control writer ends only once every producer has dropped
             // its sender, and this one is still here.
             let _ = answers.send(ControlFrame::Answer(Answer { offset, found }));
+        }
+    }
+
+    /// Answer no to a query whose block the lookup in the index did not
+    /// find, and count the miss. Only a query that gets its answer counts,
+    /// so the counts stop changing at Completing, and the host can read them
+    /// once the stream has ended or stopped, while a lookup still runs.
+    fn answer_miss(&mut self, offset: u64, miss: Miss) {
+        if !self.completing() {
+            match miss {
+                Miss::NotIndexed => self.misses.false_positives += 1,
+                Miss::Unverified => self.misses.not_found += 1,
+            }
+            self.answer(offset, false);
         }
     }
 
@@ -223,6 +255,7 @@ impl Pins {
                 cache: LruCache::sparse(NonZeroUsize::new(blocks).unwrap_or(NonZeroUsize::MIN)),
                 answers: Some(answers),
                 completing: Some(completing_tx),
+                misses: Misses::default(),
             }),
             completing,
         }
@@ -245,8 +278,9 @@ impl Pins {
     /// and verifies candidates outside the lock. A copy or a found block
     /// goes to a new extent; then the pin is published and answered yes,
     /// unless the output passed `offset` in the meantime. An obsolete
-    /// query is answered no; in Completing, nothing is answered.
-    pub fn answer(&self, offset: u64, strong: &Strong, find: impl FnOnce() -> Option<Block>) {
+    /// query is answered no, and so is a query whose block `find` did not
+    /// find; in Completing, nothing is answered.
+    pub fn answer(&self, offset: u64, strong: &Strong, find: impl FnOnce() -> Result<Block, Miss>) {
         let source = {
             let mut state = self.lock();
             if state.completing() {
@@ -276,8 +310,8 @@ impl Pins {
                 (Arc::new(buf), true)
             }
             Source::Index => match find() {
-                Some(block) => (block, true),
-                None => return self.lock().answer(offset, false),
+                Ok(block) => (block, true),
+                Err(miss) => return self.lock().answer_miss(offset, miss),
             },
         };
         let extent = {
@@ -434,6 +468,14 @@ impl Pins {
         self.completing.clone()
     }
 
+    /// The queries that the lookups answered no after they looked their
+    /// blocks up in the index, by the reason (DESIGN.md §8). The counts are
+    /// final once the stream has ended or stopped: from Completing on, no
+    /// query gets an answer.
+    pub fn misses(&self) -> Misses {
+        self.lock().misses
+    }
+
     /// The normal end of the pins, after the lookups have ended
     /// (DESIGN.md §6.9): close all open segments of the pins, which frees
     /// their storage. The tmp_data directory closes with its last user.
@@ -523,7 +565,7 @@ mod tests {
     }
 
     /// The `find` of a query that must not look its block up in the index.
-    fn no_lookup() -> Option<Block> {
+    fn no_lookup() -> Result<Block, Miss> {
         panic!("a lookup of a pinned block")
     }
 
@@ -549,7 +591,7 @@ mod tests {
     /// extents follow the order of `blocks`.
     fn pin_all(setup: &Setup, offsets: impl IntoIterator<Item = u64>, blocks: &[(Strong, Block)]) {
         for (offset, (strong, data)) in offsets.into_iter().zip(blocks) {
-            setup.pins.answer(offset, strong, || Some(Arc::clone(data)));
+            setup.pins.answer(offset, strong, || Ok(Arc::clone(data)));
         }
     }
 
@@ -586,7 +628,7 @@ mod tests {
     fn a_found_block_is_pinned_answered_and_released() {
         let setup = setup(BS);
         let (strong, data) = block(1, BS);
-        setup.pins.answer(0, &strong, || Some(Arc::clone(&data)));
+        setup.pins.answer(0, &strong, || Ok(Arc::clone(&data)));
         assert_eq!(answers(&setup), vec![(0, true)]);
         assert_eq!(read_back(&setup, BS), *data);
         assert_eq!(open_segments(&setup), [1]);
@@ -606,7 +648,7 @@ mod tests {
         // is released with the highest pin.
         let setup = setup(BS);
         let (strong, data) = block(2, BS);
-        setup.pins.answer(10, &strong, || Some(Arc::clone(&data)));
+        setup.pins.answer(10, &strong, || Ok(Arc::clone(&data)));
         // A read of the block would put it in the cache again.
         setup.pins.lock().cache.clear();
         setup.pins.answer(30, &strong, no_lookup);
@@ -634,7 +676,7 @@ mod tests {
         // without gaps.
         let setup = setup(BS);
         let (strong, data) = block(2, BS);
-        setup.pins.answer(10, &strong, || Some(Arc::clone(&data)));
+        setup.pins.answer(10, &strong, || Ok(Arc::clone(&data)));
         setup.pins.reached(20);
         setup
             .pins
@@ -659,8 +701,8 @@ mod tests {
         let setup = setup_with_minimum(BS, size);
         let (h, data) = block(1, BS);
         let (b, other) = block(2, BS);
-        setup.pins.answer(0, &h, || Some(Arc::clone(&data)));
-        setup.pins.answer(size, &b, || Some(Arc::clone(&other)));
+        setup.pins.answer(0, &h, || Ok(Arc::clone(&data)));
+        setup.pins.answer(size, &b, || Ok(Arc::clone(&other)));
         assert_eq!(open_segments(&setup), [1, 1]);
         setup.pins.answer(2 * size, &h, no_lookup);
         assert_eq!(open_segments(&setup), [2]);
@@ -698,7 +740,7 @@ mod tests {
         let size = u64::from(BS);
         let setup = setup_with_minimum(BS, size);
         let (h, data) = block(1, BS);
-        setup.pins.answer(0, &h, || Some(Arc::clone(&data)));
+        setup.pins.answer(0, &h, || Ok(Arc::clone(&data)));
         // A read of the block would put it in the cache again.
         setup.pins.lock().cache.clear();
         setup.pins.answer(size, &h, no_lookup);
@@ -707,8 +749,8 @@ mod tests {
         assert!(setup.pins.lock().cache.is_empty(), "a share read the block");
         let (b, other) = block(2, BS);
         let (c, more) = block(3, BS);
-        setup.pins.answer(2 * size, &b, || Some(Arc::clone(&other)));
-        setup.pins.answer(3 * size, &c, || Some(Arc::clone(&more)));
+        setup.pins.answer(2 * size, &b, || Ok(Arc::clone(&other)));
+        setup.pins.answer(3 * size, &c, || Ok(Arc::clone(&more)));
         assert_eq!(open_segments(&setup), [1, 2]);
         setup.pins.answer(4 * size, &h, no_lookup);
         assert_eq!(open_segments(&setup), [2, 1]);
@@ -733,11 +775,11 @@ mod tests {
         let setup = setup(BS);
         let (strong, data) = block(4, BS);
         setup.pins.answer(10, &strong, || {
-            setup.pins.answer(20, &strong, || Some(Arc::clone(&data)));
-            Some(Arc::clone(&data))
+            setup.pins.answer(20, &strong, || Ok(Arc::clone(&data)));
+            Ok(Arc::clone(&data))
         });
         let (other, more) = block(5, BS);
-        setup.pins.answer(30, &other, || Some(Arc::clone(&more)));
+        setup.pins.answer(30, &other, || Ok(Arc::clone(&more)));
         assert_eq!(answers(&setup), vec![(20, true), (10, true), (30, true)]);
         assert_eq!(extent(&setup, 10), (0, 0));
         assert_eq!(extent(&setup, 20), (0, 0));
@@ -784,19 +826,37 @@ mod tests {
 
     #[test]
     fn nothing_found_and_obsolete_queries_are_answered_no() {
+        // Candidates that do not verify, and no candidate at all, both get
+        // a no. The summary counts the first as not found, and the second as
+        // a false positive of the weak hash, also when the output passes its
+        // query during the lookup. A query that is obsolete before its
+        // lookup gets none, and counts in neither (DESIGN.md §8).
         let setup = setup(BS);
         let (strong, data) = block(3, BS);
-        setup.pins.answer(0, &strong, || None);
+        let (unknown, _) = block(4, BS);
+        setup.pins.answer(0, &strong, || Err(Miss::Unverified));
+        setup.pins.answer(10, &unknown, || Err(Miss::NotIndexed));
         setup.pins.reached(100);
         setup
             .pins
             .answer(50, &strong, || panic!("no lookup below the output"));
-        // The output passes the query while its candidates are read.
+        // The output passes the queries while their candidates are read.
+        // The block that the first one finds goes to the cache.
         setup.pins.answer(200, &strong, || {
             setup.pins.reached(300);
-            Some(Arc::clone(&data))
+            Ok(Arc::clone(&data))
         });
-        assert_eq!(answers(&setup), vec![(0, false), (50, false), (200, false)]);
+        setup.pins.answer(400, &unknown, || {
+            setup.pins.reached(500);
+            Err(Miss::NotIndexed)
+        });
+        let no = [0, 10, 50, 200, 400].map(|offset| (offset, false));
+        assert_eq!(answers(&setup), no);
+        let misses = Misses {
+            false_positives: 2,
+            not_found: 1,
+        };
+        assert_eq!(setup.pins.misses(), misses);
         assert!(setup.pins.lock().pins.is_empty());
         // No query got an extent, so no segment was created.
         assert_eq!(open_segments(&setup), []);
@@ -804,17 +864,32 @@ mod tests {
 
     #[test]
     fn completing_suppresses_answers_and_pins() {
+        // Three lookups read their candidates when the stream ends: one
+        // finds its block, one finds no candidate, and one finds candidates
+        // that do not verify. None of them answers, the first publishes no
+        // pin, and the others count as neither a false positive nor not
+        // found: the counts are final at Completing (DESIGN.md §8).
         let setup = setup(BS);
         let (strong, data) = block(4, BS);
+        let (other, _) = block(5, BS);
+        let (third, _) = block(6, BS);
+        let size = u64::from(BS);
         setup.pins.answer(0, &strong, || {
-            setup.pins.complete();
-            Some(Arc::clone(&data))
+            setup.pins.answer(size, &other, || {
+                setup.pins.answer(2 * size, &third, || {
+                    setup.pins.complete();
+                    Err(Miss::Unverified)
+                });
+                Err(Miss::NotIndexed)
+            });
+            Ok(Arc::clone(&data))
         });
         setup
             .pins
-            .answer(BS.into(), &strong, || panic!("no lookup in Completing"));
+            .answer(3 * size, &strong, || panic!("no lookup in Completing"));
         assert!(answers(&setup).is_empty());
         assert!(setup.pins.lock().pins.is_empty());
+        assert_eq!(setup.pins.misses(), Misses::default());
     }
 
     #[test]
@@ -824,7 +899,7 @@ mod tests {
         // worker that waits for a query wakes up (DESIGN.md §6.4).
         let setup = setup(BS);
         let (strong, data) = block(6, BS);
-        setup.pins.answer(0, &strong, || Some(Arc::clone(&data)));
+        setup.pins.answer(0, &strong, || Ok(Arc::clone(&data)));
         let completing = setup.pins.completing();
         assert!(matches!(completing.try_recv(), Err(TryRecvError::Empty)));
         assert!(!setup.pins.lock().completing());
@@ -932,9 +1007,7 @@ mod tests {
         let blocks = blocks(3, BS);
         let steps: [(u64, &[usize]); 3] = [(0, &[0]), (size, &[]), (0, &[0])];
         for ((i, (strong, data)), (offset, passed)) in (0..).zip(&blocks).zip(steps) {
-            setup
-                .pins
-                .answer(i * size, strong, || Some(Arc::clone(data)));
+            setup.pins.answer(i * size, strong, || Ok(Arc::clone(data)));
             assert_eq!(open_segments(&setup), [1]);
             assert_eq!(extent(&setup, i * size), (0, offset));
             assert_eq!(read_back(&setup, BS), **data);
@@ -1089,7 +1162,7 @@ mod tests {
                     scope.spawn(|| {
                         for i in &queue {
                             let (strong, data) = block_of(i);
-                            let find = || Some(Arc::clone(data));
+                            let find = || Ok(Arc::clone(data));
                             setup.pins.answer(i * size, strong, find);
                         }
                     });
@@ -1130,7 +1203,7 @@ mod tests {
     fn a_corrupt_pin_is_detected() {
         let setup = setup(BS);
         let (strong, data) = block(5, BS);
-        setup.pins.answer(0, &strong, || Some(Arc::clone(&data)));
+        setup.pins.answer(0, &strong, || Ok(Arc::clone(&data)));
         let (file, offset) = {
             let state = setup.pins.lock();
             let extent = &state.pinned[&strong].extent;
