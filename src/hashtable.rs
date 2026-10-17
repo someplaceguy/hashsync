@@ -5,6 +5,8 @@
 //! scanner checks each hit with it, so that a false positive costs no
 //! strong hash and no query.
 
+use crate::hashlist;
+
 /// 16 slots of one bucket, one cache line. The fingerprints and the high
 /// bits both use it, so that the slots of a bucket are one cache line in
 /// each array, whatever the alignment that the allocator gives.
@@ -36,9 +38,27 @@ pub struct Lookup {
 impl HashTable {
     /// Build the table from the list's values, in any order.
     pub fn build(values: &[u64]) -> Self {
+        let mut table = HashTable::for_values(values.len());
+        for &value in values {
+            table.insert(value);
+        }
+        table
+    }
+
+    /// Build the table straight from the encoded list `encoded`, which
+    /// must be canonical (DESIGN.md §5.4), inserting each value as it is
+    /// decoded. This function exists so that a list that only feeds the
+    /// table needs no vector of all its values in between: at 21 million
+    /// values, that vector takes 171 MB.
+    pub fn from_list(encoded: &[u8]) -> Result<Self, String> {
+        hashlist::decode_with(encoded, HashTable::for_values, HashTable::insert)
+    }
+
+    /// An empty table for `n` values.
+    fn for_values(n: usize) -> Self {
         // An empty list allocates no buckets, and every lookup misses
         // without computing a bucket address.
-        if values.is_empty() {
+        if n == 0 {
             return HashTable {
                 buckets: Vec::new(),
                 high: Vec::new(),
@@ -46,16 +66,11 @@ impl HashTable {
         }
         // `buckets = ceil(N / (16 * 0.7))`, so at least 30% of the slots
         // stay empty and insertion always finds one.
-        let n = values.len() as u64;
-        let buckets = (u128::from(n) * 10).div_ceil(u128::from(SLOTS) * 7) as usize;
-        let mut table = HashTable {
+        let buckets = (n as u128 * 10).div_ceil(u128::from(SLOTS) * 7) as usize;
+        HashTable {
             buckets: vec![Bucket([0; 16]); buckets],
             high: vec![Bucket([0; 16]); buckets],
-        };
-        for &value in values {
-            table.insert(value);
         }
-        table
     }
 
     /// Insert in the first empty slot, continuing to the next bucket when
@@ -278,7 +293,38 @@ mod tests {
         }
     }
 
+    /// Every slot of both arrays of `table`.
+    fn slots(table: &HashTable) -> Vec<[u32; 16]> {
+        table
+            .buckets
+            .iter()
+            .chain(&table.high)
+            .map(|bucket| bucket.0)
+            .collect()
+    }
+
+    /// A list that is not canonical gives no table: here a byte follows the
+    /// last value (DESIGN.md §5.4).
+    #[test]
+    fn a_list_that_is_not_canonical_gives_no_table() {
+        let mut list = hashlist::encode(&[1, 2, 3]);
+        assert!(HashTable::from_list(&list).is_ok());
+        list.push(0);
+        assert!(HashTable::from_list(&list).is_err());
+    }
+
     proptest! {
+        /// A table built straight from an encoded list is the table that
+        /// `build` makes of its values, slot for slot.
+        #[test]
+        fn a_table_from_a_list_is_the_table_of_its_values(
+            values in proptest::collection::btree_set(any::<u64>(), 0..2000)
+        ) {
+            let values: Vec<u64> = values.into_iter().collect();
+            let from_list = HashTable::from_list(&hashlist::encode(&values)).unwrap();
+            prop_assert_eq!(slots(&from_list), slots(&HashTable::build(&values)));
+        }
+
         /// No false negatives, whatever the values (DESIGN.md §11).
         #[test]
         fn no_false_negatives(values in proptest::collection::vec(any::<u64>(), 1..500)) {

@@ -7,16 +7,16 @@
 //! are deduplicated, each against the index of the host that receives it,
 //! and a stream that is not is plain. In a pull, the default, the backward
 //! stream is deduplicated against the client's index: before the sessions
-//! start, the client updates that index (or opens it read-only), exports
-//! its hash list, and starts its pins and lookup workers. In a push, with
-//! `--dedup-stdin`, the forward stream is deduplicated against the server's
-//! index, and the client needs no index. With `--dedup-stdin
-//! --dedup-stdout`, both are: the client updates its index before the
-//! sessions start, releases it while the server updates its own, and opens
-//! it again for the backward stream's list exchange, which follows the
-//! forward stream's. The client sends REQUEST, with the command and every
-//! setting of the run, then runs its side of each list exchange (DESIGN.md
-//! §4.4 and §5.6).
+//! start, the client updates that index (or opens it read-only), and starts
+//! its pins; after its HELLO, it exports the index's hash list and starts
+//! its lookup workers. In a push, with `--dedup-stdin`, the forward stream
+//! is deduplicated against the server's index, and the client needs no
+//! index. With `--dedup-stdin --dedup-stdout`, both are: the client updates
+//! its index before the sessions start, releases it while the server
+//! updates its own, and opens it again for the backward stream's list
+//! exchange, which follows the forward stream's. The client sends REQUEST,
+//! with the command and every setting of the run, then runs its side of
+//! each list exchange (DESIGN.md §4.4 and §5.6).
 //!
 //! Once the list exchanges are done, both streams run. The data reader
 //! takes the backward stream's CHUNK frames into that stream's spool, so

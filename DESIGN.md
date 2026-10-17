@@ -96,14 +96,12 @@ system calls, with no asynchronous runtime or event loop.
 1. The receiver opens its tmp_data directory (section 6.5), resolves its
    configured roots, updates its index, and then holds it read-only
    (section 4.4). `--no-update` skips the update and opens the index
-   read-only. It exports the hash list from one database snapshot, and
-   starts its lookup workers. In a pull, the client does this before step
-   2, so a failed update starts no remote process. In a push, the client
-   needs no index, and the server does this after step 2, before its
-   HELLO. With both streams deduplicated, each host does this for the
-   stream that it receives, but the client releases its index after its
-   update, and opens it again, exports its list, and starts its lookup
-   workers only once the server's update is done (section 4.4).
+   read-only. In a pull, the client does this before step 2, so a failed
+   update starts no remote process. In a push, the client needs no index,
+   and the server does this after step 2, before its HELLO. With both
+   streams deduplicated, each host does this for the stream that it
+   receives, but the client releases its index after its update, and opens
+   it again only once the server's update is done (section 4.4).
 2. The client starts data and control SSH sessions to the server. Each
    side sends its protocol version at once, and the client follows its
    own with REQUEST, with the command and the settings of the run, without
@@ -111,10 +109,12 @@ system calls, with no asynchronous runtime or event loop.
    it needs one when it receives a deduplicated stream, and otherwise uses
    one only if it has one (section 7).
 3. Each deduplicated stream has a list exchange, the forward stream's
-   first. HELLO negotiates the hashes and the cached lists. With sender
-   caching enabled, the receiver durably publishes its target list. It
-   sends a full list, a delta, or confirmation that the sender's list is
-   current.
+   first. HELLO negotiates the hashes and the cached lists. After its
+   HELLO, the receiver exports its hash list, the target, from one
+   database snapshot, and starts its lookup workers, while the sender
+   prepares the list that its cache holds. With sender caching enabled,
+   the receiver durably publishes its target list. It sends a full list, a
+   delta, or confirmation that the sender's list is current.
    The sender verifies it, builds its table, and durably publishes it when
    caching is enabled.
    Then it removes its other cached lists for this peer and index, expires
@@ -503,7 +503,8 @@ these steps:
   close, before the command starts. The client cannot update the index
   again here: it would wait for an exclusive lock while the run holds the
   server's.
-- **L4.** Export the hash list, start the lookup workers, and send HELLO.
+- **L4.** Send HELLO, export the hash list, and start the lookup
+  workers.
 
 With `--no-update`, both hosts take only shared locks, and the client
 opens its index before SSH starts, as in a pull.
@@ -823,30 +824,45 @@ only expiry removes them. For example, an NFS client gives such a name to
 a removed file that is still open, and the removal of that name fails
 while the file is open.
 
-1. Export and hash the target from one database snapshot. Once the sender's
-   account is known, the receiver lists its peer/index directory. With
-   sender caching enabled, it then durably publishes the target there
-   before sending list data, and retains bytes or an open fd. Failure to
-   persist the receiver's target ends setup.
+1. After its HELLO, the receiver exports and hashes the target from one
+   database snapshot. Once the sender's account is known, the receiver
+   lists its peer/index directory. With sender caching enabled, it then
+   durably publishes the target there before sending list data. If its
+   listing holds a file with the target's name, it keeps that file instead,
+   unless it read the file as a base in step 3 and found it damaged.
+   Otherwise, if another of its peer/index directories holds the target,
+   which happens when it receives the same target from several senders, it
+   links that file into this directory, unless it is the file found damaged
+   in step 3 under another name. It does not read a file that it keeps or
+   links: a damaged copy shows only when an exchange reads it as a base,
+   and costs a full list then. Either way, it retains an open fd.
+   Failure to persist the receiver's target ends setup.
 2. Before it sends HELLO, the sender lists its peer/index directory. With
    sender caching enabled, it advertises the IDs of all listed lists of
-   the stream's strong hash, usually one; otherwise none.
+   the stream's strong hash, usually one; otherwise none. Right after its
+   HELLO, while the receiver exports, it prepares the first advertised
+   list: it reads it through the open file of its listing, verifies it,
+   decodes it, and builds the table from it.
 3. If the target is one of the advertised lists, the receiver uses
    HASHKEEP. Otherwise it searches all its `local-hashlists/*/*.cache`
    directories for the advertised lists, in their order, and verifies the
-   first one that it finds. A missing or damaged base uses HASHLIST. With a
-   base, merge sorted sets and encode removed and added values as lists;
-   use HASHDELTA, which names the base, only when smaller than the full
-   transfer.
-4. The sender reads the list that HASHDELTA or HASHKEEP names through the
-   open file of its listing, and verifies it. It decodes or applies the
-   delta, re-encodes canonically, and verifies the full target digest. An
-   invalid listed list or a bad delta requests HASHLIST once via HASHFULL;
-   the result of a bad delta is never published or used for the table. A
-   bad full list is a protocol error.
-5. The sender builds the table, durably publishes the verified target
-   when sender caching is enabled, ends its exchange, and only then
-   replies CACHE_RESULT.
+   first one that it finds. It does this during the export, before it
+   knows the target. A missing or damaged base uses HASHLIST. With a base,
+   merge sorted sets and encode removed and added values as lists; use
+   HASHDELTA, which names the base, only when smaller than the full
+   transfer. HASHKEEP, HASHDELTA and HASHLIST all name the target.
+4. The sender takes the list that HASHDELTA or HASHKEEP names from step 2
+   if it prepared that list, and otherwise reads it through the open file
+   of its listing, and verifies it. It decodes or applies the delta,
+   re-encodes canonically, and verifies the full target digest. An invalid
+   listed list or a bad delta requests HASHLIST once via HASHFULL; the
+   result of a bad delta is never published or used for the table. A bad
+   full list, or a full list after HASHFULL that names another target, is
+   a protocol error.
+5. The sender builds the table, unless it built it in step 2 from the list
+   that HASHKEEP names. With sender caching enabled, it durably publishes
+   the verified target, or after HASHKEEP keeps the listed file that it
+   verified. It ends its exchange, and only then replies CACHE_RESULT.
 6. On CACHE_RESULT, the receiver ends its exchange. Without CACHE_RESULT,
    it removes nothing.
 
@@ -864,9 +880,17 @@ they publish; no storage-success flag is needed.
 
 Publish complete files using a unique hidden temporary, file fsync, rename
 to the content-derived name, and directory fsync. Make new directory
-hierarchies durable too. Republish even an existing target ID rather than
-trusting its filename; HASHKEEP can copy its retained verified bytes.
-Published files are never edited in place. When the temporary cannot be
+hierarchies durable too. A side whose listing already holds its target
+keeps that file instead of publishing it again, and the receiver can link
+a copy from another of its peer/index directories (steps 1 and 5): the
+list takes 110 MB at 21 million values, and its publication about half a
+second. To keep or link a file, renew it first (below), check that the
+listed name still leads to it, and make the entries of its directories
+durable as after a publication, since its publisher may have died before
+it did. A link goes through `/proc/self/fd`, to the file that the side has
+open, and needs no fsync of the file. A failed link, for example across
+filesystems, falls back to a publication. Published files are never edited
+in place. When the temporary cannot be
 created because its directory is missing, create the directory and try
 again: expiry can remove an empty directory at any time, also just after
 its creation. Once the temporary exists, the directory is not empty, and
@@ -889,10 +913,10 @@ deletion.
 
 A run with another target needs a modifying process first, which needs the
 exclusive lock of the index (section 4.4). The receiver takes its lock
-before it exports its list and sends HELLO, and keeps it, exclusive or
+before it sends HELLO and exports its list, and keeps it, exclusive or
 shared, until after the list exchange. The client of a run with both
 streams deduplicated releases its lock after its update, and takes it
-again before its export (section 4.4, steps L1 to L4). The sender lists
+again before its HELLO (section 4.4, steps L1 to L4). The sender lists
 its directory only after the receiver's HELLO, and before its own HELLO.
 So a run with another target starts only after this run's listing. The
 sender ends its exchange only after HASHLIST, HASHDELTA, or HASHKEEP,
@@ -900,12 +924,17 @@ which its receiver sends only after it received the sender's HELLO. So no
 exchange that ends has a listing that holds the target of a later run,
 also when a sender outlives its failed receiver. A later run can still
 publish a listed list again under the same name, when its index has
-returned to an earlier state. So a side removes a listed list only if its
-name still names the listed file: it moves the name to a new temporary
-name, compares the file there with its open file, removes it if they are
-the same, and moves any other file back. A listed temporary belongs to an
-earlier run, or to a concurrent run with the same target, which then
-publishes nothing: normal absence.
+returned to an earlier state, or keep the listed file as its target. So a
+side removes a listed list only if its name still names the listed file,
+and nobody renewed the file since the listing: it moves the name to a new
+temporary name, compares the file there with its open file and with the
+modification time that the file had at the listing, removes it if both
+match, and moves it back otherwise. Keeping reuses the inode, so only the
+renewal tells a later run's target apart. A rename changes the ctime of
+the moved file on most filesystems, but not its modification time, so the
+comparison comes after the rename, once the name is the side's alone. A
+listed temporary belongs to an earlier run, or to a concurrent run with
+the same target, which then publishes nothing: normal absence.
 
 The end of an exchange and expiry can remove the base of a concurrent
 exchange at any time. So each side reads its base once, through one open
@@ -914,10 +943,12 @@ file, until the end of the exchange: the sender through the file of its
 listing. Neither side opens a list by name a second time.
 
 Touch verified files through their open descriptors after successful use.
-Use `ctime` as the renewal marker. To expire the cache, a side removes
-every file in every peer/index directory of both cache trees whose `ctime`
-is older than the `hashlist_max_age` of its host (default 30 days, section
-7): lists and abandoned hidden temporaries. Then it removes every
+Use `ctime` as the renewal marker. A renewal also sets the modification
+time later than the file had, by at least a nanosecond, so that a listing
+made before it no longer matches the file. To expire the cache, a side
+removes every file in every peer/index directory of both cache trees whose
+`ctime` is older than the `hashlist_max_age` of its host (default 30 days,
+section 7): lists and abandoned hidden temporaries. Then it removes every
 peer/index directory that is empty.
 
 A lost acknowledgement or a failed run can leave extra files until the
@@ -1039,8 +1070,9 @@ count. Output offsets and lengths are `u64`; overflow is a protocol error.
 exchange of a deduplicated stream negotiates. Every digest of the stream
 uses that algorithm, including all list IDs of its exchange, so a list ID
 travels as its digest alone, `[u8; S]`. A list exchange has one target and
-at most one base: the receiver's HELLO names the target, and HASHDELTA
-names the base, one of the lists that the sender's HELLO advertises.
+at most one base: HASHLIST, HASHDELTA, and HASHKEEP name the target, and
+HASHDELTA also names the base, one of the lists that the sender's HELLO
+advertises.
 
 The data session has two levels of frames:
 
@@ -1095,23 +1127,25 @@ Payloads:
   u8`: the client's `-q`, and the opposite of its `--no-human-readable`,
   which the server applies to its own notes.
 - HELLO, receiver to sender: `block_size u32`, `weak_hash_id string`,
-  `strong_hash_id string`, `target [u8; S]`, `account_id [u8; 16]`, and
-  `index_id [u8; 16]`.
+  `strong_hash_id string`, `account_id [u8; 16]`, and `index_id [u8; 16]`.
+  It names no target, so the receiver sends it before its export, and the
+  sender prepares its cached list meanwhile (section 5.6).
 - HELLO, sender to receiver: `account_id [u8; 16]`, and `lists`, a list of
   the IDs `[u8; S]` of the advertised lists (section 5.6).
-- HASHLIST: `length u64`. That many encoded bytes of the target follow the
-  frame directly.
-- HASHDELTA: `base [u8; S], removed_length u64, added_length u64`. The
-  removed and added encoded lists follow the frame directly. They change
-  the base, one of the advertised lists, into the target.
-- HASHKEEP: empty. The target is one of the advertised lists; no data
-  follows.
+- HASHLIST: `target [u8; S], length u64`. That many encoded bytes of the
+  target follow the frame directly.
+- HASHDELTA: `target [u8; S], base [u8; S], removed_length u64,
+  added_length u64`. The removed and added encoded lists follow the frame
+  directly. They change the base, one of the advertised lists, into the
+  target.
+- HASHKEEP: `target [u8; S]`. The target is one of the advertised lists;
+  no data follows.
 - List bytes after HASHLIST and HASHDELTA are not frames. Enforce exact
   lengths and canonical encoding, including ordering and padding.
 - HASHFULL: empty. Request a full list once when the listed list that
   HASHDELTA or HASHKEEP names is invalid, or after a delta digest
   mismatch, before the streams start (section 5.6). The response is
-  HASHLIST.
+  HASHLIST, which names the same target.
 - CACHE_RESULT: empty. The sender's single acknowledgement of the target
   of its exchange (section 5.6). A second one in the same exchange is a
   protocol error. Both streams start after the CACHE_RESULT of the last
@@ -1154,28 +1188,28 @@ Payloads:
 
 The receiver's HELLO sets the block size, weak hash, and strong hash of
 its stream. The sender uses them, or it ends the run with `die` before
-command startup if it does not support them. It checks the strong hash
-before it reads the target, whose length depends on it. Its HELLO does not
-repeat them. In the same way, the server ends the run before command
-startup if it does not support a setting of REQUEST, such as a compression
-level. And the sender of a deduplicated stream reserves the scanner's
-lookahead buffer and starts its probe threads before its HELLO. The
-client sets their sizes to any value, so a host that cannot provide them
-ends the run there (section 6.3).
+command startup if it does not support them. It checks the strong hash as
+soon as it reads its name: the length of every list ID of the exchange
+depends on it. Its HELLO does not repeat them. In the same way, the server
+ends the run before command startup if it does not support a setting of
+REQUEST, such as a compression level. And the sender of a deduplicated
+stream reserves the scanner's lookahead buffer and starts its probe
+threads before its HELLO. The client sets their sizes to any value, so a
+host that cannot provide them ends the run there (section 6.3).
 
-The data handshake is the version exchange, the features, REQUEST, and
-the list exchange of each deduplicated stream, the forward stream's
-first, so that their frames need no stream ID. A list exchange is
-receiver HELLO, sender HELLO, durable receiver publication with sender
-caching, then HASHLIST/HASHDELTA/HASHKEEP and its data. The sender replies
-with CACHE_RESULT, possibly after one HASHFULL fallback. The receiver
-handles the result and cache cleanup. Then both streams start: the server
-starts the command, and the client starts the forward stream. In a pull,
-the client sends its HELLO right after REQUEST, without waiting for the
-server. The server, as the receiver of the forward stream, sends its
-HELLO after its update. With both streams deduplicated, the client sends
-its HELLO after the forward stream's CACHE_RESULT, and after an update,
-only once it has opened its index again (section 4.4).
+The data handshake is the version exchange, the features, REQUEST, and the
+list exchange of each deduplicated stream, the forward stream's first, so
+that their frames need no stream ID. A list exchange is receiver HELLO,
+sender HELLO during the receiver's export, durable receiver publication
+with sender caching, then HASHLIST/HASHDELTA/HASHKEEP and its data. The
+sender replies with CACHE_RESULT, possibly after one HASHFULL fallback.
+The receiver handles the result and cache cleanup. Then both streams
+start: the server starts the command, and the client starts the forward
+stream. In a pull, the client sends its HELLO right after REQUEST, without
+waiting for the server. The server, as the receiver of the forward stream,
+sends its HELLO after its update. With both streams deduplicated, the
+client sends its HELLO after the forward stream's CACHE_RESULT, and after
+an update, only once it has opened its index again (section 4.4).
 
 Each session frame goes to SSH in a single write, together with any list
 bytes that follow HASHLIST or HASHDELTA. SSH puts the bytes of each read
@@ -2062,6 +2096,7 @@ SIGTERM during the end still give `128 + signal`.
 | Sender | lookahead reader | Fill the lookahead from the spool of the stream's source, and pass its idle points to the scanner, until its EOF or the stop; then close the spool at its end. |
 | Sender | scanner | Own records and query states; queue queries and frames (section 6.3). |
 | Sender | probe threads | Probe the parts of long stretches of windows for the scanner (section 6.3). |
+| Receiver | list export | Export the hash list, while the main thread reads the sender's HELLO and the base of a delta (section 5.6). |
 | Receiver | lookup workers | Answer queries out of order, until Completing (section 6.4). |
 | Attach | relay | Copy both directions (section 6.1). |
 
@@ -2526,6 +2561,23 @@ decision history, including fuller measurements, is in version control.
   publication can remove the target of a later run, when a sender
   outlives its failed receiver. A listing made before the sender's HELLO
   needs no clock and holds no later target (section 5.6).
+- **The target in the receiver's HELLO:** the receiver had to export its
+  list before its HELLO, and the sender could start on its cached list
+  only after HASHKEEP or HASHDELTA, so the two sides worked one after the
+  other. With an index of 30.3M blocks (21.4M distinct weak hashes, a
+  110 MB list), a run took 6.6–7.2 s after its update with an unchanged
+  list, and 8.8–9.4 s with a changed one. With the target in HASHKEEP,
+  HASHDELTA, and HASHLIST, the export overlapping the sender's
+  preparation, and unchanged lists kept, it takes 3.4–4.0 s and
+  5.6–6.4 s.
+- **Writing an unchanged target again:** with its fsync, a 110 MB list
+  took about half a second on each side, and so did writing a target that
+  another of the receiver's peer/index directories holds. The sender keeps
+  a list that it has just verified. The receiver reads its copy only when
+  it serves as a base, so a damaged copy costs one full list then, which
+  is rare enough. Reusing a file reuses its inode, so the cleanup of an
+  older exchange also compares the modification time, which a renewal
+  changes (section 5.6).
 - **Advertising only the sender's newest list, by `ctime`:** depends on the
   clock, and a sender that outlives its failed receiver can publish a
   newer list that the receiver no longer has; the next run then transfers

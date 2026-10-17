@@ -208,12 +208,14 @@ impl Request {
 /// HELLO, receiver to sender. Its block size and hashes are the stream's:
 /// the sender uses them or ends the run. Every digest of the stream's list
 /// exchange, including the target's, uses `strong_hash` (DESIGN.md §6.2).
+/// It does not name the target: the receiver sends it before it exports
+/// its hash list, so that the sender can prepare its cached list in the
+/// meantime, and the message that hands over the target names it
+/// (`TargetList`).
 pub struct ReceiverHello {
     pub block_size: u32,
     pub weak_hash_id: String,
     pub strong_hash: StrongHash,
-    /// The digest of the receiver's hash list.
-    pub target: Strong,
     pub account_id: [u8; 16],
     pub index_id: [u8; 16],
 }
@@ -224,15 +226,15 @@ impl ReceiverHello {
         enc.u32(self.block_size);
         enc.bytes(self.weak_hash_id.as_bytes());
         enc.bytes(self.strong_hash.id().as_bytes());
-        enc.raw(&self.target);
         enc.raw(&self.account_id);
         enc.raw(&self.index_id);
         enc.buf
     }
 
-    /// The target's length depends on the strong hash, so an unsupported
-    /// strong hash ends the run here, before the target is read
-    /// (DESIGN.md §6.2). The sender checks the weak hash after decoding.
+    /// The strong hash sets the length of every list ID that the later
+    /// frames of the exchange carry, so an unsupported strong hash ends the
+    /// run here (DESIGN.md §6.2). The sender checks the weak hash after
+    /// decoding.
     pub fn decode(payload: &[u8]) -> Self {
         let mut dec = Dec::new(payload, "HELLO");
         let block_size = dec.u32();
@@ -247,7 +249,6 @@ impl ReceiverHello {
             block_size,
             weak_hash_id,
             strong_hash,
-            target: dec.array(),
             account_id: dec.array(),
             index_id: dec.array(),
         };
@@ -290,16 +291,17 @@ impl SenderHello {
 
 /// The message in which the receiver hands the sender its target
 /// (DESIGN.md §5.6): a frame, followed directly by the encoded lists that it
-/// announces, outside any frame.
-#[derive(Debug, PartialEq, Eq)]
+/// announces, outside any frame. Each form names the target by its digest.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TargetList {
     /// HASHLIST, with the full target.
-    Full(Vec<u8>),
+    Full { target: Strong, list: Vec<u8> },
     /// HASHKEEP: the target is one of the lists that the sender advertised.
-    Keep,
+    Keep { target: Strong },
     /// HASHDELTA: the removed and added lists that turn `base`, one of the
     /// advertised lists, into the target.
     Delta {
+        target: Strong,
         base: Strong,
         removed: Vec<u8>,
         added: Vec<u8>,
@@ -307,20 +309,31 @@ pub enum TargetList {
 }
 
 impl TargetList {
-    /// The type and payload of the frame. The payload holds the base, if
-    /// there is one, and the lengths of the lists that follow.
+    /// The digest of the target that the message hands over.
+    pub fn target(&self) -> Strong {
+        match self {
+            TargetList::Full { target, .. }
+            | TargetList::Keep { target }
+            | TargetList::Delta { target, .. } => *target,
+        }
+    }
+
+    /// The type and payload of the frame. The payload holds the target,
+    /// the base, if there is one, and the lengths of the lists that follow.
     fn frame(&self) -> (u8, Vec<u8>) {
         let mut enc = Enc::new();
+        enc.raw(&self.target());
         let kind = match self {
-            TargetList::Full(list) => {
+            TargetList::Full { list, .. } => {
                 enc.u64(list.len() as u64);
                 frame::HASHLIST
             }
-            TargetList::Keep => frame::HASHKEEP,
+            TargetList::Keep { .. } => frame::HASHKEEP,
             TargetList::Delta {
                 base,
                 removed,
                 added,
+                ..
             } => {
                 enc.raw(base);
                 enc.u64(removed.len() as u64);
@@ -334,8 +347,8 @@ impl TargetList {
     /// The lists that follow the frame, in order.
     fn lists(&self) -> Vec<&[u8]> {
         match self {
-            TargetList::Full(list) => vec![list],
-            TargetList::Keep => Vec::new(),
+            TargetList::Full { list, .. } => vec![list],
+            TargetList::Keep { .. } => Vec::new(),
             TargetList::Delta { removed, added, .. } => vec![removed, added],
         }
     }
@@ -361,19 +374,26 @@ impl TargetList {
         let list = match frame.kind {
             frame::HASHLIST => {
                 let mut dec = Dec::new(frame.payload, "HASHLIST");
-                let length = dec.u64();
+                let (target, length) = (dec.array(), dec.u64());
                 dec.done();
-                TargetList::Full(input.bytes(length)?)
+                TargetList::Full {
+                    target,
+                    list: input.bytes(length)?,
+                }
             }
             frame::HASHKEEP => {
-                Dec::new(frame.payload, "HASHKEEP").done();
-                TargetList::Keep
+                let mut dec = Dec::new(frame.payload, "HASHKEEP");
+                let target = dec.array();
+                dec.done();
+                TargetList::Keep { target }
             }
             frame::HASHDELTA => {
                 let mut dec = Dec::new(frame.payload, "HASHDELTA");
-                let (base, removed, added) = (dec.array(), dec.u64(), dec.u64());
+                let (target, base) = (dec.array(), dec.array());
+                let (removed, added) = (dec.u64(), dec.u64());
                 dec.done();
                 TargetList::Delta {
+                    target,
                     base,
                     removed: input.bytes(removed)?,
                     added: input.bytes(added)?,
@@ -1456,12 +1476,17 @@ mod tests {
     #[test]
     fn target_lists_carry_their_lists_after_the_frame() {
         // The list bytes after HASHLIST and HASHDELTA are not frames: they
-        // follow the frame directly, with the removed list first. The base
-        // of a delta travels as just its digest (DESIGN.md §6.2).
+        // follow the frame directly, with the removed list first. The
+        // target, and the base of a delta, travel as just their digests
+        // (DESIGN.md §6.2).
         let lists = [
-            TargetList::Full(b"full".to_vec()),
-            TargetList::Keep,
+            TargetList::Full {
+                target: [1; 32],
+                list: b"full".to_vec(),
+            },
+            TargetList::Keep { target: [2; 32] },
             TargetList::Delta {
+                target: [3; 32],
                 base: [4; 32],
                 removed: b"rm".to_vec(),
                 added: b"add".to_vec(),
@@ -1474,11 +1499,14 @@ mod tests {
         }
         writer.send(frame::STREAM_END, b"").unwrap();
         let expected = [
-            &[frame::HASHLIST, 8, 0, 0, 0][..],
+            &[frame::HASHLIST, 40, 0, 0, 0][..],
+            &[1; 32],
             &4u64.to_le_bytes(),
             b"full",
-            &[frame::HASHKEEP, 0, 0, 0, 0],
-            &[frame::HASHDELTA, 48, 0, 0, 0],
+            &[frame::HASHKEEP, 32, 0, 0, 0],
+            &[2; 32],
+            &[frame::HASHDELTA, 80, 0, 0, 0],
+            &[3; 32],
             &[4; 32],
             &2u64.to_le_bytes(),
             &3u64.to_le_bytes(),
@@ -1488,7 +1516,7 @@ mod tests {
         .concat();
         assert_eq!(out, expected);
         let sizes: Vec<usize> = lists.iter().map(TargetList::size).collect();
-        assert_eq!(sizes, [17, 5, 58]);
+        assert_eq!(sizes, [49, 37, 90]);
 
         let mut reader = FrameReader::new(&out[..]);
         for list in lists {
@@ -1604,9 +1632,13 @@ mod tests {
         // takes only part of the bytes gets the rest in later calls, in
         // order.
         let lists = [
-            TargetList::Full(b"full".to_vec()),
-            TargetList::Keep,
+            TargetList::Full {
+                target: [1; 32],
+                list: b"full".to_vec(),
+            },
+            TargetList::Keep { target: [2; 32] },
             TargetList::Delta {
+                target: [3; 32],
                 base: [4; 32],
                 removed: b"rm".to_vec(),
                 added: b"add".to_vec(),
@@ -1636,7 +1668,6 @@ mod tests {
             block_size: 4096,
             weak_hash_id: "weak".into(),
             strong_hash: StrongHash::Sha256,
-            target: [3; 32],
             account_id: [7; 16],
             index_id: [9; 16],
         }
@@ -1761,7 +1792,6 @@ mod tests {
         assert_eq!(decoded.block_size, 4096);
         assert_eq!(decoded.weak_hash_id, "weak");
         assert_eq!(decoded.strong_hash, StrongHash::Sha256);
-        assert_eq!(decoded.target, hello.target);
         assert_eq!(decoded.account_id, [7; 16]);
         assert_eq!(decoded.index_id, [9; 16]);
     }
@@ -2336,24 +2366,18 @@ mod tests {
             },
         );
         let strong_hash = prop_oneof![Just(StrongHash::Blake3), Just(StrongHash::Sha256)];
-        let receiver_hello = (
-            1u32..,
-            "\\PC{0,10}",
-            strong_hash,
-            any::<Strong>(),
-            any::<[[u8; 16]; 2]>(),
-        )
-            .prop_map(|(block_size, weak_hash_id, strong_hash, target, ids)| {
+        let receiver_hello = (1u32.., "\\PC{0,10}", strong_hash, any::<[[u8; 16]; 2]>()).prop_map(
+            |(block_size, weak_hash_id, strong_hash, ids)| {
                 let hello = ReceiverHello {
                     block_size,
                     weak_hash_id,
                     strong_hash,
-                    target,
                     account_id: ids[0],
                     index_id: ids[1],
                 };
                 (Payload::ReceiverHello, hello.encode())
-            });
+            },
+        );
         let sender_hello =
             (any::<[u8; 16]>(), vec(any::<Strong>(), 0..4)).prop_map(|(account_id, lists)| {
                 let hello = SenderHello { account_id, lists };
@@ -2410,11 +2434,13 @@ mod tests {
             (Payload::TargetList, out.into_inner())
         };
         let target_list = prop_oneof![
-            list().prop_map(move |list| sent(TargetList::Full(list))),
-            Just(()).prop_map(move |()| sent(TargetList::Keep)),
-            (any::<Strong>(), list(), list()).prop_map(move |(base, removed, added)| {
+            (any::<Strong>(), list())
+                .prop_map(move |(target, list)| sent(TargetList::Full { target, list })),
+            any::<Strong>().prop_map(move |target| sent(TargetList::Keep { target })),
+            (any::<[Strong; 2]>(), list(), list()).prop_map(move |(ids, removed, added)| {
                 sent(TargetList::Delta {
-                    base,
+                    target: ids[0],
+                    base: ids[1],
                     removed,
                     added,
                 })

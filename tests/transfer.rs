@@ -840,8 +840,8 @@ fn output_reproduces_byte_for_byte_and_lists_are_cached() {
             assert!(transfer.env.path(identity).exists(), "{identity}");
         }
 
-        // A second run reuses both identities and republishes the same
-        // list; nothing accumulates.
+        // A second run reuses both identities and keeps the same list;
+        // nothing accumulates.
         succeeded(transfer.run_stream(direction, &[], "true"));
         let cached = transfer.cache_files(direction.receiver(), "local-hashlists");
         assert_eq!(cached, receiver);
@@ -3119,10 +3119,11 @@ fn kept_list(transfer: &Transfer, direction: Direction) -> String {
 fn an_unchanged_list_is_kept_and_a_changed_one_goes_as_a_delta() {
     // The first run sends the full list. With the index unchanged, the next
     // run sends no list bytes at all, because the sender already has the
-    // target, and its summary line shows no list. After a change, a run
-    // sends the delta from the list that both sides keep, which is smaller.
-    // However the sender gets the target, it builds its table from it, so
-    // the blocks of the files become references (DESIGN.md §5.6 and §8).
+    // target, and its summary line shows no list; neither side writes that
+    // list again, both keep their files. After a change, a run sends the
+    // delta from the list that both sides keep, which is smaller. However
+    // the sender gets the target, it builds its table from it, so the
+    // blocks of the files become references (DESIGN.md §5.6 and §8).
     for direction in DIRECTIONS {
         let transfer = Transfer::new(&[]);
         transfer.configure_receiver(direction, "");
@@ -3133,9 +3134,23 @@ fn an_unchanged_list_is_kept_and_a_changed_one_goes_as_a_delta() {
         assert_eq!(delta, None);
         let full = full.expect("no full list");
         let first_list = kept_list(&transfer, direction);
+        let inodes = || {
+            let receiver = (direction.receiver(), "local-hashlists");
+            let sender = (direction.sender(), "remote-hashlists");
+            [receiver, sender].map(|(side, tree)| {
+                let dir = transfer.peer_dir(side, tree).unwrap();
+                std::fs::metadata(dir.join(&first_list)).unwrap().ino()
+            })
+        };
+        let written = inodes();
 
         assert_eq!(cat_references(&transfer, direction, "first"), (None, None));
         assert_eq!(kept_list(&transfer, direction), first_list);
+        assert_eq!(
+            inodes(),
+            written,
+            "{direction:?}: an unchanged list was written again"
+        );
 
         transfer
             .env
@@ -3206,13 +3221,75 @@ fn a_base_from_the_directory_of_another_peer_serves() {
 }
 
 #[test]
+fn a_target_in_the_directory_of_another_sender_is_linked() {
+    // A receiver that gets the same target from two senders keeps a copy in
+    // its directory for each. Here, after a first run, the sender gets a new
+    // account ID, as another sender would have. Its own cache belongs to the
+    // receiver's account and index, so it still holds the target, and the
+    // run sends HASHKEEP. The receiver's directory for the new account is
+    // empty, and the receiver links the copy from its directory for the old
+    // account into it, instead of writing the list again. Then the shared
+    // file gets damaged: the next run finds the damage in the receiver's
+    // link, and writes the target again in place of linking the other,
+    // damaged, link back (DESIGN.md §5.6).
+    for direction in DIRECTIONS {
+        let transfer = Transfer::new(&[]);
+        transfer.configure_receiver(direction, "");
+        transfer
+            .env
+            .write(transfer.indexed(direction, "first"), &tiled(64, 7));
+        let (full, _) = cat_references(&transfer, direction, "first");
+        let full = full.expect("no full list");
+        let target = kept_list(&transfer, direction);
+        let account = match direction {
+            Direction::Pull => "server/home/.config/hashsync/account-id",
+            Direction::Push => "client/config/hashsync/account-id",
+        };
+        std::fs::remove_file(transfer.env.path(account)).unwrap();
+        assert_eq!(cat_references(&transfer, direction, "first"), (None, None));
+        // The receiver's copies of the target, one per account directory:
+        // their paths, inode numbers and sizes.
+        let tree = transfer.cache_tree(direction.receiver(), "local-hashlists");
+        let copies = || -> Vec<(PathBuf, u64, u64)> {
+            std::fs::read_dir(&tree)
+                .unwrap()
+                .map(|dir| {
+                    let path = dir.unwrap().path().join(&target);
+                    let meta = std::fs::metadata(&path).unwrap();
+                    (path, meta.ino(), meta.len())
+                })
+                .collect()
+        };
+        let linked = copies();
+        assert_eq!(linked.len(), 2, "{direction:?}: a directory per account");
+        assert_eq!(
+            linked[0].1, linked[1].1,
+            "{direction:?}: the target was written again"
+        );
+
+        // Written in place, so both links show the damage.
+        std::fs::write(&linked[0].0, b"damaged").unwrap();
+        assert_eq!(cat_references(&transfer, direction, "first"), (None, None));
+        let mut sizes: Vec<u64> = copies().iter().map(|copy| copy.2).collect();
+        sizes.sort_unstable();
+        let valid = ("hsynlist\x01".len() + full) as u64;
+        assert_eq!(
+            sizes,
+            [7, valid],
+            "{direction:?}: the damaged link came back"
+        );
+    }
+}
+
+#[test]
 fn a_damaged_cached_list_gives_way_to_the_full_list_on_either_side() {
     // A damaged cached list is a miss, and its file is removed (DESIGN.md
-    // §5.6). If the damage is on the receiver, the run sends the full list
-    // right away. The sender only finds out when it reads the list that
-    // HASHKEEP or HASHDELTA names, so there the run sends the full list
-    // after HASHFULL. Either way, both sides end up keeping only the valid
-    // target.
+    // §5.6). If the damage is on the receiver, the receiver finds out when
+    // it reads the list as a base: the run sends the full list when the
+    // target changed, and nothing more when it did not. The sender only
+    // finds out when it reads the list that HASHKEEP or HASHDELTA names, so
+    // there the run sends the full list after HASHFULL. Either way, both
+    // sides end up keeping only the valid target.
     for direction in DIRECTIONS {
         let transfer = Transfer::new(&[]);
         transfer.configure_receiver(direction, "");
@@ -3249,11 +3326,31 @@ fn a_damaged_cached_list_gives_way_to_the_full_list_on_either_side() {
             third > full && delta.is_some(),
             "full {third}, delta {delta:?}"
         );
-        for (side, tree) in [receiver, sender] {
-            let dir = transfer.peer_dir(side, tree).unwrap();
-            let bytes = std::fs::read(dir.join(kept_list(&transfer, direction))).unwrap();
-            assert_eq!(bytes.len(), "hsynlist\x01".len() + third, "{side}");
-        }
+        // Both sides keep one valid copy of the target, `full` list bytes
+        // after the wrapper.
+        let both_keep = |full: usize| {
+            for (side, tree) in [receiver, sender] {
+                let dir = transfer.peer_dir(side, tree).unwrap();
+                let bytes = std::fs::read(dir.join(kept_list(&transfer, direction))).unwrap();
+                assert_eq!(bytes.len(), "hsynlist\x01".len() + full, "{side}");
+            }
+        };
+        both_keep(third);
+
+        // With the index unchanged, the receiver reads its copy of the
+        // target as the base of a delta while it exports, since the sender
+        // advertises that list. So damage there shows at once: the receiver
+        // writes its target again instead of keeping the damaged copy, the
+        // run needs no list bytes, and the next change goes as a delta.
+        damage(receiver);
+        assert_eq!(cat_references(&transfer, direction, "third"), (None, None));
+        both_keep(third);
+        write("fourth", &tiled(4, 13));
+        let (full, delta) = cat_references(&transfer, direction, "fourth");
+        assert!(
+            full.is_none() && delta.is_some(),
+            "full {full:?}, delta {delta:?}"
+        );
     }
 }
 
@@ -4596,7 +4693,9 @@ fn the_clients_index_closes_at_the_stop_of_the_backward_stream() {
 /// The bytes of the CHUNK payloads in `session`, the bytes that one
 /// direction of the data session carried: the version and the features,
 /// then whole frames, and the list bytes that follow HASHLIST and HASHDELTA
-/// outside any frame, with the 32-byte IDs of BLAKE3 (DESIGN.md §6.2).
+/// outside any frame. Both payloads start with the target's ID, and the
+/// one of HASHDELTA then has the base's, 32 bytes each with BLAKE3
+/// (DESIGN.md §6.2).
 fn chunk_payload_bytes(session: &[u8]) -> usize {
     let mut rest = &session[version_and_features(FEATURES).len()..];
     let mut chunks = 0;
@@ -4609,8 +4708,8 @@ fn chunk_payload_bytes(session: &[u8]) -> usize {
                 chunks += length;
                 0
             }
-            HASHLIST => u64_at(0),
-            HASHDELTA => u64_at(32) + u64_at(40),
+            HASHLIST => u64_at(32),
+            HASHDELTA => u64_at(64) + u64_at(72),
             _ => 0,
         };
         rest = &rest[5 + length + follows as usize..];

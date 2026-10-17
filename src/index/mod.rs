@@ -123,8 +123,9 @@ pub struct Index {
     shared: Arc<Shared>,
 }
 
-/// A read-only view of the index for a lookup worker during a transfer.
-/// Reads see the latest committed transaction of this process.
+/// A read-only view of the index for another thread during a transfer: a
+/// lookup worker, or the receiver's export of its hash list. Reads see the
+/// latest committed transaction of this process.
 pub struct Reader {
     shared: Arc<Shared>,
 }
@@ -443,6 +444,15 @@ pub struct Candidate {
 }
 
 impl Reader {
+    /// The distinct weak hashes, sorted as unsigned 64-bit values, from
+    /// one database snapshot (DESIGN.md §5.4). No column family orders
+    /// the blocks by weak hash, so the sort is in memory.
+    pub fn export_weak_hashes(&self) -> Vec<u64> {
+        let mut values = self.shared.sorted_weak_hashes();
+        values.dedup();
+        values
+    }
+
     /// At most `limit` candidates of the blocks whose strong-hash prefix is
     /// `prefix`: one for every path of each block's inode, and one for each
     /// block whose inode has no path. Any order would do; this one is
@@ -799,15 +809,6 @@ impl Index {
         let mut options = WaitForCompactOptions::default();
         options.set_flush(true);
         db(self.shared.db.wait_for_compact(&options));
-    }
-
-    /// The distinct weak hashes, sorted as unsigned 64-bit values, from
-    /// one database snapshot (DESIGN.md §5.4). No column family orders
-    /// the blocks by weak hash, so the sort is in memory.
-    pub fn export_weak_hashes(&self) -> Vec<u64> {
-        let mut values = self.shared.sorted_weak_hashes();
-        values.dedup();
-        values
     }
 
     /// Reconcile roots before scanning (DESIGN.md §4.2): remove the paths
@@ -1207,7 +1208,7 @@ mod tests {
     fn weak_hashes_export_distinct_and_unsigned_sorted() {
         let dir = tempfile::tempdir().unwrap();
         let index = new_index(dir.path());
-        assert_eq!(index.export_weak_hashes(), Vec::<u64>::new());
+        assert_eq!(index.reader().export_weak_hashes(), Vec::<u64>::new());
         // 7 repeats on another inode.
         let values = [7, 0, u64::MAX, 1 << 63, i64::MAX as u64];
         let mut blocks: Vec<_> = values
@@ -1224,7 +1225,7 @@ mod tests {
             &blocks,
         );
         assert_eq!(
-            index.export_weak_hashes(),
+            index.reader().export_weak_hashes(),
             vec![0, 7, i64::MAX as u64, 1 << 63, u64::MAX]
         );
         let stats = index.stats();

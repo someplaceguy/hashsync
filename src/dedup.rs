@@ -43,7 +43,7 @@ use crate::fsops;
 use crate::hash::StrongHash;
 use crate::hashtable::HashTable;
 use crate::index::{self, Index, Settings};
-use crate::list_exchange::{ListBytes, ReceiverExchange, SenderExchange, Target};
+use crate::list_exchange::{ListBytes, ReceiverExchange, SenderExchange};
 use crate::lookup;
 use crate::pins::Pins;
 use crate::pool::Pool;
@@ -657,15 +657,14 @@ impl Receiving {
 
     /// Prepare the receiver's index for one run, as DESIGN.md §4.4 orders
     /// it: update it and keep it read-only with a shared lock, or with
-    /// `no_update`, open it read-only; export its hash list; then start the
-    /// lookups, which take over the index, and answer the queries as soon
-    /// as they arrive.
+    /// `no_update`, open it read-only. Its hash list waits for the HELLO
+    /// (`ReceivingIndex::hello`).
     pub fn prepare(self, config: &Config, no_update: bool) -> ReceivingIndex {
         let (index, locations) = open_index(config, no_update);
-        let peer = self.peer;
         ReceivingIndex {
-            state: Prepared::Open(self.export(index, locations, config)),
-            peer,
+            receiving: self,
+            index: Some(index),
+            locations,
         }
     }
 
@@ -679,76 +678,38 @@ impl Receiving {
     pub fn update_and_release(self, config: &Config) -> ReceivingIndex {
         let (index, locations) = update::perform(config, false, None);
         index.close();
-        let peer = self.peer;
         ReceivingIndex {
-            state: Prepared::Released {
-                receiving: self,
-                locations,
-            },
-            peer,
-        }
-    }
-
-    /// Export the hash list of `index`, which is read-only with a shared
-    /// lock, from one database snapshot, and start the lookups, which take
-    /// over the index, and answer the queries as soon as they arrive.
-    /// `locations` are the current locations of the roots of `config`.
-    fn export(self, index: Index, locations: Vec<Location>, config: &Config) -> Exported {
-        let meta = index.read_meta().expect("the index lost its metadata");
-        let target = Target::export(&index, config.strong_hash);
-        let workers = lookup::start(index, locations, &self.pins, config, self.queries.1);
-        Exported {
-            lookups: Lookups {
-                pins: self.pins,
-                workers,
-            },
-            target,
-            index_id: meta.index_id,
+            receiving: self,
+            index: None,
+            locations,
         }
     }
 }
 
 /// The receiver's role once its index is prepared, until its HELLO.
 pub struct ReceivingIndex {
-    state: Prepared,
-    peer: &'static str,
-}
-
-/// The index of a `ReceivingIndex`: ready for the run, or, for the client
-/// of a run with both streams deduplicated, released between its update
-/// and its HELLO.
-enum Prepared {
-    /// Open read-only with a shared lock, with its hash list exported and
-    /// its lookups running.
-    Open(Exported),
-    /// Updated and closed, without a lock, with the root locations of the
-    /// update, until the HELLO opens it again.
-    Released {
-        receiving: Receiving,
-        locations: Vec<Location>,
-    },
-}
-
-/// A receiver's index once its lookups own it, with the hash list that the
-/// receiver's HELLO names.
-struct Exported {
-    lookups: Lookups,
-    /// The hash list of the index, exported from one database snapshot.
-    target: Target,
-    /// The ID of the index, which partitions the list caches.
-    index_id: [u8; 16],
+    receiving: Receiving,
+    /// The index, read-only with a shared lock, or `None` for the client of
+    /// a run with both streams deduplicated, whose index stays closed
+    /// between its update and its HELLO.
+    index: Option<Index>,
+    /// The current locations of the roots, from which the lookups read
+    /// candidate blocks.
+    locations: Vec<Location>,
 }
 
 impl ReceivingIndex {
     /// The first step of the receiver's list exchange (DESIGN.md §5.6):
     /// send its HELLO on `output`, with the block size and the hashes of
-    /// `config`, which are the stream's, and the ID of the index's hash
-    /// list. An index that `update_and_release` released opens again first,
-    /// read-only with a shared lock, and only then exports its hash list:
-    /// another process can have changed it meanwhile. If that process
-    /// rebuilt it with other settings, so that it no longer matches
-    /// `config`, the run ends with `die`, as a run with `--no-update` does
-    /// (DESIGN.md §4.4). A failure of the session ends the run.
+    /// `config`, which are the stream's, and the ID of the index, and start
+    /// the export of the index's hash list. Then start the lookups, which
+    /// take over the index, and answer the queries as soon as they arrive.
+    /// An index that `update_and_release` released opens again first,
+    /// read-only with a shared lock: another process can have changed it
+    /// meanwhile. If that process rebuilt it with other settings, so that
+    /// it no longer matches `config`, the run ends with `die`, as a run
+    /// with `--no-update` does (DESIGN.md §4.4). A failure of the session
+    /// ends the run.
     ///
     /// For an index that `update_and_release` released, call this only
     /// once the server's update is done, which the forward stream's list
@@ -761,24 +722,30 @@ impl ReceivingIndex {
         output: &mut FrameWriter<W>,
         config: &Config,
     ) -> ReceivingExchange {
-        let exported = match self.state {
-            Prepared::Open(exported) => exported,
-            Prepared::Released {
-                receiving,
-                locations,
-            } => receiving.export(open_read_only(config), locations, config),
-        };
-        let Exported {
-            lookups,
-            target,
-            index_id,
-        } = exported;
-        let exchange = ReceiverExchange::start(output, config, target, index_id)
-            .unwrap_or_else(|e| die_data(self.peer, &e));
+        let ReceivingIndex {
+            receiving,
+            index,
+            locations,
+        } = self;
+        let peer = receiving.peer;
+        let index = index.unwrap_or_else(|| open_read_only(config));
+        let meta = index.read_meta().expect("the index lost its metadata");
+        let exchange = ReceiverExchange::start(output, config, meta.index_id, index.reader())
+            .unwrap_or_else(|e| die_data(peer, &e));
+        let workers = lookup::start(
+            index,
+            locations,
+            &receiving.pins,
+            config,
+            receiving.queries.1,
+        );
         ReceivingExchange {
-            lookups,
+            lookups: Lookups {
+                pins: receiving.pins,
+                workers,
+            },
             exchange,
-            peer: self.peer,
+            peer,
         }
     }
 }

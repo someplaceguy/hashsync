@@ -147,10 +147,10 @@ fn request_payload(
     request
 }
 
-/// The client's HELLO payload for `list`, with BLAKE3 as its strong hash.
-fn hello_payload(block_size: u32, list: &[u8]) -> Vec<u8> {
+/// The client's HELLO payload, with BLAKE3 as its strong hash. It names
+/// no target: HASHLIST does (`Serve::send_list`).
+fn hello_payload(block_size: u32) -> Vec<u8> {
     let mut hello = hello_prefix(block_size, b"blake3");
-    hello.extend_from_slice(blake3::hash(list).as_bytes()); // target
     hello.extend_from_slice(&[0xaa; 16]); // account ID
     hello.extend_from_slice(&[0xbb; 16]); // index ID
     hello
@@ -663,28 +663,22 @@ impl Serve {
     }
 
     /// The versions and the features, REQUEST, then the data HELLOs: the
-    /// client's, for the empty list and 4 KiB blocks, then `serve`'s reply,
-    /// whose payload this returns.
+    /// client's, for 4 KiB blocks, then `serve`'s reply, whose payload this
+    /// returns.
     fn hello(&mut self, command: &[&str]) -> Vec<u8> {
-        self.hello_with(4096, &empty_list(), command, 0)
+        self.hello_with(4096, command, 0)
     }
 
-    fn hello_with(
-        &mut self,
-        block_size: u32,
-        list: &[u8],
-        command: &[&str],
-        level: i32,
-    ) -> Vec<u8> {
+    fn hello_with(&mut self, block_size: u32, command: &[&str], level: i32) -> Vec<u8> {
         let request = request_payload(command, BACKWARD, level, 2 << 30, self.delivery);
-        self.send_hello(&request, &hello_payload(block_size, list))
+        self.send_hello(&request, &hello_payload(block_size))
     }
 
     /// The versions, the features, REQUEST and the data HELLOs, as `hello`
     /// exchanges them, with spools that hold at most `spool_limit` bytes.
     fn hello_with_spool_limit(&mut self, command: &[&str], spool_limit: u64) {
         let request = request_payload(command, BACKWARD, 0, spool_limit, self.delivery);
-        self.send_hello(&request, &hello_payload(4096, &empty_list()));
+        self.send_hello(&request, &hello_payload(4096));
     }
 
     /// Returns the payload of `serve`'s HELLO.
@@ -739,8 +733,14 @@ impl Serve {
         self.send_list(&empty_list());
     }
 
+    /// HASHLIST, which names the target, `list`, by its BLAKE3 digest, and
+    /// the list after it.
     fn send_list(&mut self, list: &[u8]) {
-        self.send(HASHLIST, &(list.len() as u64).to_le_bytes());
+        let length = (list.len() as u64).to_le_bytes();
+        self.send(
+            HASHLIST,
+            &[blake3::hash(list).as_bytes(), &length[..]].concat(),
+        );
         self.send_raw(list);
     }
 
@@ -878,11 +878,17 @@ impl Serve {
         let mut sender_hello = vec![0xaa; 16]; // account ID
         sender_hello.extend_from_slice(&0u32.to_le_bytes()); // no list
         self.send(HELLO, &sender_hello);
-        let (kind, length) = self.recv();
+        let (kind, payload) = self.recv();
         assert_eq!(kind, HASHLIST);
+        let (target, length) = payload.split_at(32);
         let length = u64::from_le_bytes(length.try_into().unwrap());
         let mut list = vec![0; length as usize];
         self.data_out.read_exact(&mut list).unwrap();
+        assert_eq!(
+            target,
+            blake3::hash(&list).as_bytes(),
+            "HASHLIST names its list"
+        );
         self.send(CACHE_RESULT, b"");
         let mut theirs = [0u8; 12];
         socket.read_exact(&mut theirs).unwrap();
@@ -1047,12 +1053,12 @@ fn serve_advertises_its_listed_lists_and_removes_only_listed_files() {
 }
 
 #[test]
-fn an_unknown_strong_hash_is_rejected_before_the_target() {
-    // The target's length depends on the strong hash, so `serve` rejects
-    // an unknown one with `die` before it reads the target, as it would
-    // for a newer client's algorithm (DESIGN.md §6.2 and §11). The payload
-    // ends after the algorithm's name: a read of any later field would
-    // panic on truncation instead.
+fn an_unknown_strong_hash_is_rejected_at_hello() {
+    // The strong hash sets the length of every list ID of the exchange, so
+    // `serve` rejects an unknown one with `die` as soon as it reads its
+    // name, as it would for a newer client's algorithm (DESIGN.md §6.2 and
+    // §11). The payload ends after the algorithm's name: a read of any
+    // later field would panic on truncation instead.
     let mut serve = Serve::start();
     serve.send_version_and_features();
     serve.send(
@@ -1222,7 +1228,7 @@ fn an_answer_decides_between_a_reference_and_literals() {
             let mut serve = Serve::start();
             let file = serve.home.path().join("block");
             std::fs::write(&file, &block).unwrap();
-            serve.hello_with(4096, &list, &["cat", file.to_str().unwrap()], level);
+            serve.hello_with(4096, &["cat", file.to_str().unwrap()], level);
             let mut control = serve.control_session(&list, level);
             let digest = blake3::hash(&block).as_bytes().to_vec();
             assert_eq!(control.query(), (0, digest), "the window at offset 0");
@@ -1314,7 +1320,7 @@ fn obsolete_queries_in_flight(level: i32) {
     // In eager delivery, an idle point of the output of `cat` could make a
     // window of a chain literal, and change the queries (DESIGN.md §6.3).
     serve.delivery = Delivery::Batch;
-    serve.hello_with(B as u32, &list, &["cat", file.to_str().unwrap()], level);
+    serve.hello_with(B as u32, &["cat", file.to_str().unwrap()], level);
     let mut control = serve.control_session(&list, level);
     assert_eq!(control.query().0, 0);
     for &offset in &w {
@@ -1371,7 +1377,7 @@ fn a_compressed_stream_is_one_zstd_frame_in_chunks() {
     // which ends with the last CHUNK. STREAM_END and END follow it, outside
     // it, and nothing follows END (DESIGN.md §6.2).
     let mut serve = Serve::start();
-    serve.hello_with(4096, &empty_list(), &["printf", "%s", "compressed"], 3);
+    serve.hello_with(4096, &["printf", "%s", "compressed"], 3);
     let mut control = serve.control_session(&empty_list(), 3);
     serve.recv_result();
     let mut chunks = Vec::new();
@@ -1410,7 +1416,7 @@ fn eager_delivery_sends_the_output_while_the_command_waits() {
         let go = serve.home.path().join("go");
         mkfifoat(CWD, &go, Mode::RUSR | Mode::WUSR).unwrap();
         let script = format!("printf partial; read go <'{}'; printf more", go.display());
-        serve.hello_with(4096, &empty_list(), &["sh", "-c", &script], level);
+        serve.hello_with(4096, &["sh", "-c", &script], level);
         let mut control = serve.control_session(&empty_list(), level);
         serve.recv_result();
         {
@@ -1437,7 +1443,7 @@ fn batch_delivery_keeps_the_output_while_the_command_waits() {
         mkfifoat(CWD, &go, Mode::RUSR | Mode::WUSR).unwrap();
         let script = format!("printf partial; read go <'{}'; printf more", go.display());
         serve.delivery = Delivery::Batch;
-        serve.hello_with(4096, &empty_list(), &["sh", "-c", &script], level);
+        serve.hello_with(4096, &["sh", "-c", &script], level);
         let mut control = serve.control_session(&empty_list(), level);
         // The open waits for the command to open the FIFO, after it wrote
         // its first bytes. Then `serve` has nothing more to do until the
@@ -1468,7 +1474,7 @@ fn the_forward_stream_reaches_the_command() {
     let input = b"the stdin of the command\n".repeat(10_000);
     for level in [0, 3] {
         let mut serve = Serve::start();
-        serve.hello_with(4096, &empty_list(), &["cat"], level);
+        serve.hello_with(4096, &["cat"], level);
         let mut control = serve.control_session(&empty_list(), level);
         serve.recv_result();
         let stream = forward_stream(&input, level);

@@ -624,7 +624,10 @@ mod tests {
     #[should_panic(expected = "protocol error: unexpected data frame type 3")]
     fn a_full_list_that_was_not_asked_for_is_a_protocol_error() {
         let mut session = FrameWriter::new(Vec::new());
-        let full = TargetList::Full(hashlist::encode(&[]));
+        let full = TargetList::Full {
+            target: [0; 32],
+            list: hashlist::encode(&[]),
+        };
         full.send(&mut session).unwrap();
         read_session(&session.into_inner());
     }

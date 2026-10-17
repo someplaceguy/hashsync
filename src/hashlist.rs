@@ -88,6 +88,21 @@ pub fn encode(values: &[u64]) -> Vec<u8> {
 /// Decode a canonical list into its sorted distinct values. Any
 /// deviation from the canonical form is an error naming the problem.
 pub fn decode(bytes: &[u8]) -> Result<Vec<u64>, String> {
+    decode_with(bytes, Vec::with_capacity, Vec::push)
+}
+
+/// Decode a canonical list as `decode` does, but hand each value to `add`
+/// as soon as it is decoded, in order, instead of collecting the values.
+/// `start` gets the number of values from the header and makes what
+/// `add` adds to. This function exists so that the sender can build its
+/// hash table straight from a list (`HashTable::from_list`), without a
+/// vector of all its values in between. On an error, what `add` built so
+/// far is dropped, and the caller gets only the error.
+pub fn decode_with<T>(
+    bytes: &[u8],
+    start: impl FnOnce(usize) -> T,
+    mut add: impl FnMut(&mut T, u64),
+) -> Result<T, String> {
     if bytes.len() < HEADER_LEN {
         return Err("truncated header".into());
     }
@@ -100,7 +115,7 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<u64>, String> {
         return Err("more values than encoded bits".into());
     }
     let mut reader = BitReader::new(body);
-    let mut values = Vec::with_capacity(n as usize);
+    let mut values = start(n as usize);
     let mut previous: Option<u64> = None;
     for _ in 0..n {
         let quotient = reader.unary().ok_or("truncated value")?;
@@ -124,7 +139,7 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<u64>, String> {
                 .ok_or("values overflow the value width")?,
         };
         previous = Some(value);
-        values.push(value);
+        add(&mut values, value);
     }
     // The last byte is padded with zeros and nothing may follow it.
     if !reader.rest_is_zero_padding() {
