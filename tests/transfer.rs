@@ -31,9 +31,10 @@ use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use std::time::Duration;
 
 use common::{
-    ANSWER, BLOCK, CACHE_RESULT, CHUNK, END, Env, FEATURES, HASHDELTA, HASHLIST, HELLO, KillOnDrop,
-    LIT, QUERY, REQUEST, STOP, STREAM_END, frame, ofd_lock, proc_state, random, tiled,
-    toml_literal, try_recv_frame, version_and_features, wait_for_lock_wait,
+    ANSWER, BLOCK, CHUNK, END, Env, FEATURES, HASHDELTA, HASHLIST, HASHNONE, HELLO, KillOnDrop,
+    LIT, QUERY, REQUEST, STOP, STREAM_END, exclusive_lock, frame, hello_payload, ofd_lock,
+    poll_syscall, proc_state, random, shared_lock, tiled, toml_literal, try_recv_frame,
+    version_and_features, wait_for_lock_wait, wait_until_asleep,
 };
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::fs::{CWD, Mode, OFlags, inotify, mkfifoat};
@@ -49,11 +50,14 @@ const HOST: &str = "testhost";
 /// counts exactly.
 const EXACT: &str = "--no-human-readable";
 
-/// Batch delivery of the output, for the tests that count references and
-/// runs exactly. In eager delivery, a block or a run whose window spans an
-/// idle point of the command's stdout becomes literal, and the idle points
-/// depend on timing (DESIGN.md §6.3).
-const BATCH: &str = "--batch-stdout";
+/// The options of the tests that count the references and runs of the
+/// output exactly. With `--wait`, the scanner scans the output only once it
+/// has the whole list: without it, the output can start before the list
+/// arrives, and how much of it does depends on timing. And batch delivery:
+/// in eager delivery, a block or a run whose window spans an idle point of
+/// the command's stdout becomes literal, and the idle points depend on
+/// timing too (DESIGN.md §6.3).
+const COUNTED: [&str; 2] = ["--wait", "--batch-stdout"];
 
 /// The bytes of noise that fill the data session in the tests of a busy
 /// data writer: the consumer reads none of the client's stdout, the
@@ -123,8 +127,7 @@ exec /bin/sh -c "$1"
 "#
         );
         let ssh = env.path("ssh");
-        std::fs::write(&ssh, script).unwrap();
-        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_script(&ssh, script);
         let ssh = ssh.to_str().expect("the test path must be plain text");
         assert!(
             !ssh.contains(['\'', '"', '\\', ' ']),
@@ -256,6 +259,14 @@ exec /bin/sh -c "$1"
         match direction {
             Direction::Pull => format!("tree/{name}"),
             Direction::Push => format!("server-tree/{name}"),
+        }
+    }
+
+    /// The index of the receiver of `direction`.
+    fn receiver_index(&self, direction: Direction) -> PathBuf {
+        match direction {
+            Direction::Pull => self.env.index_path(),
+            Direction::Push => self.server_index(),
         }
     }
 
@@ -409,14 +420,12 @@ enum Direction {
 const DIRECTIONS: [Direction; 2] = [Direction::Pull, Direction::Push];
 
 impl Direction {
-    /// The batch delivery of the deduplicated stream, for the tests that
-    /// count references and runs exactly: in eager delivery, a block or a
-    /// run whose window spans an idle point becomes literal, and the idle
-    /// points depend on timing (DESIGN.md §6.3).
-    fn batch(self) -> &'static str {
+    /// `--wait` and the batch delivery of the deduplicated stream, for the
+    /// tests that count references and runs exactly, as `COUNTED` says.
+    fn counted(self) -> [&'static str; 2] {
         match self {
-            Direction::Pull => "--batch-stdout",
-            Direction::Push => "--batch-stdin",
+            Direction::Pull => COUNTED,
+            Direction::Push => ["--wait", "--batch-stdin"],
         }
     }
 
@@ -735,13 +744,15 @@ fn assert_running(child: &mut KillOnDrop) {
 /// Wait for `client` to end, and return its output, as
 /// `Child::wait_with_output` does. A test that fails before kills the
 /// client instead, so that it does not stay. A stdout that the test took
-/// from the client already gives no bytes here.
+/// from the client already, and a stderr that goes to a file, give no bytes
+/// here.
 fn output_of(mut client: KillOnDrop) -> Output {
-    let mut stderr = client.0.stderr.take().unwrap();
-    let errors = std::thread::spawn(move || {
-        let mut text = Vec::new();
-        stderr.read_to_end(&mut text).unwrap();
-        text
+    let errors = client.0.stderr.take().map(|mut stderr| {
+        std::thread::spawn(move || {
+            let mut text = Vec::new();
+            stderr.read_to_end(&mut text).unwrap();
+            text
+        })
     });
     let mut stdout = Vec::new();
     if let Some(mut pipe) = client.0.stdout.take() {
@@ -751,7 +762,9 @@ fn output_of(mut client: KillOnDrop) -> Output {
     Output {
         status,
         stdout,
-        stderr: errors.join().unwrap(),
+        stderr: errors
+            .map(|errors| errors.join().unwrap())
+            .unwrap_or_default(),
     }
 }
 
@@ -785,12 +798,13 @@ fn output_reproduces_byte_for_byte_and_lists_are_cached() {
         std::fs::write(&source, &payload).unwrap();
         // In a pull, the command reads its empty stdin to the EOF first, so
         // that the forward stream ends before the command's exit can stop
-        // it, and its summary line is that of an empty zstd frame.
+        // it, and its summary line is that of an empty zstd frame. With
+        // `--wait`, the list goes out before the stream can end.
         let script = match direction {
             Direction::Pull => format!("cat >/dev/null; cat '{}'", source.display()),
             Direction::Push => format!("cat '{}'", source.display()),
         };
-        let output = succeeded(transfer.run_stream(direction, &[], &script));
+        let output = succeeded(transfer.run_stream(direction, &["--wait"], &script));
         assert!(
             output.stdout == payload,
             "{direction:?}: stdout must match byte for byte"
@@ -842,7 +856,7 @@ fn output_reproduces_byte_for_byte_and_lists_are_cached() {
 
         // A second run reuses both identities and keeps the same list;
         // nothing accumulates.
-        succeeded(transfer.run_stream(direction, &[], "true"));
+        succeeded(transfer.run_stream(direction, LISTED.0, LISTED.1));
         let cached = transfer.cache_files(direction.receiver(), "local-hashlists");
         assert_eq!(cached, receiver);
         let cached = transfer.cache_files(direction.sender(), "remote-hashlists");
@@ -868,7 +882,7 @@ fn indexed_blocks_become_references_at_any_offset() {
             "printf abc; cat '{0}'; printf defg; cat '{0}'",
             transfer.env.path(&indexed).display()
         );
-        let output = succeeded(transfer.run_stream(direction, &[direction.batch()], &script));
+        let output = succeeded(transfer.run_stream(direction, &direction.counted(), &script));
         let expected = [&b"abc"[..], &blocks, b"defg", &blocks].concat();
         assert!(
             output.stdout == expected,
@@ -913,7 +927,7 @@ fn stale_and_unreadable_candidates_are_misses() {
         std::fs::write(&payload, &original).unwrap();
         transfer.update_receiver(direction, &[]);
         let script = format!("cat '{}'", payload.display());
-        let flags = ["--no-update", direction.batch()];
+        let flags = [&["--no-update"][..], &direction.counted()].concat();
 
         let mut changed = original.clone();
         changed[3 * BLOCK + 100] ^= 1;
@@ -983,7 +997,7 @@ fn a_window_that_only_shares_its_weak_hash_is_a_false_positive() {
         let payload = transfer.env.path("payload");
         std::fs::write(&payload, &stream).unwrap();
         let script = format!("cat '{}'", payload.display());
-        let output = succeeded(transfer.run_stream(direction, &[direction.batch()], &script));
+        let output = succeeded(transfer.run_stream(direction, &direction.counted(), &script));
         assert!(output.stdout == stream, "{direction:?}: the output differs");
         let line = deduplicated(&output);
         assert_eq!(line.bytes, [BLOCK, BLOCK, 0, 0], "{direction:?}");
@@ -1016,7 +1030,8 @@ fn candidate_attempts_bound_each_query() {
         for (attempts, reference, not_found) in [(1, 0, 1), (2, BLOCK, 0)] {
             let attempts = format!("candidate_attempts = {attempts}\n");
             transfer.configure_receiver(direction, &attempts);
-            let output = succeeded(transfer.run_stream(direction, &["--no-update"], &script));
+            let flags = ["--wait", "--no-update"];
+            let output = succeeded(transfer.run_stream(direction, &flags, &script));
             assert_eq!(output.stdout, block);
             let line = deduplicated(&output);
             let counts = [BLOCK, BLOCK - reference, reference, 0];
@@ -1050,7 +1065,8 @@ fn a_rejected_window_does_not_hide_an_overlapping_match() {
             .write(transfer.indexed(direction, "hider"), &random(BLOCK, 15));
 
         let script = format!("cat '{}'", transfer.env.path("payload").display());
-        let output = succeeded(transfer.run_stream(direction, &["--no-update"], &script));
+        let flags = ["--wait", "--no-update"];
+        let output = succeeded(transfer.run_stream(direction, &flags, &script));
         assert_eq!(output.stdout, payload);
         assert_eq!(summary(&output), [8 + BLOCK, 8, BLOCK, 0], "{direction:?}");
     }
@@ -1070,7 +1086,7 @@ fn the_client_keeps_its_temporary_data_in_the_configured_directory() {
     let blocks = tiled(8, 16);
     transfer.env.write("tree/blocks", &blocks);
     let command = args(&["cat", transfer.env.path("tree/blocks").to_str().unwrap()]);
-    let output = succeeded(transfer.run(&[BATCH], &refs(&command)));
+    let output = succeeded(transfer.run(&COUNTED, &refs(&command)));
     assert_eq!(output.stdout, blocks);
     assert_eq!(summary(&output), [8 * BLOCK, 0, 8 * BLOCK, 0]);
     assert_eq!(mode(&tmp_data), 0o700);
@@ -1131,7 +1147,7 @@ fn a_full_tmp_data_directory_fails_the_run() {
     ));
     transfer.env.write("tree/blocks", &tiled(32, 19));
     let command = args(&["cat", transfer.env.path("tree/blocks").to_str().unwrap()]);
-    let run = transfer.invocation(&[], &refs(&command));
+    let run = transfer.invocation(&COUNTED, &refs(&command));
     let mut unshare = Command::new("unshare");
     unshare
         .args([
@@ -1167,8 +1183,7 @@ fn a_server_tmp_data_directory_that_cannot_hold_a_segment_fails_before_the_comma
     transfer.env.mkdir(tmp_data);
     transfer.env.chmod(tmp_data, 0o500);
     let script = transfer.env.path("command");
-    std::fs::write(&script, "#!/bin/sh\n").unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    write_script(&script, "#!/bin/sh\n");
     let opens =
         inotify::init(inotify::CreateFlags::CLOEXEC | inotify::CreateFlags::NONBLOCK).unwrap();
     inotify::add_watch(&opens, &script, inotify::WatchFlags::OPEN).unwrap();
@@ -1202,8 +1217,7 @@ fn a_file_size_limit_on_the_server_ends_the_run_with_its_cleanup() {
         "#!/bin/sh\nulimit -f 128\nexec '{}' \"$@\"\n",
         env!("CARGO_BIN_EXE_hashsync")
     );
-    std::fs::write(&limited, script).unwrap();
-    std::fs::set_permissions(&limited, std::fs::Permissions::from_mode(0o755)).unwrap();
+    write_script(&limited, script);
     transfer.set_hashsync_path(limited.as_os_str());
     transfer.env.write("payload", &random(1 << 20, 23));
     let command = args(&["cat", transfer.env.path("payload").to_str().unwrap()]);
@@ -1263,7 +1277,7 @@ fn a_slow_consumer_and_a_one_window_lookahead_keep_the_output_exact() {
             "printf x; cat '{0}'; printf yz; cat '{0}'",
             transfer.env.path(&indexed).display()
         );
-        let mut stream = transfer.spawn_stream(direction, &[direction.batch()], &script);
+        let mut stream = transfer.spawn_stream(direction, &direction.counted(), &script);
         let mut received = Vec::new();
         let mut chunk = vec![0u8; 16 << 10];
         loop {
@@ -1304,7 +1318,7 @@ fn runs_and_compression_shrink_the_wire() {
                 transfer.env.path("text").display(),
                 transfer.env.path("noise").display()
             );
-            let output = succeeded(transfer.run_stream(direction, &[direction.batch()], &script));
+            let output = succeeded(transfer.run_stream(direction, &direction.counted(), &script));
             let expected = [&vec![0; ZEROS][..], text.as_bytes(), &noise].concat();
             assert!(output.stdout == expected, "the output differs");
             let literal = text.len() + noise.len();
@@ -1358,7 +1372,7 @@ fn a_source_that_pauses_transfers_exactly() {
             "cat '{0}'; sleep 0.5; cat '{0}'",
             transfer.env.path(&indexed).display()
         );
-        let output = succeeded(transfer.run_stream(direction, &[direction.batch()], &script));
+        let output = succeeded(transfer.run_stream(direction, &direction.counted(), &script));
         assert_eq!(output.stdout, blocks.repeat(2));
         let counts = [2 * blocks.len(), 0, 2 * blocks.len(), 0];
         assert_eq!(summary(&output), counts, "{direction:?}");
@@ -1387,8 +1401,8 @@ fn the_summary_counts_both_sessions() {
     // Each reference needs a QUERY on the control session and a yes
     // ANSWER, which the data session does not carry. The last summary line
     // counts both sessions in both directions (DESIGN.md §8). Without
-    // compression, the control session carries its frames as they are, and
-    // the CHUNK payloads are the stream frames as they are.
+    // compression, the CHUNK payloads of both sessions are the stream and
+    // control frames as they are.
     let transfer = Transfer::new(&["--compression-level", "0"]);
     let blocks = tiled(64, 7);
     transfer.env.write("tree/blocks", &blocks);
@@ -1396,7 +1410,7 @@ fn the_summary_counts_both_sessions() {
     // forward stream ends before the command's exit can stop it.
     let path = transfer.env.path("tree/blocks");
     let command = args(&[&format!("cat >/dev/null; cat '{}'", path.display())]);
-    let output = succeeded(transfer.run(&[BATCH], &refs(&command)));
+    let output = succeeded(transfer.run(&COUNTED, &refs(&command)));
     assert_eq!(output.stdout, blocks);
     let line = deduplicated(&output);
     assert_eq!(line.bytes[2], blocks.len(), "every block is a reference");
@@ -1413,25 +1427,29 @@ fn the_summary_counts_both_sessions() {
     assert_eq!(plain_counts(&output, "stdin"), [0, 0]);
 
     // On the data session, the client reads the server's version and
-    // features, its HELLO with its account ID and no list, CACHE_RESULT,
-    // the backward stream in one CHUNK, STREAM_END, and END with its
-    // status, an empty error, the server's nine counts of the forward
+    // features, the backward stream in one CHUNK, STREAM_END, and END with
+    // its status, an empty error, the server's nine counts of the forward
     // stream, and its count and EOF flag of the command's stdout. On the
-    // control session, it reads the version and features, one QUERY per
-    // block: a 5-byte frame header, the offset, and the full digest, and
-    // the STOP of the forward stream at the command's exit, a header alone.
-    // The server does not wait for its control writer at the end, so the
-    // closure of the session can cut STOP off (DESIGN.md §6.6 and §6.9).
-    // The client writes its versions and features on both sessions, the
-    // hash list, and one ANSWER per block: a header, the offset, and the
-    // flag.
+    // control session, it reads the version and features, ADVERTISE with
+    // the server's account ID and no list, CACHE_RESULT, and the control
+    // stream: one QUERY per block, a 5-byte frame header, the offset, and
+    // the full digest, and the STOP of the forward stream at the command's
+    // exit, a header alone. The server does not wait for its control writer
+    // at the end, so the closure of the session can cut STOP off (DESIGN.md
+    // §6.6 and §6.9). The control stream goes in CHUNK frames, one each
+    // time the server's queue of control frames runs empty: at least one,
+    // and at most one for each frame. The client writes its versions and
+    // features on both sessions, REQUEST, HELLO, INDEX, the hash list, and
+    // one ANSWER per block: a header, the offset, and the flag.
     let traffic = traffic(&output);
     let start = version_and_features(FEATURES).len();
     let end = 5 + 4 + 4 + 9 * 8 + 8 + 1;
-    let data = start + (5 + 16 + 4) + 5 + (5 + line.chunks()) + 5 + end;
-    let control = start + 64 * (5 + 8 + 32);
+    let data = start + (5 + line.chunks()) + 5 + end;
+    let control = start + (5 + 16 + 4) + 5 + 64 * (5 + 8 + 32);
+    // The CHUNK headers of the control stream, and STOP.
+    let rest = traffic.received - (data + control);
     assert!(
-        [data + control, data + control + 5].contains(&traffic.received),
+        rest.is_multiple_of(5) && (5..=(65 + 1) * 5).contains(&rest),
         "received {} bytes",
         traffic.received
     );
@@ -1459,7 +1477,8 @@ fn summaries_show_scale_units() {
     // Without `--no-human-readable`, amounts show in binary units with
     // two decimal digits (DESIGN.md §8). No block of the payload is
     // indexed, so all of it is literal. The indexed file makes the hash
-    // list, and so the sent bytes, larger than 1 KiB.
+    // list, and so the sent bytes, larger than 1 KiB. With `--wait`, the
+    // list goes out before the stream can end.
     let transfer = Transfer::new(&[]);
     transfer.env.write("tree/blocks", &tiled(256, 7));
     let payload = random(10 << 20, 42);
@@ -1468,7 +1487,8 @@ fn summaries_show_scale_units() {
     // The command reads its empty stdin to the EOF first, so that the
     // forward stream ends before the command's exit can stop it.
     let command = args(&[&format!("cat >/dev/null; cat '{}'", source.display())]);
-    let output = succeeded(transfer.invocation(&[], &refs(&command)).output().unwrap());
+    let mut invocation = transfer.invocation(&["--wait"], &refs(&command));
+    let output = succeeded(invocation.output().unwrap());
     assert_eq!(output.stdout, payload);
     let line = summary_line(&output, DEDUPLICATED);
     assert!(
@@ -1541,9 +1561,8 @@ fn the_notes_of_the_servers_update_follow_the_options_of_the_client() {
 #[test]
 fn a_push_to_a_server_without_a_configuration_file_fails() {
     // The receiver of a push needs its configuration file, for its roots
-    // and its index (DESIGN.md §7). The server reads it after REQUEST, so
-    // its error ends the run before the list exchange, and the command
-    // never runs.
+    // and its index (DESIGN.md §7). The server reads it at REQUEST, so its
+    // error ends the run before the command starts.
     let transfer = Transfer::new(&[]);
     let marker = transfer.env.path("command-ran");
     let command = format!(": >'{}'", marker.display());
@@ -1654,8 +1673,7 @@ fn a_command_line_runs_in_the_remote_users_shell() {
         "#!/bin/sh\nprintf '%s\\n' \"$@\" >>'{}'\nexec /bin/sh \"$@\"\n",
         calls.display()
     );
-    std::fs::write(&shell, script).unwrap();
-    std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+    write_script(&shell, script);
     let command = ["printf", "%s.", "a  b", "$HASHSYNC_TEST_LOGIN"];
     let run = |flags: &[&str]| {
         let output = transfer
@@ -1755,8 +1773,7 @@ fn the_server_reads_its_own_configuration() {
         env!("CARGO_BIN_EXE_hashsync"),
         transfer.env.path("other-config.toml").display()
     );
-    std::fs::write(&wrapper, script).unwrap();
-    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    write_script(&wrapper, script);
     transfer.set_hashsync_path(wrapper.as_os_str());
     succeeded(transfer.run(&[], &refs(&command)));
     assert_eq!(mode(&other), 0o700);
@@ -1961,9 +1978,12 @@ fn cache_failures_are_fatal_on_either_side() {
     // Receiver: an unwritable cache root fails the run at publication
     // (DESIGN.md §5.6 and §6.7). The tmp_data directory is in the same
     // root and opens earlier, so it exists already: else its creation
-    // would fail first, and the run would end before the publication.
-    let transfer = Transfer::new(&[]);
-    let command = args(&["true"]);
+    // would fail first, and the run would end before the publication. Each
+    // run waits for its list, and has a byte of output: the exchange of a
+    // stream that ends before its list ends without one, and publishes
+    // nothing.
+    let transfer = Transfer::new(&["--wait"]);
+    let command = args(&["printf", "x"]);
     transfer.env.mkdir("client/cache/hashsync/tmp-data");
     transfer.env.chmod("client/cache/hashsync", 0o555);
     let output = transfer.run(&[], &refs(&command));
@@ -2247,8 +2267,9 @@ fn eager_delivery_sends_the_bytes_before_a_pause_at_once() {
     // client's stdout, then writes the rest. In eager delivery, those 100
     // bytes leave at the idle point that the wait makes. The window of the
     // first block spans the idle point, so that block is literal, and only
-    // the second one becomes a reference (DESIGN.md §6.3). A build that
-    // keeps the bytes hangs the test.
+    // the second one becomes a reference (DESIGN.md §6.3). With `--wait`,
+    // the scanner has the whole list before it scans the 100 bytes. A build
+    // that keeps the bytes hangs the test.
     for direction in DIRECTIONS {
         let transfer = Transfer::new(&[]);
         transfer.configure_receiver(direction, "");
@@ -2267,7 +2288,7 @@ fn eager_delivery_sends_the_bytes_before_a_pause_at_once() {
             go.display(),
             transfer.env.path("rest").display()
         );
-        let mut stream = transfer.spawn_stream(direction, &[], &script);
+        let mut stream = transfer.spawn_stream(direction, &["--wait"], &script);
         let mut first = vec![0u8; 100];
         stream.stdout().read_exact(&mut first).unwrap();
         assert_eq!(first, blocks[..100]);
@@ -2289,7 +2310,8 @@ fn eager_delivery_keeps_a_block_that_spans_a_pause_while_the_session_is_full() {
     // rest of the file fills the window of the first block: both blocks
     // become references (DESIGN.md §6.3). The pause makes the idle point,
     // but its length decides nothing for a correct build: the session
-    // stays full until the command has ended.
+    // stays full until the command has ended. With `--wait`, the scanner
+    // has the whole list before it scans.
     let transfer = Transfer::new(&["--spool-limit", "64KiB", "--compression-level", "0"]);
     let blocks = tiled(2, 38);
     let noise = random(SESSION_NOISE, 39);
@@ -2308,7 +2330,7 @@ fn eager_delivery_keeps_a_block_that_spans_a_pause_while_the_session_is_full() {
         ended.display()
     );
     let client = transfer
-        .invocation(&[EXACT], &refs(&args(&[&script])))
+        .invocation(&[EXACT, "--wait"], &refs(&args(&[&script])))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -2401,7 +2423,7 @@ fn batch_delivery_keeps_a_block_that_spans_a_pause() {
             transfer.env.path("head").display(),
             transfer.env.path("rest").display()
         );
-        let output = succeeded(transfer.run_stream(direction, &[direction.batch()], &script));
+        let output = succeeded(transfer.run_stream(direction, &direction.counted(), &script));
         assert_eq!(output.stdout, blocks);
         let counts = [blocks.len(), 0, blocks.len(), 0];
         assert_eq!(summary(&output), counts, "{direction:?}");
@@ -2668,9 +2690,9 @@ fn a_command_that_closes_its_stdin_stops_the_forward_stream() {
             .read_to_string(&mut message)
             .unwrap();
         assert_eq!(message, "closed\n");
-        // The client starts its stdin reader after CACHE_RESULT. Only a
-        // stop or the EOF of stdin ends it, and neither can come before the
-        // bytes that this test writes.
+        // The client starts its stdin reader once it has sent REQUEST.
+        // Only a stop or the EOF of stdin ends it, and neither can come
+        // before the bytes that this test writes.
         let pid = client.0.id();
         wait_for_thread(pid, "stdin-reader", true);
         producer.write_all(&random(64 << 10, 35)).unwrap();
@@ -2809,7 +2831,13 @@ fn a_deduplicated_command_output_that_never_pauses_reaches_stdout() {
     // Once `head` has exited, the client's next write to its stdout fails
     // with `EPIPE`, which stops the backward stream, and the command's next
     // `cat` dies of SIGPIPE, whose status ends the run (DESIGN.md §6.6).
-    let transfer = Transfer::new(&["--spool-limit", "64KiB", "--lookahead", "1MiB", BATCH]);
+    let transfer = Transfer::new(&[
+        "--spool-limit",
+        "64KiB",
+        "--lookahead",
+        "1MiB",
+        "--batch-stdout",
+    ]);
     let blocks = tiled(64, 46);
     transfer.env.write("tree/blocks", &blocks);
     let script = format!(
@@ -2839,7 +2867,13 @@ fn a_stopped_forward_stream_sends_nothing_more() {
     // KiB); a writer that went on would send all 8 MiB. A data writer that
     // takes the frames that a push's data queue holds at the stop is the
     // unit test `the_data_writer_takes_no_queued_frame_after_the_stop`'s: in
-    // a whole run, no event shows that the queue is full.
+    // a whole run, no event shows that the queue is full. The command starts
+    // at once, so the writer can also wait before the server reads the data
+    // session at all; then the server would take the whole session at once
+    // after the stop, and its control writer, which starts later, would
+    // send STOP late. So the test waits for the server's decoder, in its
+    // wait for room in the command's stdin, and for its idle control
+    // writer, before the writer's wait.
     for direction in DIRECTIONS {
         let transfer = Transfer::new(&["--spool-limit", "0"]);
         transfer.configure_receiver(direction, "");
@@ -2857,13 +2891,17 @@ fn a_stopped_forward_stream_sends_nothing_more() {
             .unwrap();
         let client = KillOnDrop(client);
         // No deadline: a writer that never waits hangs the test.
+        let server = server_of(client.0.id());
+        wait_until_asleep_again_in(server, "decoder", poll_syscall());
+        wait_until_asleep_again_in(server, "control-writer", libc::SYS_futex as u64);
         wait_until_asleep_again_in(client.0.id(), "data-writer", libc::SYS_writev as u64);
         std::fs::write(&go, b"go\n").unwrap();
         let output = succeeded(output_of(client));
         let sent = traffic(&output).sent;
         assert!(
             sent < 9 << 19,
-            "{direction:?}: {sent} bytes sent, though the stream stopped"
+            "{direction:?}: {sent} bytes sent, though the stream stopped\n{}",
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 }
@@ -2984,6 +3022,12 @@ fn the_producer_waits_when_both_spools_of_the_forward_stream_reach_their_limits(
     }
 }
 
+/// The flags and the script of a run whose list exchange always sends its
+/// target: with `--wait`, the stream waits for its list, and it has a byte,
+/// so it cannot end before its list. The exchange of a stream that ends
+/// before its list ends without one (DESIGN.md §5.6).
+const LISTED: (&[&str], &str) = (&["--wait"], "printf x");
+
 #[test]
 fn no_sender_cache_stores_nothing_and_removes_earlier_lists() {
     for direction in DIRECTIONS {
@@ -2992,7 +3036,7 @@ fn no_sender_cache_stores_nothing_and_removes_earlier_lists() {
         transfer.configure_receiver(direction, "");
         let data = transfer.indexed(direction, "data");
         transfer.env.write(data, &common::tiled(8, 5));
-        succeeded(transfer.run_stream(direction, &[], "true"));
+        succeeded(transfer.run_stream(direction, LISTED.0, LISTED.1));
         let sender = transfer.cache_files(direction.sender(), "remote-hashlists");
         assert_eq!(sender.len(), 1, "{direction:?}");
 
@@ -3000,7 +3044,8 @@ fn no_sender_cache_stores_nothing_and_removes_earlier_lists() {
         // sends the full list; neither side stores a list for this peer and
         // index, and both remove their earlier lists. Expiry then removes
         // the empty directories (DESIGN.md §5.6).
-        let output = succeeded(transfer.run_stream(direction, &["--no-sender-cache"], "true"));
+        let flags = [LISTED.0, &["--no-sender-cache"]].concat();
+        let output = succeeded(transfer.run_stream(direction, &flags, LISTED.1));
         let (full, delta) = list_bytes(&output);
         assert!(
             full.is_some() && delta.is_none(),
@@ -3027,7 +3072,7 @@ fn each_side_keeps_only_its_latest_list() {
         let sender = (direction.sender(), "remote-hashlists");
         let data = transfer.indexed(direction, "data");
         transfer.env.write(data, &common::tiled(8, 5));
-        succeeded(transfer.run_stream(direction, &[], "true"));
+        succeeded(transfer.run_stream(direction, LISTED.0, LISTED.1));
         let first = transfer.cache_files(receiver.0, receiver.1);
         assert_eq!(first.len(), 1, "{direction:?}: receiver cache: {first:?}");
         assert_eq!(transfer.cache_files(sender.0, sender.1), first);
@@ -3046,7 +3091,7 @@ fn each_side_keeps_only_its_latest_list() {
         // A changed index has a new target.
         let more = transfer.indexed(direction, "more");
         transfer.env.write(more, &common::tiled(8, 6));
-        succeeded(transfer.run_stream(direction, &[], "true"));
+        succeeded(transfer.run_stream(direction, LISTED.0, LISTED.1));
         let second = transfer.cache_files(receiver.0, receiver.1);
         assert_eq!(second.len(), 1, "{direction:?}: receiver cache: {second:?}");
         assert!(second[0].ends_with(".cache") && !first.contains(&second[0]));
@@ -3078,7 +3123,7 @@ fn cat_references(
     name: &str,
 ) -> (Option<usize>, Option<usize>) {
     let script = cat(transfer, direction, name);
-    let output = transfer.run_stream(direction, &[direction.batch()], &script);
+    let output = transfer.run_stream(direction, &direction.counted(), &script);
     all_references(transfer, direction, name, output)
 }
 
@@ -3440,15 +3485,16 @@ fn a_rebuilt_index_starts_its_lists_again() {
 }
 
 #[test]
-fn a_sender_reads_its_base_after_a_concurrent_exchange_removed_it() {
-    // Read-only runs of one index can overlap, with the same sender account.
-    // The sender opens its listing before its HELLO, but reads the base that
-    // HASHDELTA names only after `attach` has connected, so a concurrent
-    // exchange can remove the base in between (DESIGN.md §5.6). Here a gate
-    // holds back the control session of the first run while a second run
-    // goes through its whole exchange and removes the base from both caches.
-    // The first run must still send a delta, which its sender can only
-    // apply through the file that its listing opened.
+fn an_exchange_sends_its_delta_after_a_concurrent_exchange_removed_its_base() {
+    // Read-only runs of one index can overlap, with the same sender
+    // account. Each side reads its base once, through the file that its
+    // listing opened, at the start of its exchange: the sender the first
+    // list that it advertises, and the receiver the first of those that it
+    // has (DESIGN.md §5.6). Here a wrapper holds what the client sends on
+    // the first run's control session after INDEX, so its HASHDELTA waits,
+    // while a second run goes through its whole exchange and removes the
+    // base from both caches. The first run must still send its delta, which
+    // its sender applies to the base that it read.
     let transfer = Transfer::new(&[]);
     transfer.env.write("tree/first", &tiled(64, 7));
     cat_references(&transfer, Direction::Pull, "first");
@@ -3457,50 +3503,58 @@ fn a_sender_reads_its_base_after_a_concurrent_exchange_removed_it() {
     transfer.env.update();
     let gate = transfer.env.path("gate");
     let mut gate_writer = held_fifo(&gate);
+    let copied = transfer.env.path("copied");
+    // The version and the features, then INDEX: the account and the index.
+    let before_the_target = 12 + 5 + 16 + 16;
     wrap_ssh(
         &transfer,
-        r#"if [ $session = control ] && [ -n "${HASHSYNC_TEST_GATE:-}" ]; then
-    read -r go <"$HASHSYNC_TEST_GATE"
+        &format!(
+            r#"if [ $session = control ] && [ -n "${{HASHSYNC_TEST_GATE:-}}" ]; then
+    tee "$HASHSYNC_TEST_COPY" | {{
+        head -c {before_the_target}
+        read -r go <"$HASHSYNC_TEST_GATE"
+        exec cat
+    }} | "$ssh" "$@"
+    exit $?
 fi
-exec "$ssh" "$@""#,
+exec "$ssh" "$@""#
+        ),
     );
     let first = transfer
         .invocation(
-            &[EXACT, BATCH, "--no-update"],
+            &[EXACT, COUNTED[0], COUNTED[1], "--no-update"],
             &refs(&args(&[&cat(&transfer, Direction::Pull, "second")])),
         )
         .env("HASHSYNC_TEST_GATE", &gate)
+        .env("HASHSYNC_TEST_COPY", &copied)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     let mut first = KillOnDrop(first);
-
-    // The first run's receiver publishes its target only after the sender's
-    // HELLO, so once the target shows up, the sender has opened its listing.
-    // It is now waiting for `attach`, before it reads anything that names
-    // the base. Poll for the target with no deadline.
-    let client_dir = transfer.peer_dir("client", "local-hashlists").unwrap();
-    let target_published = || {
-        let names = transfer.cache_files("client", "local-hashlists");
-        names
-            .into_iter()
-            .any(|name| !name.starts_with('.') && name != base)
-    };
-    while !target_published() {
-        assert!(first.0.try_wait().unwrap().is_none(), "the first run ended");
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    // The client sends HASHDELTA once it has read the sender's ADVERTISE,
+    // and so both listings, and its base. No deadline.
+    wait_for_bytes(&copied, std::slice::from_mut(&mut first), |copy| {
+        copy.len() > before_the_target
+    });
+    assert_eq!(
+        std::fs::read(&copied).unwrap()[before_the_target],
+        HASHDELTA
+    );
 
     // The second run has no gate. The end of its exchange removes the base
     // on both sides.
     let script = cat(&transfer, Direction::Pull, "second");
-    let second = transfer.run(&[BATCH, "--no-update"], &refs(&args(&[&script])));
+    let second = transfer.run(
+        &[&COUNTED[..], &["--no-update"]].concat(),
+        &refs(&args(&[&script])),
+    );
     let (full, delta) = all_references(&transfer, Direction::Pull, "second", second);
     assert!(
         full.is_none() && delta.is_some(),
         "second run: full {full:?}, delta {delta:?}"
     );
+    let client_dir = transfer.peer_dir("client", "local-hashlists").unwrap();
     let server_dir = transfer.peer_dir("server", "remote-hashlists").unwrap();
     assert!(!client_dir.join(&base).exists() && !server_dir.join(&base).exists());
 
@@ -3542,9 +3596,11 @@ fn an_empty_cache_directory_that_cannot_be_removed_only_warns() {
     // failure to remove one does not end the run: it warns, and the
     // directory stays until a later run (DESIGN.md §5.6). A read-only
     // tree lets the run publish in its existing directory, but not
-    // remove the other directory.
-    let transfer = Transfer::new(&[]);
-    let command = args(&["true"]);
+    // remove the other directory. Expiry comes at the end of a list
+    // exchange, so each run waits for its list, and has a byte of output:
+    // the exchange of a stream that ends before its list ends without one.
+    let transfer = Transfer::new(&["--wait"]);
+    let command = args(&["printf", "x"]);
     transfer.run_ok(&refs(&command));
     let trees = [
         "client/cache/hashsync/local-hashlists",
@@ -3605,7 +3661,7 @@ fn fake_server(transfer: &Transfer, name: &str, data: &[u8], control: &[u8]) -> 
     let control_path = transfer.env.path(format!("{name}.control"));
     std::fs::write(&control_path, control).unwrap();
     let server = transfer.env.path(name);
-    std::fs::write(
+    write_script(
         &server,
         format!(
             r#"#!/bin/sh
@@ -3619,9 +3675,7 @@ exec cat 3>&1 >/dev/null
             data_path.display(),
             control_path.display(),
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     server
 }
 
@@ -3644,31 +3698,22 @@ fn a_server_with_another_protocol_version_is_rejected() {
     );
 }
 
-/// The data frames of a fake server, from HELLO through the backward
-/// stream: an account ID and no advertised list in HELLO, then
-/// CACHE_RESULT, the stream with `output` in one LIT, and STREAM_END. The
-/// stream is not compressed, so a run that gets it needs
-/// `--compression-level 0`: with compression, it would be a zstd frame.
+/// The frames of a fake server's backward stream: `output` in one LIT,
+/// and STREAM_END. The stream is not compressed, so a run that gets it
+/// needs `--compression-level 0`: with compression, it would be a zstd
+/// frame.
 fn fake_frames(output: &[u8]) -> Vec<u8> {
-    let mut hello = vec![0x11; 16];
-    hello.extend_from_slice(&0u32.to_le_bytes());
-    [
-        frame(HELLO, &hello),
-        frame(CACHE_RESULT, b""),
-        frame(CHUNK, &frame(LIT, output)),
-        frame(STREAM_END, b""),
-    ]
-    .concat()
+    [frame(CHUNK, &frame(LIT, output)), frame(STREAM_END, b"")].concat()
 }
 
 #[test]
 fn a_data_session_that_ends_before_end_fails_the_run() {
-    // A fake server sends its version and features, HELLO, CACHE_RESULT,
-    // and a whole backward stream, then ends the data session without END,
-    // as a server that fails at its end does, and reads what the client
-    // sends. The run fails although the stream is complete (DESIGN.md
-    // §6.9). The fake control session sends its version and features and
-    // stays open until its stdin ends.
+    // A fake server sends its version and features, and a whole backward
+    // stream, then ends the data session without END, as a server that
+    // fails at its end does, and reads what the client sends. The run fails
+    // although the stream is complete (DESIGN.md §6.9). The fake control
+    // session sends its version and features and stays open until its
+    // stdin ends.
     let transfer = Transfer::new(&[]);
     let start = version_and_features(FEATURES);
     let data = [&start[..], &fake_frames(b"output")].concat();
@@ -3689,17 +3734,32 @@ fn a_data_session_that_ends_before_end_fails_the_run() {
 fn feature_bits_that_the_client_does_not_know_are_ignored() {
     // A later server can send feature bits that this client does not
     // know, on both sessions. The client ignores them, and the run ends as
-    // with none (DESIGN.md §6.2).
+    // with none (DESIGN.md §6.2). The fake server receives a push, whose
+    // forward stream is empty: it sends its HELLO, and ends its side of the
+    // list exchange at once with HASHNONE, so that the client's side ends
+    // too (DESIGN.md §5.6).
     let transfer = Transfer::new(&[]);
     let start = version_and_features(u64::MAX);
     // END with status 0, no error text, the nine counts of an empty
     // forward stream, and the 6 bytes of the command's stdout, read to its
     // EOF.
     let end = [&[0; 4 + 4 + 9 * 8][..], &6u64.to_le_bytes(), &[1]].concat();
-    let data = [&start[..], &fake_frames(b"output"), &frame(END, &end)].concat();
-    let server = fake_server(&transfer, "unknown-features", &data, &start);
+    let hello = frame(HELLO, &hello_payload(4096, b"blake3"));
+    let data = [
+        &start[..],
+        &hello,
+        &fake_frames(b"output"),
+        &frame(END, &end),
+    ]
+    .concat();
+    let control = [&start[..], &frame(HASHNONE, b"")].concat();
+    let server = fake_server(&transfer, "unknown-features", &data, &control);
     transfer.set_hashsync_path(server.as_os_str());
-    let output = transfer.run(&["--compression-level", "0"], &refs(&args(&["true"])));
+    let flags = ["--compression-level", "0"];
+    let output = transfer
+        .push(&flags, &refs(&args(&["true"])))
+        .output()
+        .unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(0), "stderr:\n{stderr}");
     assert_eq!(output.stdout, b"output");
@@ -3858,6 +3918,27 @@ fn a_termination_signal_decides_the_status_even_after_the_sessions_break() {
     }
 }
 
+/// Write the executable script `content` at `path`. Another thread of this
+/// test process can fork while the process has a file open for writing,
+/// and the child keeps that descriptor until it execs: an exec of the file
+/// meanwhile fails with `ETXTBSY`. So this process writes a staging file,
+/// and `install`, a process of its own, writes the script: no descriptor
+/// of this process ever writes it.
+fn write_script(path: &std::path::Path, content: impl AsRef<[u8]>) {
+    let mut staging = path.as_os_str().to_owned();
+    staging.push(".staging");
+    std::fs::write(&staging, content).unwrap();
+    let status = Command::new("install")
+        .arg("-m")
+        .arg("755")
+        .arg(&staging)
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(status.success(), "install {}: {status}", path.display());
+    std::fs::remove_file(&staging).unwrap();
+}
+
 /// Put a wrapper in place of the fake `ssh`. The wrapper sets `$ssh` to the
 /// fake `ssh`, and `$session` to `control` for the session that runs
 /// `attach`, else to `data`. Then it runs `body`, which runs `"$ssh" "$@"`
@@ -3877,8 +3958,7 @@ esac
 "#,
         inner.display()
     );
-    std::fs::write(&ssh, script).unwrap();
-    std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    write_script(&ssh, script);
 }
 
 #[test]
@@ -3893,7 +3973,7 @@ fn the_client_closes_stdin_before_either_stdout_ends() {
     transfer.env.write("tree/blocks", &blocks);
     wrap_ssh(&transfer, "\"$ssh\" \"$@\"\nexit $?");
     let command = args(&["cat", transfer.env.path("tree/blocks").to_str().unwrap()]);
-    let output = succeeded(transfer.run(&[BATCH], &refs(&command)));
+    let output = succeeded(transfer.run(&COUNTED, &refs(&command)));
     assert_eq!(output.stdout, blocks);
     assert_eq!(summary(&output), [blocks.len(), 0, blocks.len(), 0]);
 }
@@ -3926,9 +4006,9 @@ exit $status"#,
     let cat = args(&["cat", transfer.env.path("tree/blocks").to_str().unwrap()]);
     let missing = args(&["/nonexistent-hashsync-test-command"]);
     for (flags, command, status) in [
-        (&[BATCH][..], &cat, 0),
-        (&["--no-update", BATCH][..], &cat, 0),
-        (&[BATCH, "-s"][..], &missing, 127),
+        (&COUNTED[..], &cat, 0),
+        (&["--no-update", COUNTED[0], COUNTED[1]][..], &cat, 0),
+        (&[COUNTED[0], COUNTED[1], "-s"][..], &missing, 127),
     ] {
         let _ = std::fs::remove_file(&marker);
         let output = transfer.run(flags, &refs(command));
@@ -3953,9 +4033,9 @@ fn the_summary_counts_every_byte_that_the_sessions_deliver() {
     // Completing (DESIGN.md §6.4). The client reads both sessions to EOF
     // before the summary (DESIGN.md §6.9 and §8), so the summary counts
     // exactly the bytes of both files, that QUERY included. One changed
-    // block makes the scanner rescan. The late QUERY is a plain frame, so
-    // this run has no compression: inside a zstd stream, the client could
-    // not decode it.
+    // block makes the scanner rescan. The late QUERY goes in a CHUNK of its
+    // own, so this run has no compression: inside a zstd stream, the client
+    // could not decode it.
     let transfer = Transfer::new(&["--compression-level", "0"]);
     let mut blocks = tiled(32, 27);
     transfer.env.write("tree/blocks", &blocks);
@@ -3963,8 +4043,8 @@ fn the_summary_counts_every_byte_that_the_sessions_deliver() {
     blocks[5 * BLOCK + 9] ^= 1;
     transfer.env.write("tree/blocks", &blocks);
     let captured = transfer.env.path("captured");
-    // QUERY: offset 0 and a zero digest.
-    let late = frame(QUERY, &[0; 8 + 32]);
+    // QUERY: offset 0 and a zero digest, in the control stream.
+    let late = frame(CHUNK, &frame(QUERY, &[0; 8 + 32]));
     let late_path = transfer.env.path("late-query");
     std::fs::write(&late_path, &late).unwrap();
     wrap_ssh(
@@ -3981,7 +4061,7 @@ exit $status"#,
         ),
     );
     let command = args(&["cat", transfer.env.path("tree/blocks").to_str().unwrap()]);
-    let output = succeeded(transfer.run(&["--no-update", BATCH], &refs(&command)));
+    let output = succeeded(transfer.run(&["--no-update", COUNTED[0], COUNTED[1]], &refs(&command)));
     assert_eq!(output.stdout, blocks);
     assert_eq!(summary(&output), [blocks.len(), BLOCK, 31 * BLOCK, 0]);
     let read = |session: &str| std::fs::read(format!("{}.{session}", captured.display())).unwrap();
@@ -4018,7 +4098,7 @@ exit "$(cat '{0}'.$session.status)""#,
             captured.display(),
         ),
     );
-    let flags = ["--no-update", Direction::Push.batch()];
+    let flags = [&["--no-update"][..], &Direction::Push.counted()].concat();
     let output = succeeded(transfer.run_push(&flags, &refs(&args(&["cat"])), &blocks));
     assert_eq!(output.stdout, blocks);
     assert_eq!(summary(&output), [blocks.len(), BLOCK, 31 * BLOCK, 0]);
@@ -4170,14 +4250,13 @@ tee '{1}' | "$ssh" "$@""#,
         &b"the second piece, dropped"[..],
     );
     producer.write_all(first).unwrap();
-    // Without compression, after its version and its features, the server
-    // sends nothing on the control session but STOP: the command writes no
-    // output to query.
+    // Without compression, the server's control stream holds nothing but
+    // STOP: the command writes no output to query.
     let stop = frame(STOP, b"");
     wait_for_bytes(&stops, std::slice::from_mut(&mut client), |received| {
-        received.len() >= 12 + stop.len()
+        control_stream(received).len() >= stop.len()
     });
-    assert_eq!(std::fs::read(&stops).unwrap()[12..], stop);
+    assert_eq!(control_stream(&std::fs::read(&stops).unwrap()), stop);
     producer.write_all(second).unwrap();
     wait_for_bytes(&sent, std::slice::from_mut(&mut client), |sent| {
         holds(sent, &frame(LIT, second))
@@ -4195,6 +4274,29 @@ tee '{1}' | "$ssh" "$@""#,
             5 + second.len()
         )
     );
+}
+
+/// The control stream in `session`, the bytes of one direction of a
+/// control session without compression: the payloads of its CHUNK frames
+/// after the version and the features, without the frames of the list
+/// exchanges (DESIGN.md §6.2). A frame that the bytes cut short counts
+/// only once it is whole.
+fn control_stream(session: &[u8]) -> Vec<u8> {
+    let mut rest = session
+        .get(version_and_features(FEATURES).len()..)
+        .unwrap_or_default();
+    let mut stream = Vec::new();
+    while rest.len() >= 5 {
+        let length = u32::from_le_bytes(rest[1..5].try_into().unwrap()) as usize;
+        if rest.len() < 5 + length {
+            break;
+        }
+        if rest[0] == CHUNK {
+            stream.extend_from_slice(&rest[5..5 + length]);
+        }
+        rest = &rest[5 + length..];
+    }
+    stream
 }
 
 /// The script of a command that writes 10 bytes to its stdout, waits until
@@ -4479,15 +4581,14 @@ exit "$(cat '{3}')""#,
         let mut run = HeadOfStdout::spawn(&invocation, transfer.env.path("."));
         assert_eq!(run.wait_for_head(), b"0123456789");
         more.release();
-        // Without compression, after its version and its features, the
-        // client sends nothing on the control session but STOP: the output
-        // is too short for a query.
+        // Without compression, the client's control stream holds nothing
+        // but STOP: the output is too short for a query.
         let stop = frame(STOP, b"");
         wait_for_bytes(&control, std::slice::from_mut(&mut run.shell), |sent| {
-            sent.len() >= 12 + stop.len()
+            control_stream(sent).len() >= stop.len()
         });
         assert_eq!(
-            std::fs::read(&control).unwrap()[12..],
+            control_stream(&std::fs::read(&control).unwrap()),
             stop,
             "{direction:?}"
         );
@@ -4719,14 +4820,15 @@ fn chunk_payload_bytes(session: &[u8]) -> usize {
 
 #[test]
 fn both_directions_of_the_control_session_are_compressed() {
-    // After the version and the features, the queries and the STOP of the
-    // forward stream at the command's exit form one zstd stream, and the
-    // answers another. No frame ends either stream: the closure of the
-    // session does (DESIGN.md §6.2). `tee` copies both directions of the
-    // control session. Every block of the output is queried once, in
-    // order, and answered yes. STOP can come between any two queries, and
-    // as the server does not wait for its control writer at the end, the
-    // closure can also cut it off (DESIGN.md §6.6 and §6.9).
+    // The queries and the STOP of the forward stream at the command's exit
+    // form one zstd stream, in the CHUNK frames of the server's direction
+    // of the control session, and the answers another. No frame ends either
+    // stream: the closure of the session does (DESIGN.md §6.2). `tee`
+    // copies both directions of the control session. Every block of the
+    // output is queried once, in order, and answered yes. STOP can come
+    // between any two queries, and as the server does not wait for its
+    // control writer at the end, the closure can also cut it off (DESIGN.md
+    // §6.6 and §6.9).
     let transfer = Transfer::new(&[]);
     let blocks = tiled(16, 29);
     transfer.env.write("tree/blocks", &blocks);
@@ -4743,18 +4845,19 @@ exec "$ssh" "$@""#,
         ),
     );
     let command = args(&["cat", transfer.env.path("tree/blocks").to_str().unwrap()]);
-    let output = succeeded(transfer.run(&[BATCH], &refs(&command)));
+    let output = succeeded(transfer.run(&COUNTED, &refs(&command)));
     assert_eq!(output.stdout, blocks);
     assert_eq!(summary(&output), [blocks.len(), 0, blocks.len(), 0]);
 
     let offsets: Vec<u64> = (0..16).map(|i| (i * BLOCK) as u64).collect();
-    // The frames of one direction, through the end of the copy, which
-    // comes inside the zstd frame.
+    // The control frames of one direction, through the end of the copy,
+    // which comes inside the zstd frame.
     let decode = |direction: &str| {
-        let stream = std::fs::read(format!("{}.{direction}", captured.display())).unwrap();
+        let session = std::fs::read(format!("{}.{direction}", captured.display())).unwrap();
         let start = version_and_features(FEATURES);
-        assert_eq!(stream[..start.len()], start, "{direction}");
-        let mut stream = zstd::stream::read::Decoder::new(&stream[start.len()..]).unwrap();
+        assert_eq!(session[..start.len()], start, "{direction}");
+        let stream = control_stream(&session);
+        let mut stream = zstd::stream::read::Decoder::new(&stream[..]).unwrap();
         let mut frames = Vec::new();
         loop {
             match try_recv_frame(&mut stream) {
@@ -4888,102 +4991,20 @@ fn wait_until_asleep_again_in(pid: u32, name: &str, nr: u64) {
 }
 
 #[test]
-fn stop_before_the_client_starts_its_forward_stream_ends_it_before_a_read() {
-    // The command exits at once, so the server stops the forward stream
-    // right after the list exchange. A wrapper of the control session passes
-    // STOP on, and a wrapper of the data session holds CACHE_RESULT, which
-    // follows the server's version, features and HELLO, until this test
-    // releases it. The delivery of STOP woke the client's control reader, so
-    // once that thread sleeps in a read again, it has taken STOP and raised
-    // the stop. Only then does CACHE_RESULT pass. So the client starts its
-    // forward stream after the stop, which exists from before the sessions
-    // start, and its stdin reader ends before it reads anything (DESIGN.md
-    // §6.6): the bytes of stdin stay for their next reader. Without
-    // compression, STOP is the first frame of the control session after the
-    // version and the features: the index is empty, so no QUERY comes first.
-    // The server's cache is empty too, so its HELLO advertises no list, and
-    // takes 25 bytes.
-    let transfer = Transfer::new(&["--compression-level", "0"]);
-    let stopped = transfer.env.path("stopped");
-    let status = transfer.env.path("status");
-    let mut cache_result_gate = Gate::new(transfer.env.path("cache-result-gate"));
-    wrap_ssh(
-        &transfer,
-        &format!(
-            r#"if [ $session = control ]; then
-    {{ "$ssh" "$@"; echo $? >'{2}'.control; }} | {{ head -c 17; : >'{0}'; exec cat; }}
-else
-    {{ "$ssh" "$@"; echo $? >'{2}'.data; }} | {{
-        head -c 37
-        read go <'{1}'
-        exec cat
-    }}
-fi
-exit "$(cat '{2}'.$session)""#,
-            stopped.display(),
-            cache_result_gate.path.display(),
-            status.display()
-        ),
-    );
-    let (stdin, mut producer) = std::io::pipe().unwrap();
-    let mut unread = stdin.try_clone().unwrap();
-    producer.write_all(b"stdin that nothing reads").unwrap();
-    drop(producer);
-    let client = transfer
-        .invocation(&[EXACT], &refs(&args(&["true"])))
-        .stdin(stdin)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut client = KillOnDrop(client);
-    // No deadline: a server that sends no STOP hangs the test.
-    wait_for_file(&stopped, std::slice::from_mut(&mut client));
-    wait_until_asleep_again_in(client.0.id(), "control-reader", libc::SYS_read as u64);
-    cache_result_gate.release();
-    let output = succeeded(output_of(client));
-    assert!(output.stdout.is_empty());
-    let mut left = Vec::new();
-    unread.read_to_end(&mut left).unwrap();
-    assert_eq!(left, b"stdin that nothing reads");
-}
-
-#[test]
 fn end_stops_the_forward_stream_when_it_comes_before_stop() {
-    // A wrapper of the control session passes the server's version and
-    // features, then holds the rest, STOP included, until the data
-    // session's SSH has exited. So END reaches the client before STOP, and
-    // END must stop the forward stream (DESIGN.md §6.6): stdin stays open,
-    // so nothing else ends the stdin reader. A client that waited for STOP
-    // would never close the data session, and the server never exit, so
-    // the test would hang. The late STOP then changes nothing. The forward
-    // stream is plain in a pull, and deduplicated in a push.
+    // A wrapper of the control session holds the server's control stream,
+    // STOP included, until the data session's SSH has exited, and lets the
+    // list exchange through (`HeldControlStream`). So END reaches the
+    // client before STOP, and END must stop the forward stream (DESIGN.md
+    // §6.6): stdin stays open, so nothing else ends the stdin reader. A
+    // client that waited for STOP would never close the data session, and
+    // the server never exit, so the test would hang. The late STOP then
+    // changes nothing. The forward stream is plain in a pull, and
+    // deduplicated in a push.
     for direction in DIRECTIONS {
         let transfer = Transfer::new(&["--compression-level", "0"]);
         transfer.configure_receiver(direction, "");
-        let status = transfer.env.path("status");
-        // The control session waits here until the wrapper of the data
-        // session lets it go on, once its SSH has exited.
-        let data_ended = Gate::new(transfer.env.path("data-ended"));
-        wrap_ssh(
-            &transfer,
-            &format!(
-                r#"if [ $session = control ]; then
-    {{ "$ssh" "$@"; echo $? >'{1}'.control; }} | {{
-        head -c 12
-        read go <'{0}'
-        exec cat
-    }}
-    exit "$(cat '{1}'.control)"
-fi
-"$ssh" "$@"
-status=$?
-echo go >'{0}'
-exit $status"#,
-                data_ended.path.display(),
-                status.display()
-            ),
-        );
+        let held = HeldControlStream::wrap(&transfer);
         let (stdin, producer) = std::io::pipe().unwrap();
         let output = transfer
             .invocation_in(direction, &[EXACT], &refs(&args(&["true"])))
@@ -4991,7 +5012,85 @@ exit $status"#,
             .output()
             .unwrap();
         succeeded(output);
+        held.join();
         drop(producer);
+    }
+}
+
+/// A wrapper of the control session that copies what the client sends to
+/// `copied`, and sends what the server sends through a thread of this
+/// test, which passes the version and the features and the frames of the
+/// list exchanges at once, and holds the CHUNK frames of the server's
+/// control stream until the server has ended the session and the data
+/// session's SSH has exited. So END reaches the client before any control
+/// frame of the server, such as an answer or STOP.
+struct HeldControlStream {
+    copied: PathBuf,
+    relay: std::thread::JoinHandle<()>,
+}
+
+impl HeldControlStream {
+    fn wrap(transfer: &Transfer) -> Self {
+        let (copied, from_server, to_client, data_ended) = (
+            transfer.env.path("control-copy"),
+            transfer.env.path("from-server"),
+            transfer.env.path("to-client"),
+            transfer.env.path("data-ended"),
+        );
+        for fifo in [&from_server, &to_client] {
+            mkfifoat(CWD, fifo, Mode::RUSR | Mode::WUSR).unwrap();
+        }
+        // The wrapper of the data session creates this file once its SSH
+        // has exited.
+        wrap_ssh(
+            transfer,
+            &format!(
+                r#"if [ $session = control ]; then
+    cat '{2}' &
+    tee '{0}' | "$ssh" "$@" >'{1}'
+    status=$?
+    wait
+    exit $status
+fi
+"$ssh" "$@"
+status=$?
+: >'{3}'
+exit $status"#,
+                copied.display(),
+                from_server.display(),
+                to_client.display(),
+                data_ended.display(),
+            ),
+        );
+        let relay = std::thread::spawn(move || {
+            let mut from = BufReader::new(File::open(&from_server).unwrap());
+            let mut to = File::options().write(true).open(&to_client).unwrap();
+            let mut start = [0; 12];
+            from.read_exact(&mut start).unwrap();
+            to.write_all(&start).unwrap();
+            // The end of the session can cut the last frame short; the
+            // client never gets that part.
+            let mut held = Vec::new();
+            loop {
+                match try_recv_frame(&mut from) {
+                    Ok((CHUNK, payload)) => held.extend_from_slice(&frame(CHUNK, &payload)),
+                    Ok((kind, payload)) => to.write_all(&frame(kind, &payload)).unwrap(),
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                    Err(e) => panic!("cannot read the control session: {e}"),
+                }
+            }
+            // No deadline: the data session ends with the run.
+            while !data_ended.exists() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            to.write_all(&held).unwrap();
+        });
+        HeldControlStream { copied, relay }
+    }
+
+    /// Wait for the end of the relay, once the client has ended.
+    fn join(self) {
+        self.relay.join().unwrap();
     }
 }
 
@@ -5002,47 +5101,21 @@ fn end_stops_a_forward_scan_that_waits_for_an_answer() {
     // first block and waits for the answer. With a lookahead of one block
     // and batch delivery, the two blocks fill the scanner's buffer and no
     // idle point comes, so the scanner waits for that answer alone: neither
-    // more bytes nor the end of its input would wake it. A wrapper of the
-    // control session copies what the client sends, and holds what the
-    // server sends after its version and features, the answer and STOP
-    // included, until the data session's SSH has exited. Once the copy
-    // holds the QUERY, the command exits. END then reaches a scanner that
-    // waits for an answer that cannot come, and only the stop that END
-    // raises can end it (DESIGN.md §6.3 and §6.6): a scanner that did not
-    // wait for the stop would never let the client close the data session,
-    // and the test would hang. Without compression, the QUERY is a plain
-    // frame after the 12 bytes of the version and the features.
+    // more bytes nor the end of its input would wake it. With `--wait`, the
+    // scanner has the whole list before it scans. A wrapper of the control
+    // session holds the server's control stream, the answer and STOP
+    // included, until the data session's SSH has exited, and lets the list
+    // exchange through (`HeldControlStream`). Once the client has sent the
+    // QUERY, the command exits. END then reaches a scanner that waits for
+    // an answer that cannot come, and only the stop that END raises can end
+    // it (DESIGN.md §6.3 and §6.6): a scanner that did not wait for the
+    // stop would never let the client close the data session, and the test
+    // would hang.
     let transfer = Transfer::new(&["--compression-level", "0"]);
     transfer.configure_server("");
     let block = tiled(1, 47);
     transfer.env.write("server-tree/block", &block);
-    let (copied, status) = (
-        transfer.env.path("control-copy"),
-        transfer.env.path("status"),
-    );
-    // The control session waits here until the wrapper of the data session
-    // lets it go on, once its SSH has exited.
-    let data_ended = Gate::new(transfer.env.path("data-ended"));
-    wrap_ssh(
-        &transfer,
-        &format!(
-            r#"if [ $session = control ]; then
-    tee '{0}' | {{ "$ssh" "$@"; echo $? >'{2}'.control; }} | {{
-        head -c 12
-        read go <'{1}'
-        exec cat
-    }}
-    exit "$(cat '{2}'.control)"
-fi
-"$ssh" "$@"
-status=$?
-echo go >'{1}'
-exit $status"#,
-            copied.display(),
-            data_ended.path.display(),
-            status.display()
-        ),
-    );
+    let held = HeldControlStream::wrap(&transfer);
     let mut go = Gate::new(transfer.env.path("go"));
     let script = format!("read go <'{}'", go.path.display());
     let (stdin, mut producer) = std::io::pipe().unwrap();
@@ -5051,7 +5124,7 @@ exit $status"#,
     let lookahead = BLOCK.to_string();
     let client = transfer
         .push(
-            &[EXACT, "--batch-stdin", "--lookahead", &lookahead],
+            &[EXACT, "--wait", "--batch-stdin", "--lookahead", &lookahead],
             &refs(&args(&[&script])),
         )
         .stdin(stdin)
@@ -5060,12 +5133,18 @@ exit $status"#,
         .spawn()
         .unwrap();
     let mut client = KillOnDrop(client);
-    // No deadline: a scanner that queries nothing hangs the test.
-    wait_for_bytes(&copied, std::slice::from_mut(&mut client), |copy| {
-        copy.len() > 12
+    // No deadline: a scanner that queries nothing hangs the test. Without
+    // compression, the client's control stream holds the QUERY alone.
+    wait_for_bytes(&held.copied, std::slice::from_mut(&mut client), |copy| {
+        !control_stream(copy).is_empty()
     });
+    assert_eq!(
+        control_stream(&std::fs::read(&held.copied).unwrap())[0],
+        QUERY
+    );
     go.release();
     succeeded(output_of(client));
+    held.join();
     drop(producer);
 }
 
@@ -5095,7 +5174,7 @@ fn closing_the_control_session_before_end_is_fatal_also_after_completing() {
     std::fs::write(path("part2"), after).unwrap();
     std::fs::write(path("control"), start).unwrap();
     let server = transfer.env.path("fake-server");
-    std::fs::write(
+    write_script(
         &server,
         format!(
             r#"#!/bin/sh
@@ -5115,9 +5194,7 @@ exec cat >/dev/null
             path("control"),
             close_gate.path.display(),
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     transfer.set_hashsync_path(server.as_os_str());
     let client = transfer
         .invocation(
@@ -5130,8 +5207,8 @@ exec cat >/dev/null
         .unwrap();
     let client = KillOnDrop(client);
     let pid = client.0.id();
-    // The lookup workers start before the sessions, and end at Completing,
-    // which STREAM_END causes.
+    // The lookup workers start once the client's update is done, and end
+    // at Completing, which STREAM_END causes.
     wait_for_thread(pid, "lookup0", true);
     stream_end_gate.release();
     wait_for_thread(pid, "lookup0", false);
@@ -5188,23 +5265,28 @@ exit $status"#,
     assert!(output.stdout == payload, "the output differs");
 }
 
-/// Wait until the main thread of `pid` sleeps in a write to its stderr:
-/// `write` with fd 2, as its `syscall` file shows; no deadline. Fail when
-/// the process has ended.
+/// Wait until a thread of `pid` sleeps in a write to its stderr: `write`
+/// with fd 2, as its `syscall` file shows; no deadline. Fail when the
+/// process has ended.
 fn wait_for_stderr_write(pid: u32) {
-    let path = format!("/proc/{pid}/syscall");
     loop {
         assert_ne!(
             proc_state(format!("/proc/{pid}")),
             Some('Z'),
             "the process ended"
         );
-        let syscall = std::fs::read_to_string(&path).unwrap();
-        let fields: Vec<&str> = syscall.split_whitespace().collect();
-        if fields.first().and_then(|nr| nr.parse().ok()) == Some(libc::SYS_write as u64)
-            && fields.get(1) == Some(&"0x2")
-        {
-            return;
+        let tasks = std::fs::read_dir(format!("/proc/{pid}/task")).unwrap();
+        for task in tasks.flatten() {
+            // A thread that ends meanwhile has no file any more.
+            let Ok(syscall) = std::fs::read_to_string(task.path().join("syscall")) else {
+                continue;
+            };
+            let fields: Vec<&str> = syscall.split_whitespace().collect();
+            if fields.first().and_then(|nr| nr.parse().ok()) == Some(libc::SYS_write as u64)
+                && fields.get(1) == Some(&"0x2")
+            {
+                return;
+            }
         }
         std::thread::sleep(Duration::from_millis(1));
     }
@@ -5315,6 +5397,166 @@ fn server_of(pid: u32) -> u32 {
 }
 
 #[test]
+fn the_command_runs_while_the_receivers_update_waits() {
+    // The server starts the command at once, and the streams flow while
+    // the receiver of the deduplicated stream updates its index (DESIGN.md
+    // §3). This test holds a shared lock on the receiver's index, so its
+    // update waits. Meanwhile `cat` copies a line of stdin to stdout, which
+    // reaches the client's stdout: without `--wait`, the scanner of the
+    // deduplicated stream starts with an empty table, and the line goes as
+    // a literal.
+    for direction in DIRECTIONS {
+        let transfer = Transfer::new(&[]);
+        transfer.configure_receiver(direction, "");
+        let indexed = transfer.indexed(direction, "blocks");
+        transfer.env.write(indexed, &tiled(4, 72));
+        transfer.update_receiver(direction, &[]);
+        let lock = shared_lock(&transfer.receiver_index(direction));
+        let (stdin, mut producer) = std::io::pipe().unwrap();
+        let client = transfer
+            .invocation_in(direction, &[EXACT], &refs(&args(&["cat"])))
+            .stdin(stdin)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut client = KillOnDrop(client);
+        let receiver = match direction {
+            Direction::Pull => client.0.id(),
+            Direction::Push => server_of(client.0.id()),
+        };
+        wait_for_lock_wait(receiver);
+        producer.write_all(b"a line\n").unwrap();
+        // No deadline: a stream that waits for the update hangs the test.
+        let mut line = [0; 7];
+        let stdout = client.0.stdout.as_mut().unwrap();
+        stdout.read_exact(&mut line).unwrap();
+        assert_eq!(&line, b"a line\n", "{direction:?}");
+        drop(producer);
+        drop(lock);
+        let output = succeeded(output_of(client));
+        assert_eq!(summary(&output), [7, 7, 0, 0], "{direction:?}");
+    }
+}
+
+#[test]
+fn with_wait_a_deduplicated_stream_waits_for_its_whole_list() {
+    // With `--wait`, the scanner scans only once it has the whole list
+    // (DESIGN.md §6.3). This test holds a shared lock on the receiver's
+    // index, so the receiver's update, and so its list, wait. The source of
+    // the stream gives indexed blocks and ends, and then every thread of
+    // the sender sleeps. Only then does this test let the update go, and
+    // every block becomes a reference: a scanner that did not wait would
+    // have scanned them with an empty table, as literals.
+    for direction in DIRECTIONS {
+        let transfer = Transfer::new(&[]);
+        transfer.configure_receiver(direction, "");
+        let blocks = tiled(16, 73);
+        let indexed = transfer.indexed(direction, "blocks");
+        transfer.env.write(&indexed, &blocks);
+        transfer.update_receiver(direction, &[]);
+        let lock = shared_lock(&transfer.receiver_index(direction));
+        let source = transfer.env.path(&indexed);
+        let written = transfer.env.path("written");
+        let (command, stdin) = match direction {
+            Direction::Pull => {
+                let script = format!("cat '{}' && : >'{}'", source.display(), written.display());
+                (script, Stdio::null())
+            }
+            Direction::Push => {
+                std::fs::write(&written, b"").unwrap();
+                ("cat".to_owned(), Stdio::from(File::open(&source).unwrap()))
+            }
+        };
+        let flags = [&[EXACT][..], &direction.counted()].concat();
+        let client = transfer
+            .invocation_in(direction, &flags, &refs(&args(&[&command])))
+            .stdin(stdin)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut client = KillOnDrop(client);
+        let (receiver, sender) = match direction {
+            Direction::Pull => (client.0.id(), server_of(client.0.id())),
+            Direction::Push => (server_of(client.0.id()), client.0.id()),
+        };
+        wait_for_lock_wait(receiver);
+        // In a pull, the command has written the blocks; in a push, they
+        // are the client's stdin. Then the sender reads them all, and
+        // waits for the list.
+        wait_for_file(&written, std::slice::from_mut(&mut client));
+        wait_until_asleep(sender);
+        drop(lock);
+        let output = succeeded(output_of(client));
+        assert!(output.stdout == blocks, "{direction:?}: the output differs");
+        let counts = [blocks.len(), 0, blocks.len(), 0];
+        assert_eq!(summary(&output), counts, "{direction:?}");
+    }
+}
+
+#[test]
+fn with_wait_one_deduplicated_stream_flows_while_the_other_waits_for_its_list() {
+    // With both streams deduplicated, each stream waits only for its own
+    // list (DESIGN.md §6.3). With `--no-update`, each host opens its index
+    // as it is. This test holds an exclusive lock on the server's index, so
+    // the server waits for it, and the list of the forward stream does not
+    // exist yet. The backward stream does not wait for that list: the
+    // client's list reaches the server, whose scanner deduplicates the
+    // command's output against it, and the whole output reaches the
+    // client's stdout while the server still waits for its index. The
+    // command writes its output in one write, so in eager delivery the idle
+    // point after it, and no other, flushes the stream. Once this test lets
+    // the index go, the forward stream gets its list, and its blocks become
+    // references too.
+    let transfer = Transfer::new(&[]);
+    transfer.configure_server("");
+    let client_blocks = tiled(8, 74);
+    let server_blocks = tiled(16, 75);
+    transfer.env.write("tree/blocks", &client_blocks);
+    transfer.env.write("server-tree/blocks", &server_blocks);
+    transfer.update_receiver(Direction::Pull, &[]);
+    transfer.update_receiver(Direction::Push, &[]);
+    let lock = exclusive_lock(&transfer.server_index());
+    let received = transfer.env.path("received");
+    let script = format!(
+        "cat '{}' && cat >'{}'",
+        transfer.env.path("tree/blocks").display(),
+        received.display()
+    );
+    let input = transfer.env.path("input");
+    std::fs::write(&input, &server_blocks).unwrap();
+    let flags = [EXACT, "--wait", "--no-update", "--batch-stdin"];
+    let client = transfer
+        .both(&flags, &refs(&args(&[&script])))
+        .stdin(File::open(&input).unwrap())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut client = KillOnDrop(client);
+    wait_for_lock_wait(server_of(client.0.id()));
+    // No deadline: a backward stream that waits for the list of the
+    // forward stream hangs the test.
+    let mut output = vec![0; client_blocks.len()];
+    let stdout = client.0.stdout.as_mut().unwrap();
+    stdout.read_exact(&mut output).unwrap();
+    assert!(output == client_blocks, "the output differs");
+    drop(lock);
+    let output = succeeded(output_of(client));
+    assert!(
+        std::fs::read(&received).unwrap() == server_blocks,
+        "the command's stdin differs"
+    );
+    let stdout = deduplicated_stream(&output, "stdout");
+    let counts = [client_blocks.len(), 0, client_blocks.len(), 0];
+    assert_eq!(stdout.bytes, counts);
+    let stdin = deduplicated_stream(&output, "stdin");
+    let counts = [server_blocks.len(), 0, server_blocks.len(), 0];
+    assert_eq!(stdin.bytes, counts);
+}
+
+#[test]
 fn an_update_waits_for_the_lookups_and_gets_in_while_the_run_writes_stdout() {
     // The command writes a part of its output, then waits for this test.
     // Meanwhile `update` waits for the run's lock: the run's lookup workers
@@ -5388,8 +5630,7 @@ fn the_command_of_a_push_starts_with_the_descriptor_limit_of_the_server() {
         "#!/bin/sh\nulimit -Sn 256\nexec '{}' \"$@\"\n",
         env!("CARGO_BIN_EXE_hashsync")
     );
-    std::fs::write(&wrapper, script).unwrap();
-    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    write_script(&wrapper, script);
     transfer.set_hashsync_path(wrapper.as_os_str());
     let output = succeeded(transfer.run_push(&[], &refs(&args(&["ulimit -Sn"])), b""));
     assert_eq!(output.stdout, b"256\n");
@@ -5462,12 +5703,12 @@ fn a_push_whose_command_updates_the_servers_index_after_its_stdin_ends() {
 fn a_lookahead_below_the_block_size_of_the_servers_index_ends_a_push() {
     // In a push, the server's HELLO gives the block size of the stream,
     // here 64 KiB, and the run asks for a lookahead of 32 KiB: the client
-    // reports the user error right after that HELLO, before it sends its
-    // own, so the server does no work for the run, and the command never
-    // runs (DESIGN.md §8). A copy of what the client sends on the data
-    // session shows it: after the version and the features, REQUEST alone.
-    // The client kills only the wrapper of the fake ssh, so the copy goes
-    // on until the client has exited.
+    // reports the user error right after that HELLO, before its scanner
+    // starts, so no byte of the stream goes out (DESIGN.md §8). A copy of
+    // what the client sends on the data session shows it: after the
+    // version and the features, REQUEST alone. The client kills only the
+    // wrapper of the fake ssh, so the copy goes on until the client has
+    // exited.
     let transfer = Transfer::new(&["--lookahead", "32KiB"]);
     transfer.configure_server("");
     let config = std::fs::read_to_string(transfer.server_config()).unwrap();
@@ -5489,9 +5730,7 @@ exec "$ssh" "$@""#,
             copied.display()
         ),
     );
-    let marker = transfer.env.path("command-ran");
-    let command = format!(": >'{}'", marker.display());
-    let output = transfer.run_push(&[], &refs(&args(&[&command])), b"input");
+    let output = transfer.run_push(&[], &refs(&args(&["cat"])), b"input");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(1), "{stderr}");
     assert!(
@@ -5506,26 +5745,27 @@ exec "$ssh" "$@""#,
     }
     let sent = std::fs::read(&captured).unwrap();
     assert_eq!(frame_types(&sent), [REQUEST], "the client went on");
-    assert!(!marker.exists(), "the command ran");
 }
 
 #[test]
-fn a_lookahead_that_the_sender_cannot_hold_ends_the_run_before_the_command() {
+fn a_lookahead_that_the_sender_cannot_hold_ends_the_run() {
     // The sender of a deduplicated stream reserves the scanner's buffer,
-    // twice `lookahead + B`, and starts its probe threads before its HELLO:
-    // settings that its host cannot provide end the run there, before the
-    // command starts, and not in the middle of the stream (DESIGN.md §6.2).
-    // A lookahead of 2^62 bytes needs a buffer above the largest
-    // allocation, so the reservation fails on any host. A command that
-    // started would be killed at once, before it could leave a mark of its
-    // own, so the test watches the command's script: `exec` opens it.
+    // twice `lookahead + B`, and starts its probe threads at the receiver's
+    // HELLO: settings that its host cannot provide end the run there, and
+    // not in the middle of the stream (DESIGN.md §6.2). In a pull, the
+    // server reads the client's HELLO before it starts the command, so the
+    // command does not start; in a push, the server has started it before
+    // the client reads the server's HELLO. A lookahead of 2^62 bytes needs a
+    // buffer above the largest allocation, so the reservation fails on any
+    // host. A command that started would be killed at once, before it could
+    // leave a mark of its own, so the test watches the command's script:
+    // `exec` opens it.
     for direction in DIRECTIONS {
         let lookahead = (1u64 << 62).to_string();
         let transfer = Transfer::new(&["--lookahead", &lookahead]);
         transfer.configure_receiver(direction, "");
         let script = transfer.env.path("command");
-        std::fs::write(&script, "#!/bin/sh\n").unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_script(&script, "#!/bin/sh\n");
         let opens =
             inotify::init(inotify::CreateFlags::CLOEXEC | inotify::CreateFlags::NONBLOCK).unwrap();
         inotify::add_watch(&opens, &script, inotify::WatchFlags::OPEN).unwrap();
@@ -5547,12 +5787,14 @@ fn a_lookahead_that_the_sender_cannot_hold_ends_the_run_before_the_command() {
             stderr.contains(&format!("{sender}{message}")),
             "{direction:?}: {stderr}"
         );
-        let mut event = [0u8; 256];
-        assert_eq!(
-            read(&opens, &mut event),
-            Err(Errno::AGAIN),
-            "{direction:?}: the command started"
-        );
+        if direction == Direction::Pull {
+            let mut event = [0u8; 256];
+            assert_eq!(
+                read(&opens, &mut event),
+                Err(Errno::AGAIN),
+                "{direction:?}: the command started"
+            );
+        }
     }
 }
 
@@ -5587,7 +5829,7 @@ fn both_streams_are_deduplicated_against_the_indexes_of_their_receivers() {
         let server_blocks = tiled(48, 62);
         transfer.env.write("tree/blocks", &client_blocks);
         transfer.env.write("server-tree/blocks", &server_blocks);
-        let mut flags = vec![EXACT, "--batch-stdin", "--batch-stdout"];
+        let mut flags = vec![EXACT, "--wait", "--batch-stdin", "--batch-stdout"];
         if no_update {
             transfer.update_receiver(Direction::Pull, &[]);
             transfer.update_receiver(Direction::Push, &[]);
@@ -5680,7 +5922,10 @@ fn the_forward_stream_stops_while_the_deduplicated_backward_stream_goes_on() {
     );
     let (stdin, mut producer) = std::io::pipe().unwrap();
     let client = transfer
-        .both(&[EXACT, "--batch-stdout"], &refs(&args(&[&script])))
+        .both(
+            &[EXACT, "--wait", "--batch-stdout"],
+            &refs(&args(&[&script])),
+        )
         .stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -5731,7 +5976,7 @@ fn each_stream_uses_the_block_size_and_strong_hash_of_its_receiver() {
     let input = [&b"xy"[..], &server_blocks].concat();
     let path = transfer.env.path("input");
     std::fs::write(&path, &input).unwrap();
-    let flags = [EXACT, "--batch-stdin", "--batch-stdout"];
+    let flags = [EXACT, "--wait", "--batch-stdin", "--batch-stdout"];
     let output = transfer
         .both(&flags, &refs(&args(&[&script])))
         .stdin(File::open(&path).unwrap())
@@ -5780,8 +6025,7 @@ exec '{hashsync}' --config '{config}' "$@"
         hashsync = env!("CARGO_BIN_EXE_hashsync"),
         config = config.display()
     );
-    std::fs::write(&wrapper, script).unwrap();
-    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    write_script(&wrapper, script);
     wrapper
 }
 
@@ -5810,19 +6054,48 @@ fn holds(bytes: &[u8], part: &[u8]) -> bool {
     bytes.windows(part.len()).any(|window| window == part)
 }
 
+/// Wait until the receiver of `direction` in the run of `client`, whose
+/// stderr goes to the file at `stderr`, has updated its index, as its note
+/// says, and then released the lock of that index, whose lock file is at
+/// `lock`, polling with no deadline: a receiver that keeps its lock hangs
+/// the test. In a run with both streams deduplicated, each host releases
+/// its index after its update, and takes it again only once the other
+/// host's update is done (DESIGN.md §4.4), which the test holds back.
+fn wait_for_the_release_after_the_update(
+    client: &mut KillOnDrop,
+    direction: Direction,
+    stderr: &std::path::Path,
+    lock: &std::path::Path,
+) {
+    // The server's lines reach the client's stderr with their marker.
+    let (host, receiver) = match direction {
+        Direction::Pull => ("hashsync: ", client.0.id()),
+        Direction::Push => ("hashsync (server): ", server_of(client.0.id())),
+    };
+    let notes = ["updated index in ", "rebuilt index in "].map(|note| format!("{host}{note}"));
+    wait_for_bytes(stderr, std::slice::from_mut(client), |bytes| {
+        notes.iter().any(|note| holds(bytes, note.as_bytes()))
+    });
+    while ofd_lock(receiver, lock).is_some() {
+        assert_running(client);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 #[test]
 fn two_runs_in_opposite_directions_with_both_streams_deduplicated_both_end() {
     // Two hosts, A and B, each with its own index, and two runs at once
     // with both streams deduplicated: one with its client on A and its
-    // server on B, and one the other way around. Each client updates its
-    // index before SSH starts, and a wrapper holds each server back until
-    // both clients have finished their updates. A client that kept a lock
-    // of its index then would make the server of the other run wait for it
-    // in its update, while its own server waits for the other client in
-    // the same way, and both runs would hang. So each client releases its
-    // index after its update, and opens it again only at its HELLO, which
-    // follows the server's update (DESIGN.md §4.4): neither client holds a
-    // lock while the servers update.
+    // server on B, and one the other way around. A wrapper holds each
+    // server back until both clients have finished their updates. A client
+    // that kept a lock of its index then would make the server of the
+    // other run wait for it in its update, while its own server waits for
+    // the other client in the same way, and both runs would hang. So each
+    // host releases its index after its update, and opens it again only at
+    // the other host's UPDATED, which follows that host's update (DESIGN.md
+    // §4.4): neither client holds a lock while the servers update. With
+    // `--wait`, each stream waits for its list, so a run cannot end before
+    // its exchanges do.
     let transfer = Transfer::new(&[]);
     // Host A has the transfer's client configuration, host B a second one.
     transfer.env.mkdir("b-tree");
@@ -5844,6 +6117,7 @@ fn two_runs_in_opposite_directions_with_both_streams_deduplicated_both_end() {
         transfer.env.path("serving-b"),
     ];
     let inputs = [random(256 << 10, 67), random(256 << 10, 68)];
+    let stderrs = [0, 1].map(|i| transfer.env.path(format!("stderr-{i}")));
     let mut clients = Vec::new();
     for (i, input) in inputs.iter().enumerate() {
         // The client of run `i` is on host `i`, and its server on the other.
@@ -5862,112 +6136,102 @@ fn two_runs_in_opposite_directions_with_both_streams_deduplicated_both_end() {
             .arg("--config")
             .arg(&configs[i])
             .args(["ssh", "--dedup-stdin", "--dedup-stdout"]);
-        transfer.add_options(&mut client, &[EXACT]);
+        transfer.add_options(&mut client, &[EXACT, "--wait"]);
         let client = client
             .arg(HOST)
             .arg("--")
             .arg("cat")
             .stdin(File::open(&path).unwrap())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(File::create(&stderrs[i]).unwrap())
             .spawn()
             .unwrap();
         clients.push(KillOnDrop(client));
     }
-    // Each server starts only after its client's update.
     for mark in &marks {
         wait_for_file(mark, &mut clients);
     }
-    for (client, lock) in clients.iter().zip(&locks) {
-        assert_eq!(
-            ofd_lock(client.0.id(), lock),
-            None,
-            "a client keeps its lock"
-        );
+    for ((client, stderr), lock) in clients.iter_mut().zip(&stderrs).zip(&locks) {
+        wait_for_the_release_after_the_update(client, Direction::Pull, stderr, lock);
     }
     std::fs::write(&go, b"").unwrap();
-    for (client, input) in clients.into_iter().zip(&inputs) {
-        let output = succeeded(output_of(client));
+    for ((client, input), stderr) in clients.into_iter().zip(&inputs).zip(&stderrs) {
+        let mut output = output_of(client);
+        output.stderr = std::fs::read(stderr).unwrap();
+        let output = succeeded(output);
         assert!(output.stdout == *input, "the output differs");
     }
 }
 
 #[test]
-fn a_rebuild_of_the_clients_index_before_its_hello_ends_the_run_before_the_command() {
-    // With both streams deduplicated, the client's index has no lock
-    // between the client's update and its HELLO, which opens it again
-    // (DESIGN.md §4.4). A wrapper holds the server back while another
-    // configuration with the same index and blocks of another size
-    // rebuilds that index. The client then finds an index that does not
-    // match its configuration, and ends the run with `die`, before the
-    // command starts: its script is never opened, which `exec` would do.
-    let transfer = Transfer::new(&[]);
-    transfer.configure_server("");
-    transfer.env.write("tree/blocks", &tiled(4, 69));
-    let other = transfer.env.path("other.toml");
-    std::fs::write(
-        &other,
-        format!(
-            "block_size = 8192\nindex_path = '{}'\n{}",
-            toml_literal(transfer.env.index_path().as_os_str().as_bytes()),
-            transfer.env.root("tree", "")
-        ),
-    )
-    .unwrap();
-    let waiting = transfer.env.path("waiting");
-    let rebuilt = transfer.env.path("rebuilt");
-    let server = held_server(
-        &transfer,
-        "held-server",
-        &transfer.server_config(),
-        &waiting,
-        &rebuilt,
-    );
-    transfer.set_hashsync_path(server.as_os_str());
-    let script = transfer.env.path("command");
-    std::fs::write(&script, "#!/bin/sh\n").unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let opens =
-        inotify::init(inotify::CreateFlags::CLOEXEC | inotify::CreateFlags::NONBLOCK).unwrap();
-    inotify::add_watch(&opens, &script, inotify::WatchFlags::OPEN).unwrap();
-    let client = transfer
-        .both(&[], &[script.as_os_str()])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+fn a_rebuild_of_an_index_before_its_host_opens_it_again_ends_the_run() {
+    // With both streams deduplicated, both hosts update their index at the
+    // same time, and each one releases its index after its update and opens
+    // it again only at the other host's UPDATED (DESIGN.md §4.4). The test
+    // runs once for each host, the receiver of `direction`. It holds a
+    // shared lock on the other host's index, so that the other host's update
+    // waits, while this host's update ends and releases its index. Another
+    // configuration with the same index and blocks of another size then
+    // rebuilds it, and the test lets the other update go. At the other
+    // host's UPDATED, this host opens its index again, finds that it no
+    // longer matches its configuration, and ends the run with `die`. When
+    // this host is the server, the client sees its end as the loss of the
+    // server.
+    for direction in DIRECTIONS {
+        let transfer = Transfer::new(&[]);
+        transfer.configure_server("");
+        transfer.env.write("tree/blocks", &tiled(4, 69));
+        transfer.env.write("server-tree/blocks", &tiled(4, 70));
+        transfer.update_receiver(Direction::Pull, &[]);
+        transfer.update_receiver(Direction::Push, &[]);
+        let (other_direction, root, host) = match direction {
+            Direction::Pull => (Direction::Push, "tree", "hashsync: "),
+            Direction::Push => (Direction::Pull, "server-tree", "hashsync (server): "),
+        };
+        let index = transfer.receiver_index(direction);
+        let other = transfer.env.path("other.toml");
+        std::fs::write(
+            &other,
+            format!(
+                "block_size = 8192\nindex_path = '{}'\n{}",
+                toml_literal(index.as_os_str().as_bytes()),
+                transfer.env.root(root, "")
+            ),
+        )
         .unwrap();
-    let mut client = KillOnDrop(client);
-    // The server starts after the client's update.
-    wait_for_file(&waiting, std::slice::from_mut(&mut client));
-    let lock = transfer.env.index_path().join("hashsync.lock");
-    assert_eq!(
-        ofd_lock(client.0.id(), &lock),
-        None,
-        "the client keeps its lock"
-    );
-    let rebuild = Command::new(env!("CARGO_BIN_EXE_hashsync"))
-        .arg("--config")
-        .arg(&other)
-        .arg("update")
-        .output()
-        .unwrap();
-    let stderr = String::from_utf8_lossy(&rebuild.stderr);
-    assert!(rebuild.status.success(), "rebuild failed:\n{stderr}");
-    assert!(stderr.contains("rebuilt index"), "{stderr}");
-    std::fs::write(&rebuilt, b"").unwrap();
-    let output = output_of(client);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(output.status.code(), Some(1), "{stderr}");
-    assert!(
-        stderr.contains("does not match the configuration; run `hashsync update`"),
-        "{stderr}"
-    );
-    let mut event = [0u8; 256];
-    assert_eq!(
-        read(&opens, &mut event),
-        Err(Errno::AGAIN),
-        "the command started"
-    );
+        let held = shared_lock(&transfer.receiver_index(other_direction));
+        let stderr = transfer.env.path("stderr");
+        let client = transfer
+            .both(&["--wait"], &refs(&args(&["cat"])))
+            .stdout(Stdio::piped())
+            .stderr(File::create(&stderr).unwrap())
+            .spawn()
+            .unwrap();
+        let mut client = KillOnDrop(client);
+        let lock = index.join("hashsync.lock");
+        wait_for_the_release_after_the_update(&mut client, direction, &stderr, &lock);
+        let rebuild = Command::new(env!("CARGO_BIN_EXE_hashsync"))
+            .arg("--config")
+            .arg(&other)
+            .arg("update")
+            .output()
+            .unwrap();
+        let notes = String::from_utf8_lossy(&rebuild.stderr);
+        assert!(
+            rebuild.status.success(),
+            "{direction:?}: rebuild failed:\n{notes}"
+        );
+        assert!(notes.contains("rebuilt index"), "{direction:?}: {notes}");
+        drop(held);
+        let output = output_of(client);
+        let stderr = String::from_utf8_lossy(&std::fs::read(&stderr).unwrap()).into_owned();
+        assert_eq!(output.status.code(), Some(1), "{direction:?}: {stderr}");
+        let message = format!(
+            "{host}index {} does not match the configuration; run `hashsync update`",
+            index.display()
+        );
+        assert!(stderr.contains(&message), "{direction:?}: {stderr}");
+    }
 }
 
 #[test]

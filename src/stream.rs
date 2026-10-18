@@ -1449,7 +1449,7 @@ pub(crate) mod tests {
 
     /// A session frame has no place inside a stream.
     #[test]
-    #[should_panic(expected = "protocol error: unexpected stream frame type 8")]
+    #[should_panic(expected = "protocol error: unexpected stream frame type 3")]
     fn another_frame_in_a_stream_is_a_protocol_error() {
         let (spool, _tempdir) = ended_spool(&encoded(&[(frame::CHUNK, b"x")], 0));
         decode(spool, false, &mut Collect::default(), None);

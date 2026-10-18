@@ -12,6 +12,8 @@ use std::process::{Child, Command, Output};
 use std::time::Duration;
 
 use rocksdb::{ColumnFamily, DB, IteratorMode, Options, WriteBatch};
+use rustix::event::{PollFd, PollFlags, poll};
+use rustix::io::retry_on_intr;
 use tempfile::TempDir;
 
 pub const BLOCK: usize = 4096;
@@ -538,23 +540,32 @@ pub fn namespaces_available() -> bool {
 pub const PROTOCOL_VERSION: u32 = 1;
 /// The features that hashsync sends: it supports none yet.
 pub const FEATURES: u64 = 0;
-// Session frames: the data session, never compressed.
+// Session frames of the data session, never compressed. CHUNK is a session
+// frame of the control session too.
 pub const REQUEST: u8 = 1;
 pub const HELLO: u8 = 2;
-pub const HASHLIST: u8 = 3;
-pub const HASHDELTA: u8 = 4;
-pub const CACHE_RESULT: u8 = 7;
-pub const CHUNK: u8 = 8;
-pub const STREAM_END: u8 = 9;
-pub const END: u8 = 10;
+pub const CHUNK: u8 = 3;
+pub const STREAM_END: u8 = 4;
+pub const END: u8 = 5;
+// Session frames of the control session: the list exchanges, and UPDATED.
+pub const INDEX: u8 = 6;
+pub const ADVERTISE: u8 = 7;
+pub const HASHLIST: u8 = 8;
+pub const HASHDELTA: u8 = 9;
+pub const HASHKEEP: u8 = 10;
+pub const HASHNONE: u8 = 11;
+pub const HASHDATA: u8 = 12;
+pub const HASHFULL: u8 = 13;
+pub const CACHE_RESULT: u8 = 14;
+pub const UPDATED: u8 = 15;
 // Stream frames: inside the zstd frame of a stream.
-pub const LIT: u8 = 11;
-pub const REF: u8 = 12;
-pub const RLE: u8 = 13;
-// Control frames.
-pub const QUERY: u8 = 14;
-pub const ANSWER: u8 = 15;
-pub const STOP: u8 = 16;
+pub const LIT: u8 = 16;
+pub const REF: u8 = 17;
+pub const RLE: u8 = 18;
+// Control frames: inside the control stream of the control session.
+pub const QUERY: u8 = 19;
+pub const ANSWER: u8 = 20;
+pub const STOP: u8 = 21;
 
 /// The first bytes of each session, in both directions: the protocol
 /// version, then `features`. hashsync sends `FEATURES`, but a later peer
@@ -564,6 +575,21 @@ pub fn version_and_features(features: u64) -> [u8; 12] {
     bytes[..4].copy_from_slice(&PROTOCOL_VERSION.to_le_bytes());
     bytes[4..].copy_from_slice(&features.to_le_bytes());
     bytes
+}
+
+/// The name of the weak hash of DESIGN.md §5.1, as HELLO carries it.
+pub const WEAK_HASH_ID: &[u8] = b"poly64-9e3779b97f4a7c15-splitmix64";
+
+/// The payload of a receiver's HELLO: its block size, then the names of
+/// the weak hash of this build and of its strong hash `strong`, each with
+/// its length as a little-endian `u32` (DESIGN.md §6.2).
+pub fn hello_payload(block_size: u32, strong: &[u8]) -> Vec<u8> {
+    let mut hello = block_size.to_le_bytes().to_vec();
+    for name in [WEAK_HASH_ID, strong] {
+        hello.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        hello.extend_from_slice(name);
+    }
+    hello
 }
 
 /// A frame: the type, the length of the payload as a little-endian `u32`,
@@ -601,6 +627,24 @@ pub fn proc_state(dir: impl AsRef<Path>) -> Option<char> {
     stat.rsplit(')').next()?.trim_start().chars().next()
 }
 
+/// Wait until every thread of the process `pid` sleeps, polling with no
+/// deadline. Fail when the process has ended: it stays a zombie until its
+/// parent reaps it.
+pub fn wait_until_asleep(pid: u32) {
+    loop {
+        // A thread that ends meanwhile has no state.
+        let states: Vec<Option<char>> = std::fs::read_dir(format!("/proc/{pid}/task"))
+            .unwrap()
+            .map(|task| proc_state(task.unwrap().path()))
+            .collect();
+        assert!(!states.contains(&Some('Z')), "the process ended");
+        if states.iter().all(|&state| state == Some('S')) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 /// Kills and reaps a child that a test leaves behind, even when the test
 /// fails. `kill` does nothing to a child that `wait` reaped, whose PID
 /// another process can have then.
@@ -613,31 +657,37 @@ impl Drop for KillOnDrop {
     }
 }
 
-/// Wait until the main thread of `pid` sleeps in a wait for the lock of an
-/// index: `fcntl` with `F_OFD_SETLKW`, its second argument in the `syscall`
-/// file (DESIGN.md §4.4); no deadline. Reading that file needs the ptrace
-/// access that a parent has. Fail when the process has ended.
+/// Wait until a thread of `pid` sleeps in a wait for the lock of an index:
+/// `fcntl` with `F_OFD_SETLKW`, its second argument in the `syscall` file
+/// (DESIGN.md §4.4); no deadline. The thread is the main thread of `update`
+/// or `stats`, and the receiver's thread of a run. Reading that file needs
+/// the ptrace access that a parent has. Fail when the process has ended.
 pub fn wait_for_lock_wait(pid: u32) {
-    let path = format!("/proc/{pid}/syscall");
     loop {
         assert_ne!(
             proc_state(format!("/proc/{pid}")),
             Some('Z'),
             "the process ended"
         );
-        let syscall = std::fs::read_to_string(&path).unwrap();
-        let fields: Vec<&str> = syscall.split_whitespace().collect();
-        let argument = |i: usize| {
-            fields
-                .get(i)
-                .and_then(|field| u64::from_str_radix(field.trim_start_matches("0x"), 16).ok())
-        };
-        // A running thread has no number; one that sleeps outside a
-        // system call has -1.
-        if fields.first().is_some_and(|nr| nr.parse::<u64>().is_ok())
-            && argument(2) == Some(libc::F_OFD_SETLKW as u64)
-        {
-            return;
+        let tasks = std::fs::read_dir(format!("/proc/{pid}/task")).unwrap();
+        for task in tasks.flatten() {
+            // A thread that ends meanwhile has no file any more.
+            let Ok(syscall) = std::fs::read_to_string(task.path().join("syscall")) else {
+                continue;
+            };
+            let fields: Vec<&str> = syscall.split_whitespace().collect();
+            let argument = |i: usize| {
+                fields
+                    .get(i)
+                    .and_then(|field| u64::from_str_radix(field.trim_start_matches("0x"), 16).ok())
+            };
+            // A running thread has no number; one that sleeps outside a
+            // system call has -1.
+            if fields.first().is_some_and(|nr| nr.parse::<u64>().is_ok())
+                && argument(2) == Some(libc::F_OFD_SETLKW as u64)
+            {
+                return;
+            }
         }
         std::thread::sleep(Duration::from_millis(1));
     }
@@ -652,6 +702,21 @@ pub fn wait_for_lock_wait(pid: u32) {
 pub fn shared_lock(index: &Path) -> std::fs::File {
     let file = std::fs::File::open(index.join("hashsync.lock")).unwrap();
     rustix::fs::fcntl_lock(&file, rustix::fs::FlockOperation::NonBlockingLockShared)
+        .unwrap_or_else(|e| panic!("cannot lock {}: {e}", index.display()));
+    file
+}
+
+/// The lock file of the index at `index`, with an exclusive lock that this
+/// process holds until the drop of the file, as `shared_lock` holds a
+/// shared one: a run that opens that index as it is, with `--no-update`,
+/// then waits (DESIGN.md §4.4).
+pub fn exclusive_lock(index: &Path) -> std::fs::File {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(index.join("hashsync.lock"))
+        .unwrap();
+    rustix::fs::fcntl_lock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
         .unwrap_or_else(|e| panic!("cannot lock {}: {e}", index.display()));
     file
 }
@@ -694,4 +759,59 @@ pub fn ofd_lock(pid: u32, path: &Path) -> Option<&'static str> {
         }
     }
     None
+}
+
+/// The number of the system call in which the thread whose `syscall` file
+/// is at `path` sleeps; `None` while it runs or sleeps outside a system
+/// call. The file names a system call only while the thread sleeps in it.
+pub fn sleeping_syscall(path: &Path) -> std::io::Result<Option<u64>> {
+    let syscall = std::fs::read_to_string(path)?;
+    Ok(syscall
+        .split_whitespace()
+        .next()
+        .and_then(|nr| nr.parse().ok()))
+}
+
+/// The system call in which a thread of this process sleeps while it runs
+/// `wait`, which must wait until the drop of the returned value of `make`.
+/// The thread tells its ID before the wait, so the wait is the only call
+/// that it can then sleep in. A process can always read the `syscall` files
+/// of its own threads.
+pub fn sleeping_syscall_of<T: Send + 'static, D>(
+    make: impl FnOnce() -> (T, D),
+    wait: impl FnOnce(T) + Send + 'static,
+) -> u64 {
+    let (waited, ends) = make();
+    let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        tid_tx.send(rustix::thread::gettid()).unwrap();
+        wait(waited);
+    });
+    let tid = tid_rx.recv().unwrap().as_raw_nonzero();
+    let path = PathBuf::from(format!("/proc/self/task/{tid}/syscall"));
+    let nr = loop {
+        if let Some(nr) = sleeping_syscall(&path).unwrap() {
+            break nr;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    drop(ends);
+    waiter.join().unwrap();
+    nr
+}
+
+/// The system call in which `poll` sleeps, `ppoll` or `poll`, by its number
+/// on this architecture: the wait of a pipe that nothing writes, until the
+/// write end closes.
+pub fn poll_syscall() -> u64 {
+    sleeping_syscall_of(
+        || {
+            let (reader, writer) = std::io::pipe().unwrap();
+            (reader, writer)
+        },
+        |reader| {
+            let mut fds = [PollFd::new(&reader, PollFlags::IN)];
+            retry_on_intr(|| poll(&mut fds, None)).unwrap();
+        },
+    )
 }

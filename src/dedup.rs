@@ -1,35 +1,38 @@
 //! The dedup block of a deduplicated stream (DESIGN.md §6.3 and §6.4): what
 //! such a stream adds to the blocks that every stream has, and the two
 //! roles that a host can play in it, from the start of the run to its end.
-//! Client and server build their deduplicated ends from these roles alone,
-//! and keep only the order of the steps, which the wire fixes, and their
-//! own steps between them.
+//! Client and server build their deduplicated ends from these roles alone.
+//! Both roles start with the streams, and work while the streams run.
 //!
 //! The sender's role (`Sending`) holds, from the start of the run, the
-//! queue of its answers, which the control reader fills, and its own
-//! sender of the control writer's queue. Its list exchange gives the
-//! stream's `Scan`. Then the lookahead reader takes the stream's bytes and
-//! idle points from its spool into the scanner's lookahead buffer, and the
-//! scanner, on a thread of its own with its probe threads, turns them into
-//! literals, runs, and references, and queues QUERY for the windows that
-//! the hash table finds. The scanner is the stream's encoder: its data
-//! queue is what the stream's data writer takes (`DataItems`).
+//! queue of its answers and the frames of its side of the list exchange,
+//! which the control reader fills, and its own sender of the control
+//! writer's queue. At the receiver's HELLO, it starts the scanner of the
+//! stream, with an empty table: the lookahead reader takes the stream's
+//! bytes and idle points from its spool into the scanner's lookahead
+//! buffer, and the scanner, on a thread of its own with its probe threads,
+//! turns them into literals, runs, and references, and queues QUERY for the
+//! windows that the hash table finds. The scanner is the stream's encoder:
+//! its data queue is what the stream's data writer takes (`DataItems`).
+//! Then the sender's side of the list exchange runs on a thread of its own,
+//! and gives the scanner its table as the target becomes known. With
+//! `--wait`, the scanner scans only once its table is whole.
 //!
 //! The receiver's role (`Receiving`) holds, from the start of the run, its
-//! pins and the queue of its lookup workers, which the control reader
-//! fills. The index of the host, prepared for the run, gives the hash list
-//! for the list exchange and the candidates, and the lookup workers answer
-//! the queries with the pins, which the decoder reads for REF. The workers
-//! own the index, which closes when they end at Completing. In a run with
-//! both streams deduplicated, the client's index is released between its
-//! update and its HELLO, so that the run holds no lock while the server
-//! updates its own (DESIGN.md §4.4).
+//! pins, the queue of its lookup workers, and the frames of its side of the
+//! list exchange, which the control reader fills. Its thread prepares the
+//! index of the host for the run, starts the lookup workers, which answer
+//! the queries with the pins, which the decoder reads for REF, and runs the
+//! receiver's side of the list exchange. The workers own the index, which
+//! closes when they end at Completing. In a run with both streams
+//! deduplicated, both hosts update their index at the same time, and each
+//! keeps its index closed from the end of its update until the other host's
+//! update is done too (DESIGN.md §4.4).
 //!
 //! At the stop of a deduplicated stream, its scanner returns at once,
 //! without the end of the stream: it would otherwise wait for answers that
 //! the receiver no longer sends (DESIGN.md §6.6).
 
-use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -43,19 +46,17 @@ use crate::fsops;
 use crate::hash::StrongHash;
 use crate::hashtable::HashTable;
 use crate::index::{self, Index, Settings};
-use crate::list_exchange::{ListBytes, ReceiverExchange, SenderExchange};
+use crate::list_exchange::{self, Link, ListBytes, ReceiverExchange, TableUpdate};
 use crate::lookup;
 use crate::pins::Pins;
 use crate::pool::Pool;
-use crate::protocol::{
-    Answer, ControlFrame, FrameReader, FrameWriter, Query, ReceiverHello, die_data,
-};
+use crate::protocol::{Answer, ControlFrame, ExchangeFrame, Query, frame};
 use crate::roots::{self, Location};
 use crate::scanner::{Frame, Lookahead, Scanner};
 use crate::segments::Directory;
-use crate::settings::RunSettings;
+use crate::settings::{Deduplicated, RunSettings};
 use crate::spool::{Spool, Taken};
-use crate::stream::{Frames, Item, PlainFrames, READ_SIZE, Stop};
+use crate::stream::{Frames, Item, READ_SIZE, Stop};
 use crate::update;
 
 /// The data queue holds `max(1, QUEUED_BYTES / B)` frames; each frame
@@ -75,20 +76,20 @@ enum Piece {
     Idle,
 }
 
-/// The scanner of one stream, ready to start: the hash table of its
-/// receiver's list, its receiver's block size and strong hash, and the
-/// settings of the run (DESIGN.md §6.3), with the resources that those
-/// settings size, its reserved lookahead buffer and its probe threads, and
-/// with the channels of its sender role: the queue of the answers, and its
-/// own sender of the control writer's queue, for its queries. That sender
-/// keeps the control writer alive until the scan ends, whatever the host
-/// does with its own.
-pub struct Scan {
-    table: HashTable,
+/// The scanner of one stream, ready to start: its receiver's block size and
+/// strong hash, and the settings of the run (DESIGN.md §6.3), with the
+/// resources that those settings size, its reserved lookahead buffer and its
+/// probe threads; the updates of its table, which the sender's side of the
+/// list exchange gives; and the channels of its sender role: the queue of
+/// the answers, and its own sender of the control writer's queue, for its
+/// queries. That sender keeps the control writer alive until the scan
+/// ends, whatever the host does with its own.
+struct Scan {
     block_size: u32,
     strong: StrongHash,
     resources: ScanResources,
     negative_cache: u64,
+    table: Feed,
     answers: Receiver<Answer>,
     control: Sender<ControlFrame>,
 }
@@ -96,9 +97,9 @@ pub struct Scan {
 /// What the scanner of a stream holds of this host for the whole stream:
 /// its lookahead buffer and its probe threads. The client sets their sizes
 /// with `--lookahead` and `--probe-threads`, to any value, so the sender
-/// takes them before its HELLO: a host that cannot provide them ends the
-/// run there, before the command starts (DESIGN.md §6.2), and not in the
-/// middle of the stream.
+/// takes them at the receiver's HELLO, before the scanner starts: a host
+/// that cannot provide them ends the run there (DESIGN.md §6.2), and not in
+/// the middle of the stream.
 struct ScanResources {
     lookahead: Lookahead,
     /// The probe threads, which end with the scanner's thread, which joins
@@ -124,6 +125,52 @@ impl ScanResources {
     }
 }
 
+/// The table of a scanner while the list exchange of its stream runs
+/// (DESIGN.md §6.3): the updates that the sender's side of the exchange
+/// gives, until it ends, and whether the scanner waits for the whole table
+/// before it scans, with `--wait`.
+struct Feed {
+    /// The updates; `None` once the exchange has given every update.
+    updates: Option<Receiver<TableUpdate>>,
+    /// A table came. An exchange that ended with HASHNONE gives none.
+    has_table: bool,
+    wait: bool,
+}
+
+impl Feed {
+    /// Give `scanner` every update that has come. True when one came, or
+    /// when the exchange has given its last.
+    fn apply(&mut self, scanner: &mut Scanner) -> bool {
+        let Some(updates) = &self.updates else {
+            return false;
+        };
+        let mut progress = false;
+        loop {
+            match updates.try_recv() {
+                Ok(TableUpdate::Table(table)) => {
+                    scanner.set_table(table);
+                    self.has_table = true;
+                }
+                Ok(TableUpdate::Values(values)) => scanner.insert(&values),
+                Err(TryRecvError::Empty) => return progress,
+                Err(TryRecvError::Disconnected) => {
+                    self.updates = None;
+                    return true;
+                }
+            }
+            progress = true;
+        }
+    }
+
+    /// True when the scanner may scan: at once without `--wait`, and with
+    /// it once the table is whole. Without a table, after HASHNONE, the
+    /// receiver's stream has ended or stopped before the target, and the
+    /// scanner then waits for the stop.
+    fn ready(&self) -> bool {
+        !self.wait || (self.updates.is_none() && self.has_table)
+    }
+}
+
 /// The threads of the sender's dedup block, for their join at the normal
 /// end.
 pub struct Scanning {
@@ -137,25 +184,6 @@ impl Scanning {
             .join()
             .expect("the lookahead reader panicked");
         self.scanner.join().expect("the scanner panicked");
-    }
-}
-
-/// The encoder of a sending end (DESIGN.md §6.6), which its data writer
-/// takes: the scanner of a deduplicated stream, with `scan`, or for a plain
-/// stream, the bytes of `spool` as they are. `stop` is the stop of the
-/// stream on this host. Returns the scanner's threads too, for their join
-/// at the end of the run.
-pub fn encoder(
-    scan: Option<Scan>,
-    spool: Spool,
-    stop: Stop,
-) -> (Box<dyn Frames + Send>, Option<Scanning>) {
-    match scan {
-        Some(scan) => {
-            let (items, scanning) = start_scan(scan, spool, stop);
-            (Box::new(items), Some(scanning))
-        }
-        None => (Box::new(PlainFrames::new(spool)), None),
     }
 }
 
@@ -177,11 +205,11 @@ fn start_scan(scan: Scan, spool: Spool, stop: Stop) -> (DataItems, Scanning) {
         .name("scanner".into())
         .spawn(move || {
             let Scan {
-                table,
                 block_size,
                 strong,
                 resources,
                 negative_cache,
+                mut table,
                 answers,
                 control,
             } = scan;
@@ -190,7 +218,7 @@ fn start_scan(scan: Scan, spool: Spool, stop: Stop) -> (DataItems, Scanning) {
                 probe_pool,
             } = resources;
             let mut scanner = Scanner::new(
-                table,
+                HashTable::empty(),
                 block_size,
                 strong,
                 lookahead,
@@ -205,6 +233,7 @@ fn start_scan(scan: Scan, spool: Spool, stop: Stop) -> (DataItems, Scanning) {
                 &mut scanner,
                 &piece_rx,
                 &answers,
+                &mut table,
                 &mut data,
                 &control,
                 &stop,
@@ -382,17 +411,20 @@ impl Frames for DataItems {
 }
 
 /// Run the scanner until the stream is emitted (DESIGN.md §6.3). Each round
-/// takes the waiting answers first, then the stream's bytes and its idle
-/// points while the scanner's buffer has room, then scans, sends the tail
-/// before an idle point when the data writer is idle, and queues ready
-/// frames while the data queue has room. A round that moves nothing waits
-/// for an answer, bytes, room in the data queue, or, while a tail waits, an
-/// idle data writer, and for `stop`. The queries go to `control`, the queue
-/// of the control writer. True at the end of the stream, false at the stop.
+/// takes the updates of the table first, then the waiting answers, then the
+/// stream's bytes and its idle points while the scanner's buffer has room.
+/// Once `table` is ready, which with `--wait` takes the whole table, it
+/// scans, sends the tail before an idle point when the data writer is
+/// idle, and queues ready frames while the data queue has room. A round
+/// that moves nothing waits for an update, an answer, bytes, room in the
+/// data queue, or, while a tail waits, an idle data writer, and for `stop`.
+/// The queries go to `control`, the queue of the control writer. True at
+/// the end of the stream, false at the stop.
 fn transfer(
     scanner: &mut Scanner,
     pieces: &Receiver<Piece>,
     answers: &Receiver<Answer>,
+    table: &mut Feed,
     data: &mut DataQueue,
     control: &Sender<ControlFrame>,
     stop: &Stop,
@@ -406,7 +438,9 @@ fn transfer(
         if stop.is_raised() {
             return false;
         }
-        let mut progress = false;
+        // The values that have arrived go into the table before the next
+        // scan, so that it finds every block that they can find.
+        let mut progress = table.apply(scanner);
         for answer in answers.try_iter() {
             scanner.answer(answer.offset, answer.found);
             progress = true;
@@ -423,26 +457,30 @@ fn transfer(
             }
             progress = true;
         }
-        progress |= scanner.scan(&mut |offset, strong| {
-            // The control writer ends only after this producer.
-            let _ = control.send(ControlFrame::Query(Query { offset, strong }));
-        });
-        // The tail before an idle point leaves only when it can leave at
-        // once. While the data writer is busy, as on a slow link, the tail
-        // waits, and bytes that arrive meanwhile can fill its windows
-        // (DESIGN.md §6.3).
-        if scanner.tail_waits() && data.writer_idle() {
-            scanner.send_tail();
-            progress = true;
-        }
         // This thread is the queue's only producer, so a queue with room
         // keeps it. Only a queue that is full before this attempt can hold
         // back a ready frame, so only then does the wait include room.
         let full = data.is_full();
-        progress |= queue_frames(scanner, data);
+        let scanning = table.ready();
+        if scanning {
+            progress |= scanner.scan(&mut |offset, strong| {
+                // The control writer ends only after this producer.
+                let _ = control.send(ControlFrame::Query(Query { offset, strong }));
+            });
+            // The tail before an idle point leaves only when it can leave
+            // at once. While the data writer is busy, as on a slow link, the
+            // tail waits, and bytes that arrive meanwhile can fill its
+            // windows (DESIGN.md §6.3).
+            if scanner.tail_waits() && data.writer_idle() {
+                scanner.send_tail();
+                progress = true;
+            }
+            progress |= queue_frames(scanner, data);
+        }
         if progress {
             continue;
         }
+        // An empty stream has nothing to scan, also before the table.
         if scanner.finished() {
             return true;
         }
@@ -450,15 +488,19 @@ fn transfer(
         select.recv(answers);
         // The receiver sends no answer after the stop, and the scanner can
         // wait for one alone: when its lookahead is full and the window at
-        // its front waits for an answer.
+        // its front waits for an answer. A scanner that waits for its table
+        // waits for the stop too.
         select.recv(stop.signal());
+        if let Some(updates) = &table.updates {
+            select.recv(updates);
+        }
         if reading && scanner.has_room() {
             select.recv(pieces);
         }
-        if full {
+        if scanning && full {
             select.send(&data.items);
         }
-        if scanner.tail_waits() {
+        if scanning && scanner.tail_waits() {
             select.recv(&data.wakes);
         }
         select.ready();
@@ -509,24 +551,29 @@ fn read_lookahead(mut spool: Spool, pieces: &Sender<Piece>) {
 
 /// The sender's role in a deduplicated stream (DESIGN.md §5.6 and §6.3),
 /// from the start of the run: the queue of the answers, which the control
-/// reader fills once the stream runs, and the role's own sender of the
-/// control writer's queue, for the queries of its scanner. The role's list
-/// exchange gives the stream's `Scan`.
+/// reader fills once the stream runs, the link of its side of the list
+/// exchange, and the role's own sender of the control writer's queue, for
+/// the queries of its scanner.
 pub struct Sending {
     answers: (Sender<Answer>, Receiver<Answer>),
+    /// The end of the link where the control reader passes the frames of
+    /// the receiver's side of the exchange.
+    frames: Sender<ExchangeFrame>,
+    link: Link,
     control: Sender<ControlFrame>,
-    /// The other host, as the messages about the data session name it.
-    peer: &'static str,
 }
 
 impl Sending {
     /// The sender's role, with its own sender of `control`, the queue of
-    /// this host's control writer.
-    pub fn new(control: &Sender<ControlFrame>, peer: &'static str) -> Sending {
+    /// this host's control writer, and `output`, the queue of that writer
+    /// for the frames of this side of the list exchange.
+    pub fn new(control: &Sender<ControlFrame>, output: Sender<ExchangeFrame>) -> Sending {
+        let (frames, input) = unbounded();
         Sending {
             answers: unbounded(),
+            frames,
+            link: Link::new(input, output),
             control: control.clone(),
-            peer,
         }
     }
 
@@ -535,113 +582,153 @@ impl Sending {
         self.answers.0.clone()
     }
 
-    /// The first step of the sender's list exchange (DESIGN.md §5.6): read
-    /// the receiver's HELLO from `input`. `lookahead` then gives the
+    /// Where the control reader passes the frames of the receiver's side of
+    /// the list exchange.
+    pub fn frames(&self) -> Sender<ExchangeFrame> {
+        self.frames.clone()
+    }
+
+    /// Start the sender's role at the receiver's HELLO, `hello`, the payload
+    /// of the frame (DESIGN.md §5.6 and §6.3), which ends the run if this
+    /// build does not support its hashes. `lookahead` then gives the
     /// scanner's lookahead for the receiver's block size, or ends the run.
     /// Then this side takes the scanner's lookahead buffer and probe
-    /// threads, or ends the run, and only then sends its HELLO on `output`,
-    /// with the lists of the cache when `settings` keep sender caching. A
-    /// failure of the session ends the run.
-    pub fn start<R: Read, W: Write>(
+    /// threads, or ends the run, and starts the scanner of the stream on
+    /// `spool`, with an empty table, at once, or with `--wait` once its
+    /// table is whole. `stop` is the stop of the stream on this host. Then
+    /// it starts the sender's side of the list exchange, on a thread of its
+    /// own, with the sender caching of `settings` and the list cache's
+    /// `max_age`, which gives the scanner its table. Returns the stream's
+    /// encoder, for its data writer, and the threads.
+    pub fn start(
         self,
-        input: &mut FrameReader<R>,
-        output: &mut FrameWriter<W>,
+        hello: &[u8],
+        spool: Spool,
+        stop: Stop,
         settings: &RunSettings,
+        max_age: u64,
         lookahead: impl FnOnce(u32) -> u64,
-    ) -> SendingExchange {
-        let accept = |receiver: &ReceiverHello| {
-            let block_size = receiver.block_size;
-            ScanResources::take(lookahead(block_size), block_size, settings)
-        };
-        let (exchange, resources) =
-            SenderExchange::start(input, output, settings.sender_cache, accept)
-                .unwrap_or_else(|e| die_data(self.peer, &e));
-        SendingExchange {
-            exchange,
+    ) -> (DataItems, SendingThreads) {
+        let hello = list_exchange::read_hello(hello);
+        let block_size = hello.block_size;
+        let resources = ScanResources::take(lookahead(block_size), block_size, settings);
+        let (table_tx, table_rx) = unbounded();
+        let scan = Scan {
+            block_size,
+            strong: hello.strong_hash,
             resources,
+            negative_cache: settings.negative_cache,
+            table: Feed {
+                updates: Some(table_rx),
+                has_table: false,
+                wait: settings.wait,
+            },
             answers: self.answers.1,
             control: self.control,
-            peer: self.peer,
-        }
+        };
+        let (items, scanning) = start_scan(scan, spool, stop);
+        let link = self.link;
+        let (strong, sender_cache) = (hello.strong_hash, settings.sender_cache);
+        let exchange = std::thread::Builder::new()
+            .name("sender".into())
+            .spawn(move || list_exchange::send(&link, strong, sender_cache, max_age, table_tx))
+            .expect("cannot start the sender's list exchange");
+        let threads = SendingThreads { exchange, scanning };
+        (items, threads)
     }
 }
 
-/// The sender's role during its list exchange, after its HELLO.
-pub struct SendingExchange {
-    exchange: SenderExchange,
-    resources: ScanResources,
-    answers: Receiver<Answer>,
-    control: Sender<ControlFrame>,
-    peer: &'static str,
+/// The threads of the sender's role, for their join at the normal end: its
+/// side of the list exchange, and its dedup block.
+pub struct SendingThreads {
+    exchange: JoinHandle<ListBytes>,
+    scanning: Scanning,
 }
 
-impl SendingExchange {
-    /// The rest of the sender's list exchange, up to CACHE_RESULT, with the
-    /// list cache's `max_age` (DESIGN.md §5.6). Returns the stream's scanner
-    /// with the scan settings of `settings`, and the bytes of the lists
-    /// received. A failure of the session ends the run.
-    pub fn finish<R: Read, W: Write>(
-        self,
-        input: &mut FrameReader<R>,
-        output: &mut FrameWriter<W>,
-        settings: &RunSettings,
-        max_age: u64,
-    ) -> (Scan, ListBytes) {
-        let (block_size, strong) = (
-            self.exchange.receiver.block_size,
-            self.exchange.receiver.strong_hash,
-        );
-        let (table, lists) = self
+impl SendingThreads {
+    /// Join the threads, once the list exchange and the stream have ended.
+    /// Returns the bytes of the lists received.
+    pub fn join(self) -> ListBytes {
+        let lists = self
             .exchange
-            .finish(input, output, max_age)
-            .unwrap_or_else(|e| die_data(self.peer, &e));
-        let scan = Scan {
-            table,
-            block_size,
-            strong,
-            resources: self.resources,
-            negative_cache: settings.negative_cache,
-            answers: self.answers,
-            control: self.control,
-        };
-        (scan, lists)
+            .join()
+            .expect("the sender's list exchange panicked");
+        self.scanning.join();
+        lists
+    }
+}
+
+/// How the receiver of a run gets its index ready, which the lock rule of
+/// DESIGN.md §4.4 decides: an update waits for nothing else while it holds
+/// its exclusive lock, and no run waits for an exclusive lock while it holds
+/// a shared one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Preparation {
+    /// With `--no-update`: open the index read-only, as it is.
+    Open,
+    /// The only update of the run: update the index, and keep it read-only
+    /// on the same lock, so that no modifying process comes between the
+    /// update and the use of the index.
+    UpdateAndKeep,
+    /// Both hosts update their index, at the same time: update it, and
+    /// release it, because the other host can still be waiting for the
+    /// exclusive lock of its own update then. Open it again, read-only, once
+    /// that update is done too (steps L1 and L2).
+    UpdateAndReopen,
+}
+
+impl Preparation {
+    /// The preparation for a run with `--no-update` (`no_update`) or
+    /// without it, whose `deduplicated` streams tell whether the other host
+    /// updates an index of its own too.
+    fn of(no_update: bool, deduplicated: Deduplicated) -> Self {
+        match (no_update, deduplicated) {
+            (true, _) => Preparation::Open,
+            (false, Deduplicated::Both) => Preparation::UpdateAndReopen,
+            (false, Deduplicated::Stdin | Deduplicated::Stdout) => Preparation::UpdateAndKeep,
+        }
     }
 }
 
 /// The receiver's role in a deduplicated stream (DESIGN.md §4.4, §5.6 and
 /// §6.4), from the start of the run: the pins, which hold the blocks that
-/// the lookups find, and the queue of the lookup workers, which the control
-/// reader fills once the stream runs. The stop of the stream on the
-/// receiving host holds the pins from the start too, to put the receiver
-/// into Completing. The index, once prepared, gives the hash list that the
-/// list exchange hands the sender.
+/// the lookups find, the queue of the lookup workers, which the control
+/// reader fills once the stream runs, and the link of its side of the list
+/// exchange. The stop of the stream on the receiving host holds the pins
+/// from the start too, to put the receiver into Completing.
 pub struct Receiving {
     pins: Arc<Pins>,
     queries: (Sender<Query>, Receiver<Query>),
-    /// The other host, as the messages about the data session name it.
-    peer: &'static str,
+    /// The end of the link where the control reader passes the frames of
+    /// the sender's side of the exchange, and the peer's UPDATED.
+    frames: Sender<ExchangeFrame>,
+    link: Link,
 }
 
 impl Receiving {
     /// The receiver's role for the host's index, whose block size and
     /// strong hash `config` gives, with its pins in `tmp_data`, which
-    /// answer on `control`, the queue of this host's control writer.
+    /// answer on `control`, the queue of this host's control writer, and
+    /// `output`, the queue of that writer for the frames of this side of
+    /// the list exchange.
     pub fn new(
         config: &Config,
         tmp_data: &Arc<Directory>,
         control: &Sender<ControlFrame>,
-        peer: &'static str,
-    ) -> Receiving {
+        output: Sender<ExchangeFrame>,
+    ) -> Self {
         let pins = Pins::new(
             Arc::clone(tmp_data),
             config.strong_hash,
             config.block_size,
             control.clone(),
         );
+        let (frames, input) = unbounded();
         Receiving {
             pins: Arc::new(pins),
             queries: unbounded(),
-            peer,
+            frames,
+            link: Link::new(input, output),
         }
     }
 
@@ -655,142 +742,122 @@ impl Receiving {
         self.queries.0.clone()
     }
 
-    /// Prepare the receiver's index for one run, as DESIGN.md §4.4 orders
-    /// it: update it and keep it read-only with a shared lock, or with
-    /// `no_update`, open it read-only. Its hash list waits for the HELLO
-    /// (`ReceivingIndex::hello`).
-    pub fn prepare(self, config: &Config, no_update: bool) -> ReceivingIndex {
-        let (index, locations) = open_index(config, no_update);
-        ReceivingIndex {
-            receiving: self,
-            index: Some(index),
-            locations,
-        }
+    /// Where the control reader passes the frames of the sender's side of
+    /// the list exchange, and the peer's UPDATED.
+    pub fn frames(&self) -> Sender<ExchangeFrame> {
+        self.frames.clone()
     }
 
-    /// Update the receiver's index for one run, then close it, which
-    /// releases its lock until the receiver's HELLO opens the index again
-    /// (`ReceivingIndex::hello`). This is the client's step in a run with
-    /// both streams deduplicated: the run must hold no lock while the
-    /// server waits for the exclusive lock of its own update, or two such
-    /// runs in opposite directions between the same hosts would each hold
-    /// one index and wait for the other (DESIGN.md §4.4).
-    pub fn update_and_release(self, config: &Config) -> ReceivingIndex {
-        let (index, locations) = update::perform(config, false, None);
-        index.close();
-        ReceivingIndex {
-            receiving: self,
-            index: None,
-            locations,
-        }
-    }
-}
-
-/// The receiver's role once its index is prepared, until its HELLO.
-pub struct ReceivingIndex {
-    receiving: Receiving,
-    /// The index, read-only with a shared lock, or `None` for the client of
-    /// a run with both streams deduplicated, whose index stays closed
-    /// between its update and its HELLO.
-    index: Option<Index>,
-    /// The current locations of the roots, from which the lookups read
-    /// candidate blocks.
-    locations: Vec<Location>,
-}
-
-impl ReceivingIndex {
-    /// The first step of the receiver's list exchange (DESIGN.md §5.6):
-    /// send its HELLO on `output`, with the block size and the hashes of
-    /// `config`, which are the stream's, and the ID of the index, and start
-    /// the export of the index's hash list. Then start the lookups, which
-    /// take over the index, and answer the queries as soon as they arrive.
-    /// An index that `update_and_release` released opens again first,
-    /// read-only with a shared lock: another process can have changed it
-    /// meanwhile. If that process rebuilt it with other settings, so that
-    /// it no longer matches `config`, the run ends with `die`, as a run
-    /// with `--no-update` does (DESIGN.md §4.4). A failure of the session
-    /// ends the run.
-    ///
-    /// For an index that `update_and_release` released, call this only
-    /// once the server's update is done, which the forward stream's list
-    /// exchange shows: the reopen takes this index's lock, and a run that
-    /// held it while the server waits for the exclusive lock of its update
-    /// could deadlock with a run in the opposite direction (DESIGN.md §4.4,
-    /// step L1).
-    pub fn hello<W: Write>(
+    /// Start the receiver's role on a thread of its own: prepare the index
+    /// of `config` for the run, with the `--no-update` and sender caching of
+    /// `settings`, and with the other host when both streams are
+    /// `deduplicated`, since it then updates an index of its own at the same
+    /// time (DESIGN.md §4.4). Then start the lookups, which take over the
+    /// index and answer the queries as soon as they arrive, and run the
+    /// receiver's side of the list exchange (DESIGN.md §5.6), unless the
+    /// stream has ended or stopped by then.
+    pub fn start(
         self,
-        output: &mut FrameWriter<W>,
-        config: &Config,
-    ) -> ReceivingExchange {
-        let ReceivingIndex {
-            receiving,
-            index,
-            locations,
-        } = self;
-        let peer = receiving.peer;
-        let index = index.unwrap_or_else(|| open_read_only(config));
-        let meta = index.read_meta().expect("the index lost its metadata");
-        let exchange = ReceiverExchange::start(output, config, meta.index_id, index.reader())
-            .unwrap_or_else(|e| die_data(peer, &e));
-        let workers = lookup::start(
-            index,
-            locations,
-            &receiving.pins,
-            config,
-            receiving.queries.1,
-        );
-        ReceivingExchange {
-            lookups: Lookups {
-                pins: receiving.pins,
-                workers,
-            },
-            exchange,
-            peer,
-        }
-    }
-}
-
-/// The receiver's role during its list exchange, after its HELLO.
-pub struct ReceivingExchange {
-    lookups: Lookups,
-    exchange: ReceiverExchange,
-    peer: &'static str,
-}
-
-impl ReceivingExchange {
-    /// The rest of the receiver's list exchange, up to CACHE_RESULT, with
-    /// sender caching as `settings` say, and the list cache's `max_age`
-    /// (DESIGN.md §5.6). Returns the lookups, and the bytes of the lists
-    /// sent. A failure of the session ends the run.
-    pub fn finish<R: Read, W: Write>(
-        self,
-        input: &mut FrameReader<R>,
-        output: &mut FrameWriter<W>,
+        config: Arc<Config>,
         settings: &RunSettings,
-        max_age: u64,
+        deduplicated: Deduplicated,
+    ) -> ReceivingThread {
+        let preparation = Preparation::of(settings.no_update, deduplicated);
+        let sender_cache = settings.sender_cache;
+        let thread = std::thread::Builder::new()
+            .name("receiver".into())
+            .spawn(move || self.run(&config, preparation, sender_cache))
+            .expect("cannot start the receiver's list exchange");
+        ReceivingThread(thread)
+    }
+
+    /// The body of the role's thread (`start`). The receiver always
+    /// prepares its index, so that an update that the run needs always
+    /// happens, and an index that does not fit always ends the run. Its
+    /// side of the exchange then ends at once with HASHNONE if the stream
+    /// has ended or stopped meanwhile: the lists would have no use.
+    fn run(
+        self,
+        config: &Config,
+        preparation: Preparation,
+        sender_cache: bool,
     ) -> (Lookups, ListBytes) {
-        let lists = self
-            .exchange
-            .finish(input, output, settings.sender_cache, max_age)
-            .unwrap_or_else(|e| die_data(self.peer, &e));
-        (self.lookups, lists)
+        let Receiving {
+            pins,
+            queries,
+            frames,
+            link,
+        } = self;
+        // The control reader keeps its own end of the link.
+        drop(frames);
+        let (index, locations) = prepare(config, preparation, &link);
+        if pins.is_completing() {
+            list_exchange::send_none(&link, config.hashlist_max_age);
+            index.close();
+            let lookups = Lookups {
+                pins,
+                workers: Vec::new(),
+            };
+            return (lookups, ListBytes::default());
+        }
+        let meta = index.read_meta().expect("the index lost its metadata");
+        let exchange =
+            ReceiverExchange::start(link, config.strong_hash, meta.index_id, index.reader());
+        let workers = lookup::start(index, locations, &pins, config, queries.1);
+        let lists = exchange.finish(sender_cache, config.hashlist_max_age, || {
+            pins.is_completing()
+        });
+        (Lookups { pins, workers }, lists)
     }
 }
 
-/// The receiver's index for one run (DESIGN.md §4.4): after an update, the
-/// read-only index with a shared lock, or with `no_update`, the index
-/// opened read-only, which must match the configuration. Returns the index
+/// The thread of the receiver's role, for its join at the normal end.
+pub struct ReceivingThread(JoinHandle<(Lookups, ListBytes)>);
+
+impl ReceivingThread {
+    /// Join the thread, once the list exchange has ended. Returns the
+    /// lookups, and the bytes of the lists sent.
+    pub fn join(self) -> (Lookups, ListBytes) {
+        self.0
+            .join()
+            .expect("the receiver's list exchange panicked")
+    }
+}
+
+/// Prepare the receiver's index for one run, as `preparation` says
+/// (DESIGN.md §4.4), with the other host through `link` when both hosts
+/// update their index. Returns the index, read-only with a shared lock,
 /// with the current root locations, from which the lookups read candidate
 /// blocks.
-fn open_index(config: &Config, no_update: bool) -> (Index, Vec<Location>) {
-    if !no_update {
-        let (index, locations) = update::perform(config, false, None);
-        return (index.into_read_only(&config.index_path), locations);
+fn prepare(config: &Config, preparation: Preparation, link: &Link) -> (Index, Vec<Location>) {
+    match preparation {
+        Preparation::Open => {
+            fsops::raise_descriptor_limit();
+            let fs_cache = FsCache::new();
+            let locations = roots::expand(config, &fs_cache);
+            (open_read_only(config), locations)
+        }
+        Preparation::UpdateAndKeep => {
+            let (index, locations) = update::perform(config, false, None);
+            (index.into_read_only(&config.index_path), locations)
+        }
+        // L1. The update, then the lock goes: the other host updates its own
+        // index at the same time, and can still be waiting for its exclusive
+        // lock. A lock that this host kept could close a cycle of waits: two
+        // such runs in opposite directions between the same hosts could
+        // each hold one index while the other run's update waits for it.
+        // L2. Once the other host's update is done, the index opens again,
+        // read-only, which needs a shared lock alone. Another process can
+        // have changed the index in between, and a rebuild with other
+        // settings ends the run, as with `--no-update`.
+        Preparation::UpdateAndReopen => {
+            let (index, locations) = update::perform(config, false, None);
+            index.close();
+            link.send(frame::UPDATED, Vec::new());
+            link.expect_empty(frame::UPDATED, "UPDATED");
+            (open_read_only(config), locations)
+        }
     }
-    fsops::raise_descriptor_limit();
-    let fs_cache = FsCache::new();
-    let locations = roots::expand(config, &fs_cache);
-    (open_read_only(config), locations)
 }
 
 /// The index of `config`, opened read-only with a shared lock: with
@@ -855,6 +922,16 @@ mod tests {
     use crate::stream::write_stream;
 
     const BS: u32 = 64;
+
+    /// The table of a scanner whose list exchange has given it the whole
+    /// table already.
+    fn whole() -> Feed {
+        Feed {
+            updates: None,
+            has_table: true,
+            wait: false,
+        }
+    }
 
     /// A stop that nothing raises, for a stream that ends normally, with
     /// the spool that it would stop and the guard of that spool's
@@ -970,6 +1047,7 @@ mod tests {
                     &mut scanner,
                     &piece_rx,
                     &answer_rx,
+                    &mut whole(),
                     &mut data,
                     &query_tx,
                     &stop,
@@ -1043,6 +1121,7 @@ mod tests {
                     &mut scanner,
                     &piece_rx,
                     &answer_rx,
+                    &mut whole(),
                     &mut data,
                     &query_tx,
                     &stop,
@@ -1062,6 +1141,146 @@ mod tests {
         stop.raise();
         assert!(!scanning.join().unwrap(), "the scan ended the stream");
         assert!(matches!(items.next(), Item::Stopped));
+    }
+
+    /// A stream whose scanner waits for its table, with `--wait`, on a
+    /// thread of its own, with an empty table at first.
+    struct Waiting {
+        /// The scanner, which returns whether it ended the stream.
+        scanning: std::thread::JoinHandle<bool>,
+        /// The thread ID of the scanner.
+        tid: i32,
+        /// The bytes of the stream, which the scanner takes as they come:
+        /// a send returns once it has taken them.
+        pieces: Sender<Piece>,
+        table: Sender<TableUpdate>,
+        stop: Stop,
+        queries: Receiver<ControlFrame>,
+        answers: Sender<Answer>,
+        items: DataItems,
+        _tempdir: tempfile::TempDir,
+    }
+
+    fn waiting() -> Waiting {
+        let (stop, _spool, tempdir) = unraised();
+        let (pieces, piece_rx) = bounded(0);
+        let (answers, answer_rx) = crossbeam_channel::unbounded();
+        let (query_tx, queries) = crossbeam_channel::unbounded();
+        let (table, table_rx) = crossbeam_channel::unbounded();
+        let (mut data, items) = data_queue(16);
+        let (tid_tx, tid_rx) = bounded(1);
+        let scanning = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                tid_tx
+                    .send(rustix::thread::gettid().as_raw_nonzero())
+                    .unwrap();
+                let lookahead = Lookahead::reserve(1 << 20, BS).unwrap();
+                let mut scanner = Scanner::new(
+                    HashTable::empty(),
+                    BS,
+                    StrongHash::Blake3,
+                    lookahead,
+                    0,
+                    None,
+                );
+                let mut table = Feed {
+                    updates: Some(table_rx),
+                    has_table: false,
+                    wait: true,
+                };
+                let ended = transfer(
+                    &mut scanner,
+                    &piece_rx,
+                    &answer_rx,
+                    &mut table,
+                    &mut data,
+                    &query_tx,
+                    &stop,
+                );
+                if ended {
+                    data.end();
+                }
+                ended
+            })
+        };
+        Waiting {
+            scanning,
+            tid: tid_rx.recv().unwrap().get(),
+            pieces,
+            table,
+            stop,
+            queries,
+            answers,
+            items,
+            _tempdir: tempdir,
+        }
+    }
+
+    /// With `--wait`, the scanner scans only once its table is whole: before
+    /// that, it takes the bytes of the stream into its buffer, but sends no
+    /// frame and no query. Then the block of the list is a reference
+    /// (DESIGN.md §6.3).
+    #[test]
+    fn with_wait_the_scanner_starts_once_its_table_is_whole() {
+        let block = noise(BS as usize, 7);
+        let input = [noise(10, 8), block.clone(), noise(10, 9)].concat();
+        let mut stream = waiting();
+        stream.pieces.send(Piece::Bytes(input)).unwrap();
+        drop(stream.pieces);
+        // The scanner has the bytes. No deadline: a scanner that never waits
+        // hangs the test.
+        wait_until_parked(stream.tid);
+        assert!(stream.items.items.is_empty(), "a frame before the table");
+        assert!(stream.queries.is_empty(), "a query before the table");
+        let mut whole = HashTable::for_values(1);
+        whole.insert(WeakHasher::new(BS as usize).hash(&block));
+        stream.table.send(TableUpdate::Table(whole)).unwrap();
+        drop(stream.table);
+        let Ok(ControlFrame::Query(query)) = stream.queries.recv() else {
+            panic!("no query once the table is whole");
+        };
+        assert_eq!(query.offset, 10);
+        let yes = Answer {
+            offset: 10,
+            found: true,
+        };
+        stream.answers.send(yes).unwrap();
+        let mut frames = Vec::new();
+        loop {
+            match stream.items.next() {
+                Item::Literal(bytes) => frames.push(("literal", bytes.len())),
+                Item::Reference => frames.push(("reference", BS as usize)),
+                Item::Flush => {}
+                Item::End => break,
+                Item::Run { .. } | Item::Stopped => panic!("an unexpected item"),
+            }
+        }
+        assert_eq!(
+            frames,
+            [("literal", 10), ("reference", 64), ("literal", 10)]
+        );
+        assert!(stream.scanning.join().unwrap());
+    }
+
+    /// An exchange that ends with HASHNONE gives no table: the receiver's
+    /// stream has stopped, and the scanner that waits for its table waits
+    /// for that stop, without a frame (DESIGN.md §6.3).
+    #[test]
+    fn with_wait_a_scanner_without_a_table_waits_for_the_stop() {
+        let mut stream = waiting();
+        drop(stream.table);
+        stream.pieces.send(Piece::Bytes(noise(100, 10))).unwrap();
+        // The scanner has seen the end of the updates before it took the
+        // bytes. No deadline: a scanner that never waits hangs the test.
+        wait_until_parked(stream.tid);
+        assert!(stream.items.items.is_empty() && stream.queries.is_empty());
+        stream.stop.raise();
+        assert!(
+            !stream.scanning.join().unwrap(),
+            "the scan ended the stream"
+        );
+        assert!(matches!(stream.items.next(), Item::Stopped));
     }
 
     /// At the stop, the data writer of the forward stream takes none of the

@@ -103,52 +103,125 @@ pub fn decode_with<T>(
     start: impl FnOnce(usize) -> T,
     mut add: impl FnMut(&mut T, u64),
 ) -> Result<T, String> {
-    if bytes.len() < HEADER_LEN {
-        return Err("truncated header".into());
-    }
-    let n = u64::from_le_bytes(bytes[..HEADER_LEN].try_into().unwrap());
-    let k = rice_k(n);
-    let body = &bytes[HEADER_LEN..];
-    // Each value takes at least one bit, so this also bounds `n` before
-    // any allocation.
-    if n > body.len() as u64 * 8 {
+    let mut decoder = ListDecoder::start(bytes).ok_or("truncated header")?;
+    // This bounds the number of values before anything is allocated for
+    // them.
+    if !decoder.fits(bytes) {
         return Err("more values than encoded bits".into());
     }
-    let mut reader = BitReader::new(body);
-    let mut values = start(n as usize);
-    let mut previous: Option<u64> = None;
-    for _ in 0..n {
-        let quotient = reader.unary().ok_or("truncated value")?;
-        let remainder = reader.bits(u32::from(k)).ok_or("truncated value")?;
-        let gap = if k == 64 {
-            if quotient != 0 {
-                return Err("gap overflows the value width".into());
-            }
-            remainder
-        } else {
-            if quotient > u64::MAX >> k {
-                return Err("gap overflows the value width".into());
-            }
-            (quotient << k) | remainder
-        };
-        let value = match previous {
-            None => gap,
-            Some(p) => p
-                .checked_add(gap)
-                .and_then(|v| v.checked_add(1))
-                .ok_or("values overflow the value width")?,
-        };
-        previous = Some(value);
-        add(&mut values, value);
-    }
-    // The last byte is padded with zeros and nothing may follow it.
-    if !reader.rest_is_zero_padding() {
-        return Err("non-zero padding".into());
-    }
-    if body.len() != reader.bytes_consumed() {
-        return Err("excess bytes after the last value".into());
-    }
+    let mut values = start(decoder.len());
+    decoder.decode(bytes, |value| add(&mut values, value))?;
+    decoder.finish(bytes)?;
     Ok(values)
+}
+
+/// Decodes a canonical list while its bytes arrive (DESIGN.md §5.4). This
+/// type exists so that the sender can add the values of a full list to its
+/// hash table before the rest of the list has arrived (DESIGN.md §6.3). It
+/// decodes each value once all its bits are in, and keeps its place
+/// between calls; `finish` makes the checks that need the whole list. Each
+/// call takes all the bytes of the list so far, header included, which
+/// the caller keeps anyway, for the digest of the list.
+pub struct ListDecoder {
+    /// `N`, from the header.
+    n: u64,
+    k: u8,
+    /// The values decoded so far.
+    decoded: u64,
+    /// The next bit of the body to decode.
+    position: usize,
+    /// The last value decoded.
+    previous: Option<u64>,
+}
+
+impl ListDecoder {
+    /// The decoder of the list whose first bytes are `bytes`, once they
+    /// hold its header; `None` before.
+    pub fn start(bytes: &[u8]) -> Option<ListDecoder> {
+        let header = bytes.get(..HEADER_LEN)?;
+        let n = u64::from_le_bytes(header.try_into().unwrap());
+        Some(ListDecoder {
+            n,
+            k: rice_k(n),
+            decoded: 0,
+            position: 0,
+            previous: None,
+        })
+    }
+
+    /// The number of values of the list, `N`. It saturates where `N` does
+    /// not fit a `usize`, which only a list that `fits` never does.
+    pub fn len(&self) -> usize {
+        usize::try_from(self.n).unwrap_or(usize::MAX)
+    }
+
+    /// True when `bytes`, the bytes of the list so far, could hold all its
+    /// values: each takes at least one bit. A corrupt header can announce
+    /// any number of values, so a reader that allocates for them waits for
+    /// this, and memory grows only as bytes arrive (DESIGN.md §3).
+    pub fn fits(&self, bytes: &[u8]) -> bool {
+        let body = bytes.len().saturating_sub(HEADER_LEN) as u64;
+        self.n <= body.saturating_mul(8)
+    }
+
+    /// Decode the values whose bits `bytes`, the bytes of the list so far,
+    /// hold in full, and give each to `add`, in order. A value whose bits
+    /// are not all in waits for the next call. An error names a deviation
+    /// from the canonical form that no later byte can mend.
+    pub fn decode(&mut self, bytes: &[u8], mut add: impl FnMut(u64)) -> Result<(), String> {
+        let k = self.k;
+        let mut reader = BitReader::at(&bytes[HEADER_LEN..], self.position);
+        while self.decoded < self.n {
+            // A read that runs past the bytes so far can have moved the
+            // reader; the next call starts again at the value's first bit.
+            let Some(quotient) = reader.unary() else {
+                break;
+            };
+            let Some(remainder) = reader.bits(u32::from(k)) else {
+                break;
+            };
+            let gap = if k == 64 {
+                if quotient != 0 {
+                    return Err("gap overflows the value width".into());
+                }
+                remainder
+            } else {
+                if quotient > u64::MAX >> k {
+                    return Err("gap overflows the value width".into());
+                }
+                (quotient << k) | remainder
+            };
+            let value = match self.previous {
+                None => gap,
+                Some(p) => p
+                    .checked_add(gap)
+                    .and_then(|v| v.checked_add(1))
+                    .ok_or("values overflow the value width")?,
+            };
+            self.previous = Some(value);
+            self.decoded += 1;
+            self.position = reader.position;
+            add(value);
+        }
+        Ok(())
+    }
+
+    /// The end of the list, once `bytes` holds all of it: every value must
+    /// have been decoded, and the canonical end must follow the last one:
+    /// a last byte padded with zeros, and nothing after it.
+    pub fn finish(&self, bytes: &[u8]) -> Result<(), String> {
+        if self.decoded < self.n {
+            return Err("truncated value".into());
+        }
+        let reader = BitReader::at(&bytes[HEADER_LEN..], self.position);
+        if !reader.rest_is_zero_padding() {
+            return Err("non-zero padding".into());
+        }
+        if reader.body.len() != reader.bytes_consumed() {
+            return Err("excess bytes after the last value".into());
+        }
+        Ok(())
+    }
 }
 
 /// The delta from `base` to `target`, both sorted and distinct: the values
@@ -276,8 +349,9 @@ struct BitReader<'a> {
 }
 
 impl BitReader<'_> {
-    fn new(body: &[u8]) -> BitReader<'_> {
-        BitReader { body, position: 0 }
+    /// A reader of `body` from bit `position` on.
+    fn at(body: &[u8], position: usize) -> BitReader<'_> {
+        BitReader { body, position }
     }
 
     /// The number of bits not read yet.
@@ -533,7 +607,101 @@ pub(crate) mod tests {
         out
     }
 
+    /// Decode `bytes` as a `ListDecoder` does while they arrive, in the
+    /// pieces that end at `cuts`, and check the end. Returns the values
+    /// that the decoder gave, or its error.
+    fn decode_in_pieces(bytes: &[u8], cuts: &[usize]) -> Result<Vec<u64>, String> {
+        let mut ends: Vec<usize> = cuts.iter().map(|cut| cut % (bytes.len() + 1)).collect();
+        ends.push(bytes.len());
+        ends.sort_unstable();
+        let (mut decoder, mut values) = (None, Vec::new());
+        for end in ends {
+            let arrived = &bytes[..end];
+            if decoder.is_none() {
+                decoder = ListDecoder::start(arrived);
+            }
+            if let Some(decoder) = &mut decoder {
+                decoder.decode(arrived, |value| values.push(value))?;
+            }
+        }
+        decoder.ok_or("truncated header")?.finish(bytes)?;
+        Ok(values)
+    }
+
+    /// The values come out of a decoder as soon as their bits are in, and
+    /// each one once: here the list arrives a byte at a time.
+    #[test]
+    fn each_value_comes_out_once_its_bits_are_in() {
+        let values = [3, 70, 700, 7000];
+        let encoded = encode(&values);
+        let mut decoder = ListDecoder::start(&encoded[..HEADER_LEN]).unwrap();
+        assert_eq!(decoder.len(), 4);
+        let mut seen = Vec::new();
+        for end in HEADER_LEN..=encoded.len() {
+            decoder
+                .decode(&encoded[..end], |value| seen.push((end, value)))
+                .unwrap();
+        }
+        decoder.finish(&encoded).unwrap();
+        let decoded: Vec<u64> = seen.iter().map(|&(_, value)| value).collect();
+        assert_eq!(decoded, values);
+        assert!(
+            seen[0].0 < encoded.len(),
+            "the first value waited for the end"
+        );
+        assert!(ListDecoder::start(&encoded[..HEADER_LEN - 1]).is_none());
+    }
+
+    /// A corrupt header can announce more values than the bytes can hold:
+    /// the reader waits until enough bytes have arrived before it allocates
+    /// for them (DESIGN.md §3).
+    #[test]
+    fn a_list_fits_its_values_only_once_enough_bytes_are_in() {
+        let encoded = encode(&(0..64).map(|i| i << 58).collect::<Vec<u64>>());
+        let decoder = ListDecoder::start(&encoded).unwrap();
+        assert!(!decoder.fits(&encoded[..HEADER_LEN + 7]));
+        assert!(decoder.fits(&encoded[..HEADER_LEN + 8]));
+        let huge = ListDecoder::start(&u64::MAX.to_le_bytes()).unwrap();
+        assert!(!huge.fits(&[0; 1024]));
+    }
+
     proptest! {
+        /// A list decodes to the same values whatever pieces it arrives in.
+        #[test]
+        fn a_list_decodes_the_same_in_any_pieces(
+            values in proptest::collection::vec(any::<u64>(), 0..300),
+            dense in proptest::collection::vec(0u64..2000, 0..300),
+            cuts in proptest::collection::vec(any::<usize>(), 0..20),
+        ) {
+            for values in [set(&values), set(&dense), {
+                let mut far = set(&dense);
+                far.push(u64::MAX);
+                far
+            }] {
+                prop_assert_eq!(decode_in_pieces(&encode(&values), &cuts), Ok(values));
+            }
+        }
+
+        /// A damaged list fails in pieces as it fails whole, and a list
+        /// that a damage left valid gives the same values both ways.
+        #[test]
+        fn a_damaged_list_fails_in_pieces_as_it_fails_whole(
+            values in proptest::collection::vec(0u64..5000, 0..100),
+            at in any::<usize>(),
+            byte in any::<u8>(),
+            damage in 0..3u8,
+            cuts in proptest::collection::vec(any::<usize>(), 0..20),
+        ) {
+            let mut bytes = encode(&set(&values));
+            let at = at % bytes.len();
+            match damage {
+                0 => bytes[at] ^= byte | 1,
+                1 => bytes.truncate(at),
+                _ => bytes.insert(at, byte),
+            }
+            prop_assert_eq!(decode_in_pieces(&bytes, &cuts).ok(), decode(&bytes).ok());
+        }
+
         #[test]
         fn the_encoding_matches_the_bit_by_bit_definition(
             values in proptest::collection::vec(any::<u64>(), 0..300),

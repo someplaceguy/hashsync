@@ -468,6 +468,13 @@ impl Pins {
         self.completing.clone()
     }
 
+    /// True in Completing: the stream has ended or stopped, and the lookups
+    /// have no use any more, nor has the list exchange of the stream
+    /// (DESIGN.md §5.6).
+    pub fn is_completing(&self) -> bool {
+        self.lock().completing()
+    }
+
     /// The queries that the lookups answered no after they looked their
     /// blocks up in the index, by the reason (DESIGN.md §8). The counts are
     /// final once the stream has ended or stopped: from Completing on, no

@@ -538,12 +538,12 @@ pub struct Base {
 /// lists that the target replaces, and the lists and temporaries that
 /// failed runs left. A run with another target needs the exclusive lock of
 /// the index for its update, and the receiver holds its lock from before
-/// its HELLO until after the list exchange. The sender starts its exchange
-/// after the receiver's HELLO and before its own, and ends it only after
-/// HASHLIST, HASHDELTA, or HASHKEEP, which the receiver sends only after
-/// it received the sender's HELLO. So no exchange that ends has a listing
-/// that holds the target of a later run, also when the sender outlives its
-/// receiver.
+/// INDEX until its lookups end. The sender lists its directory at INDEX,
+/// before ADVERTISE, and the receiver its own at ADVERTISE, and the
+/// receiver sends its target only if its lookups still run after both
+/// listings. The sender ends its exchange only after HASHLIST, HASHDELTA,
+/// or HASHKEEP. So no exchange that ends has a listing that holds the
+/// target of a later run, also when the sender outlives its receiver.
 ///
 /// The end of another exchange, or expiry, can remove a list at any moment,
 /// including the base that a concurrent exchange is about to read. So each
@@ -1006,10 +1006,11 @@ fn for_each_entry(dir: &Path, mut each: impl FnMut(std::fs::DirEntry)) -> std::i
 
 /// Expire the files older than `max_age` seconds in every peer/index
 /// directory of both cache trees, lists and abandoned hidden temporaries,
-/// then remove the directories that are left empty. Run after the
-/// exchange. Absence is normal; other failures are fatal, except a failed
-/// removal of an empty directory, which only warns (DESIGN.md §5.6).
-fn expire(max_age: u64) {
+/// then remove the directories that are left empty. Run at the end of each
+/// exchange, also one that HASHNONE ends. Absence is normal; other failures
+/// are fatal, except a failed removal of an empty directory, which only
+/// warns (DESIGN.md §5.6).
+pub fn expire(max_age: u64) {
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs().min(i64::MAX as u64) as i64);

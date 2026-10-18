@@ -6,29 +6,34 @@
 //! receives the command's stdout, the backward stream. One or both of them
 //! are deduplicated, each against the index of the host that receives it,
 //! and a stream that is not is plain. In a pull, the default, the backward
-//! stream is deduplicated against the client's index: before the sessions
-//! start, the client updates that index (or opens it read-only), and starts
-//! its pins; after its HELLO, it exports the index's hash list and starts
-//! its lookup workers. In a push, with `--dedup-stdin`, the forward stream
-//! is deduplicated against the server's index, and the client needs no
-//! index. With `--dedup-stdin --dedup-stdout`, both are: the client updates
-//! its index before the sessions start, releases it while the server
-//! updates its own, and opens it again for the backward stream's list
-//! exchange, which follows the forward stream's. The client sends REQUEST,
-//! with the command and every setting of the run, then runs its side of
-//! each list exchange (DESIGN.md §4.4 and §5.6).
+//! stream is deduplicated against the client's index; in a push, with
+//! `--dedup-stdin`, the forward stream against the server's, and the client
+//! needs no index; with `--dedup-stdin --dedup-stdout`, both are.
 //!
-//! Once the list exchanges are done, both streams run. The data reader
-//! takes the backward stream's CHUNK frames into that stream's spool, so
-//! that a blocked stdout does not stop the transfer until `--spool-limit`
-//! bytes wait there, and the decoder writes the stream to stdout, with the
-//! references that the pins hold when the stream is deduplicated. The
-//! stdin reader copies stdin into the forward stream's spool, which is
-//! empty with `-n`, and the forward data writer sends it, through the
-//! scanner when the stream is deduplicated. The forward stream
-//! stops at STOP, or at END. The backward stream stops once no process
-//! reads stdout any more: this side then sends STOP, and the server closes
-//! the command's stdout, as the end of the reader of a local pipeline does.
+//! The client starts the sessions at once, and sends REQUEST, with the
+//! command and every setting of the run, so that the server starts the
+//! command at once too. Both streams start then. The data reader takes the
+//! backward stream's CHUNK frames into that stream's spool, so that a
+//! blocked stdout does not stop the transfer until `--spool-limit` bytes
+//! wait there, and the decoder writes the stream to stdout, with the
+//! references that the pins hold when the stream is deduplicated. The stdin
+//! reader copies stdin into the forward stream's spool, which is empty with
+//! `-n`, and the forward data writer sends it, through the scanner when the
+//! stream is deduplicated, which starts at the server's HELLO, with an empty
+//! table.
+//!
+//! The list exchanges run while the streams run, each side on a thread of
+//! its own (DESIGN.md §5.6). As the receiver of a deduplicated backward
+//! stream, this side sends its HELLO right after REQUEST, so that the
+//! server's scanner can start, then updates its index (or opens it
+//! read-only), starts its lookup workers, and runs its side of the
+//! exchange. With both streams deduplicated, the server updates its own
+//! index at the same time, and each side keeps its index closed from the
+//! end of its update until the other's update is done too (DESIGN.md §4.4).
+//! The forward stream stops at STOP, or at END. The backward stream
+//! stops once no process reads stdout any more: this side then sends STOP,
+//! and the server closes the command's stdout, as the end of the reader of
+//! a local pipeline does.
 //!
 //! The end is orderly (DESIGN.md §6.9, steps N1 to N6). At END, the main
 //! thread stops the forward stream, closes the data session's stdin once
@@ -49,9 +54,9 @@ use crossbeam_channel::{Sender, bounded, unbounded};
 
 use crate::config::Config;
 use crate::control::{self, Dispatch, EndFlag};
-use crate::dedup::{self, Receiving, Sending};
+use crate::dedup::{Receiving, Sending};
 use crate::die::{self, die};
-use crate::list_exchange::ListBytes;
+use crate::list_exchange::{self, ListBytes};
 use crate::protocol::{
     self, Counts, End, FrameReader, FrameWriter, Request, SourceRead, die_data, flush_data, frame,
     lost, send_data,
@@ -60,7 +65,7 @@ use crate::rendezvous;
 use crate::segments::Directory;
 use crate::spool::Spool;
 use crate::ssh;
-use crate::stream::{self, Inlet, Stdout, Stop};
+use crate::stream::{self, Frames, Inlet, PlainFrames, Stdout, Stop};
 use crate::sys;
 use crate::units::Bytes;
 
@@ -80,17 +85,18 @@ static RECEIVED: AtomicU64 = AtomicU64::new(0);
 /// DESIGN.md §8).
 /// `config` is the client's configuration, whose index a deduplicated
 /// backward stream needs.
-pub fn run(config: &Config, remote: &ssh::Remote, request: &Request, no_stdin: bool) -> ! {
+pub fn run(config: Config, remote: &ssh::Remote, request: &Request, no_stdin: bool) -> ! {
     let start = Instant::now();
     // Before any other thread starts: SIGINT and SIGTERM end the run with
     // `128 + signal`, and the end kills the SSH children (DESIGN.md §6.8).
     die::handle_termination_signals();
+    let config = Arc::new(config);
     let settings = &request.settings;
     let compressed = settings.compression_level != 0;
     let deduplicated = request.deduplicated;
     // When the backward stream is deduplicated, a `--lookahead` below the
     // block size of this side's index is a user error, reported before
-    // anything else, the update included (DESIGN.md §8).
+    // anything else (DESIGN.md §8).
     if deduplicated.stdout()
         && let Err(e) = settings.lookahead(config.block_size, "the index")
     {
@@ -105,19 +111,23 @@ pub fn run(config: &Config, remote: &ssh::Remote, request: &Request, no_stdin: b
     // deduplicated backward stream, and the sender of a deduplicated forward
     // stream. With the stop of the backward stream, they are the producers
     // of the control writer's queue (see `control`).
+    // Each side has its own queue in the control writer for the frames of
+    // its list exchange, so that the frames of one never wait behind the
+    // list of the other.
     let (control_tx, control_rx) = unbounded();
+    let (receiver_out, receiver_frames) = bounded(1);
+    let (sender_out, sender_frames) = bounded(1);
     let backward = deduplicated
         .stdout()
-        .then(|| Receiving::new(config, &tmp_data, &control_tx, PEER));
+        .then(|| Receiving::new(&config, &tmp_data, &control_tx, receiver_out));
     let forward = deduplicated
         .stdin()
-        .then(|| Sending::new(&control_tx, PEER));
+        .then(|| Sending::new(&control_tx, sender_out));
 
     // The spools of both streams, and their stops, which exist before the
-    // sessions start: STOP can come at any time, also before CACHE_RESULT,
-    // and the stop of the backward stream, which this side decides, puts
-    // the receiver of a deduplicated backward stream into Completing
-    // (DESIGN.md §6.6).
+    // sessions start: STOP can come at any time, and the stop of the
+    // backward stream, which this side decides, puts the receiver of a
+    // deduplicated backward stream into Completing (DESIGN.md §6.6).
     let (forward_writer, forward_spool) = Spool::pipe(Arc::clone(&tmp_data), settings.spool_limit);
     // With `-n`, the forward stream is empty, as `ssh -n` reads `/dev/null`
     // in place of stdin: its spool ends here, before any stop can come, and
@@ -138,37 +148,18 @@ pub fn run(config: &Config, remote: &ssh::Remote, request: &Request, no_stdin: b
     );
     // The control reader passes the queries to the lookup workers of a
     // deduplicated backward stream, the answers to the scanner of a
-    // deduplicated forward stream, and STOP to the forward stream.
+    // deduplicated forward stream, STOP to the forward stream, and the
+    // frames of the exchanges to their sides.
     let dispatch = Dispatch {
         queries: backward.as_ref().map(Receiving::queries),
         answers: forward.as_ref().map(Sending::answers),
         stop: forward_stop.clone(),
+        receiver: backward.as_ref().map(Receiving::frames),
+        sender: forward.as_ref().map(Sending::frames),
     };
 
-    // The index of a deduplicated backward stream, before the sessions
-    // start: a failed update starts no remote process, and no session waits
-    // idle during the update (DESIGN.md §3 and §4.4). The index, updated and
-    // then read-only, or read-only with `--no-update`, gives the hash list,
-    // and the lookup workers own it from then on: they answer queries as
-    // soon as they arrive, and the index closes once the backward stream
-    // has ended (DESIGN.md §6.4).
-    //
-    // With a deduplicated forward stream too, this side's HELLO comes after
-    // the forward stream's list exchange, for two reasons: the exchanges
-    // come one after the other, so that their frames need no stream ID
-    // (DESIGN.md §6.2), and the server updates its index before its HELLO
-    // of the forward exchange. The run must hold no lock while the server
-    // waits for the exclusive lock of that update (DESIGN.md §4.4, step L1),
-    // so then this side's update releases its index, and its late HELLO
-    // opens it again.
-    let hello_after_forward = deduplicated.stdin();
-    let backward = backward.map(
-        |receiving| match hello_after_forward && !settings.no_update {
-            true => receiving.update_and_release(config),
-            false => receiving.prepare(config, settings.no_update),
-        },
-    );
-
+    // The sessions start at once: the update of a deduplicated backward
+    // stream's index runs while the command runs (DESIGN.md §3).
     let token = rendezvous::new_token();
     sys::reset_sigchld();
     let (data, control) = ssh::start_sessions(remote, &token);
@@ -186,9 +177,20 @@ pub fn run(config: &Config, remote: &ssh::Remote, request: &Request, no_stdin: b
             count: &SENT,
         };
         let level = settings.compression_level;
+        let exchanges = [receiver_frames, sender_frames];
         std::thread::Builder::new()
             .name("control-writer".into())
-            .spawn(move || control::write(control_stdin, level, &control_rx, &end, PEER))
+            .spawn(move || {
+                control::write(
+                    control_stdin,
+                    level,
+                    &control_rx,
+                    &exchanges,
+                    None,
+                    &end,
+                    PEER,
+                )
+            })
             .expect("cannot start the control writer")
     };
     let control_reader = {
@@ -197,9 +199,10 @@ pub fn run(config: &Config, remote: &ssh::Remote, request: &Request, no_stdin: b
             inner: control.stdout,
             count: &RECEIVED,
         };
+        let level = settings.compression_level;
         std::thread::Builder::new()
             .name("control-reader".into())
-            .spawn(move || control::read(control_stdout, compressed, &dispatch, None, &end, PEER))
+            .spawn(move || control::read(control_stdout, level, &dispatch, &end, PEER))
             .expect("cannot start the control reader")
     };
 
@@ -218,65 +221,83 @@ pub fn run(config: &Config, remote: &ssh::Remote, request: &Request, no_stdin: b
     ));
     // REQUEST follows the version and the features at once, without
     // waiting for the server's features: this build supports none, so it
-    // cannot depend on them (DESIGN.md §6.2). Without a forward exchange,
-    // this side's HELLO, as the backward stream's receiver, follows REQUEST
-    // at once too.
+    // cannot depend on them (DESIGN.md §6.2). Then the HELLO of a
+    // deduplicated backward stream, from this side's configuration: the
+    // server's scanner needs it before it scans a byte, and it reads it
+    // before it starts the command.
     if let Err(e) = data_out.send_version_and_features() {
         die_data(PEER, &e);
     }
     send_data(&mut data_out, frame::REQUEST, &request.encode(), PEER);
-    let (backward_index, backward) = match hello_after_forward {
-        true => (backward, None),
-        false => (
-            None,
-            backward.map(|index| index.hello(&mut data_out, config)),
-        ),
-    };
+    if backward.is_some() {
+        let hello = list_exchange::hello(&config);
+        send_data(&mut data_out, frame::HELLO, &hello, PEER);
+    }
     flush_data(&mut data_out, PEER);
-    read_server_version_and_features(&mut data_in, &remote.host);
 
-    // The list exchange of a deduplicated forward stream, with this side
-    // as its sender: the server's HELLO sets the block size and the hashes
-    // of the stream. A `--lookahead` below that block size is a user error,
-    // which ends the run before this side's HELLO, and so before the
-    // command starts (DESIGN.md §8).
-    let forward = forward.map(|sending| {
-        let lookahead = |block_size| {
-            let lookahead = settings.lookahead(block_size, "the server's index");
-            lookahead.unwrap_or_else(|e| die(e))
-        };
-        sending
-            .start(&mut data_in, &mut data_out, settings, lookahead)
-            .finish(
-                &mut data_in,
-                &mut data_out,
-                settings,
-                config.hashlist_max_age,
-            )
-    });
-    // The rest of the backward stream's list exchange. With both streams
-    // deduplicated, this side's HELLO goes out only now. The server's HELLO
-    // came before the forward exchange, after the server's update, so the
-    // HELLO here can open this side's index again (DESIGN.md §4.4, step
-    // L2).
-    let backward =
-        backward.or_else(|| backward_index.map(|index| index.hello(&mut data_out, config)));
-    let backward = backward.map(|exchange| {
-        exchange.finish(
-            &mut data_in,
-            &mut data_out,
-            settings,
-            config.hashlist_max_age,
-        )
-    });
-
-    // The exchange is complete, and both streams start. The data reader
-    // takes the backward stream into its spool until STREAM_END, and the
-    // decoder writes it to stdout, until the stop of the backward stream
-    // once no process reads stdout.
+    // The receiver's role of a deduplicated backward stream, while the
+    // streams run: the index, which gives the hash list and the candidates,
+    // and this side of the list exchange. With both streams deduplicated,
+    // the server updates its own index at the same time, and the run must
+    // hold no lock while the server can still wait for the exclusive lock of
+    // its update: this side releases its index after its update, and opens
+    // it again only once the server's update is done (DESIGN.md §4.4).
     let backward_pins = backward
         .as_ref()
-        .map(|(lookups, _)| Arc::clone(lookups.pins()));
+        .map(|receiving| Arc::clone(receiving.pins()));
+    let receiving =
+        backward.map(|receiving| receiving.start(Arc::clone(&config), settings, deduplicated));
+    // The stdin reader reads this process's stdin, as ssh does, from the
+    // start: its bytes wait in the spool until the forward data writer
+    // takes them.
+    let stdin_reader = forward_writer.map(|writer| {
+        let (stop, delivery) = (forward_stop.clone(), settings.stdin_delivery());
+        std::thread::Builder::new()
+            .name("stdin-reader".into())
+            .spawn(move || stream::read_stdin(rustix::stdio::stdin(), writer, &stop, delivery))
+            .expect("cannot start the stdin reader")
+    });
+    read_server_version_and_features(&mut data_in, &remote.host);
+
+    // The encoder of the forward stream. For a deduplicated forward stream,
+    // the scanner, which starts at the server's HELLO, the server's first
+    // frame: its block size and hashes are the stream's. A `--lookahead`
+    // below that block size is a user error (DESIGN.md §8). The scanner
+    // stops with the stream: it can wait for answers that the server no
+    // longer sends after the stop. Its sender's side of the list exchange
+    // then fills its table.
+    let (frames, sending): (Box<dyn Frames + Send>, _) = match forward {
+        Some(sending) => {
+            let hello = data_in
+                .expect(frame::HELLO, "HELLO")
+                .unwrap_or_else(|e| die_data(PEER, &e));
+            let lookahead = |block_size| {
+                let lookahead = settings.lookahead(block_size, "the server's index");
+                lookahead.unwrap_or_else(|e| die(e))
+            };
+            let (items, threads) = sending.start(
+                hello,
+                forward_spool,
+                forward_stop.clone(),
+                settings,
+                config.hashlist_max_age,
+                lookahead,
+            );
+            (Box::new(items), Some(threads))
+        }
+        None => (Box::new(PlainFrames::new(forward_spool)), None),
+    };
+    let forward_data_writer = {
+        let (settings, stop) = (settings.clone(), forward_stop.clone());
+        std::thread::Builder::new()
+            .name("data-writer".into())
+            .spawn(move || stream::write_stream(data_out, frames, &settings, PEER, &stop))
+            .expect("cannot start the data writer")
+    };
+
+    // The data reader takes the backward stream into its spool until
+    // STREAM_END, and the decoder writes it to stdout, until the stop of
+    // the backward stream once no process reads stdout.
     let (end_tx, end_rx) = bounded(1);
     let data_reader = {
         let (end, stop) = (Arc::clone(&end), backward_stop.clone());
@@ -296,27 +317,6 @@ pub fn run(config: &Config, remote: &ssh::Remote, request: &Request, no_stdin: b
             })
             .expect("cannot start the decoder")
     };
-    // The stdin reader reads this process's stdin, as ssh does.
-    let stdin_reader = forward_writer.map(|writer| {
-        let (stop, delivery) = (forward_stop.clone(), settings.stdin_delivery());
-        std::thread::Builder::new()
-            .name("stdin-reader".into())
-            .spawn(move || stream::read_stdin(rustix::stdio::stdin(), writer, &stop, delivery))
-            .expect("cannot start the stdin reader")
-    });
-    // The forward data writer sends the spool's bytes as they are, or for a
-    // deduplicated forward stream, the frames of the scanner, which stops
-    // with the stream: it can wait for answers that the server no longer
-    // sends after the stop.
-    let (scan, forward_lists) = forward.unzip();
-    let (frames, scanning) = dedup::encoder(scan, forward_spool, forward_stop.clone());
-    let forward_data_writer = {
-        let (settings, stop) = (settings.clone(), forward_stop.clone());
-        std::thread::Builder::new()
-            .name("data-writer".into())
-            .spawn(move || stream::write_stream(data_out, frames, &settings, PEER, &stop))
-            .expect("cannot start the data writer")
-    };
 
     // END (DESIGN.md §6.9). The data reader ends the run if the data
     // session ends before it.
@@ -332,11 +332,14 @@ pub fn run(config: &Config, remote: &ssh::Remote, request: &Request, no_stdin: b
     // N2. Close the data session's stdin once the data writer has ended,
     // then the control session's once the control writer has ended: it
     // ends once its producers are gone, the pins at their Completing, the
-    // scanner at the end of its scan, and the stop of the backward stream
-    // at its raise or at step N1, or when a write fails. Neither close
-    // waits for the EOF of a stdout: through an SSH multiplexing client, or
-    // a wrapper that waits for SSH, that EOF comes only after SSH has
-    // exited.
+    // scanner at the end of its scan, the stop of the backward stream at
+    // its raise or at step N1, and the sides of the list exchanges at their
+    // end, or when a write fails. The server ended its sides of the
+    // exchanges before END, so this side's end at once, or once the last
+    // frame of the server's side, which the control session carries,
+    // arrives. Neither close waits for the EOF of a stdout: through an SSH
+    // multiplexing client, or a wrapper that waits for SSH, that EOF comes
+    // only after SSH has exited.
     let (data_out, stdin_sent) = forward_data_writer
         .join()
         .expect("the data writer panicked");
@@ -347,7 +350,7 @@ pub fn run(config: &Config, remote: &ssh::Remote, request: &Request, no_stdin: b
     // end, or ends at the stop. Then join the other threads: the data
     // reader reads the data session to its EOF, and the control reader the
     // control session; the stdin reader and a scan ended at the stop or at
-    // the EOF of stdin.
+    // the EOF of stdin, and the sides of the list exchanges at their end.
     let mut stdout_counts = decoder.join().expect("the decoder panicked");
     let received = data_reader.join().expect("the data reader panicked");
     control_reader.join().expect("the control reader panicked");
@@ -359,9 +362,8 @@ pub fn run(config: &Config, remote: &ssh::Remote, request: &Request, no_stdin: b
             eof: true,
         },
     };
-    if let Some(scanning) = scanning {
-        scanning.join();
-    }
+    let forward_lists = sending.map(|threads| threads.join());
+    let backward = receiving.map(|thread| thread.join());
 
     // N4. Both sessions must exit successfully before the command's status
     // is returned, without reaping (DESIGN.md §6.8–6.9).
@@ -379,7 +381,6 @@ pub fn run(config: &Config, remote: &ssh::Remote, request: &Request, no_stdin: b
         lookups.close();
         lists
     });
-
     // N6.
     if end_frame.status == 127 && !end_frame.error.is_empty() {
         die::error(format!(
@@ -700,8 +701,8 @@ mod tests {
     use super::*;
     use crate::segments::Directory;
 
-    /// The server's side of the data session after the list exchange:
-    /// `frames` as frames, then `trailing` as raw bytes.
+    /// The server's side of the data session after its version and
+    /// features: `frames` as frames, then `trailing` as raw bytes.
     fn server_session(frames: &[(u8, &[u8])], trailing: &[u8]) -> Vec<u8> {
         let mut session = FrameWriter::new(Vec::new());
         for &(kind, payload) in frames {

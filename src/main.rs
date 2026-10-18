@@ -6,11 +6,14 @@
 //!
 //! This build implements PLAN.md steps 1–6: `update` and `stats` for
 //! mutable roots, and `ssh`, which deduplicates stdout by default, stdin
-//! with `--dedup-stdin`, and both with `--dedup-stdin --dedup-stdout`. A
-//! transfer reuses the hash lists of earlier transfers, replaces indexed
-//! blocks with verified references, sends runs of one byte compactly,
-//! compresses both streams, and spools both ends of each. Stdout and stdin
-//! each use eager or batch delivery.
+//! with `--dedup-stdin`, and both with `--dedup-stdin --dedup-stdout`. The
+//! command starts at once, and its streams with it; the hash lists that
+//! deduplicate them follow while they run, unless `--wait` holds each
+//! deduplicated stream until its list is in. A transfer reuses the hash
+//! lists of earlier transfers, replaces indexed blocks with verified
+//! references, sends runs of one byte compactly, compresses both streams,
+//! and spools both ends of each. Stdout and stdin each use eager or batch
+//! delivery.
 
 mod attach;
 mod blocks;
@@ -233,7 +236,7 @@ fn main() {
         Command::Ssh(args) => {
             let request = args.request(cli.quiet, cli.no_human_readable);
             let config = config::load_for_run(config_path, request.deduplicated.stdout());
-            client::run(&config, &args.remote(), &request, args.no_stdin)
+            client::run(config, &args.remote(), &request, args.no_stdin)
         }
         // The server reads its configuration once REQUEST has told it its
         // roles.

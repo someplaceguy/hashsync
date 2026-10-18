@@ -29,8 +29,13 @@ sessions. The client's stdin is the forward stream, and the command's
 stdout the backward stream; `-n` sends an empty forward stream. The
 backward stream is deduplicated against the client's index by default,
 the forward stream against the server's with `--dedup-stdin`, and both
-with `--dedup-stdin --dedup-stdout`, in which the client releases its
-index between its update and the server's (DESIGN.md §4.4). A
+with `--dedup-stdin --dedup-stdout`, in which both hosts update their
+index at the same time, and each one releases its index from the end of
+its update until the other's is done (DESIGN.md §4.4). The server
+starts the command at once, and the streams flow while each receiver
+updates its index and runs its list exchange on the control session: a
+deduplicated stream finds more blocks as more of its list arrives, and
+with `--wait`, it waits for its whole list (DESIGN.md §3 and §6.3). A
 deduplicated stream has the hash-list exchange, account identities, and
 durable list caches, replaces indexed blocks with references verified
 through the receiver's pins, and sends constant-byte runs compactly. Both
@@ -113,19 +118,20 @@ disabled. Block references and compressed output follow in steps 4 and 5.
   Reject incompatible peers before starting the command.
 - Update before normal runs, then keep a shared lock until the run's
   lookups end, so that no modifying process comes between the update and
-  the transfer; with both streams deduplicated, the client releases its
-  lock between its update and its list exchange (DESIGN.md §4.4). Support
-  concurrent read-only `--no-update` runs, resolving current roots and
-  reporting missing or incompatible indexes clearly.
-- Export the full canonical hash list from one index snapshot. Complete
-  HELLO, full-list verification, table construction, and `CACHE_RESULT`
-  before command startup. The sender advertises its listed lists, but the
-  receiver always sends a full list; cached-list reuse and deltas follow
-  in step 6.
+  the transfer; with both streams deduplicated, each host releases its
+  lock from the end of its update until the other's is done (DESIGN.md
+  §4.4). Support concurrent read-only `--no-update` runs, resolving
+  current roots and reporting missing or incompatible indexes clearly.
+- Export the full canonical hash list from one index snapshot. Run the
+  list exchange on the control session while the command runs: INDEX,
+  ADVERTISE, full-list verification, a table that fills while the list
+  arrives, and `CACHE_RESULT`. The sender advertises its listed lists, but
+  the receiver always sends a full list; cached-list reuse and deltas
+  follow in step 6.
 - Introduce account identities and durable list storage with this exchange,
   applying the specified listing, publication, renewal, and cleanup rules:
   each side lists its directory for the peer and index when its part of
-  the exchange starts, the sender before its HELLO, and at the end removes
+  the exchange starts, the sender at INDEX, and at the end removes
   the listed files except its target, a name only while it still names the
   listed file.
   Preserve correct behavior across concurrent transfers, interrupted

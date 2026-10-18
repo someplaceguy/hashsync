@@ -3,46 +3,54 @@
 //! `serve` sends the command's stdout, the backward stream, deduplicated,
 //! and writes the forward stream to the command's stdin. In a push, it
 //! receives the forward stream deduplicated against its own index, which
-//! it updates first, and sends the backward stream plain. The client's
-//! disappearance is fatal at every stage before END (DESIGN.md §6.9):
-//! during rendezvous, during the update of the index of a push, while
-//! `serve` waits for the control session, while the data reader waits at
-//! the limit of the forward stream's spool, and while command stderr still
+//! it updates while the command runs, and sends the backward stream plain.
+//! `serve` starts the command at REQUEST, and with it both streams; the
+//! list exchange of the deduplicated stream runs meanwhile on the control
+//! session (DESIGN.md §5.6 and §6.2). The client's disappearance is fatal
+//! at every stage before END (DESIGN.md §6.9): during rendezvous, during
+//! the update of the index of a push, while the data reader waits at the
+//! limit of the forward stream's spool, and while command stderr still
 //! drains. After END, stdin EOF is the normal end. Queries, answers, and
-//! STOP travel on the control session (DESIGN.md §6.2); obsolete queries
-//! still unsent at the normal end do not fail it, also inside a compressed
-//! block. The stream frames of a stream form one zstd frame, whose pieces
-//! travel in CHUNK frames; after the features, each direction of the
-//! control session is one zstd stream that no frame ends.
+//! STOP travel on the control session, inside its control stream; obsolete
+//! queries still unsent at the normal end do not fail it, also inside a
+//! compressed block. The stream frames of a stream form one zstd frame,
+//! whose pieces travel in CHUNK frames; on the control session, the CHUNK
+//! frames of each direction carry one zstd stream that no frame ends.
 
 mod common;
 
-use std::io::{BufReader, Read, Write};
+use std::cell::RefCell;
+use std::collections::VecDeque;
+use std::io::{BufReader, IoSlice, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::ExitStatusExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
+use std::rc::Rc;
 use std::time::Duration;
 
 use common::{
-    ANSWER, CACHE_RESULT, CHUNK, END, FEATURES, HASHLIST, HELLO, LIT, PROTOCOL_VERSION, QUERY, REF,
-    REQUEST, RLE, STOP, STREAM_END, frame, ofd_lock, proc_state, recv_frame, shared_lock,
-    toml_literal, try_recv_frame, version_and_features, wait_for_lock_wait,
+    ADVERTISE, ANSWER, CACHE_RESULT, CHUNK, END, FEATURES, HASHDATA, HASHLIST, HASHNONE, HELLO,
+    INDEX, LIT, PROTOCOL_VERSION, QUERY, REF, REQUEST, RLE, STOP, STREAM_END, frame, hello_payload,
+    ofd_lock, poll_syscall, proc_state, recv_frame, shared_lock, sleeping_syscall,
+    sleeping_syscall_of, toml_literal, try_recv_frame, version_and_features, wait_for_lock_wait,
+    wait_until_asleep,
 };
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
-use rustix::fs::{CWD, Mode, mkfifoat};
-use rustix::io::retry_on_intr;
+use rustix::fs::{CWD, Mode, OFlags, mkfifoat};
+use rustix::io::{Errno, retry_on_intr};
 use rustix::process::{Pid, PidfdFlags, Signal, kill_process, pidfd_open};
 use rustix::thread::{CpuSet, sched_getaffinity, sched_setaffinity};
 use tempfile::TempDir;
 
-// The weak hash of DESIGN.md §5.1, spelled out because the tests reach
-// only the binary.
-const WEAK_HASH_ID: &[u8] = b"poly64-9e3779b97f4a7c15-splitmix64";
-
 const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+/// The client's account and the ID of its index, as its INDEX names them
+/// in a pull, and its account, as its ADVERTISE names it in a push.
+const ACCOUNT: [u8; 16] = [0xaa; 16];
+const INDEX_ID: [u8; 16] = [0xbb; 16];
 
 /// The empty hash list (DESIGN.md §5.4): the header `N = 0` alone.
 fn empty_list() -> Vec<u8> {
@@ -98,33 +106,29 @@ fn string(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(bytes);
 }
 
-/// The start of the client's HELLO payload, as the receiver of the
-/// backward stream, through the name of its strong hash: the block size,
-/// then the weak and strong hashes.
-fn hello_prefix(block_size: u32, strong: &[u8]) -> Vec<u8> {
-    let mut hello = block_size.to_le_bytes().to_vec();
-    string(&mut hello, WEAK_HASH_ID);
-    string(&mut hello, strong);
-    hello
-}
-
 /// The deduplicated stream, as REQUEST encodes it (DESIGN.md §6.2): the
 /// forward stream in a push, the backward stream in a pull.
 const FORWARD: u8 = 1;
 const BACKWARD: u8 = 2;
 
-/// The client's REQUEST payload for `command`, run without a shell, as `-s`
-/// sends it, with the `deduplicated` stream, zstd compression at `level`,
-/// 0 for none, spools that hold at most `spool_limit` bytes, and the
-/// command's stdout in `delivery`. The other settings have their defaults
-/// (DESIGN.md §6.2).
-fn request_payload(
-    command: &[&str],
-    deduplicated: u8,
+/// The settings of a REQUEST that the tests change.
+#[derive(Clone, Copy, Debug)]
+struct Settings {
+    /// zstd compression at this level, 0 for none.
     level: i32,
+    /// The most bytes that wait in a spool.
     spool_limit: u64,
+    /// The delivery of the command's stdout.
     delivery: Delivery,
-) -> Vec<u8> {
+    /// `--wait`: a deduplicated stream starts only once its sender has the
+    /// whole list.
+    wait: bool,
+}
+
+/// The client's REQUEST payload for `command`, run without a shell, as `-s`
+/// sends it, with the `deduplicated` stream and `settings`. The other
+/// settings have their defaults (DESIGN.md §6.2).
+fn request_payload(command: &[&str], deduplicated: u8, settings: Settings) -> Vec<u8> {
     let mut request = vec![1]; // the command's words, without a shell
     request.extend_from_slice(&(command.len() as u32).to_le_bytes());
     for arg in command {
@@ -133,27 +137,19 @@ fn request_payload(
     request.push(deduplicated);
     request.push(0); // no_update
     request.push(1); // sender_cache
-    request.extend_from_slice(&level.to_le_bytes()); // compression level
+    request.extend_from_slice(&settings.level.to_le_bytes()); // compression level
     request.push(1); // compression_long
     request.extend_from_slice(&0u32.to_le_bytes()); // compression threads
     request.extend_from_slice(&0u32.to_le_bytes()); // probe threads
     request.extend_from_slice(&0u64.to_le_bytes()); // lookahead: the default
     request.extend_from_slice(&(128u64 << 20).to_le_bytes()); // negative cache
-    request.extend_from_slice(&spool_limit.to_le_bytes()); // spool limit
+    request.extend_from_slice(&settings.spool_limit.to_le_bytes()); // spool limit
     request.push(0); // stdin delivery: eager
-    request.push(delivery as u8); // stdout delivery
+    request.push(settings.delivery as u8); // stdout delivery
+    request.push(settings.wait.into()); // wait
     request.push(0); // quiet
     request.push(1); // human_readable
     request
-}
-
-/// The client's HELLO payload, with BLAKE3 as its strong hash. It names
-/// no target: HASHLIST does (`Serve::send_list`).
-fn hello_payload(block_size: u32) -> Vec<u8> {
-    let mut hello = hello_prefix(block_size, b"blake3");
-    hello.extend_from_slice(&[0xaa; 16]); // account ID
-    hello.extend_from_slice(&[0xbb; 16]); // index ID
-    hello
 }
 
 /// The client's forward stream with `input`: LIT frames of at most 4 KiB,
@@ -205,24 +201,6 @@ fn on_one_cpu<T>(start: impl FnOnce() -> T) -> T {
     started
 }
 
-/// Wait until every thread of the process `pid` sleeps, polling with no
-/// deadline. Fail when the process has ended: it stays a zombie until the
-/// test reaps it.
-fn wait_until_asleep(pid: u32) {
-    loop {
-        // A thread that ends meanwhile has no state.
-        let states: Vec<Option<char>> = std::fs::read_dir(format!("/proc/{pid}/task"))
-            .unwrap()
-            .map(|task| proc_state(task.unwrap().path()))
-            .collect();
-        assert!(!states.contains(&Some('Z')), "the process ended");
-        if states.iter().all(|&state| state == Some('S')) {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-}
-
 /// The default send buffer of a socket, `net.core.wmem_default`, in
 /// bytes. A Unix socket holds at most about one and a half times as many.
 fn send_buffer() -> usize {
@@ -233,70 +211,18 @@ fn send_buffer() -> usize {
         .unwrap()
 }
 
-/// The number of the system call in which the thread whose `syscall` file
-/// is at `path` sleeps; `None` while it runs or sleeps outside a system
-/// call. The file names a system call only while the thread sleeps in it.
-fn sleeping_syscall(path: &Path) -> std::io::Result<Option<u64>> {
-    let syscall = std::fs::read_to_string(path)?;
-    Ok(syscall
-        .split_whitespace()
-        .next()
-        .and_then(|nr| nr.parse().ok()))
-}
-
-/// The system call in which a thread of this process sleeps while it runs
-/// `wait`, which must wait until the drop of the returned value of `make`.
-/// The thread tells its ID before the wait, so the wait is the only call
-/// that it can then sleep in. A process can always read the `syscall` files
-/// of its own threads.
-fn sleeping_syscall_of<T: Send + 'static, D>(
-    make: impl FnOnce() -> (T, D),
-    wait: impl FnOnce(T) + Send + 'static,
-) -> u64 {
-    let (waited, ends) = make();
-    let (tid_tx, tid_rx) = std::sync::mpsc::channel();
-    let waiter = std::thread::spawn(move || {
-        tid_tx.send(rustix::thread::gettid()).unwrap();
-        wait(waited);
-    });
-    let tid = tid_rx.recv().unwrap().as_raw_nonzero();
-    let path = PathBuf::from(format!("/proc/self/task/{tid}/syscall"));
-    let nr = loop {
-        if let Some(nr) = sleeping_syscall(&path).unwrap() {
-            break nr;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    };
-    drop(ends);
-    waiter.join().unwrap();
-    nr
-}
-
-/// The system call in which `UnixStream::write` sleeps on a full socket:
-/// `sendto`, `send`, or `socketcall`, by architecture and C library. The
-/// write fails once the other end closes.
+/// The system call in which `UnixStream::write_vectored` sleeps on a full
+/// socket, as the frame writers of `serve` write a header and a payload:
+/// `writev` or `sendmsg`, by architecture and C library. The write fails
+/// once the other end closes.
 fn blocking_send_syscall() -> u64 {
     let size = 4 * send_buffer();
     sleeping_syscall_of(
         || UnixStream::pair().unwrap(),
         move |mut full| {
-            full.write_all(&vec![0; size]).unwrap_err();
-        },
-    )
-}
-
-/// The system call in which `poll` sleeps, `ppoll` or `poll`, by its number
-/// on this architecture: the wait of a pipe that nothing writes, until the
-/// write end closes.
-fn poll_syscall() -> u64 {
-    sleeping_syscall_of(
-        || {
-            let (reader, writer) = std::io::pipe().unwrap();
-            (reader, writer)
-        },
-        |reader| {
-            let mut fds = [PollFd::new(&reader, PollFlags::IN)];
-            retry_on_intr(|| poll(&mut fds, None)).unwrap();
+            let (header, payload) = ([0; 5], vec![0; size]);
+            let parts = [IoSlice::new(&header), IoSlice::new(&payload)];
+            while full.write_vectored(&parts).is_ok() {}
         },
     )
 }
@@ -330,34 +256,40 @@ fn wait_until_gone(pid: u32, name: &str) {
 }
 
 /// Wait until the thread `name` of the process `pid` sleeps in the system
-/// call `nr`, polling with no deadline. Reading its `syscall` file needs
-/// the ptrace access that a parent has. Fail when the process has ended.
+/// call `nr`, polling with no deadline. Fail when the process has ended.
 fn wait_until_asleep_in(pid: u32, name: &str, nr: u64) {
-    loop {
-        assert_ne!(
-            proc_state(format!("/proc/{pid}")),
-            Some('Z'),
-            "the process ended"
-        );
-        for task in std::fs::read_dir(format!("/proc/{pid}/task")).unwrap() {
-            let task = task.unwrap().path();
-            // A thread that ends meanwhile has no files.
-            let Ok(comm) = std::fs::read_to_string(task.join("comm")) else {
-                continue;
-            };
-            if comm.trim_end() != name {
-                continue;
-            }
-            match sleeping_syscall(&task.join("syscall")) {
-                Ok(sleeping) if sleeping == Some(nr) => return,
-                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                    panic!("cannot see the system call of {name}: {e}")
-                }
-                _ => {}
-            }
-        }
+    while !asleep_in(pid, name, nr) {
         std::thread::sleep(Duration::from_millis(1));
     }
+}
+
+/// Whether the thread `name` of the process `pid` sleeps in the system call
+/// `nr`. Reading its `syscall` file needs the ptrace access that a parent
+/// has. Fail when the process has ended.
+fn asleep_in(pid: u32, name: &str, nr: u64) -> bool {
+    assert_ne!(
+        proc_state(format!("/proc/{pid}")),
+        Some('Z'),
+        "the process ended"
+    );
+    for task in std::fs::read_dir(format!("/proc/{pid}/task")).unwrap() {
+        let task = task.unwrap().path();
+        // A thread that ends meanwhile has no files.
+        let Ok(comm) = std::fs::read_to_string(task.join("comm")) else {
+            continue;
+        };
+        if comm.trim_end() != name {
+            continue;
+        }
+        match sleeping_syscall(&task.join("syscall")) {
+            Ok(sleeping) if sleeping == Some(nr) => return true,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                panic!("cannot see the system call of {name}: {e}")
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// The bytes of the stream that `serve` sends on the data session, as they
@@ -466,14 +398,67 @@ impl<'a, R: Read> StreamFrames<'a, R> {
     }
 }
 
+/// The incoming direction of the control session, as the client reads it:
+/// its session frames. The payloads of the CHUNK frames make the control
+/// stream, and the frames of the list exchange wait in their own queue
+/// (DESIGN.md §6.2).
+struct Incoming {
+    socket: UnixStream,
+    /// The bytes of the control stream that arrived and were not decoded
+    /// yet.
+    stream: VecDeque<u8>,
+    /// The frames of the list exchange that arrived and were not read yet.
+    exchange: VecDeque<(u8, Vec<u8>)>,
+}
+
+impl Incoming {
+    /// Read the next session frame into its place; the error of the
+    /// session, `UnexpectedEof` at its closure.
+    fn read_frame(&mut self) -> std::io::Result<()> {
+        let (kind, payload) = try_recv_frame(&mut self.socket)?;
+        if kind == CHUNK {
+            assert!(!payload.is_empty(), "an empty CHUNK");
+            self.stream.extend(payload);
+        } else {
+            self.exchange.push_back((kind, payload));
+        }
+        Ok(())
+    }
+}
+
+/// The control stream of the incoming direction, as bytes: the CHUNK
+/// payloads, read as the decoder needs them.
+struct StreamBytes(Rc<RefCell<Incoming>>);
+
+impl Read for StreamBytes {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut incoming = self.0.borrow_mut();
+        while incoming.stream.is_empty() {
+            incoming.read_frame()?;
+        }
+        let n = buf.len().min(incoming.stream.len());
+        for (slot, byte) in buf.iter_mut().zip(incoming.stream.drain(..n)) {
+            *slot = byte;
+        }
+        Ok(n)
+    }
+}
+
 /// This side of the control session after both versions and features, as
-/// the client's: each direction as plain frames at level 0, else as one
-/// zstd stream, which no frame ends (DESIGN.md §6.2). In a pull, `serve`
-/// sends queries and STOP, and the client answers; in a push, the client
-/// sends the queries, and `serve` answers and sends STOP.
+/// the client's (DESIGN.md §6.2). Each direction carries session frames:
+/// the CHUNK frames of its control stream, whose control frames are plain
+/// at level 0, else one zstd stream that no frame ends, and the frames of
+/// the list exchange as they are. In a pull, `serve` sends queries and
+/// STOP, the client answers, and the client is the receiver of the list
+/// exchange; in a push, the client sends the queries, `serve` answers and
+/// sends STOP, and the client is the sender.
 struct Control {
-    incoming: Box<dyn Read>,
-    outgoing: Box<dyn Write>,
+    incoming: Rc<RefCell<Incoming>>,
+    /// The control frames, decoded from the incoming control stream.
+    frames: Box<dyn Read>,
+    outgoing: UnixStream,
+    /// The outgoing control stream, unless compression is disabled.
+    encoder: Option<zstd::stream::write::Encoder<'static, Vec<u8>>>,
     /// STOP arrived. `serve` sends it once, at `EPIPE` or at the exit of
     /// the command, so it can come between any two queries (DESIGN.md
     /// §6.6).
@@ -482,28 +467,33 @@ struct Control {
 
 impl Control {
     fn new(socket: &UnixStream, level: i32) -> Self {
-        let (read, write) = (socket.try_clone().unwrap(), socket.try_clone().unwrap());
-        let (incoming, outgoing): (Box<dyn Read>, Box<dyn Write>) = if level == 0 {
-            (Box::new(read), Box::new(write))
-        } else {
-            (
-                Box::new(zstd::stream::read::Decoder::new(read).unwrap()),
-                Box::new(zstd::stream::write::Encoder::new(write, level).unwrap()),
-            )
+        let incoming = Rc::new(RefCell::new(Incoming {
+            socket: socket.try_clone().unwrap(),
+            stream: VecDeque::new(),
+            exchange: VecDeque::new(),
+        }));
+        let bytes = StreamBytes(Rc::clone(&incoming));
+        let frames: Box<dyn Read> = match level {
+            0 => Box::new(bytes),
+            _ => Box::new(zstd::stream::read::Decoder::new(bytes).unwrap()),
         };
+        let encoder =
+            (level != 0).then(|| zstd::stream::write::Encoder::new(Vec::new(), level).unwrap());
         Control {
             incoming,
-            outgoing,
+            frames,
+            outgoing: socket.try_clone().unwrap(),
+            encoder,
             stopped: false,
         }
     }
 
-    /// The next frame from `serve` other than STOP, which this notes; else
-    /// the error that ends the session first, `UnexpectedEof` at its
-    /// closure.
+    /// The next control frame from `serve` other than STOP, which this
+    /// notes; else the error that ends the session first, `UnexpectedEof`
+    /// at its closure.
     fn next(&mut self) -> std::io::Result<(u8, Vec<u8>)> {
         loop {
-            let frame = try_recv_frame(&mut self.incoming)?;
+            let frame = try_recv_frame(&mut self.frames)?;
             if frame.0 != STOP {
                 return Ok(frame);
             }
@@ -521,41 +511,54 @@ impl Control {
         (u64::from_le_bytes(payload.try_into().unwrap()), digest)
     }
 
-    /// Wait for STOP, unless it arrived already; no other frame may come
-    /// first. `serve` queues STOP before it sends END, and shuts the session
-    /// down only after the EOF of the data session, so a test that waits
-    /// here before it closes the data session always gets STOP (DESIGN.md
-    /// §6.6).
+    /// Wait for STOP, unless it arrived already; no other control frame may
+    /// come first. `serve` queues STOP before it sends END, and shuts the
+    /// session down only after the EOF of the data session, so a test that
+    /// waits here before it closes the data session always gets STOP
+    /// (DESIGN.md §6.6).
     fn stop(&mut self) {
         if !self.stopped {
-            assert_eq!(recv_frame(&mut self.incoming), (STOP, Vec::new()));
+            assert_eq!(recv_frame(&mut self.frames), (STOP, Vec::new()));
             self.stopped = true;
         }
     }
 
-    /// ANSWER frames, flushed: `serve` waits for them.
+    /// Control frames, `frames` with their headers, in the control stream,
+    /// flushed into one CHUNK: `serve` waits for them.
+    fn send_control(&mut self, frames: &[u8]) {
+        let bytes = match &mut self.encoder {
+            None => frames.to_vec(),
+            Some(encoder) => {
+                encoder.write_all(frames).unwrap();
+                encoder.flush().unwrap();
+                std::mem::take(encoder.get_mut())
+            }
+        };
+        self.outgoing.write_all(&frame(CHUNK, &bytes)).unwrap();
+    }
+
+    /// ANSWER frames: `serve` waits for them.
     fn answer(&mut self, answers: &[(u64, bool)]) {
+        let mut frames = Vec::new();
         for &(offset, found) in answers {
             let mut answer = offset.to_le_bytes().to_vec();
             answer.push(found.into());
-            self.outgoing.write_all(&frame(ANSWER, &answer)).unwrap();
+            frames.extend_from_slice(&frame(ANSWER, &answer));
         }
-        self.outgoing.flush().unwrap();
+        self.send_control(&frames);
     }
 
-    /// STOP, flushed: the client stops the backward stream once no process
-    /// reads its stdout (DESIGN.md §6.6).
+    /// STOP: the client stops the backward stream once no process reads its
+    /// stdout (DESIGN.md §6.6).
     fn send_stop(&mut self) {
-        self.outgoing.write_all(&frame(STOP, b"")).unwrap();
-        self.outgoing.flush().unwrap();
+        self.send_control(&frame(STOP, b""));
     }
 
     /// In a push, a QUERY for the window at `offset` with the strong hash
-    /// `digest`, flushed: the client waits for its answer.
+    /// `digest`: the client waits for its answer.
     fn send_query(&mut self, offset: u64, digest: &[u8]) {
         let query = [&offset.to_le_bytes()[..], digest].concat();
-        self.outgoing.write_all(&frame(QUERY, &query)).unwrap();
-        self.outgoing.flush().unwrap();
+        self.send_control(&frame(QUERY, &query));
     }
 
     /// In a push, the next ANSWER: its offset, and whether `serve` has the
@@ -566,6 +569,76 @@ impl Control {
         let (offset, found) = payload.split_at(8);
         assert!(found == [0] || found == [1], "{found:?}");
         (u64::from_le_bytes(offset.try_into().unwrap()), found == [1])
+    }
+
+    /// A frame of the list exchange, outside the control stream.
+    fn send_exchange(&mut self, kind: u8, payload: &[u8]) {
+        self.outgoing.write_all(&frame(kind, payload)).unwrap();
+    }
+
+    /// The next frame of the list exchange from `serve`. The control frames
+    /// that come meanwhile wait for `next`.
+    fn recv_exchange(&mut self) -> (u8, Vec<u8>) {
+        let mut incoming = self.incoming.borrow_mut();
+        loop {
+            if let Some(frame) = incoming.exchange.pop_front() {
+                return frame;
+            }
+            incoming.read_frame().unwrap();
+        }
+    }
+
+    /// INDEX, as the receiver of a pull sends it once its index is ready:
+    /// the client's account and the ID of its index (DESIGN.md §5.6).
+    fn send_index(&mut self) {
+        self.send_exchange(INDEX, &[ACCOUNT, INDEX_ID].concat());
+    }
+
+    /// HASHLIST, which names the target, `list`, by its BLAKE3 digest, and
+    /// the bytes of the list in HASHDATA frames.
+    fn send_list(&mut self, list: &[u8]) {
+        let length = (list.len() as u64).to_le_bytes();
+        self.send_exchange(
+            HASHLIST,
+            &[blake3::hash(list).as_bytes(), &length[..]].concat(),
+        );
+        for piece in list.chunks(16 << 10) {
+            self.send_exchange(HASHDATA, piece);
+        }
+    }
+
+    /// The client's side of the list exchange of a pull, as the receiver:
+    /// INDEX, then, after `serve`'s ADVERTISE, whose payload this returns,
+    /// the full target `list`, and CACHE_RESULT, which ends the exchange
+    /// (DESIGN.md §5.6).
+    fn give_list(&mut self, list: &[u8]) -> Vec<u8> {
+        self.send_index();
+        let (kind, advertise) = self.recv_exchange();
+        assert_eq!(kind, ADVERTISE);
+        self.send_list(list);
+        assert_eq!(self.recv_exchange(), (CACHE_RESULT, Vec::new()));
+        advertise
+    }
+
+    /// The client's side of the list exchange of a pull without a list:
+    /// HASHNONE in place of INDEX, as a receiver sends it whose stream has
+    /// ended or stopped before its index was ready. `serve`'s side ends at
+    /// once, without a table (DESIGN.md §5.6).
+    fn no_list(&mut self) {
+        self.send_exchange(HASHNONE, b"");
+    }
+
+    /// The next `length` bytes of the lists of a target, from HASHDATA
+    /// frames, as the sender of a push reads them.
+    fn recv_list(&mut self, length: u64) -> Vec<u8> {
+        let mut list = Vec::new();
+        while (list.len() as u64) < length {
+            let (kind, piece) = self.recv_exchange();
+            assert_eq!(kind, HASHDATA);
+            assert!(!piece.is_empty() && list.len() + piece.len() <= length as usize);
+            list.extend_from_slice(&piece);
+        }
+        list
     }
 }
 
@@ -585,12 +658,9 @@ struct Serve {
     /// The features that this side sends on both sessions, as the client:
     /// `FEATURES`, unless a test sets bits that `serve` does not know.
     features: u64,
-    /// The delivery of the command's stdout that REQUEST asks for: eager,
-    /// the default, unless a test needs batch delivery.
-    delivery: Delivery,
-    /// The spool limit that the REQUEST of a push asks for: 2 GiB, unless
-    /// a test needs a spool that fills.
-    spool_limit: u64,
+    /// The settings of REQUEST: no compression, spools of 2 GiB, eager
+    /// delivery and no `--wait`, unless a test needs others.
+    settings: Settings,
 }
 
 impl Drop for Serve {
@@ -626,8 +696,12 @@ impl Serve {
             child,
             home,
             features: FEATURES,
-            delivery: Delivery::Eager,
-            spool_limit: 2 << 30,
+            settings: Settings {
+                level: 0,
+                spool_limit: 2 << 30,
+                delivery: Delivery::Eager,
+                wait: false,
+            },
         }
     }
 
@@ -662,37 +736,22 @@ impl Serve {
         recv_frame(&mut self.data_out)
     }
 
-    /// The versions and the features, REQUEST, then the data HELLOs: the
-    /// client's, for 4 KiB blocks, then `serve`'s reply, whose payload this
-    /// returns.
-    fn hello(&mut self, command: &[&str]) -> Vec<u8> {
-        self.hello_with(4096, command, 0)
+    /// The start of a pull of `command`, with 4 KiB blocks and the settings
+    /// of `self.settings`: the versions and the features, REQUEST, and the
+    /// client's HELLO, after which `serve` starts the command (DESIGN.md
+    /// §6.2).
+    fn pull(&mut self, command: &[&str]) {
+        self.pull_with(4096, command);
     }
 
-    fn hello_with(&mut self, block_size: u32, command: &[&str], level: i32) -> Vec<u8> {
-        let request = request_payload(command, BACKWARD, level, 2 << 30, self.delivery);
-        self.send_hello(&request, &hello_payload(block_size))
-    }
-
-    /// The versions, the features, REQUEST and the data HELLOs, as `hello`
-    /// exchanges them, with spools that hold at most `spool_limit` bytes.
-    fn hello_with_spool_limit(&mut self, command: &[&str], spool_limit: u64) {
-        let request = request_payload(command, BACKWARD, 0, spool_limit, self.delivery);
-        self.send_hello(&request, &hello_payload(4096));
-    }
-
-    /// Returns the payload of `serve`'s HELLO.
-    fn send_hello(&mut self, request: &[u8], hello: &[u8]) -> Vec<u8> {
+    fn pull_with(&mut self, block_size: u32, command: &[&str]) {
         self.send_version_and_features();
-        self.send(REQUEST, request);
-        self.send(HELLO, hello);
+        self.send(REQUEST, &request_payload(command, BACKWARD, self.settings));
+        self.send(HELLO, &hello_payload(block_size, b"blake3"));
         assert_eq!(
             self.recv_version_and_features(),
             version_and_features(FEATURES)
         );
-        let (kind, reply) = self.recv();
-        assert_eq!(kind, HELLO);
-        reply
     }
 
     /// Open the control session as the client does: connect as `hashsync
@@ -717,43 +776,20 @@ impl Serve {
         UnixStream::connect(address).unwrap()
     }
 
-    /// Attach, send `list`, and exchange the versions and the features of
-    /// the control session, whose later frames use compression at `level`.
-    fn control_session(&mut self, list: &[u8], level: i32) -> Control {
+    /// Attach, and exchange the versions and the features of the control
+    /// session, whose control streams use the compression of the settings.
+    fn control_session(&mut self) -> Control {
         let mut socket = self.attach();
-        self.send_list(list);
         let mut theirs = [0u8; 12];
         socket.read_exact(&mut theirs).unwrap();
         assert_eq!(theirs, version_and_features(FEATURES));
-        Control::new(&socket, level)
-    }
-
-    /// The full empty list, whose bytes follow HASHLIST directly.
-    fn send_empty_list(&mut self) {
-        self.send_list(&empty_list());
-    }
-
-    /// HASHLIST, which names the target, `list`, by its BLAKE3 digest, and
-    /// the list after it.
-    fn send_list(&mut self, list: &[u8]) {
-        let length = (list.len() as u64).to_le_bytes();
-        self.send(
-            HASHLIST,
-            &[blake3::hash(list).as_bytes(), &length[..]].concat(),
-        );
-        self.send_raw(list);
-    }
-
-    /// CACHE_RESULT, the first data frame after the list, without a
-    /// payload. `serve` flushes it: the client starts the forward stream
-    /// only after it (DESIGN.md §6.2).
-    fn recv_result(&mut self) {
-        assert_eq!(self.recv(), (CACHE_RESULT, Vec::new()));
+        Control::new(&socket, self.settings.level)
     }
 
     /// The backward stream, as it arrives: its stream frames, from its
     /// CHUNK frames through STREAM_END.
-    fn stream(&mut self, level: i32) -> StreamFrames<'_, BufReader<ChildStdout>> {
+    fn stream(&mut self) -> StreamFrames<'_, BufReader<ChildStdout>> {
+        let level = self.settings.level;
         StreamFrames::new(&mut self.data_out, level)
     }
 
@@ -764,47 +800,13 @@ impl Serve {
         EndFrame::parse(&payload)
     }
 
-    /// From CACHE_RESULT: the backward stream's frames through its end, and
-    /// END.
-    fn result_through_end(&mut self, level: i32) -> (Vec<(u8, Vec<u8>)>, EndFrame) {
-        self.recv_result();
-        self.stream_through_end(level)
-    }
-
-    /// After CACHE_RESULT: the backward stream's frames through its end,
-    /// and END. `serve` sends nothing after END until the client closes the
-    /// data session.
-    fn stream_through_end(&mut self, level: i32) -> (Vec<(u8, Vec<u8>)>, EndFrame) {
-        let frames = self.stream(level).rest();
+    /// The backward stream's frames through its end, and END. `serve` sends
+    /// nothing after END until the client closes the data session.
+    fn stream_through_end(&mut self) -> (Vec<(u8, Vec<u8>)>, EndFrame) {
+        let frames = self.stream().rest();
         let end = self.recv_end();
         assert!(self.data_out.buffer().is_empty(), "bytes after END");
         (frames, end)
-    }
-
-    /// Wait until `serve` has published the list in its cache, which it
-    /// does before it ends its exchange and sends CACHE_RESULT (DESIGN.md
-    /// §5.6). No event tells the client when, so this polls the cache
-    /// directory, with no deadline: a `serve` that neither publishes nor
-    /// ends hangs the test, and a debugger can inspect it.
-    fn wait_for_published_list(&mut self) {
-        let dir = self.home.path().join("cache/hashsync/remote-hashlists");
-        let published = || {
-            let peers = std::fs::read_dir(&dir).into_iter().flatten().flatten();
-            peers
-                .flat_map(|peer| std::fs::read_dir(peer.path()))
-                .any(|files| {
-                    files
-                        .flatten()
-                        .any(|file| file.file_name().to_string_lossy().ends_with(".cache"))
-                })
-        };
-        while !published() {
-            if self.child.try_wait().unwrap().is_some() {
-                let (status, stderr) = self.finish();
-                panic!("serve ended before it published the list ({status}):\n{stderr}");
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
     }
 
     /// Wait until `serve` ends, with no deadline: if `serve` hangs, the
@@ -851,11 +853,14 @@ impl Serve {
         self.home.path().join("index")
     }
 
-    /// The versions, the features, and REQUEST for a push to `command`, at
-    /// compression `level`.
-    fn push_request(&mut self, command: &[&str], level: i32) {
+    /// The start of a push to `command`: the versions, the features, and
+    /// REQUEST, with the settings of `self.settings`. Then `serve`'s HELLO,
+    /// as the receiver of the forward stream, from its configuration, the
+    /// first frame of the data session after its features: blocks of 4 KiB
+    /// (DESIGN.md §6.2).
+    fn push_request(&mut self, command: &[&str]) {
         self.send_version_and_features();
-        let request = request_payload(command, FORWARD, level, self.spool_limit, self.delivery);
+        let request = request_payload(command, FORWARD, self.settings);
         self.send(REQUEST, &request);
         assert_eq!(
             self.recv_version_and_features(),
@@ -863,37 +868,43 @@ impl Serve {
         );
     }
 
-    /// A push to `command`, at compression `level`, up to CACHE_RESULT:
-    /// `serve` updates its index and sends its HELLO, as the receiver of
-    /// the forward stream; the client attaches, and sends its own HELLO as
-    /// the sender, with no listed list; `serve` sends the full target list;
-    /// the client sends CACHE_RESULT (DESIGN.md §5.6). Returns the target
-    /// list, and the control session.
-    fn push(&mut self, command: &[&str], level: i32) -> (Vec<u8>, Control) {
-        self.push_request(command, level);
+    /// `serve`'s HELLO, as the receiver of a push.
+    fn recv_hello(&mut self) {
         let (kind, hello) = self.recv();
         assert_eq!(kind, HELLO);
-        assert_eq!(hello[..4], 4096u32.to_le_bytes(), "the block size");
-        let mut socket = self.attach();
-        let mut sender_hello = vec![0xaa; 16]; // account ID
-        sender_hello.extend_from_slice(&0u32.to_le_bytes()); // no list
-        self.send(HELLO, &sender_hello);
-        let (kind, payload) = self.recv();
+        assert_eq!(
+            hello,
+            hello_payload(4096, b"blake3"),
+            "the stream's parameters"
+        );
+    }
+
+    /// A push to `command`, through its list exchange: `serve` sends its
+    /// HELLO, starts the command, updates its index, and sends INDEX on the
+    /// control session; the client answers with ADVERTISE, with no listed
+    /// list; `serve` sends the full target list; the client acknowledges it
+    /// with CACHE_RESULT (DESIGN.md §5.6). Returns the target list, and the
+    /// control session.
+    fn push(&mut self, command: &[&str]) -> (Vec<u8>, Control) {
+        self.push_request(command);
+        self.recv_hello();
+        let mut control = self.control_session();
+        let (kind, index) = control.recv_exchange();
+        assert_eq!(kind, INDEX);
+        assert_eq!(index.len(), 32, "the account and the index of serve");
+        let advertise = [&ACCOUNT[..], &0u32.to_le_bytes()].concat(); // no list
+        control.send_exchange(ADVERTISE, &advertise);
+        let (kind, payload) = control.recv_exchange();
         assert_eq!(kind, HASHLIST);
         let (target, length) = payload.split_at(32);
-        let length = u64::from_le_bytes(length.try_into().unwrap());
-        let mut list = vec![0; length as usize];
-        self.data_out.read_exact(&mut list).unwrap();
+        let list = control.recv_list(u64::from_le_bytes(length.try_into().unwrap()));
         assert_eq!(
             target,
             blake3::hash(&list).as_bytes(),
             "HASHLIST names its list"
         );
-        self.send(CACHE_RESULT, b"");
-        let mut theirs = [0u8; 12];
-        socket.read_exact(&mut theirs).unwrap();
-        assert_eq!(theirs, version_and_features(FEATURES));
-        (list, Control::new(&socket, level))
+        control.send_exchange(CACHE_RESULT, b"");
+        (list, control)
     }
 
     /// The client disappears: its end of the data session closes.
@@ -993,9 +1004,10 @@ fn feature_bits_that_serve_does_not_know_are_ignored() {
     // features, and the run goes on as with none (DESIGN.md §6.2).
     let mut serve = Serve::start();
     serve.features = u64::MAX;
-    serve.hello(&["printf", "%s", "output"]);
-    let mut control = serve.control_session(&empty_list(), 0);
-    let (frames, end) = serve.result_through_end(0);
+    serve.pull(&["printf", "%s", "output"]);
+    let mut control = serve.control_session();
+    control.no_list();
+    let (frames, end) = serve.stream_through_end();
     assert_eq!(frames, [(LIT, b"output".to_vec())]);
     assert_eq!(end.outcome(), SUCCESS);
     control.stop();
@@ -1003,19 +1015,74 @@ fn feature_bits_that_serve_does_not_know_are_ignored() {
 }
 
 #[test]
+fn the_command_starts_before_the_list_exchange() {
+    // `serve` starts the command at REQUEST and the client's HELLO, and the
+    // backward stream flows at once, with an empty table: here the whole
+    // output arrives before the client has even attached the control
+    // session, which carries the list exchange (DESIGN.md §3 and §6.2).
+    // Only the end of the run waits for the exchange: END comes once its
+    // side of it has ended.
+    let mut serve = Serve::start();
+    serve.pull(&["printf", "%s", "at once"]);
+    let frames = serve.stream().rest();
+    assert_eq!(frames, [(LIT, b"at once".to_vec())]);
+    let mut control = serve.control_session();
+    control.no_list();
+    assert_eq!(serve.recv_end().outcome(), SUCCESS);
+    control.stop();
+    serve.expect_success();
+}
+
+#[test]
+fn with_wait_the_backward_stream_waits_for_the_whole_list() {
+    // With `--wait`, the scanner scans only once its table is whole. The
+    // command has written its output and ended, and every thread of `serve`
+    // sleeps, but no frame of the stream has come: the bytes wait for the
+    // list. Then the block that the list holds becomes a reference
+    // (DESIGN.md §6.3).
+    let block: Vec<u8> = (0..4096u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    let mut serve = Serve::start();
+    let file = serve.home.path().join("block");
+    std::fs::write(&file, &block).unwrap();
+    serve.settings.wait = true;
+    serve.pull(&["cat", file.to_str().unwrap()]);
+    let mut control = serve.control_session();
+    // STOP shows that the command has exited.
+    control.stop();
+    wait_until_asleep(serve.child.id());
+    assert!(
+        serve.data_out.buffer().is_empty(),
+        "a frame before the list"
+    );
+    let mut fds = [PollFd::new(serve.data_out.get_ref(), PollFlags::IN)];
+    let ready = retry_on_intr(|| poll(&mut fds, Some(&Timespec::default()))).unwrap();
+    assert_eq!(ready, 0, "a frame before the list");
+    control.give_list(&encode_list(&[weak_hash(&block)]));
+    let digest = blake3::hash(&block).as_bytes().to_vec();
+    assert_eq!(control.query(), (0, digest));
+    control.answer(&[(0, true)]);
+    let (frames, end) = serve.stream_through_end();
+    assert_eq!(frames, [(REF, Vec::new())]);
+    assert_eq!(end.outcome(), SUCCESS);
+    serve.expect_success();
+}
+
+#[test]
 fn serve_advertises_its_listed_lists_and_removes_only_listed_files() {
-    // Before its HELLO, `serve` lists its directory for this client and
-    // index, and advertises every listed list of the run's strong hash.
-    // After it published the target, it removes the listed files except
-    // the target: here an older list, a list of another strong hash, and
-    // an abandoned temporary. A file that appears after the listing stays,
-    // because a later run can own it (DESIGN.md §5.6).
+    // At INDEX, `serve` lists its directory for this client and index, and
+    // advertises every listed list of the run's strong hash. After it
+    // published the target, it removes the listed files except the target:
+    // here an older list, a list of another strong hash, and an abandoned
+    // temporary. A file that appears after the listing stays, because a
+    // later run can own it (DESIGN.md §5.6).
     let hex = |bytes: &[u8]| -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() };
     let mut serve = Serve::start();
     let dir = serve.home.path().join(format!(
         "cache/hashsync/remote-hashlists/{}-{}",
-        "aa".repeat(16),
-        "bb".repeat(16)
+        hex(&ACCOUNT),
+        hex(&INDEX_ID)
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let older = [7u8; 32];
@@ -1028,14 +1095,19 @@ fn serve_advertises_its_listed_lists_and_removes_only_listed_files() {
         std::fs::write(dir.join(name), b"").unwrap();
     }
 
+    serve.pull(&["true"]);
+    let mut control = serve.control_session();
+    control.send_index();
     // The account ID, then the advertised lists: a count and the digests.
-    let reply = serve.hello(&["true"]);
-    assert_eq!(reply[16..], [&1u32.to_le_bytes()[..], &older].concat());
+    let (kind, advertise) = control.recv_exchange();
+    assert_eq!(kind, ADVERTISE);
+    assert_eq!(advertise[16..], [&1u32.to_le_bytes()[..], &older].concat());
     let later = format!("blake3-{}.cache", hex(&[9; 32]));
     std::fs::write(dir.join(&later), b"").unwrap();
+    control.send_list(&empty_list());
+    assert_eq!(control.recv_exchange(), (CACHE_RESULT, Vec::new()));
 
-    let mut control = serve.control_session(&empty_list(), 0);
-    let (frames, end) = serve.result_through_end(0);
+    let (frames, end) = serve.stream_through_end();
     let mut names: Vec<String> = std::fs::read_dir(&dir)
         .unwrap()
         .map(|entry| entry.unwrap().file_name().into_string().unwrap())
@@ -1056,16 +1128,14 @@ fn serve_advertises_its_listed_lists_and_removes_only_listed_files() {
 fn an_unknown_strong_hash_is_rejected_at_hello() {
     // The strong hash sets the length of every list ID of the exchange, so
     // `serve` rejects an unknown one with `die` as soon as it reads its
-    // name, as it would for a newer client's algorithm (DESIGN.md §6.2 and
-    // §11). The payload ends after the algorithm's name: a read of any
-    // later field would panic on truncation instead.
+    // name, as it would for a newer client's algorithm. It reads the
+    // client's HELLO before it starts the command (DESIGN.md §6.2 and
+    // §11).
     let mut serve = Serve::start();
     serve.send_version_and_features();
-    serve.send(
-        REQUEST,
-        &request_payload(&["true"], BACKWARD, 0, 2 << 30, Delivery::Eager),
-    );
-    serve.send(HELLO, &hello_prefix(4096, b"future-hash"));
+    let request = request_payload(&["true"], BACKWARD, serve.settings);
+    serve.send(REQUEST, &request);
+    serve.send(HELLO, &hello_payload(4096, b"future-hash"));
     serve.expect_death("incompatible receiver: strong hash future-hash");
 }
 
@@ -1075,21 +1145,19 @@ fn an_unsupported_compression_level_is_rejected() {
     // command startup if it does not support them (DESIGN.md §6.2).
     let mut serve = Serve::start();
     serve.send_version_and_features();
-    serve.send(
-        REQUEST,
-        &request_payload(&["true"], BACKWARD, 20, 2 << 30, Delivery::Eager),
-    );
+    serve.settings.level = 20;
+    let request = request_payload(&["true"], BACKWARD, serve.settings);
+    serve.send(REQUEST, &request);
     serve.expect_death("incompatible client: compression level 20");
 }
 
 #[test]
 fn client_loss_during_rendezvous_is_fatal() {
     // `attach` never connects here, so the main thread of `serve` keeps
-    // waiting for it, and nothing reads stdin, where the target list would
-    // arrive. Only the session watcher can notice that the data session is
-    // gone (DESIGN.md §6.9).
+    // waiting for it. The data reader sees that the data session is gone
+    // (DESIGN.md §6.9).
     let mut serve = Serve::start();
-    serve.hello(&["true"]);
+    serve.pull(&["true"]);
     serve.lose_data_session();
     serve.expect_death("the client disappeared");
 }
@@ -1097,7 +1165,7 @@ fn client_loss_during_rendezvous_is_fatal() {
 #[test]
 fn control_loss_before_the_list_is_fatal() {
     let mut serve = Serve::start();
-    serve.hello(&["true"]);
+    serve.pull(&["true"]);
     let mut control = serve.attach();
     // Read `serve`'s version and features, so that closing sends EOF, not
     // a reset.
@@ -1109,34 +1177,45 @@ fn control_loss_before_the_list_is_fatal() {
 }
 
 #[test]
-fn client_loss_while_serve_waits_for_the_control_version_is_fatal() {
-    // The command starts only after the client's versions on both
-    // sessions matched (DESIGN.md §6.2). After it published the list,
-    // `serve` waits for the control session's version.
-    let mut serve = Serve::start();
-    serve.hello(&["true"]);
-    let _control = serve.attach_without_version();
-    serve.send_empty_list();
-    serve.wait_for_published_list();
-    serve.lose_data_session();
-    serve.expect_death("the client disappeared");
-}
-
-#[test]
 fn client_loss_while_the_data_reader_waits_at_the_spool_limit_is_fatal() {
     // With a spool limit of 0, the data reader appends one CHUNK payload to
     // the forward stream's spool, then waits until the decoder takes it.
-    // Before the client's control version, no command runs, so no decoder
-    // exists, and the data reader waits for good: it reads nothing, so it
-    // cannot see the loss of the data session. The session watcher sees it
-    // instead (DESIGN.md §6.6). The control session stays open, without its
-    // version, so only the data session shows the loss.
+    // The command reads none of its stdin, so the decoder waits for room in
+    // the full pipe of the command's stdin, and the data reader waits for
+    // good: it reads nothing, so it cannot see the loss of the data session.
+    // The session watcher sees it instead (DESIGN.md §6.6). The control
+    // session stays open, so only the data session shows the loss. The
+    // stream is 4 MiB, more than the pipe of the command's stdin holds,
+    // without STREAM_END. What the data reader does not read stays in the
+    // pipe of the data session, so this test writes the stream without
+    // waiting, as far as that pipe takes it, until both threads wait.
     let mut serve = Serve::start();
-    serve.hello_with_spool_limit(&["true"], 0);
-    let _control = serve.attach_without_version();
-    serve.send_empty_list();
-    serve.recv_result();
-    serve.send(CHUNK, &frame(LIT, b"waits"));
+    let pid = serve.child.id();
+    // The waits for the blocked threads need ptrace access to `serve`.
+    if let Err(e) = std::fs::read_to_string(format!("/proc/{pid}/syscall")) {
+        eprintln!("skipped: cannot see the system calls of serve: {e}");
+        return;
+    }
+    serve.settings.spool_limit = 0;
+    let until_the_test_ends = format!("--pid={}", std::process::id());
+    serve.pull(&["tail", &until_the_test_ends, "-f", "/dev/null"]);
+    let mut control = serve.control_session();
+    control.no_list();
+    let stream = forward_stream(&vec![b'x'; 4 << 20], 0);
+    let mut rest = &stream[..stream.len() - 5];
+    let data_in = serve.data_in.as_ref().unwrap();
+    rustix::fs::fcntl_setfl(data_in, OFlags::NONBLOCK).unwrap();
+    let poll = poll_syscall();
+    while !(asleep_in(pid, "decoder", poll)
+        && asleep_in(pid, "data-reader", libc::SYS_futex as u64))
+    {
+        match rustix::io::write(data_in, rest) {
+            Ok(written) => rest = &rest[written..],
+            Err(Errno::AGAIN) => {}
+            Err(e) => panic!("cannot write the stream: {e}"),
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
     serve.lose_data_session();
     serve.expect_death("the client disappeared");
 }
@@ -1146,8 +1225,8 @@ fn client_loss_while_the_data_reader_waits_at_the_spool_limit_is_fatal() {
 /// finish, so END does not come. The descendant runs until this test
 /// process ends: it does not end by itself, however slow the machine is,
 /// and a failed test does not leave it behind. Returns the control session,
-/// after the client's version and features, and the descendant, as a pidfd,
-/// once the backward stream has ended.
+/// after both versions and features and the client's HASHNONE, and the
+/// descendant, as a pidfd, once the backward stream has ended.
 fn run_with_a_descendant_that_holds_stderr(
     serve: &mut Serve,
 ) -> (UnixStream, std::os::fd::OwnedFd) {
@@ -1155,11 +1234,12 @@ fn run_with_a_descendant_that_holds_stderr(
         "( exec >/dev/null; exec tail --pid={} -f /dev/null ) & echo $!",
         std::process::id()
     );
-    serve.hello(&["sh", "-c", &script]);
-    let control = serve.attach();
-    serve.send_empty_list();
-    serve.recv_result();
-    let frames = serve.stream(0).rest();
+    serve.pull(&["sh", "-c", &script]);
+    let mut control = serve.attach();
+    let mut theirs = [0u8; 12];
+    control.read_exact(&mut theirs).unwrap();
+    control.write_all(&frame(HASHNONE, b"")).unwrap();
+    let frames = serve.stream().rest();
     let output: Vec<u8> = frames
         .into_iter()
         .flat_map(|(_, payload)| payload)
@@ -1200,9 +1280,7 @@ fn control_loss_after_the_end_of_the_backward_stream_is_fatal_before_end() {
     // the client then, which fails the run and kills the command's process
     // group (DESIGN.md §6.9).
     let mut serve = Serve::start();
-    let (mut control, descendant) = run_with_a_descendant_that_holds_stderr(&mut serve);
-    let mut theirs = [0u8; 12];
-    control.read_exact(&mut theirs).unwrap();
+    let (control, descendant) = run_with_a_descendant_that_holds_stderr(&mut serve);
     drop(control);
     serve.expect_death("the client disappeared");
     wait_for_the_end_of(&descendant);
@@ -1213,12 +1291,12 @@ fn an_answer_decides_between_a_reference_and_literals() {
     // The client's list holds the weak hash of the command's only window,
     // so the scanner queries it on the control session. A yes makes it a
     // REF; a no makes the scanner rescan, and the window's bytes go out as
-    // literals (DESIGN.md §6.3). With compression, each direction of the
-    // control session is one zstd stream at the level of the data session,
-    // and no frame ends it: the closure of the session ends it, after END
-    // (DESIGN.md §6.2 and §6.9). The exit of the command stops the forward
-    // stream, which STOP tells before END, between any two frames of the
-    // control session (DESIGN.md §6.6).
+    // literals (DESIGN.md §6.3). With `--wait`, the scanner waits for the
+    // list. With compression, each control stream is one zstd stream at
+    // the level of the data session, and no frame ends it: the closure of
+    // the session ends it, after END (DESIGN.md §6.2 and §6.9). The exit of
+    // the command stops the forward stream, which STOP tells before END,
+    // between any two control frames (DESIGN.md §6.6).
     let block: Vec<u8> = (0..4096u32)
         .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
         .collect();
@@ -1228,13 +1306,16 @@ fn an_answer_decides_between_a_reference_and_literals() {
             let mut serve = Serve::start();
             let file = serve.home.path().join("block");
             std::fs::write(&file, &block).unwrap();
-            serve.hello_with(4096, &["cat", file.to_str().unwrap()], level);
-            let mut control = serve.control_session(&list, level);
+            serve.settings.level = level;
+            serve.settings.wait = true;
+            serve.pull(&["cat", file.to_str().unwrap()]);
+            let mut control = serve.control_session();
+            control.give_list(&list);
             let digest = blake3::hash(&block).as_bytes().to_vec();
             assert_eq!(control.query(), (0, digest), "the window at offset 0");
             control.answer(&[(0, found)]);
 
-            let (frames, end) = serve.result_through_end(level);
+            let (frames, end) = serve.stream_through_end();
             assert_eq!(end.outcome(), SUCCESS);
             // STOP before the closure of the data session, and only then
             // the closure of the control session, which follows it.
@@ -1293,8 +1374,9 @@ fn obsolete_queries_in_flight(level: i32) {
     const B: u64 = 64;
     // A query keeps its 32-byte digest also when compressed, so the q
     // chain takes at least three send buffers, twice what the socket
-    // holds, at any level.
-    let chain = (3 * send_buffer() as u64 / 32).max(8000);
+    // holds, at any level, besides the CHUNK of up to 256 KiB that holds
+    // query 20, which this test reads whole.
+    let chain = ((3 * send_buffer() as u64 + (256 << 10)) / 32).max(8000);
     let w: Vec<u64> = (0..=chain).map(|k| 74 + B * k).collect();
     let data = common::random((138 + B * chain + 10) as usize, 21);
     let window = |offset: u64| &data[offset as usize..(offset + B) as usize];
@@ -1319,9 +1401,13 @@ fn obsolete_queries_in_flight(level: i32) {
     std::fs::write(&file, &data).unwrap();
     // In eager delivery, an idle point of the output of `cat` could make a
     // window of a chain literal, and change the queries (DESIGN.md §6.3).
-    serve.delivery = Delivery::Batch;
-    serve.hello_with(B as u32, &["cat", file.to_str().unwrap()], level);
-    let mut control = serve.control_session(&list, level);
+    // With `--wait`, the scan starts with the whole list.
+    serve.settings.delivery = Delivery::Batch;
+    serve.settings.wait = true;
+    serve.settings.level = level;
+    serve.pull_with(B as u32, &["cat", file.to_str().unwrap()]);
+    let mut control = serve.control_session();
+    control.give_list(&list);
     assert_eq!(control.query().0, 0);
     for &offset in &w {
         assert_eq!(control.query().0, offset);
@@ -1336,7 +1422,7 @@ fn obsolete_queries_in_flight(level: i32) {
     wait_until_blocked_in_send(serve.child.id(), "control-writer");
     control.answer(&[(20, false)]);
 
-    let (frames, end) = serve.result_through_end(level);
+    let (frames, end) = serve.stream_through_end();
     assert_eq!(end.outcome(), SUCCESS);
     let mut output = Vec::new();
     for (kind, payload) in &frames {
@@ -1377,9 +1463,10 @@ fn a_compressed_stream_is_one_zstd_frame_in_chunks() {
     // which ends with the last CHUNK. STREAM_END and END follow it, outside
     // it, and nothing follows END (DESIGN.md §6.2).
     let mut serve = Serve::start();
-    serve.hello_with(4096, &["printf", "%s", "compressed"], 3);
-    let mut control = serve.control_session(&empty_list(), 3);
-    serve.recv_result();
+    serve.settings.level = 3;
+    serve.pull(&["printf", "%s", "compressed"]);
+    let mut control = serve.control_session();
+    control.no_list();
     let mut chunks = Vec::new();
     let stream = loop {
         match serve.recv() {
@@ -1416,11 +1503,12 @@ fn eager_delivery_sends_the_output_while_the_command_waits() {
         let go = serve.home.path().join("go");
         mkfifoat(CWD, &go, Mode::RUSR | Mode::WUSR).unwrap();
         let script = format!("printf partial; read go <'{}'; printf more", go.display());
-        serve.hello_with(4096, &["sh", "-c", &script], level);
-        let mut control = serve.control_session(&empty_list(), level);
-        serve.recv_result();
+        serve.settings.level = level;
+        serve.pull(&["sh", "-c", &script]);
+        let mut control = serve.control_session();
+        control.no_list();
         {
-            let mut stream = serve.stream(level);
+            let mut stream = serve.stream();
             assert_eq!(stream.next(), Some((LIT, b"partial".to_vec())));
             std::fs::write(&go, b"go\n").unwrap();
             assert_eq!(stream.rest(), [(LIT, b"more".to_vec())]);
@@ -1442,9 +1530,11 @@ fn batch_delivery_keeps_the_output_while_the_command_waits() {
         let go = serve.home.path().join("go");
         mkfifoat(CWD, &go, Mode::RUSR | Mode::WUSR).unwrap();
         let script = format!("printf partial; read go <'{}'; printf more", go.display());
-        serve.delivery = Delivery::Batch;
-        serve.hello_with(4096, &["sh", "-c", &script], level);
-        let mut control = serve.control_session(&empty_list(), level);
+        serve.settings.delivery = Delivery::Batch;
+        serve.settings.level = level;
+        serve.pull(&["sh", "-c", &script]);
+        let mut control = serve.control_session();
+        control.no_list();
         // The open waits for the command to open the FIFO, after it wrote
         // its first bytes. Then `serve` has nothing more to do until the
         // command goes on.
@@ -1452,7 +1542,7 @@ fn batch_delivery_keeps_the_output_while_the_command_waits() {
         wait_until_asleep(serve.child.id());
         fifo.write_all(b"go\n").unwrap();
         drop(fifo);
-        let (frames, end) = serve.result_through_end(level);
+        let (frames, end) = serve.stream_through_end();
         assert_eq!(frames, [(LIT, b"partialmore".to_vec())]);
         assert_eq!(end.outcome(), SUCCESS);
         control.stop();
@@ -1462,25 +1552,25 @@ fn batch_delivery_keeps_the_output_while_the_command_waits() {
 
 #[test]
 fn the_forward_stream_reaches_the_command() {
-    // `serve` flushes CACHE_RESULT, and the client sends the forward stream
-    // after it: the command, `cat`, writes no output before it reads its
-    // stdin. The payloads of the CHUNK frames are pieces of the stream's
-    // LIT frames: at level 3, one zstd frame from an independent encoder,
-    // and at level 0, the frames themselves. STREAM_END ends the stream, so
-    // the command reads EOF after it, and the run ends normally
-    // (DESIGN.md §6.2 and §6.6). END gives the client the server's counts
-    // of the stream: the whole input, all literal, and every CHUNK byte
-    // decoded (DESIGN.md §8).
+    // The client sends the forward stream from the start: the command,
+    // `cat`, writes no output before it reads its stdin. The payloads of
+    // the CHUNK frames are pieces of the stream's LIT frames: at level 3,
+    // one zstd frame from an independent encoder, and at level 0, the
+    // frames themselves. STREAM_END ends the stream, so the command reads
+    // EOF after it, and the run ends normally (DESIGN.md §6.2 and §6.6).
+    // END gives the client the server's counts of the stream: the whole
+    // input, all literal, and every CHUNK byte decoded (DESIGN.md §8).
     let input = b"the stdin of the command\n".repeat(10_000);
     for level in [0, 3] {
         let mut serve = Serve::start();
-        serve.hello_with(4096, &["cat"], level);
-        let mut control = serve.control_session(&empty_list(), level);
-        serve.recv_result();
+        serve.settings.level = level;
+        serve.pull(&["cat"]);
         let stream = forward_stream(&input, level);
         serve.send_raw(&stream);
+        let mut control = serve.control_session();
+        control.no_list();
         let output: Vec<u8> = serve
-            .stream(level)
+            .stream()
             .rest()
             .into_iter()
             .flat_map(|(kind, payload)| {
@@ -1536,9 +1626,9 @@ fn a_command_that_closes_its_stdin_stops_the_forward_stream_at_once() {
         closed.display(),
         go.display()
     );
-    serve.hello(&["sh", "-c", &script]);
-    let mut control = serve.control_session(&empty_list(), 0);
-    serve.recv_result();
+    serve.pull(&["sh", "-c", &script]);
+    let mut control = serve.control_session();
+    control.no_list();
     // The open waits for the command to open the FIFO, after it closed
     // its stdin.
     let mut message = String::new();
@@ -1552,7 +1642,7 @@ fn a_command_that_closes_its_stdin_stops_the_forward_stream_at_once() {
     serve.send(CHUNK, &frame(LIT, b"discarded"));
     serve.send(STREAM_END, b"");
     std::fs::write(&go, b"go\n").unwrap();
-    let (frames, end) = serve.stream_through_end(0);
+    let (frames, end) = serve.stream_through_end();
     assert!(frames.is_empty());
     assert_eq!(end.outcome(), SUCCESS);
     // The command's stdin took none of the stream, and the decoder decoded
@@ -1579,12 +1669,12 @@ fn the_exit_of_the_command_stops_the_forward_stream_while_stdout_stays_open() {
     let go = serve.home.path().join("go");
     mkfifoat(CWD, &go, Mode::RUSR | Mode::WUSR).unwrap();
     let script = format!("( read go <'{}' ) & exit 0", go.display());
-    serve.hello(&["sh", "-c", &script]);
-    let mut control = serve.control_session(&empty_list(), 0);
-    serve.recv_result();
+    serve.pull(&["sh", "-c", &script]);
+    let mut control = serve.control_session();
+    control.no_list();
     control.stop();
     std::fs::write(&go, b"go\n").unwrap();
-    let (frames, end) = serve.stream_through_end(0);
+    let (frames, end) = serve.stream_through_end();
     assert!(frames.is_empty());
     assert_eq!(end.outcome(), SUCCESS);
     serve.expect_success();
@@ -1612,9 +1702,9 @@ fn a_descendant_that_holds_the_command_stdin_delays_nothing() {
         std::process::id(),
         go.display()
     );
-    serve.hello(&["sh", "-c", &script]);
-    let mut control = serve.control_session(&empty_list(), 0);
-    serve.recv_result();
+    serve.pull(&["sh", "-c", &script]);
+    let mut control = serve.control_session();
+    control.no_list();
     // 4 MiB, more than a pipe holds by default: the forward stream's spool
     // takes them all, and the decoder fills the command's stdin.
     let input = vec![b'x'; 4 << 20];
@@ -1622,7 +1712,7 @@ fn a_descendant_that_holds_the_command_stdin_delays_nothing() {
     serve.send_raw(&stream[..stream.len() - 5]);
     wait_until_asleep_in(serve.child.id(), "decoder", poll_syscall());
     std::fs::write(&go, b"go\n").unwrap();
-    let (frames, end) = serve.stream_through_end(0);
+    let (frames, end) = serve.stream_through_end();
     assert_eq!(end.outcome(), SUCCESS);
     control.stop();
     serve.expect_success();
@@ -1661,14 +1751,14 @@ fn a_stop_ends_the_writes_of_one_run_that_stands_for_terabytes() {
         std::process::id(),
         go.display()
     );
-    let (_, mut control) = serve.push(&["sh", "-c", &script], 0);
+    let (_, mut control) = serve.push(&["sh", "-c", &script]);
     let run = [&[0][..], &(1u64 << 40).to_le_bytes()].concat();
     let stream = stream_of(&[(RLE, &run)], 0);
     // Without STREAM_END: only the stop can end the decoder.
     serve.send_raw(&stream[..stream.len() - 5]);
     wait_until_asleep_in(serve.child.id(), "decoder", poll_syscall());
     std::fs::write(&go, b"go\n").unwrap();
-    let (frames, end) = serve.stream_through_end(0);
+    let (frames, end) = serve.stream_through_end();
     assert_eq!(end.outcome(), SUCCESS);
     // The RLE frame that the stop cut short counts whole: 14 bytes.
     assert_eq!(end.frames, [0, 14], "{end:?}");
@@ -1706,16 +1796,18 @@ fn stop_from_the_client_closes_the_command_stdout_and_ends_the_backward_stream()
         return;
     }
     serve.configure_push(&[]);
-    serve.spool_limit = 64 << 10;
+    serve.settings.spool_limit = 64 << 10;
     // `yes` writes its first two bytes alone, and only then the rest in
     // large writes. In eager delivery, an idle point after those two bytes
     // can send them in a CHUNK of their own, ahead of the CHUNK that this
     // test waits for. In batch delivery, every CHUNK is full.
-    serve.delivery = Delivery::Batch;
-    let (_, mut control) = serve.push(&["yes"], 0);
+    serve.settings.delivery = Delivery::Batch;
+    serve.push_request(&["yes"]);
+    serve.recv_hello();
+    let mut control = serve.control_session();
     // The forward stream is empty: without compression, STREAM_END alone.
     serve.send(STREAM_END, b"");
-    wait_until_asleep_in(pid, "hashsync", libc::SYS_writev as u64);
+    wait_until_asleep_in(pid, "data-writer", libc::SYS_writev as u64);
     wait_until_asleep_in(pid, "stdout-reader", libc::SYS_futex as u64);
     control.send_stop();
     // Once the stdout reader has ended, the stop is raised, and only then
@@ -1727,6 +1819,9 @@ fn stop_from_the_client_closes_the_command_stdout_and_ends_the_backward_stream()
         (CHUNK, 256 << 10),
         "the CHUNK on its way"
     );
+    // The forward stream has ended, so `serve`'s side of the list exchange
+    // ends with HASHNONE once its index is ready (DESIGN.md §5.6).
+    assert_eq!(control.recv_exchange(), (HASHNONE, Vec::new()));
     let end = serve.recv_end();
     assert_eq!(end.outcome(), (128 + libc::SIGPIPE, &b""[..]));
     // The stdout reader read at least that CHUNK, and not to the EOF.
@@ -1754,9 +1849,9 @@ fn a_second_stop_from_the_client_is_a_protocol_error() {
     };
     rustix::process::prlimit(Some(pid), rustix::process::Resource::Core, no_core).unwrap();
     let until_the_test_ends = format!("--pid={}", std::process::id());
-    serve.hello(&["tail", &until_the_test_ends, "-f", "/dev/null"]);
-    let mut control = serve.control_session(&empty_list(), 0);
-    serve.recv_result();
+    serve.pull(&["tail", &until_the_test_ends, "-f", "/dev/null"]);
+    let mut control = serve.control_session();
+    control.no_list();
     control.send_stop();
     control.send_stop();
     let (status, stderr) = serve.finish();
@@ -1778,16 +1873,18 @@ fn stdin_eof_after_end_is_the_normal_end() {
     // control session down, joins every thread, and exits with status 0
     // (DESIGN.md §6.9).
     let mut serve = Serve::start();
-    serve.hello(&["printf", "%s", "output"]);
+    serve.pull(&["printf", "%s", "output"]);
     let mut control = serve.attach();
-    serve.send_empty_list();
-    let (frames, end) = serve.result_through_end(0);
+    control.write_all(&frame(HASHNONE, b"")).unwrap();
+    let (frames, end) = serve.stream_through_end();
     assert_eq!(frames, [(LIT, b"output".to_vec())]);
     assert_eq!(end.outcome(), SUCCESS);
     // After the version and the features, the STOP of the command's exit,
-    // which comes before END, and before the closure of the session that
-    // the end of the data session allows (DESIGN.md §6.6).
-    let expected = [&version_and_features(FEATURES)[..], &frame(STOP, b"")].concat();
+    // in the control stream, which comes before END, and before the
+    // closure of the session that the end of the data session allows
+    // (DESIGN.md §6.6).
+    let stop = frame(CHUNK, &frame(STOP, b""));
+    let expected = [&version_and_features(FEATURES)[..], &stop].concat();
     let mut stopped = vec![0; expected.len()];
     control.read_exact(&mut stopped).unwrap();
     assert_eq!(stopped, expected);
@@ -1812,9 +1909,10 @@ fn a_frame_cut_short_after_end_is_the_normal_end_too() {
         "( exec >/dev/null 2>&1 </dev/null; exec tail --pid={} -f /dev/null ) & echo $!",
         std::process::id()
     );
-    serve.hello(&["sh", "-c", &script]);
-    let mut control = serve.control_session(&empty_list(), 0);
-    let (frames, end) = serve.result_through_end(0);
+    serve.pull(&["sh", "-c", &script]);
+    let mut control = serve.control_session();
+    control.no_list();
+    let (frames, end) = serve.stream_through_end();
     assert_eq!(end.outcome(), SUCCESS);
     control.stop();
     let output: Vec<u8> = frames
@@ -1848,11 +1946,11 @@ fn indexed_block() -> Vec<u8> {
 #[test]
 fn a_push_writes_the_blocks_of_the_servers_index_for_its_references() {
     // In a push, `serve` receives the forward stream, deduplicated against
-    // its own index, which it updates before its HELLO, and the target is
-    // that index's list. The client queries the block at offset 4 on the
-    // control session; `serve` pins it and answers yes, so the client sends
-    // REF, and the decoder writes the pinned block to the command's stdin.
-    // `cat` sends it all back in the backward stream, which is plain
+    // its own index, which it updates while the command runs, and the
+    // target is that index's list. The client queries the block at offset 4
+    // on the control session; `serve` pins it and answers yes, so the client
+    // sends REF, and the decoder writes the pinned block to the command's
+    // stdin. `cat` sends it all back in the backward stream, which is plain
     // (DESIGN.md §6.4 and §6.6). A query for a block that the index does not
     // have, as the client sends when only the weak hash of its window is
     // listed, gets a no, and so does a query for an indexed block whose
@@ -1864,7 +1962,8 @@ fn a_push_writes_the_blocks_of_the_servers_index_for_its_references() {
     for level in [0, 3] {
         let mut serve = Serve::start();
         serve.configure_push(&[("block", &block), ("stale", &stale)]);
-        let (list, mut control) = serve.push(&["cat"], level);
+        serve.settings.level = level;
+        let (list, mut control) = serve.push(&["cat"]);
         let mut listed = [weak_hash(&block), weak_hash(&stale)];
         listed.sort_unstable();
         assert_eq!(list, encode_list(&listed), "the target");
@@ -1879,7 +1978,7 @@ fn a_push_writes_the_blocks_of_the_servers_index_for_its_references() {
         let frames = [(LIT, &b"head"[..]), (REF, b""), (LIT, b"tail")];
         serve.send_raw(&stream_of(&frames, level));
         let output: Vec<u8> = serve
-            .stream(level)
+            .stream()
             .rest()
             .into_iter()
             .flat_map(|(kind, payload)| {
@@ -1928,7 +2027,7 @@ fn a_push_closes_the_index_at_the_stop_and_answers_no_query_after_it() {
         closed.display(),
         go.display()
     );
-    let (_, mut control) = serve.push(&["sh", "-c", &script], 0);
+    let (_, mut control) = serve.push(&["sh", "-c", &script]);
     // The open waits for the command to open the FIFO, after it closed its
     // stdin.
     let mut message = String::new();
@@ -1947,7 +2046,7 @@ fn a_push_closes_the_index_at_the_stop_and_answers_no_query_after_it() {
     serve.send(CHUNK, &frame(LIT, b"discarded"));
     serve.send(STREAM_END, b"");
     std::fs::write(&go, b"go\n").unwrap();
-    let (frames, end) = serve.stream_through_end(0);
+    let (frames, end) = serve.stream_through_end();
     assert!(frames.is_empty());
     assert_eq!(end.outcome(), SUCCESS);
     assert_eq!(end.written, [0; 4], "{end:?}");
@@ -1959,11 +2058,44 @@ fn a_push_closes_the_index_at_the_stop_and_answers_no_query_after_it() {
 }
 
 #[test]
+fn a_push_whose_stream_ends_during_the_update_sends_no_list() {
+    // This test holds a shared lock on the index of `serve`, so the update
+    // of a push waits, while the command runs. The forward stream ends
+    // meanwhile, which puts the receiver into Completing: once its index is
+    // ready, `serve` has no use for the list, so its side of the exchange
+    // ends with HASHNONE in place of INDEX, and END follows (DESIGN.md
+    // §5.6). The client's side ends with it, and sends nothing.
+    let mut serve = Serve::start();
+    serve.configure_push(&[("block", &indexed_block())]);
+    let config = serve.home.path().join("config/hashsync/config.toml");
+    let update = Command::new(env!("CARGO_BIN_EXE_hashsync"))
+        .arg("--config")
+        .arg(&config)
+        .arg("update")
+        .output()
+        .unwrap();
+    assert!(update.status.success(), "{update:?}");
+    let lock = shared_lock(&serve.index());
+    serve.push_request(&["cat"]);
+    serve.recv_hello();
+    let mut control = serve.control_session();
+    wait_for_lock_wait(serve.child.id());
+    serve.send_raw(&forward_stream(b"input", 0));
+    // `cat` copies its stdin, and ends with it.
+    assert_eq!(serve.stream().rest(), [(LIT, b"input".to_vec())]);
+    drop(lock);
+    assert_eq!(control.recv_exchange(), (HASHNONE, Vec::new()));
+    assert_eq!(serve.recv_end().outcome(), SUCCESS);
+    control.stop();
+    serve.expect_success();
+}
+
+#[test]
 fn client_loss_during_the_index_update_of_a_push_is_fatal() {
     // This test holds a shared lock on the index of `serve`, so the update
-    // that a push starts waits for good, before `serve` sends its HELLO.
-    // Only the session watcher, which starts at REQUEST, can then notice
-    // that the client has disappeared (DESIGN.md §4.4 and §6.6).
+    // that a push starts waits for good. The data reader sees that the
+    // client has disappeared, and so does the session watcher, which
+    // starts at REQUEST (DESIGN.md §4.4 and §6.6).
     let mut serve = Serve::start();
     serve.configure_push(&[("block", &indexed_block())]);
     let config = serve.home.path().join("config/hashsync/config.toml");
@@ -1975,7 +2107,8 @@ fn client_loss_during_the_index_update_of_a_push_is_fatal() {
         .unwrap();
     assert!(update.status.success(), "{update:?}");
     let _lock = shared_lock(&serve.index());
-    serve.push_request(&["true"], 0);
+    serve.push_request(&["true"]);
+    serve.recv_hello();
     wait_for_lock_wait(serve.child.id());
     serve.lose_data_session();
     serve.expect_death("the client disappeared");
@@ -1995,10 +2128,10 @@ fn client_loss_after_the_end_of_the_forward_stream_of_a_push_is_fatal_before_end
             "cat >/dev/null; ( exec >/dev/null; exec tail --pid={} -f /dev/null ) & echo $!",
             std::process::id()
         );
-        let (_, control) = serve.push(&["sh", "-c", &script], 0);
+        let (_, control) = serve.push(&["sh", "-c", &script]);
         serve.send_raw(&forward_stream(b"input", 0));
         let output: Vec<u8> = serve
-            .stream(0)
+            .stream()
             .rest()
             .into_iter()
             .flat_map(|(_, payload)| payload)

@@ -118,6 +118,14 @@ pub struct RunSettings {
     #[arg(long)]
     pub batch_stdout: bool,
 
+    /// Scan each deduplicated stream only once its sender has the whole
+    /// hash list of its receiver, so that the stream sends the fewest
+    /// bytes; meanwhile its bytes wait in the spool of its source. Without
+    /// it, a deduplicated stream starts at once, and finds more blocks as
+    /// the list arrives
+    #[arg(long)]
+    pub wait: bool,
+
     /// How far the scanner scans ahead of the bytes it has sent, at least
     /// the block size of the index that it scans against; it also flushes
     /// the stream once it has sent this many bytes since the last flush
@@ -248,6 +256,7 @@ pub mod tests {
                 no_update: false,
                 batch_stdin: false,
                 batch_stdout: false,
+                wait: false,
                 lookahead: None,
                 negative_cache: 128 << 20,
                 probe_threads: 0,
@@ -268,6 +277,7 @@ pub mod tests {
             "--no-update",
             "--batch-stdin",
             "--batch-stdout",
+            "--wait",
             "--lookahead",
             "1MiB",
             "--negative-cache",
@@ -284,6 +294,7 @@ pub mod tests {
             "--no-sender-cache",
         ]);
         assert!(settings.no_update);
+        assert!(settings.wait);
         assert_eq!(settings.stdin_delivery(), Delivery::Batch);
         assert_eq!(settings.stdout_delivery(), Delivery::Batch);
         assert_eq!(settings.lookahead, Some(1 << 20));

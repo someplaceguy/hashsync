@@ -532,6 +532,25 @@ impl ZstdDCtx {
         // SAFETY: `ZSTD_DStreamOutSize` has no preconditions.
         unsafe { zstd_sys::ZSTD_DStreamOutSize() }
     }
+
+    /// `ZSTD_DCtx_reset` of the session: the next call starts to decode a
+    /// new frame. The context keeps the memory that it allocated.
+    pub fn reset_session(&mut self) -> Result<(), &'static str> {
+        if let Some(e) = self.error {
+            return Err(e);
+        }
+        // SAFETY: `self.ptr` is a valid context that no error left in an
+        // undefined state.
+        let rc = unsafe {
+            zstd_sys::ZSTD_DCtx_reset(
+                self.ptr.as_ptr(),
+                zstd_sys::ZSTD_ResetDirective::ZSTD_reset_session_only,
+            )
+        };
+        zstd_result(rc)
+            .map(drop)
+            .inspect_err(|&e| self.error = Some(e))
+    }
 }
 
 impl Drop for ZstdDCtx {

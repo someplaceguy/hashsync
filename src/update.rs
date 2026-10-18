@@ -22,10 +22,10 @@ pub fn run(config: &Config, rebuild: bool, jobs: Option<u32>) {
 /// Update the index and return it still open, with the current root
 /// locations that the update resolved. The receiver of a run turns it into
 /// a read-only index on the same lock (`Index::into_read_only`), so no
-/// modifying process comes between the update and its use, or, as the
-/// client of a run with both streams deduplicated, closes it until its
-/// HELLO (DESIGN.md §4.4). Its lookups read candidate blocks through these
-/// locations.
+/// modifying process comes between the update and its use, or, in a run
+/// with both streams deduplicated, closes it until the other host's update
+/// is done too (DESIGN.md §4.4). Its lookups read candidate blocks through
+/// these locations.
 pub fn perform(config: &Config, rebuild: bool, jobs: Option<u32>) -> (index::Index, Vec<Location>) {
     fsops::raise_descriptor_limit();
 

@@ -9,17 +9,20 @@
 //! needs a bound beyond its field: a corrupt value costs only the bytes
 //! that really follow it.
 //!
-//! The data session has two levels of frames. Session frames are never
-//! compressed: the handshake, CHUNK, STREAM_END and END. The stream frames
-//! of a stream, LIT, REF and RLE, form one zstd frame, unless compression
-//! is disabled, and the payloads of the stream's CHUNK frames are
-//! consecutive pieces of it: the stream's data writer writes it through a
-//! `Compressor` (`stream::write_stream`), and a `StreamReader` reads it
-//! back. So a reader finds the session frames
-//! without decoding a stream, and a stopped stream is discarded without
-//! being decoded. After the features, each direction of the control
-//! session is one zstd stream too, which a `Decompressor` reads; the
-//! closure of the session ends it.
+//! Each session has two levels of frames. Session frames are never
+//! compressed. On the data session, they are REQUEST, the HELLO of each
+//! deduplicated stream, CHUNK, STREAM_END and END. The stream frames of a
+//! stream, LIT, REF and RLE, form one zstd frame, unless compression is
+//! disabled, and the payloads of the stream's CHUNK frames are consecutive
+//! pieces of it: the stream's data writer writes it through a `Compressor`
+//! (`stream::write_stream`), and a `StreamReader` reads it back. So a reader
+//! finds the session frames without decoding a stream, and a stopped stream
+//! is discarded without being decoded. On the control session, the session
+//! frames are CHUNK and the frames of the list exchanges. There, the CHUNK
+//! payloads of each direction are the pieces of one zstd stream, which
+//! carries the control frames QUERY, ANSWER and STOP, and which the closure
+//! of the session ends. The hash lists stay outside it: zstd cannot make
+//! them smaller (DESIGN.md §10).
 //!
 //! Malformed payloads, invalid compressed data, and violated frame rules
 //! are bugs in a compatible peer: parsers panic (DESIGN.md §6.7). Transport
@@ -30,7 +33,6 @@
 use std::io::{BufRead, IoSlice, Read, Write};
 use std::ops::RangeInclusive;
 
-use crossbeam_channel::{Receiver, TryRecvError};
 use zstd_sys::ZSTD_EndDirective;
 
 use crate::die::die;
@@ -52,27 +54,35 @@ pub const PROTOCOL_VERSION: u32 = 1;
 pub const FEATURES: u64 = 0;
 
 /// Frame types. `type u8, length u32, payload`, integers little endian.
-/// The numbers follow the three levels of frames (DESIGN.md §6.2).
+/// The numbers follow the levels of frames (DESIGN.md §6.2).
 pub mod frame {
-    // Session frames: the data session, never compressed.
+    // Session frames of the data session. CHUNK is a session frame of the
+    // control session too.
     pub const REQUEST: u8 = 1;
     pub const HELLO: u8 = 2;
-    pub const HASHLIST: u8 = 3;
-    pub const HASHDELTA: u8 = 4;
-    pub const HASHKEEP: u8 = 5;
-    pub const HASHFULL: u8 = 6;
-    pub const CACHE_RESULT: u8 = 7;
-    pub const CHUNK: u8 = 8;
-    pub const STREAM_END: u8 = 9;
-    pub const END: u8 = 10;
+    pub const CHUNK: u8 = 3;
+    pub const STREAM_END: u8 = 4;
+    pub const END: u8 = 5;
+    // Session frames of the control session: the frames of the list
+    // exchanges, and UPDATED.
+    pub const INDEX: u8 = 6;
+    pub const ADVERTISE: u8 = 7;
+    pub const HASHLIST: u8 = 8;
+    pub const HASHDELTA: u8 = 9;
+    pub const HASHKEEP: u8 = 10;
+    pub const HASHNONE: u8 = 11;
+    pub const HASHDATA: u8 = 12;
+    pub const HASHFULL: u8 = 13;
+    pub const CACHE_RESULT: u8 = 14;
+    pub const UPDATED: u8 = 15;
     // Stream frames: inside the zstd frame of a stream.
-    pub const LIT: u8 = 11;
-    pub const REF: u8 = 12;
-    pub const RLE: u8 = 13;
-    // Control frames: the control session.
-    pub const QUERY: u8 = 14;
-    pub const ANSWER: u8 = 15;
-    pub const STOP: u8 = 16;
+    pub const LIT: u8 = 16;
+    pub const REF: u8 = 17;
+    pub const RLE: u8 = 18;
+    // Control frames: inside the control stream of the control session.
+    pub const QUERY: u8 = 19;
+    pub const ANSWER: u8 = 20;
+    pub const STOP: u8 = 21;
 }
 
 /// The size of a frame header, `type u8, length u32`.
@@ -148,6 +158,7 @@ impl Request {
         enc.u64(settings.spool_limit);
         enc.u8(settings.batch_stdin.into());
         enc.u8(settings.batch_stdout.into());
+        enc.u8(settings.wait.into());
         enc.u8(self.quiet.into());
         enc.u8(self.human_readable.into());
         enc.buf
@@ -192,6 +203,7 @@ impl Request {
             spool_limit: dec.u64(),
             batch_stdin: dec.flag(),
             batch_stdout: dec.flag(),
+            wait: dec.flag(),
         };
         let request = Request {
             command,
@@ -205,36 +217,31 @@ impl Request {
     }
 }
 
-/// HELLO, receiver to sender. Its block size and hashes are the stream's:
-/// the sender uses them or ends the run. Every digest of the stream's list
-/// exchange, including the target's, uses `strong_hash` (DESIGN.md §6.2).
-/// It does not name the target: the receiver sends it before it exports
-/// its hash list, so that the sender can prepare its cached list in the
-/// meantime, and the message that hands over the target names it
-/// (`TargetList`).
-pub struct ReceiverHello {
+/// HELLO, receiver to sender, on the data session: the block size and the
+/// hashes of a deduplicated stream, which its sender uses, or ends the run.
+/// The receiver sends it at once, from its configuration, which its index
+/// matches once it is ready for the run: the scanner needs the block size
+/// before it scans a byte, and the index can take long to update
+/// (DESIGN.md §6.2). Every digest of the stream's list exchange uses
+/// `strong_hash`.
+pub struct Hello {
     pub block_size: u32,
     pub weak_hash_id: String,
     pub strong_hash: StrongHash,
-    pub account_id: [u8; 16],
-    pub index_id: [u8; 16],
 }
 
-impl ReceiverHello {
+impl Hello {
     pub fn encode(&self) -> Vec<u8> {
         let mut enc = Enc::new();
         enc.u32(self.block_size);
         enc.bytes(self.weak_hash_id.as_bytes());
         enc.bytes(self.strong_hash.id().as_bytes());
-        enc.raw(&self.account_id);
-        enc.raw(&self.index_id);
         enc.buf
     }
 
-    /// The strong hash sets the length of every list ID that the later
-    /// frames of the exchange carry, so an unsupported strong hash ends the
-    /// run here (DESIGN.md §6.2). The sender checks the weak hash after
-    /// decoding.
+    /// The strong hash sets the length of every list ID that the frames of
+    /// the exchange carry, so an unsupported strong hash ends the run here
+    /// (DESIGN.md §6.2). The sender checks the weak hash after decoding.
     pub fn decode(payload: &[u8]) -> Self {
         let mut dec = Dec::new(payload, "HELLO");
         let block_size = dec.u32();
@@ -245,29 +252,53 @@ impl ReceiverHello {
                 "incompatible receiver: strong hash {strong_hash_id}"
             ));
         };
-        let hello = ReceiverHello {
+        dec.done();
+        assert!(block_size > 0, "protocol error: block size 0");
+        Hello {
             block_size,
             weak_hash_id,
             strong_hash,
+        }
+    }
+}
+
+/// INDEX, receiver to sender: the IDs that partition the list caches, the
+/// receiver's account and the ID of its index. The receiver sends it once
+/// its index is ready for the run, and the sender then lists its cache
+/// directory for them (DESIGN.md §5.6).
+pub struct IndexIds {
+    pub account_id: [u8; 16],
+    pub index_id: [u8; 16],
+}
+
+impl IndexIds {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut enc = Enc::new();
+        enc.raw(&self.account_id);
+        enc.raw(&self.index_id);
+        enc.buf
+    }
+
+    pub fn decode(payload: &[u8]) -> Self {
+        let mut dec = Dec::new(payload, "INDEX");
+        let ids = IndexIds {
             account_id: dec.array(),
             index_id: dec.array(),
         };
         dec.done();
-        assert!(hello.block_size > 0, "protocol error: block size 0");
-        hello
+        ids
     }
 }
 
-/// HELLO, sender to receiver. The sender sends it only after it
-/// accepted the receiver's HELLO, so it does not repeat those
-/// parameters. The IDs of the advertised lists are digests of the stream's
-/// strong hash (DESIGN.md §5.6).
-pub struct SenderHello {
+/// ADVERTISE, sender to receiver: the sender's account, and the IDs of the
+/// lists that its cache holds for the receiver and the index of INDEX. They
+/// are digests of the stream's strong hash (DESIGN.md §5.6).
+pub struct Advertise {
     pub account_id: [u8; 16],
     pub lists: Vec<Strong>,
 }
 
-impl SenderHello {
+impl Advertise {
     pub fn encode(&self) -> Vec<u8> {
         let mut enc = Enc::new();
         enc.raw(&self.account_id);
@@ -279,19 +310,34 @@ impl SenderHello {
     }
 
     pub fn decode(payload: &[u8]) -> Self {
-        let mut dec = Dec::new(payload, "HELLO");
-        let hello = SenderHello {
+        let mut dec = Dec::new(payload, "ADVERTISE");
+        let advertise = Advertise {
             account_id: dec.array(),
             lists: dec.list(Dec::array),
         };
         dec.done();
-        hello
+        advertise
     }
 }
 
+/// A session frame of the control session other than CHUNK, with a payload
+/// of its own: what the control reader passes to a side of a list exchange,
+/// and what a side queues for the control writer (DESIGN.md §6.2).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExchangeFrame {
+    pub kind: u8,
+    pub payload: Vec<u8>,
+}
+
+/// The most list bytes of one HASHDATA frame. The lists share their
+/// direction of the control session with the control frames, which go
+/// first, but a control frame that comes while a HASHDATA frame goes out
+/// waits for it: at 1 MB/s, up to 16 ms.
+pub const HASHDATA_BYTES: usize = 16 << 10;
+
 /// The message in which the receiver hands the sender its target
-/// (DESIGN.md §5.6): a frame, followed directly by the encoded lists that it
-/// announces, outside any frame. Each form names the target by its digest.
+/// (DESIGN.md §5.6): a frame that names the target, followed by HASHDATA
+/// frames with the encoded lists that it announces.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TargetList {
     /// HASHLIST, with the full target.
@@ -344,7 +390,8 @@ impl TargetList {
         (kind, enc.buf)
     }
 
-    /// The lists that follow the frame, in order.
+    /// The lists that follow the frame, in order: the removed list of a
+    /// delta comes before its added list.
     fn lists(&self) -> Vec<&[u8]> {
         match self {
             TargetList::Full { list, .. } => vec![list],
@@ -353,55 +400,108 @@ impl TargetList {
         }
     }
 
-    /// The number of bytes that the message takes on the data session: the
-    /// frame plus the lists after it.
+    /// The number of bytes that the message takes on the control session:
+    /// the frame, the bytes of the lists, and the headers of the HASHDATA
+    /// frames that carry them.
     pub fn size(&self) -> usize {
         let lists: usize = self.lists().iter().map(|list| list.len()).sum();
-        FRAME_HEADER + self.frame().1.len() + lists
+        let pieces = lists.div_ceil(HASHDATA_BYTES);
+        FRAME_HEADER + self.frame().1.len() + lists + pieces * FRAME_HEADER
     }
 
-    /// Send the frame and the lists after it in a single write call
-    /// (`FrameWriter::send_followed_by`).
-    pub fn send<W: Write>(&self, out: &mut FrameWriter<W>) -> std::io::Result<()> {
+    /// Give `send` the frames of the message, one after the other: the
+    /// frame, then the HASHDATA frames of its lists, each with at most
+    /// `HASHDATA_BYTES` of them. The lists of a delta go as one sequence of
+    /// bytes, so one HASHDATA frame can hold the end of the removed list
+    /// and the start of the added list. A frame is made only once `send`
+    /// has taken the one before, so a long list is not copied whole.
+    pub fn send(&self, mut send: impl FnMut(ExchangeFrame)) {
         let (kind, payload) = self.frame();
-        out.send_followed_by(kind, &payload, &self.lists())
-    }
-
-    /// Receive the frame and the lists after it. EOF is `UnexpectedEof`,
-    /// and any other frame is a protocol error.
-    pub fn receive<R: Read>(input: &mut FrameReader<R>) -> std::io::Result<TargetList> {
-        let frame = input.next()?.ok_or(std::io::ErrorKind::UnexpectedEof)?;
-        let list = match frame.kind {
-            frame::HASHLIST => {
-                let mut dec = Dec::new(frame.payload, "HASHLIST");
-                let (target, length) = (dec.array(), dec.u64());
-                dec.done();
-                TargetList::Full {
-                    target,
-                    list: input.bytes(length)?,
+        send(ExchangeFrame { kind, payload });
+        let mut piece = Vec::with_capacity(HASHDATA_BYTES);
+        for mut bytes in self.lists() {
+            while !bytes.is_empty() {
+                let n = bytes.len().min(HASHDATA_BYTES - piece.len());
+                piece.extend_from_slice(&bytes[..n]);
+                bytes = &bytes[n..];
+                if piece.len() == HASHDATA_BYTES {
+                    let payload = std::mem::replace(&mut piece, Vec::with_capacity(HASHDATA_BYTES));
+                    send(ExchangeFrame {
+                        kind: frame::HASHDATA,
+                        payload,
+                    });
                 }
             }
+        }
+        if !piece.is_empty() {
+            send(ExchangeFrame {
+                kind: frame::HASHDATA,
+                payload: piece,
+            });
+        }
+    }
+}
+
+/// The frame that answers ADVERTISE, as the sender reads it (DESIGN.md
+/// §5.6): HASHLIST, HASHDELTA and HASHKEEP name the target, and HASHLIST
+/// and HASHDELTA announce the bytes of the lists that follow them in
+/// HASHDATA frames. HASHNONE ends the exchange without a target.
+#[derive(Debug, PartialEq, Eq)]
+pub enum TargetFrame {
+    Full {
+        target: Strong,
+        length: u64,
+    },
+    Keep {
+        target: Strong,
+    },
+    Delta {
+        target: Strong,
+        base: Strong,
+        removed: u64,
+        added: u64,
+    },
+    None,
+}
+
+impl TargetFrame {
+    /// The frame of type `kind` with `payload`. Any other type than these
+    /// four is a protocol error.
+    pub fn decode(kind: u8, payload: &[u8]) -> Self {
+        match kind {
+            frame::HASHLIST => {
+                let mut dec = Dec::new(payload, "HASHLIST");
+                let (target, length) = (dec.array(), dec.u64());
+                dec.done();
+                TargetFrame::Full { target, length }
+            }
             frame::HASHKEEP => {
-                let mut dec = Dec::new(frame.payload, "HASHKEEP");
+                let mut dec = Dec::new(payload, "HASHKEEP");
                 let target = dec.array();
                 dec.done();
-                TargetList::Keep { target }
+                TargetFrame::Keep { target }
             }
             frame::HASHDELTA => {
-                let mut dec = Dec::new(frame.payload, "HASHDELTA");
+                let mut dec = Dec::new(payload, "HASHDELTA");
                 let (target, base) = (dec.array(), dec.array());
                 let (removed, added) = (dec.u64(), dec.u64());
                 dec.done();
-                TargetList::Delta {
+                TargetFrame::Delta {
                     target,
                     base,
-                    removed: input.bytes(removed)?,
-                    added: input.bytes(added)?,
+                    removed,
+                    added,
                 }
             }
+            frame::HASHNONE => {
+                assert!(
+                    payload.is_empty(),
+                    "protocol error: HASHNONE with a payload"
+                );
+                TargetFrame::None
+            }
             kind => panic!("protocol error: expected the target list, received frame type {kind}"),
-        };
-        Ok(list)
+        }
     }
 }
 
@@ -854,15 +954,6 @@ impl<R: Read> FrameReader<R> {
         }))
     }
 
-    /// Exactly `length` bytes that follow a frame outside any frame: the
-    /// list bytes after HASHLIST or HASHDELTA. EOF first is
-    /// `UnexpectedEof`.
-    pub fn bytes(&mut self, length: u64) -> std::io::Result<Vec<u8>> {
-        let mut bytes = Vec::new();
-        read_exactly(&mut self.reader, length, &mut bytes)?;
-        Ok(bytes)
-    }
-
     /// The next frame, which must exist and have this type.
     pub fn expect(&mut self, kind: u8, what: &'static str) -> std::io::Result<&[u8]> {
         let frame = self.next()?.ok_or(std::io::ErrorKind::UnexpectedEof)?;
@@ -906,13 +997,11 @@ pub fn drain_to_eof(mut reader: impl Read) -> std::io::Result<bool> {
 }
 
 /// Writes frames to a transport. Each frame goes out in one write call,
-/// together with any bytes that follow it outside a frame, whenever the
-/// transport takes it whole (`send`, `send_followed_by`). A writer that
-/// sends many small frames also wraps its transport in a buffer, which
-/// makes fewer calls: a `BufWriter` on the control session, a `ChunkWriter`
-/// for the stream frames of the data session. A control writer flushes
-/// before it waits (`next_from`), and the data writer of a stream at its
-/// idle points in eager delivery (DESIGN.md §6.2).
+/// whenever the transport takes it whole (`send`). The many small frames
+/// inside a compressed stream go to a buffer first, which makes fewer
+/// calls: a `ChunkWriter` for the stream frames of the data session, and
+/// the buffer of the control stream (`control::write`), which go to the
+/// session in CHUNK frames (DESIGN.md §6.2).
 pub struct FrameWriter<W: Write> {
     writer: W,
 }
@@ -924,6 +1013,10 @@ impl<W: Write> FrameWriter<W> {
 
     pub fn into_inner(self) -> W {
         self.writer
+    }
+
+    pub fn get_mut(&mut self) -> &mut W {
+        &mut self.writer
     }
 
     /// This side's protocol version and then its features: the session's
@@ -947,22 +1040,6 @@ impl<W: Write> FrameWriter<W> {
         self.write_parts(&mut [IoSlice::new(&header), IoSlice::new(payload)])
     }
 
-    /// Write one frame followed directly by `after`, bytes that belong to
-    /// no frame: the lists after HASHLIST or HASHDELTA. They go in the same
-    /// write call as the frame, for the reason given at `send`: otherwise
-    /// SSH could send the frame and each list in packets of their own.
-    pub fn send_followed_by(
-        &mut self,
-        kind: u8,
-        payload: &[u8],
-        after: &[&[u8]],
-    ) -> std::io::Result<()> {
-        let header = frame_header(kind, payload);
-        let mut parts = vec![IoSlice::new(&header), IoSlice::new(payload)];
-        parts.extend(after.iter().map(|bytes| IoSlice::new(bytes)));
-        self.write_parts(&mut parts)
-    }
-
     /// Write `parts` with one vectored write call, and the rest with more
     /// calls if the transport takes only some of the bytes.
     fn write_parts(&mut self, mut parts: &mut [IoSlice<'_>]) -> std::io::Result<()> {
@@ -979,22 +1056,6 @@ impl<W: Write> FrameWriter<W> {
 
     pub fn flush(&mut self) -> std::io::Result<()> {
         self.writer.flush()
-    }
-
-    /// The next item from `queue`, for a control writer, which writes what
-    /// the queue delivers. When nothing is queued, flush first: the
-    /// scanner waits for answers, so queries and answers must not stay in
-    /// a buffer or in the compressor while this thread waits (DESIGN.md
-    /// §6.2 and §6.8). `None`, after a flush, once the queue is closed and
-    /// empty.
-    pub fn next_from<T>(&mut self, queue: &Receiver<T>) -> std::io::Result<Option<T>> {
-        match queue.try_recv() {
-            Ok(item) => Ok(Some(item)),
-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => {
-                self.flush()?;
-                Ok(queue.recv().ok())
-            }
-        }
     }
 }
 
@@ -1060,12 +1121,12 @@ pub const COMPRESSION_LEVELS: RangeInclusive<i32> = 0..=19;
 const LONG_WINDOW_LOG: u32 = 27;
 
 /// One compressed stream (DESIGN.md §6.2): the stream frames of a stream
-/// on the data session, in one zstd frame, or one direction of the control
-/// session after the features. With compression disabled, the bytes pass
-/// as they are. `flush` makes every byte written so far decodable by the
-/// peer. `finish` ends the zstd frame of a stream, whose checksum the
-/// reader checks; no frame ends the stream of a control session, which
-/// ends with the closure of the session.
+/// on the data session, in one zstd frame, or the control stream of one
+/// direction of the control session. With compression disabled, the bytes
+/// pass as they are. `flush` makes every byte written so far decodable by
+/// the peer. `finish` ends the zstd frame of a stream, whose checksum the
+/// reader checks; no frame ends a control stream, which ends with the
+/// closure of the session.
 ///
 /// Transport failures are `io::Error`s for the caller's `die`. A failure of
 /// zstd itself panics.
@@ -1097,11 +1158,12 @@ impl<W: Write> Compressor<W> {
         Compressor { transport, zstd }
     }
 
-    /// One direction of the control session: compress at zstd `level` in
-    /// the writer's own thread, without long-distance matching; level 0
-    /// disables compression. Its frames are small, and the writer flushes
-    /// whenever its queue runs empty, so worker threads and a long window
-    /// would only add cost (DESIGN.md §6.2).
+    /// The control stream of one direction of the control session:
+    /// compress at zstd `level` in the writer's own thread, without
+    /// long-distance matching; level 0 disables compression. Its frames are
+    /// small, and the writer flushes whenever its queue runs empty, so
+    /// worker threads and a long window would only add cost (DESIGN.md
+    /// §6.2).
     pub fn control(transport: W, level: i32) -> Self {
         Self::new(transport, level, false, 0)
     }
@@ -1119,6 +1181,30 @@ impl<W: Write> Compressor<W> {
     /// the bytes that zstd still holds are lost.
     pub fn into_transport(self) -> W {
         self.transport
+    }
+
+    /// The transport, which the control writer empties into CHUNK frames.
+    pub fn transport_mut(&mut self) -> &mut W {
+        &mut self.transport
+    }
+
+    /// Start the zstd frame of the stream now, which writes nothing: the
+    /// frame header goes out with the first block. The start of a frame
+    /// allocates the tables of the context and clears them, which takes
+    /// milliseconds, tens of them on a busy host, and waits for the other
+    /// threads of the process that map memory meanwhile, such as the decoder
+    /// of a stream that takes a window of up to 128 MiB. The control writer
+    /// calls this at its start, so that its first frame, such as STOP, waits
+    /// for neither (DESIGN.md §6.2). Ending a frame here and starting
+    /// another would clear the tables again at the first frame.
+    pub fn prepare(&mut self) {
+        if let Some(zstd) = &mut self.zstd {
+            let status = zstd
+                .encoder
+                .compress_stream(&[], &mut zstd.buffer, ZSTD_EndDirective::ZSTD_e_continue)
+                .unwrap_or_else(zstd_failed);
+            assert_eq!(status.written, 0, "zstd wrote without input");
+        }
     }
 }
 
@@ -1218,6 +1304,18 @@ impl Decoding {
             taken: 0,
             consumed: 0,
         }
+    }
+
+    /// Start afresh, before a new frame, with the memory that the context
+    /// and the buffer have taken.
+    fn reset(&mut self) {
+        self.decoder.reset_session().unwrap_or_else(zstd_failed);
+        self.start = 0;
+        self.end = 0;
+        self.ended = false;
+        self.start_of_frame = [0; 5];
+        self.taken = 0;
+        self.consumed = 0;
     }
 
     /// True when the frame is a zstd frame that announces its checksum,
@@ -1362,9 +1460,10 @@ impl<R: BufRead> Read for StreamReader<R> {
     }
 }
 
-/// The reading end of one direction of the control session after the
-/// features (DESIGN.md §6.2): the decoded bytes of a zstd frame that never
+/// The reading end of the control stream of one direction of the control
+/// session (DESIGN.md §6.2): the decoded bytes of a zstd frame that never
 /// ends, or the bytes of the transport when compression is disabled. The
+/// transport gives the payloads of the CHUNK frames of the session. The
 /// closure of the session ends the stream: EOF of the transport is
 /// `UnexpectedEof` inside the frame. The end of the frame is a protocol
 /// error and panics.
@@ -1380,6 +1479,29 @@ impl<R: BufRead> Decompressor<R> {
             transport,
             zstd: compressed.then(Decoding::new),
         }
+    }
+
+    /// Decode a control stream that a control writer at `level` sends, with
+    /// STOP alone, which reads nothing of the transport, and start afresh,
+    /// with the window buffer that zstd took for it, for the reason of
+    /// `Compressor::prepare`: the control reader calls this before the
+    /// first frame of the session. A new frame of a decoder clears no
+    /// table.
+    pub fn prepare(&mut self, level: i32) {
+        let Some(zstd) = &mut self.zstd else {
+            return;
+        };
+        let mut frames = FrameWriter::new(Compressor::control(Vec::new(), level));
+        frames
+            .send(frame::STOP, b"")
+            .and_then(|()| frames.flush())
+            .expect("a write to memory failed");
+        let stream = frames.into_inner().into_transport();
+        let decoded = zstd
+            .available(&mut &stream[..])
+            .expect("a read from memory failed");
+        assert!(decoded, "zstd decoded nothing of a flushed frame");
+        zstd.reset();
     }
 }
 
@@ -1450,6 +1572,37 @@ mod tests {
         );
     }
 
+    /// The frame that `prepare` compresses goes nowhere: a prepared control
+    /// writer sends the stream of a fresh one, byte for byte, and a prepared
+    /// reader decodes it as a fresh one does (DESIGN.md §6.2).
+    #[test]
+    fn a_prepared_control_stream_is_the_stream_of_a_fresh_one() {
+        let query = [7u8; 40];
+        for level in [0, 3, 9] {
+            let stream = |prepared: bool| {
+                let mut compressor = Compressor::control(Vec::new(), level);
+                if prepared {
+                    compressor.prepare();
+                }
+                let mut writer = FrameWriter::new(compressor);
+                writer.send(frame::QUERY, &query).unwrap();
+                writer.flush().unwrap();
+                writer.send(frame::STOP, b"").unwrap();
+                writer.flush().unwrap();
+                writer.into_inner().into_transport()
+            };
+            let prepared = stream(true);
+            assert_eq!(prepared, stream(false), "level {level}");
+            let mut decompressor = Decompressor::new(&prepared[..], level != 0);
+            decompressor.prepare(level);
+            let mut reader = FrameReader::new(decompressor);
+            let first = reader.next().unwrap().unwrap();
+            assert_eq!((first.kind, first.payload), (frame::QUERY, &query[..]));
+            let second = reader.next().unwrap().unwrap();
+            assert_eq!(second.kind, frame::STOP, "level {level}");
+        }
+    }
+
     #[test]
     fn truncated_frames_are_unexpected_eof() {
         let mut out = Vec::new();
@@ -1473,76 +1626,124 @@ mod tests {
         assert!(reader.payload.capacity() < 1 << 20);
     }
 
-    #[test]
-    fn target_lists_carry_their_lists_after_the_frame() {
-        // The list bytes after HASHLIST and HASHDELTA are not frames: they
-        // follow the frame directly, with the removed list first. The
-        // target, and the base of a delta, travel as just their digests
-        // (DESIGN.md §6.2).
-        let lists = [
-            TargetList::Full {
-                target: [1; 32],
-                list: b"full".to_vec(),
-            },
-            TargetList::Keep { target: [2; 32] },
-            TargetList::Delta {
-                target: [3; 32],
-                base: [4; 32],
-                removed: b"rm".to_vec(),
-                added: b"add".to_vec(),
-            },
-        ];
-        let mut out = Vec::new();
-        let mut writer = FrameWriter::new(&mut out);
-        for list in &lists {
-            list.send(&mut writer).unwrap();
-        }
-        writer.send(frame::STREAM_END, b"").unwrap();
-        let expected = [
-            &[frame::HASHLIST, 40, 0, 0, 0][..],
-            &[1; 32],
-            &4u64.to_le_bytes(),
-            b"full",
-            &[frame::HASHKEEP, 32, 0, 0, 0],
-            &[2; 32],
-            &[frame::HASHDELTA, 80, 0, 0, 0],
-            &[3; 32],
-            &[4; 32],
-            &2u64.to_le_bytes(),
-            &3u64.to_le_bytes(),
-            b"rmadd",
-            &[frame::STREAM_END, 0, 0, 0, 0],
-        ]
-        .concat();
-        assert_eq!(out, expected);
-        let sizes: Vec<usize> = lists.iter().map(TargetList::size).collect();
-        assert_eq!(sizes, [49, 37, 90]);
-
-        let mut reader = FrameReader::new(&out[..]);
-        for list in lists {
-            assert_eq!(TargetList::receive(&mut reader).unwrap(), list);
-        }
-        assert_eq!(reader.next().unwrap().unwrap().kind, frame::STREAM_END);
-        let error = TargetList::receive(&mut reader).unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
-
-        // The lists must arrive in full: here the added list is one byte
-        // short.
-        let mut reader = FrameReader::new(&expected[..expected.len() - 6]);
-        TargetList::receive(&mut reader).unwrap();
-        TargetList::receive(&mut reader).unwrap();
-        let error = TargetList::receive(&mut reader).unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+    /// The frames of a target list, as `TargetList::send` gives them.
+    fn sent(list: &TargetList) -> Vec<ExchangeFrame> {
+        let mut frames = Vec::new();
+        list.send(|frame| frames.push(frame));
+        frames
     }
 
     #[test]
-    #[should_panic(expected = "protocol error: expected the target list, received frame type 9")]
+    fn target_lists_carry_their_lists_in_hashdata_frames() {
+        // The target, and the base of a delta, travel as just their
+        // digests, and the frame announces the bytes of the lists, which
+        // follow in HASHDATA frames, the removed list first (DESIGN.md
+        // §6.2).
+        let full = TargetList::Full {
+            target: [1; 32],
+            list: b"full".to_vec(),
+        };
+        let keep = TargetList::Keep { target: [2; 32] };
+        let delta = TargetList::Delta {
+            target: [3; 32],
+            base: [4; 32],
+            removed: b"rm".to_vec(),
+            added: b"add".to_vec(),
+        };
+        let data = |payload: &[u8]| ExchangeFrame {
+            kind: frame::HASHDATA,
+            payload: payload.to_vec(),
+        };
+        let hashlist = ExchangeFrame {
+            kind: frame::HASHLIST,
+            payload: [&[1; 32][..], &4u64.to_le_bytes()].concat(),
+        };
+        assert_eq!(sent(&full), [hashlist, data(b"full")]);
+        let hashkeep = ExchangeFrame {
+            kind: frame::HASHKEEP,
+            payload: vec![2; 32],
+        };
+        assert_eq!(sent(&keep), [hashkeep]);
+        let hashdelta = ExchangeFrame {
+            kind: frame::HASHDELTA,
+            payload: [
+                &[3; 32][..],
+                &[4; 32],
+                &2u64.to_le_bytes(),
+                &3u64.to_le_bytes(),
+            ]
+            .concat(),
+        };
+        assert_eq!(sent(&delta), [hashdelta, data(b"rmadd")]);
+        let sizes: Vec<usize> = [&full, &keep, &delta].map(TargetList::size).to_vec();
+        assert_eq!(sizes, [54, 37, 95]);
+
+        for list in [full, keep, delta] {
+            let frames = sent(&list);
+            let first = TargetFrame::decode(frames[0].kind, &frames[0].payload);
+            let expected = match list {
+                TargetList::Full { target, list } => TargetFrame::Full {
+                    target,
+                    length: list.len() as u64,
+                },
+                TargetList::Keep { target } => TargetFrame::Keep { target },
+                TargetList::Delta {
+                    target,
+                    base,
+                    removed,
+                    added,
+                } => TargetFrame::Delta {
+                    target,
+                    base,
+                    removed: removed.len() as u64,
+                    added: added.len() as u64,
+                },
+            };
+            assert_eq!(first, expected);
+        }
+        assert_eq!(TargetFrame::decode(frame::HASHNONE, b""), TargetFrame::None);
+    }
+
+    #[test]
+    fn a_long_list_goes_in_full_hashdata_frames() {
+        // Each HASHDATA frame but the last carries `HASHDATA_BYTES`; a delta
+        // fills them across the end of its removed list, and the sizes
+        // count every header (DESIGN.md §6.2).
+        let removed = noise(HASHDATA_BYTES + 100, 1);
+        let added = noise(2 * HASHDATA_BYTES, 2);
+        let delta = TargetList::Delta {
+            target: [3; 32],
+            base: [4; 32],
+            removed: removed.clone(),
+            added: added.clone(),
+        };
+        let frames = sent(&delta);
+        let pieces: Vec<&ExchangeFrame> = frames[1..].iter().collect();
+        assert!(pieces.iter().all(|piece| piece.kind == frame::HASHDATA));
+        let lengths: Vec<usize> = pieces.iter().map(|piece| piece.payload.len()).collect();
+        assert_eq!(
+            lengths,
+            [HASHDATA_BYTES, HASHDATA_BYTES, HASHDATA_BYTES, 100]
+        );
+        let bytes: Vec<u8> = pieces
+            .iter()
+            .flat_map(|piece| piece.payload.clone())
+            .collect();
+        assert_eq!(bytes, [removed, added].concat());
+        let size: usize = frames.iter().map(|frame| 5 + frame.payload.len()).sum();
+        assert_eq!(delta.size(), size);
+    }
+
+    #[test]
+    #[should_panic(expected = "protocol error: expected the target list, received frame type 4")]
     fn another_frame_in_place_of_the_target_list_is_a_protocol_error() {
-        let mut out = Vec::new();
-        FrameWriter::new(&mut out)
-            .send(frame::STREAM_END, b"")
-            .unwrap();
-        let _ = TargetList::receive(&mut FrameReader::new(&out[..]));
+        TargetFrame::decode(frame::STREAM_END, b"");
+    }
+
+    #[test]
+    #[should_panic(expected = "protocol error: HASHNONE with a payload")]
+    fn hashnone_is_empty() {
+        TargetFrame::decode(frame::HASHNONE, b"x");
     }
 
     #[test]
@@ -1624,55 +1825,6 @@ mod tests {
         assert_eq!(calls.concat(), chunk);
     }
 
-    #[test]
-    fn a_target_list_is_one_write_call() {
-        // The lists after HASHLIST and HASHDELTA are not frames, but SSH
-        // would still put them in packets of their own if it read them
-        // separately from their frame (DESIGN.md §6.2). A transport that
-        // takes only part of the bytes gets the rest in later calls, in
-        // order.
-        let lists = [
-            TargetList::Full {
-                target: [1; 32],
-                list: b"full".to_vec(),
-            },
-            TargetList::Keep { target: [2; 32] },
-            TargetList::Delta {
-                target: [3; 32],
-                base: [4; 32],
-                removed: b"rm".to_vec(),
-                added: b"add".to_vec(),
-            },
-        ];
-        for list in &lists {
-            let mut whole = Vec::new();
-            list.send(&mut FrameWriter::new(&mut whole)).unwrap();
-            let mut writer = FrameWriter::new(Calls {
-                calls: Vec::new(),
-                most: usize::MAX,
-            });
-            list.send(&mut writer).unwrap();
-            assert_eq!(writer.into_inner().calls, [whole.clone()]);
-
-            let mut writer = FrameWriter::new(Calls {
-                calls: Vec::new(),
-                most: 7,
-            });
-            list.send(&mut writer).unwrap();
-            assert_eq!(writer.into_inner().calls.concat(), whole);
-        }
-    }
-
-    fn receiver_hello() -> ReceiverHello {
-        ReceiverHello {
-            block_size: 4096,
-            weak_hash_id: "weak".into(),
-            strong_hash: StrongHash::Sha256,
-            account_id: [7; 16],
-            index_id: [9; 16],
-        }
-    }
-
     /// The peak virtual size of this process in bytes. It includes
     /// reservations that overcommit grants without memory.
     fn peak_virtual_size() -> u64 {
@@ -1714,6 +1866,7 @@ mod tests {
     fn requests_roundtrip() {
         let settings = crate::settings::tests::settings(&[
             "--batch-stdout",
+            "--wait",
             "--lookahead",
             "64KiB",
             "--spool-limit",
@@ -1786,28 +1939,40 @@ mod tests {
     }
 
     #[test]
-    fn receiver_hello_roundtrips() {
-        let hello = receiver_hello();
-        let decoded = ReceiverHello::decode(&hello.encode());
+    fn hello_roundtrips() {
+        let hello = Hello {
+            block_size: 4096,
+            weak_hash_id: "weak".into(),
+            strong_hash: StrongHash::Sha256,
+        };
+        let decoded = Hello::decode(&hello.encode());
         assert_eq!(decoded.block_size, 4096);
         assert_eq!(decoded.weak_hash_id, "weak");
         assert_eq!(decoded.strong_hash, StrongHash::Sha256);
-        assert_eq!(decoded.account_id, [7; 16]);
-        assert_eq!(decoded.index_id, [9; 16]);
     }
 
     #[test]
-    fn sender_hello_roundtrips_with_and_without_lists() {
-        let mut hello = SenderHello {
+    fn index_ids_roundtrip() {
+        let ids = IndexIds {
+            account_id: [7; 16],
+            index_id: [9; 16],
+        };
+        let decoded = IndexIds::decode(&ids.encode());
+        assert_eq!((decoded.account_id, decoded.index_id), ([7; 16], [9; 16]));
+    }
+
+    #[test]
+    fn advertise_roundtrips_with_and_without_lists() {
+        let mut advertise = Advertise {
             account_id: [1; 16],
             lists: Vec::new(),
         };
-        let decoded = SenderHello::decode(&hello.encode());
+        let decoded = Advertise::decode(&advertise.encode());
         assert_eq!(decoded.account_id, [1; 16]);
         assert!(decoded.lists.is_empty());
-        hello.lists = vec![[5; 32], [6; 32]];
+        advertise.lists = vec![[5; 32], [6; 32]];
         assert_eq!(
-            SenderHello::decode(&hello.encode()).lists,
+            Advertise::decode(&advertise.encode()).lists,
             [[5; 32], [6; 32]]
         );
     }
@@ -2232,47 +2397,67 @@ mod tests {
     #[derive(Clone, Copy, Debug)]
     enum Payload {
         Request,
-        ReceiverHello,
-        SenderHello,
+        Hello,
+        IndexIds,
+        Advertise,
         End,
         Query,
         Answer,
         Rle,
-        /// HASHLIST, HASHKEEP or HASHDELTA with the lists after it, which
-        /// the decoder reads from a stream, not from one payload.
-        TargetList,
+        /// The frame of this type that answers ADVERTISE: HASHLIST,
+        /// HASHKEEP or HASHDELTA.
+        Target(u8),
+    }
+
+    /// The payload of the frame that `target` describes.
+    fn target_payload(target: TargetFrame) -> Vec<u8> {
+        let mut enc = Enc::new();
+        match target {
+            TargetFrame::Full { target, length } => {
+                enc.raw(&target);
+                enc.u64(length);
+            }
+            TargetFrame::Keep { target } => enc.raw(&target),
+            TargetFrame::Delta {
+                target,
+                base,
+                removed,
+                added,
+            } => {
+                enc.raw(&target);
+                enc.raw(&base);
+                enc.u64(removed);
+                enc.u64(added);
+            }
+            TargetFrame::None => {}
+        }
+        enc.buf
     }
 
     impl Payload {
-        /// Decode `bytes`, and encode the value again. Only the target list
-        /// fails without a panic: with `UnexpectedEof`, when its stream
-        /// ends before the message does.
-        fn roundtrip(self, bytes: &[u8]) -> std::io::Result<Vec<u8>> {
-            Ok(match self {
+        /// Decode `bytes`, and encode the value again.
+        fn roundtrip(self, bytes: &[u8]) -> Vec<u8> {
+            match self {
                 Payload::Request => Request::decode(bytes).encode(),
-                Payload::ReceiverHello => ReceiverHello::decode(bytes).encode(),
-                Payload::SenderHello => SenderHello::decode(bytes).encode(),
+                Payload::Hello => Hello::decode(bytes).encode(),
+                Payload::IndexIds => IndexIds::decode(bytes).encode(),
+                Payload::Advertise => Advertise::decode(bytes).encode(),
                 Payload::End => End::decode(bytes).encode(),
                 Payload::Query => Query::decode(bytes).encode(),
                 Payload::Answer => Answer::decode(bytes).encode(),
                 Payload::Rle => Rle::decode(bytes).encode(),
-                Payload::TargetList => {
-                    let list = TargetList::receive(&mut FrameReader::new(bytes))?;
-                    let mut out = FrameWriter::new(Vec::new());
-                    list.send(&mut out).unwrap();
-                    out.into_inner()
-                }
-            })
+                Payload::Target(kind) => target_payload(TargetFrame::decode(kind, bytes)),
+            }
         }
 
         /// The bytes of `valid`, a valid encoding, that the damage must
-        /// leave alone, and where the bytes after them start. Only HELLO of
-        /// the receiver has such bytes: the length of the weak-hash ID,
-        /// which tells where the strong-hash ID starts, and the strong-hash
-        /// ID. An unknown strong-hash ID ends the run with `die`, which
-        /// would end this test process; the serve tests check that end.
+        /// leave alone, and where the bytes after them start. Only HELLO has
+        /// such bytes: the length of the weak-hash ID, which tells where the
+        /// strong-hash ID starts, and the strong-hash ID. An unknown
+        /// strong-hash ID ends the run with `die`, which would end this test
+        /// process; the serve tests check that end.
         fn protected(self, valid: &[u8]) -> (Vec<std::ops::Range<usize>>, usize) {
-            let Payload::ReceiverHello = self else {
+            let Payload::Hello = self else {
                 return (Vec::new(), 0);
             };
             let length = |at: usize| u32::from_le_bytes(valid[at..at + 4].try_into().unwrap());
@@ -2280,19 +2465,14 @@ mod tests {
             let end = strong + 4 + length(strong) as usize;
             (vec![4..8, strong..end], end)
         }
+    }
 
-        /// Whether `outcome`, of damaged bytes, is one that the decoder may
-        /// have: a value, a protocol error, or for the target list, the end
-        /// of its stream.
-        fn allows(self, outcome: &Result<std::io::Result<Vec<u8>>, String>) -> bool {
-            match outcome {
-                Ok(Ok(_)) => true,
-                Ok(Err(e)) => {
-                    matches!(self, Payload::TargetList)
-                        && e.kind() == std::io::ErrorKind::UnexpectedEof
-                }
-                Err(message) => message.contains("protocol error"),
-            }
+    /// Whether `outcome`, of damaged bytes, is one that a decoder may have:
+    /// a value, or a protocol error.
+    fn allowed(outcome: &Result<Vec<u8>, String>) -> bool {
+        match outcome {
+            Ok(_) => true,
+            Err(message) => message.contains("protocol error"),
         }
     }
 
@@ -2325,7 +2505,7 @@ mod tests {
             Just(Deduplicated::Both),
         ];
         let settings = (
-            any::<[bool; 5]>(),
+            any::<[bool; 6]>(),
             any::<i32>(),
             any::<[u32; 2]>(),
             any::<[u64; 3]>(),
@@ -2337,6 +2517,7 @@ mod tests {
                     compression_long,
                     batch_stdin,
                     batch_stdout,
+                    wait,
                 ] = flags;
                 let [lookahead, negative_cache, spool_limit] = sizes;
                 RunSettings {
@@ -2351,6 +2532,7 @@ mod tests {
                     spool_limit,
                     batch_stdin,
                     batch_stdout,
+                    wait,
                 }
             });
         let request = (command, deduplicated, settings, any::<[bool; 2]>()).prop_map(
@@ -2366,22 +2548,27 @@ mod tests {
             },
         );
         let strong_hash = prop_oneof![Just(StrongHash::Blake3), Just(StrongHash::Sha256)];
-        let receiver_hello = (1u32.., "\\PC{0,10}", strong_hash, any::<[[u8; 16]; 2]>()).prop_map(
-            |(block_size, weak_hash_id, strong_hash, ids)| {
-                let hello = ReceiverHello {
+        let hello = (1u32.., "\\PC{0,10}", strong_hash).prop_map(
+            |(block_size, weak_hash_id, strong_hash)| {
+                let hello = Hello {
                     block_size,
                     weak_hash_id,
                     strong_hash,
-                    account_id: ids[0],
-                    index_id: ids[1],
                 };
-                (Payload::ReceiverHello, hello.encode())
+                (Payload::Hello, hello.encode())
             },
         );
-        let sender_hello =
+        let index_ids = any::<[[u8; 16]; 2]>().prop_map(|ids| {
+            let ids = IndexIds {
+                account_id: ids[0],
+                index_id: ids[1],
+            };
+            (Payload::IndexIds, ids.encode())
+        });
+        let advertise =
             (any::<[u8; 16]>(), vec(any::<Strong>(), 0..4)).prop_map(|(account_id, lists)| {
-                let hello = SenderHello { account_id, lists };
-                (Payload::SenderHello, hello.encode())
+                let advertise = Advertise { account_id, lists };
+                (Payload::Advertise, advertise.encode())
             });
         let end = (
             any::<i32>(),
@@ -2427,46 +2614,43 @@ mod tests {
             .prop_map(|(offset, found)| (Payload::Answer, Answer { offset, found }.encode()));
         let rle = (any::<u8>(), 1u64..)
             .prop_map(|(byte, length)| (Payload::Rle, Rle { byte, length }.encode()));
-        let list = || vec(any::<u8>(), 0..48);
-        let sent = |list: TargetList| {
-            let mut out = FrameWriter::new(Vec::new());
-            list.send(&mut out).unwrap();
-            (Payload::TargetList, out.into_inner())
-        };
-        let target_list = prop_oneof![
-            (any::<Strong>(), list())
-                .prop_map(move |(target, list)| sent(TargetList::Full { target, list })),
-            any::<Strong>().prop_map(move |target| sent(TargetList::Keep { target })),
-            (any::<[Strong; 2]>(), list(), list()).prop_map(move |(ids, removed, added)| {
-                sent(TargetList::Delta {
+        let encoded = |kind, frame| (Payload::Target(kind), target_payload(frame));
+        let target_frame = prop_oneof![
+            (any::<Strong>(), any::<u64>()).prop_map(move |(target, length)| {
+                encoded(frame::HASHLIST, TargetFrame::Full { target, length })
+            }),
+            any::<Strong>()
+                .prop_map(move |target| encoded(frame::HASHKEEP, TargetFrame::Keep { target })),
+            (any::<[Strong; 2]>(), any::<[u64; 2]>()).prop_map(move |(ids, lengths)| {
+                let delta = TargetFrame::Delta {
                     target: ids[0],
                     base: ids[1],
-                    removed,
-                    added,
-                })
+                    removed: lengths[0],
+                    added: lengths[1],
+                };
+                encoded(frame::HASHDELTA, delta)
             }),
         ];
         prop_oneof![
             request,
-            receiver_hello,
-            sender_hello,
+            hello,
+            index_ids,
+            advertise,
             end,
             query,
             answer,
             rle,
-            target_list,
+            target_frame,
         ]
     }
 
     proptest! {
         /// The decoders of the payloads of the session frames under damage
         /// (DESIGN.md §6.7 and §11). A valid encoding decodes to the value
-        /// that it encodes. Cut short, it is a protocol error, or for the
-        /// target list, which reads a stream, the end of that stream. With
-        /// a changed byte, and as random bytes, it decodes to some value or
-        /// is a protocol error, or the target list ends with its stream. No
-        /// input hangs a decoder, takes more memory than it holds, or
-        /// panics otherwise.
+        /// that it encodes. Cut short, it is a protocol error. With a
+        /// changed byte, and as random bytes, it decodes to some value or is
+        /// a protocol error. No input hangs a decoder, takes more memory than
+        /// it holds, or panics otherwise.
         #[test]
         fn session_payloads_decode_or_are_protocol_errors(
             (payload, valid) in any_payload(),
@@ -2475,24 +2659,11 @@ mod tests {
             flip in 1u8..=255,
             random in proptest::collection::vec(any::<u8>(), 0..96),
         ) {
-            prop_assert_eq!(
-                caught(|| payload.roundtrip(&valid).unwrap()),
-                Ok(valid.clone())
-            );
+            prop_assert_eq!(caught(|| payload.roundtrip(&valid)), Ok(valid.clone()));
 
             let at = cut.index(valid.len());
             let outcome = caught(|| payload.roundtrip(&valid[..at]));
-            let cut_short = match &outcome {
-                Ok(Err(e)) => {
-                    matches!(payload, Payload::TargetList)
-                        && e.kind() == std::io::ErrorKind::UnexpectedEof
-                }
-                Err(message) => {
-                    !matches!(payload, Payload::TargetList)
-                        && message.contains("protocol error: truncated")
-                }
-                Ok(Ok(_)) => false,
-            };
+            let cut_short = matches!(&outcome, Err(message) if message.contains("protocol error: truncated"));
             prop_assert!(cut_short, "{:?} cut at {}: {:?}", payload, at, outcome);
 
             let (protected, after) = payload.protected(&valid);
@@ -2503,12 +2674,12 @@ mod tests {
                 let mut damaged = valid.clone();
                 damaged[free[changed.index(free.len())]] ^= flip;
                 let outcome = caught(|| payload.roundtrip(&damaged));
-                prop_assert!(payload.allows(&outcome), "{:?} {:?}: {:?}", payload, damaged, outcome);
+                prop_assert!(allowed(&outcome), "{:?} {:?}: {:?}", payload, damaged, outcome);
             }
 
             let random = [&valid[..after], &random].concat();
             let outcome = caught(|| payload.roundtrip(&random));
-            prop_assert!(payload.allows(&outcome), "{:?} {:?}: {:?}", payload, random, outcome);
+            prop_assert!(allowed(&outcome), "{:?} {:?}: {:?}", payload, random, outcome);
         }
     }
 }

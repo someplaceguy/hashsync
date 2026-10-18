@@ -47,10 +47,12 @@ system calls, with no asynchronous runtime or event loop.
   sender; in a push, the other way around. With both streams
   deduplicated, each host is the receiver of the stream that it receives,
   and the sender of the other.
-- **Session frames** and **stream frames**: the two levels of frames of the
-  data session (section 6.2). The stream frames, LIT, REF and RLE, carry
-  the bytes of a stream inside its zstd frame, and the session frames
-  carry everything else, among them the pieces of that zstd frame.
+- **Session frames**, **stream frames**, and **control frames**: the levels
+  of frames of the sessions (section 6.2). The stream frames, LIT, REF and
+  RLE, carry the bytes of a stream inside its zstd frame. The control
+  frames, QUERY, ANSWER and STOP, form the **control stream** of each
+  direction of the control session. The session frames carry everything
+  else, among them the pieces of those zstd frames and control streams.
 - **Block**: `block_size` bytes (default 16 KiB) at an aligned offset in an
   indexed file. Only complete blocks are indexed.
 - **Window**: `block_size` bytes at any offset of a deduplicated stream.
@@ -65,7 +67,8 @@ system calls, with no asynchronous runtime or event loop.
 - **Hash list**: the canonical encoded set of indexed weak hashes.
   Its **list ID** is its strong-hash algorithm and full digest.
   A **delta** contains the removed and added values between two lists.
-- **Hash table**: the sender's in-memory membership table built from the list.
+- **Hash table**: the sender's in-memory membership table built from the
+  list, which fills while the list arrives (section 5.5).
 - **Literal / reference / run**: output sent as bytes, a verified block
   reference, or a repeated byte value and length.
 - **Query / answer**: a request for a window's full strong hash at an output
@@ -93,60 +96,69 @@ system calls, with no asynchronous runtime or event loop.
 
 ## 3. One run, step by step
 
-1. The receiver opens its tmp_data directory (section 6.5), resolves its
-   configured roots, updates its index, and then holds it read-only
-   (section 4.4). `--no-update` skips the update and opens the index
-   read-only. In a pull, the client does this before step 2, so a failed
-   update starts no remote process. In a push, the client needs no index,
-   and the server does this after step 2, before its HELLO. With both
-   streams deduplicated, each host does this for the stream that it
-   receives, but the client releases its index after its update, and opens
-   it again only once the server's update is done (section 4.4).
-2. The client starts data and control SSH sessions to the server. Each
-   side sends its protocol version at once, and the client follows its
-   own with REQUEST, with the command and the settings of the run, without
-   waiting for the server's. The server reads its own configuration file:
-   it needs one when it receives a deduplicated stream, and otherwise uses
-   one only if it has one (section 7).
-3. Each deduplicated stream has a list exchange, the forward stream's
-   first. HELLO negotiates the hashes and the cached lists. After its
-   HELLO, the receiver exports its hash list, the target, from one
-   database snapshot, and starts its lookup workers, while the sender
-   prepares the list that its cache holds. With sender caching enabled,
-   the receiver durably publishes its target list. It sends a full list, a
-   delta, or confirmation that the sender's list is current.
-   The sender verifies it, builds its table, and durably publishes it when
-   caching is enabled.
-   Then it removes its other cached lists for this peer and index, expires
-   old cache files, and acknowledges the accepted target. On the
-   acknowledgement, the receiver does the same cleanup (section 5.6).
-4. After the last acknowledgement, the server starts the command, and both
-   streams start (section 6.6). The source of each stream, the command's
-   stdout or the client's stdin, goes through a spool: it waits for the
-   transfer only when `--spool-limit` bytes wait in the spool. The
-   sender's scanner sends literals for misses, runs for repeated bytes, and
-   queries for possible block matches. The client sends its stdin to the
-   command's stdin, until the forward stream ends, or the server stops it,
-   and the server sends the command's stdout to the client's stdout, until
-   the backward stream ends, or the client stops it once no process reads
-   its stdout. In eager delivery, the bytes of both streams reach their
+1. The client opens its tmp_data directory (section 6.5), and starts data
+   and control SSH sessions to the server. Each side sends its protocol
+   version at once, and the client follows its own with REQUEST, with the
+   command and the settings of the run, without waiting for the server's.
+   When the client receives a deduplicated stream, its HELLO follows at
+   once: the block size and the hashes of that stream, from its
+   configuration. The server reads its own configuration file: it needs
+   one when it receives a deduplicated stream, and otherwise uses one only
+   if it has one (section 7). It opens its tmp_data directory, and sends
+   its own HELLO at once when it receives a deduplicated stream.
+2. The server starts the command, in a pull once it has read the client's
+   HELLO, and both streams start (section 6.6). The source of each stream,
+   the command's stdout or the client's stdin, goes through a spool: it
+   waits for the transfer only when `--spool-limit` bytes wait in the
+   spool. The sender of a deduplicated stream starts its scanner at the
+   receiver's HELLO, with an empty hash table, which fills while the list
+   exchange of step 3 goes on: the scanner sends literals for misses, runs
+   for repeated bytes, and queries for possible block matches, and the more
+   of the list it has, the more blocks it finds. With `--wait`, the scanner
+   scans only once its table is whole, and the stream waits in its spool
+   until then (section 6.3). The client sends its stdin to the command's
+   stdin, until the forward stream ends, or the server stops it, and the
+   server sends the command's stdout to the client's stdout, until the
+   backward stream ends, or the client stops it once no process reads its
+   stdout. In eager delivery, the bytes of both streams reach their
    destinations at each idle point of their sources, once the link can
    carry them (section 6.2).
-5. The receiver reads and verifies candidates, and writes each verified
+3. Meanwhile, the receiver of each deduplicated stream resolves its
+   configured roots, updates its index, and then holds it read-only
+   (section 4.4). `--no-update` skips the update and opens the index
+   read-only. A failed update ends the run, and the command with it. With
+   both streams deduplicated, both hosts update their index at the same
+   time, and each one releases its index after its update, and opens it
+   again only once the other's update is done (section 4.4). Then each
+   deduplicated stream has a list exchange, on the control session
+   (section 5.6). INDEX names the receiver's account and index, and the
+   sender advertises the lists that its cache holds for them. The receiver
+   exports its hash list, the target, from one database snapshot, and
+   starts its lookup workers, while the sender prepares its cached list.
+   With sender caching enabled, the receiver durably publishes its target
+   list. It sends a full list, a delta, or confirmation that the sender's
+   list is current. The sender verifies it, fills its table, and durably
+   publishes it when caching is enabled. Then it removes its other cached
+   lists for this peer and index, expires old cache files, and acknowledges
+   the accepted target. On the acknowledgement, the receiver does the same
+   cleanup. A receiver whose stream has ended or stopped before it sends
+   its target sends no list: HASHNONE ends the exchange.
+4. The receiver reads and verifies candidates, and writes each verified
    block to a pin before it answers yes; a block that a pin already holds
    needs no lookup. The sender emits references for yes answers and
    rescans rejected windows from the next byte. The stream is always
    emitted in order. Once a deduplicated stream has ended or stopped, its
    receiver's lookups end, and its index closes (section 6.4).
-6. Each receiving end decodes its stream from its spool: the client to
+5. Each receiving end decodes its stream from its spool: the client to
    its stdout, the server to the command's stdin. Until `--spool-limit`
    bytes wait in the spool, a blocked destination stops only the
    decoding. Once the command has exited, both streams have ended or
-   stopped, and command stderr has reached its end, the server sends END
-   with the command's status. The client then closes both session stdin
-   pipes, writes the rest of the backward stream, checks its end, and
-   flushes stdout. Both SSH sessions must exit successfully before the
-   client returns the command's status (section 6.9).
+   stopped, command stderr has reached its end, and the server's sides of
+   the list exchanges have ended, the server sends END with the command's
+   status. The client then closes both session stdin pipes, writes the
+   rest of the backward stream, checks its end, and flushes stdout. Both
+   SSH sessions must exit successfully before the client returns the
+   command's status (section 6.9).
 
 **Verification is authoritative.** The index, hash lists, caches, and weak
 hash table are hints. Verify the exact buffer of a candidate before writing
@@ -456,9 +468,9 @@ directory excludes other processes:
   So no modifying process can come between the update and the use of the
   index, and read-only processes can use the index during the rest of the
   run. A shared lock needs the lock file open for reading, so a modifying
-  process opens it read/write, not write-only. The client of a run with
-  both streams deduplicated is the exception: it releases its lock after
-  its update (steps L1 to L4 below).
+  process opens it read/write, not write-only. A run with both streams
+  deduplicated is the exception: each host releases its lock after its
+  update (steps L1 to L3 below).
 - The lock is an open file description lock (`F_OFD_SETLKW`) on the whole
   file, on a close-on-exec descriptor. Unlike a classic POSIX lock, it
   stays when another descriptor of the file closes, and at exit it goes
@@ -480,34 +492,36 @@ directory excludes other processes:
   wait forever.
 
 **Lock waits.** A lock wait has no timeout, so no run may take part in a
-cycle of waits. A run waits for an exclusive lock only while it holds no
-other index lock, and it waits for no other lock while it holds an
-exclusive one. Then the locks that runs take for themselves form no
-cycle: a shared lock waits only for an exclusive holder, which waits for
-nothing, and nobody waits for a run that waits for an exclusive lock,
-since that run holds no lock. A run with one deduplicated stream follows
-the rule as it is. With both streams deduplicated, both hosts update
-their index, the server once the sessions are up, so the client follows
-these steps:
+cycle of waits. An update waits for nothing else while it holds its
+exclusive lock, and a run waits for an exclusive lock only while it holds
+no shared lock. Then the locks that runs take for themselves form no
+cycle. A wait for a lock that an update holds lasts only until that
+update ends, whatever else the update's run waits for. Any other lock
+wait is that of an exclusive lock for a shared holder, and its run holds
+no shared lock that another wait could be stuck on. A run with one
+deduplicated stream follows the rule as it is. With both streams
+deduplicated, both hosts update their index at the start of the run, at
+the same time. A host that kept its lock after its update could hold it
+while the other host still waits for the exclusive lock of its own
+update, so each host releases its lock after its update, and takes it
+again only once the other's update is done, which UPDATED frames on the
+control session pass:
 
-- **L1.** Before SSH starts, update the index, then close it, which
-  releases the lock.
-- **L2.** Once the forward stream's list exchange is done, which comes
-  after the server's update, open the index again, read-only with a
-  shared lock.
-- **L3.** Check that the index still matches the configuration, as a run
-  with `--no-update` does. Between steps L1 and L2, another process can
-  change the index, and a process with another configuration of the same
-  `index_path` can rebuild it with other settings. If it no longer
-  matches, end the run with `die`: the server then ends when the sessions
-  close, before the command starts. The client cannot update the index
-  again here: it would wait for an exclusive lock while the run holds the
-  server's.
-- **L4.** Send HELLO, export the hash list, and start the lookup
-  workers.
+- **L1.** Each host updates its index, then closes it, which releases
+  the lock, and sends UPDATED.
+- **L2.** At the other host's UPDATED, each host opens its index again,
+  read-only with a shared lock, and checks that it still matches the
+  configuration, as a run with `--no-update` does. Between steps L1 and
+  L2, another process can change the index, and a process with another
+  configuration of the same `index_path` can rebuild it with other
+  settings. If it no longer matches, the host ends the run with `die`. It
+  cannot update the index again here: it would wait for an exclusive lock
+  while the other host can hold its shared lock.
+- **L3.** Each host sends INDEX, exports its hash list, and starts its
+  lookup workers (section 5.6).
 
-With `--no-update`, both hosts take only shared locks, and the client
-opens its index before SSH starts, as in a pull.
+With `--no-update`, both hosts take only shared locks, and each opens its
+index at the start of the run, as with one deduplicated stream.
 
 The rule cannot cover the commands. A command that waits for an
 exclusive lock waits for every run that holds a lock of that index, and
@@ -758,6 +772,20 @@ computes a strong hash, the scanner checks each hit against the whole
 value, which reads one more cache line (section 6.3): a false positive
 costs no strong hash, no query, and no rescan.
 
+The table fills while the list exchange goes on (section 5.6), so that
+the scanner finds more blocks as more of the list arrives. The scanner's
+thread owns the table and takes its updates between scans, so lookups
+need no lock (section 10):
+
+- A kept list or a delta gives a whole table, which the sender's side of
+  the exchange builds on its own thread.
+- A full list gives an empty table sized for its `N` values, once the
+  list bytes that have arrived could hold that many values, at least one
+  bit each, so that a corrupt count allocates no more than the bytes that
+  arrive allow. Then the values that each HASHDATA frame completes go
+  into it, before the list is verified: they are hints, and the receiver
+  verifies every block that they find (section 3).
+
 ### 5.6 The hash list cache and direct deltas
 
 Full lists are immutable and named by content. Account and index IDs
@@ -771,8 +799,9 @@ Each UNIX account has one random 128-bit `account_id` in
 `$XDG_CONFIG_HOME/hashsync/account-id` (fallback
 `~/.config/hashsync/account-id`), independent of `--config`. Initialize it
 durably with atomic no-replace publication; concurrent initializers use the
-winner's ID. Never overwrite an existing ID. HELLO exchanges account IDs
-and the receiver's index ID; the sender needs no index for the exchange.
+winner's ID. Never overwrite an existing ID. INDEX and ADVERTISE exchange
+account IDs, and INDEX names the receiver's index ID; the sender needs no
+index for the exchange.
 
 Let `A` be the receiver account, `B` the sender account, and `I` the
 receiver index, encoded as fixed-width lowercase hex. Under
@@ -816,7 +845,9 @@ exchange rules below.
 
 **Exchange.**
 
-A side's *listing* is the names of the lists and hidden temporaries in its
+The exchange of a deduplicated stream runs on the control session while
+the streams run, each side on a thread of its own (section 6.8). A side's
+*listing* is the names of the lists and hidden temporaries in its
 peer/index directory when it lists the directory, with an open file for
 each list. The name of a hidden temporary starts with `.hashsync-`
 (section 11). Other hidden names are not part of the cache layout, and
@@ -824,34 +855,39 @@ only expiry removes them. For example, an NFS client gives such a name to
 a removed file that is still open, and the removal of that name fails
 while the file is open.
 
-1. After its HELLO, the receiver exports and hashes the target from one
-   database snapshot. Once the sender's account is known, the receiver
-   lists its peer/index directory. With sender caching enabled, it then
-   durably publishes the target there before sending list data. If its
-   listing holds a file with the target's name, it keeps that file instead,
-   unless it read the file as a base in step 3 and found it damaged.
+1. Once its index is ready for the run (section 4.4), the receiver sends
+   INDEX, with its account ID and its index ID, and starts to export and
+   hash the target from one database snapshot. A receiver whose stream has
+   ended or stopped before its index is ready sends HASHNONE instead.
+2. At INDEX, the sender lists its peer/index directory. With sender
+   caching enabled, it advertises the IDs of all listed lists of the
+   stream's strong hash, usually one, in ADVERTISE, with its account ID;
+   otherwise none. Right after ADVERTISE, while the receiver exports, it
+   prepares the first advertised list: it reads it through the open file
+   of its listing, verifies it, decodes it, and builds the table from it.
+3. At ADVERTISE, the receiver lists its peer/index directory. During the
+   export, before it knows the target, it searches all its
+   `local-hashlists/*/*.cache` directories for the advertised lists, in
+   their order, and verifies the first one that it finds, the base. Once
+   it has the target, if its stream has ended or stopped by then, it sends
+   HASHNONE, and the exchange ends. Otherwise, with sender caching enabled,
+   it durably publishes the target in its directory before sending list
+   data. If its listing holds a file with the target's name, it keeps that
+   file instead, unless it read the file as a base and found it damaged.
    Otherwise, if another of its peer/index directories holds the target,
    which happens when it receives the same target from several senders, it
-   links that file into this directory, unless it is the file found damaged
-   in step 3 under another name. It does not read a file that it keeps or
+   links that file into this directory, unless it is the file found
+   damaged under another name. It does not read a file that it keeps or
    links: a damaged copy shows only when an exchange reads it as a base,
-   and costs a full list then. Either way, it retains an open fd.
-   Failure to persist the receiver's target ends setup.
-2. Before it sends HELLO, the sender lists its peer/index directory. With
-   sender caching enabled, it advertises the IDs of all listed lists of
-   the stream's strong hash, usually one; otherwise none. Right after its
-   HELLO, while the receiver exports, it prepares the first advertised
-   list: it reads it through the open file of its listing, verifies it,
-   decodes it, and builds the table from it.
-3. If the target is one of the advertised lists, the receiver uses
-   HASHKEEP. Otherwise it searches all its `local-hashlists/*/*.cache`
-   directories for the advertised lists, in their order, and verifies the
-   first one that it finds. It does this during the export, before it
-   knows the target. A missing or damaged base uses HASHLIST. With a base,
-   merge sorted sets and encode removed and added values as lists; use
+   and costs a full list then. Either way, it retains an open fd. Failure
+   to persist the receiver's target ends the run.
+4. If the target is one of the advertised lists, the receiver uses
+   HASHKEEP. A missing or damaged base uses HASHLIST. With a base, merge
+   sorted sets and encode removed and added values as lists; use
    HASHDELTA, which names the base, only when smaller than the full
-   transfer. HASHKEEP, HASHDELTA and HASHLIST all name the target.
-4. The sender takes the list that HASHDELTA or HASHKEEP names from step 2
+   transfer. HASHKEEP, HASHDELTA and HASHLIST all name the target, and the
+   list bytes of HASHLIST and HASHDELTA follow in HASHDATA frames.
+5. The sender takes the list that HASHDELTA or HASHKEEP names from step 2
    if it prepared that list, and otherwise reads it through the open file
    of its listing, and verifies it. It decodes or applies the delta,
    re-encodes canonically, and verifies the full target digest. An invalid
@@ -859,17 +895,21 @@ while the file is open.
    result of a bad delta is never published or used for the table. A bad
    full list, or a full list after HASHFULL that names another target, is
    a protocol error.
-5. The sender builds the table, unless it built it in step 2 from the list
-   that HASHKEEP names. With sender caching enabled, it durably publishes
-   the verified target, or after HASHKEEP keeps the listed file that it
-   verified. It ends its exchange, and only then replies CACHE_RESULT.
-6. On CACHE_RESULT, the receiver ends its exchange. Without CACHE_RESULT,
+6. The sender gives the table to its scanner as soon as it can
+   (section 5.5): after HASHKEEP or HASHDELTA, the whole table, and after
+   HASHLIST, the values while they arrive. With sender caching enabled, it
+   durably publishes the verified target, or after HASHKEEP keeps the
+   listed file that it verified. It ends its exchange, and only then
+   replies CACHE_RESULT.
+7. On CACHE_RESULT, the receiver ends its exchange. Without CACHE_RESULT,
    it removes nothing.
 
 To end its exchange, a side renews its published target, and the receiver
 also the base that it used. It removes the files of its listing except
 its published target, and then expires the cache (below). The removal of
-listed files touches no other peer/index directory.
+listed files touches no other peer/index directory. An exchange that
+HASHNONE ends removes no listed file on either side, but both sides
+expire the cache, as at the end of every exchange.
 
 With `--no-sender-cache`, the sender advertises no list, and neither side
 publishes one, so the end of the exchange removes every listed file.
@@ -882,7 +922,7 @@ Publish complete files using a unique hidden temporary, file fsync, rename
 to the content-derived name, and directory fsync. Make new directory
 hierarchies durable too. A side whose listing already holds its target
 keeps that file instead of publishing it again, and the receiver can link
-a copy from another of its peer/index directories (steps 1 and 5): the
+a copy from another of its peer/index directories (steps 3 and 6): the
 list takes 110 MB at 21 million values, and its publication about half a
 second. To keep or link a file, renew it first (below), check that the
 listed name still leads to it, and make the entries of its directories
@@ -913,16 +953,18 @@ deletion.
 
 A run with another target needs a modifying process first, which needs the
 exclusive lock of the index (section 4.4). The receiver takes its lock
-before it sends HELLO and exports its list, and keeps it, exclusive or
-shared, until after the list exchange. The client of a run with both
-streams deduplicated releases its lock after its update, and takes it
-again before its HELLO (section 4.4, steps L1 to L4). The sender lists
-its directory only after the receiver's HELLO, and before its own HELLO.
-So a run with another target starts only after this run's listing. The
-sender ends its exchange only after HASHLIST, HASHDELTA, or HASHKEEP,
-which its receiver sends only after it received the sender's HELLO. So no
-exchange that ends has a listing that holds the target of a later run,
-also when a sender outlives its failed receiver. A later run can still
+before it sends INDEX and exports its list, and keeps it, exclusive or
+shared, until its lookups end, once its stream has ended or stopped
+(section 6.4). With both streams deduplicated, each receiver releases its
+lock after its update, and takes it again before INDEX (section 4.4,
+steps L1 to L3). The sender lists its directory at INDEX, before
+ADVERTISE, and the receiver lists its own at ADVERTISE. The receiver
+sends its target only if its stream has neither ended nor stopped once
+it has the target, after both listings: then it held its lock during
+both, and a run with another target starts only after them.
+The sender ends its exchange only after HASHLIST, HASHDELTA, or HASHKEEP.
+So no exchange that ends has a listing that holds the target of a later
+run, also when a sender outlives its failed receiver. A later run can still
 publish a listed list again under the same name, when its index has
 returned to an earlier state, or keep the listed file as its target. So a
 side removes a listed list only if its name still names the listed file,
@@ -945,11 +987,12 @@ listing. Neither side opens a list by name a second time.
 Touch verified files through their open descriptors after successful use.
 Use `ctime` as the renewal marker. A renewal also sets the modification
 time later than the file had, by at least a nanosecond, so that a listing
-made before it no longer matches the file. To expire the cache, a side
-removes every file in every peer/index directory of both cache trees whose
-`ctime` is older than the `hashlist_max_age` of its host (default 30 days,
-section 7): lists and abandoned hidden temporaries. Then it removes every
-peer/index directory that is empty.
+made before it no longer matches the file. To expire the cache, at the
+end of each exchange, a side removes every file in every peer/index
+directory of both cache trees whose `ctime` is older than the
+`hashlist_max_age` of its host (default 30 days, section 7): lists and
+abandoned hidden temporaries. Then it removes every peer/index directory
+that is empty.
 
 A lost acknowledgement or a failed run can leave extra files until the
 next exchange of that peer and index, or until expiry. Database restore or
@@ -998,9 +1041,10 @@ the signal mask that the client started with (section 6.9):
 `serve` first listens on `$XDG_RUNTIME_DIR/hashsync/T.sock` (fallback: a
 private directory under `/tmp`), mode 0600. It exchanges protocol
 versions, reads REQUEST and then its configuration file (section 7),
-updates its index when it receives a deduplicated stream (section 3),
-sends its first data HELLO, accepts `attach`, and completes the list
-exchanges before starting the command.
+sends its HELLO when it receives a deduplicated stream, reads the client's
+HELLO when it sends one, and starts the command. Then it starts its
+update when it receives a deduplicated stream (section 3), and accepts
+`attach`, whose session carries the list exchanges.
 
 `attach` retries a not-yet-listening socket while its stdin remains open,
 with no deadline. It relays stdin to the socket and the socket to stdout,
@@ -1050,8 +1094,9 @@ each session. It does not wait for the peer's version before it sends its
 own. It reads the peer's version before anything else, and it ends the run
 with `die` if the versions are different; the message names both versions.
 The server starts the command only after it has checked the client's
-version on both sessions. The remote commands of section 6.1 and this
-version exchange never change. Everything after the exchange belongs to one
+version on the data session, and checks it on the control session when
+`attach` connects. The remote commands of section 6.1 and this version
+exchange never change. Everything after the exchange belongs to one
 protocol version (section 11).
 
 Directly after its version, each side sends `features u64`, little endian,
@@ -1066,19 +1111,19 @@ Every frame is `type u8, length u32, payload`. Integers are little endian.
 Strings and byte strings have a `u32` byte length; lists have a `u32` item
 count. Output offsets and lengths are `u64`; overflow is a protocol error.
 
-`S` is the full digest length of the strong algorithm that the list
-exchange of a deduplicated stream negotiates. Every digest of the stream
-uses that algorithm, including all list IDs of its exchange, so a list ID
+`S` is the full digest length of the strong algorithm that the receiver's
+HELLO names for a deduplicated stream. Every digest of the stream uses
+that algorithm, including all list IDs of its exchange, so a list ID
 travels as its digest alone, `[u8; S]`. A list exchange has one target and
 at most one base: HASHLIST, HASHDELTA, and HASHKEEP name the target, and
-HASHDELTA also names the base, one of the lists that the sender's HELLO
-advertises.
+HASHDELTA also names the base, one of the lists that the sender's
+ADVERTISE advertises.
 
-The data session has two levels of frames:
+Each session has two levels of frames. On the data session:
 
-- **Session frames** are never compressed: REQUEST, HELLO, HASHLIST,
-  HASHDELTA, HASHKEEP, HASHFULL, CACHE_RESULT, CHUNK, STREAM_END, and END.
-  They are everything that a reader must find without decoding a stream.
+- **Session frames** are never compressed: REQUEST, HELLO, CHUNK,
+  STREAM_END, and END. They are everything that a reader must find
+  without decoding a stream.
 - **Stream frames** are LIT, REF, and RLE. The stream frames of one stream
   form one zstd frame, unless compression is disabled, and the payloads of
   the stream's CHUNK frames are consecutive pieces of it. So the frames
@@ -1086,28 +1131,42 @@ The data session has two levels of frames:
   compression disabled, the CHUNK payloads are the stream frames as they
   are.
 
+On the control session:
+
+- **Session frames** are never compressed: the frames of the list
+  exchanges, INDEX, ADVERTISE, HASHLIST, HASHDELTA, HASHKEEP, HASHNONE,
+  HASHDATA, HASHFULL, and CACHE_RESULT, and UPDATED and CHUNK.
+- **Control frames** are QUERY, ANSWER, and STOP. The control frames of
+  one direction form its control stream, one zstd stream unless
+  compression is disabled, and the payloads of the direction's CHUNK
+  frames are consecutive pieces of it.
+
 Each direction of the data session carries one stream: the forward stream
 goes from the client to the server, and the backward stream from the
-server to the client. So CHUNK and STREAM_END name no stream. The control
-session carries QUERY, ANSWER, and STOP. In each of its directions, QUERY
-belongs to the stream that the sending host scans, and ANSWER and STOP to
-the stream that it receives, so none of them names a stream either.
+server to the client. So CHUNK and STREAM_END name no stream. In each
+direction of the control session, QUERY belongs to the stream that the
+sending host scans, and ANSWER and STOP to the stream that it receives,
+so none of them names a stream either. Neither do the frames of the list
+exchanges: those of a receiver belong to the stream that the sending host
+receives, and those of a sender to the stream that it sends.
 
 | Level | Types |
 |---|---|
-| Session | 1 REQUEST, 2 HELLO, 3 HASHLIST, 4 HASHDELTA, 5 HASHKEEP, 6 HASHFULL, 7 CACHE_RESULT, 8 CHUNK, 9 STREAM_END, 10 END |
-| Stream | 11 LIT, 12 REF, 13 RLE |
-| Control | 14 QUERY, 15 ANSWER, 16 STOP |
+| Session, data | 1 REQUEST, 2 HELLO, 3 CHUNK, 4 STREAM_END, 5 END |
+| Session, control | 3 CHUNK, 6 INDEX, 7 ADVERTISE, 8 HASHLIST, 9 HASHDELTA, 10 HASHKEEP, 11 HASHNONE, 12 HASHDATA, 13 HASHFULL, 14 CACHE_RESULT, 15 UPDATED |
+| Stream | 16 LIT, 17 REF, 18 RLE |
+| Control | 19 QUERY, 20 ANSWER, 21 STOP |
 
 | Session | Direction | Frames |
 |---|---|---|
-| data | client to server | REQUEST; the list exchange frames of its roles; the forward stream: CHUNK, STREAM_END |
-| data | server to client | The list exchange frames of its roles; the backward stream: CHUNK, STREAM_END; END |
-| data | receiver to sender | List exchange: HELLO, HASHLIST, HASHDELTA, HASHKEEP |
-| data | sender to receiver | List exchange: HELLO, HASHFULL, CACHE_RESULT |
-| control | sender to receiver | QUERY |
-| control | receiver to sender | ANSWER |
-| control | receiving host to sending host | STOP |
+| data | client to server | REQUEST; the client's HELLO when it receives a deduplicated stream; the forward stream: CHUNK, STREAM_END |
+| data | server to client | The server's HELLO when it receives a deduplicated stream; the backward stream: CHUNK, STREAM_END; END |
+| control | receiver to sender | List exchange: INDEX, HASHLIST, HASHDELTA, HASHKEEP, HASHNONE, HASHDATA |
+| control | sender to receiver | List exchange: ADVERTISE, HASHFULL, CACHE_RESULT |
+| control | either way | UPDATED, after the update of each host (section 4.4) |
+| control | sender to receiver | QUERY, in the control stream |
+| control | receiver to sender | ANSWER, in the control stream |
+| control | receiving host to sending host | STOP, in the control stream |
 
 Payloads:
 
@@ -1121,40 +1180,53 @@ Payloads:
   `sender_cache u8`, `compression_level i32`, `compression_long u8`,
   `compression_threads u32`, `probe_threads u32`, `lookahead u64` (bytes;
   0 for the default), `negative_cache u64` (bytes), `spool_limit u64`
-  (bytes; `2^64 − 1` for `unlimited`), and `stdin_delivery u8` and
-  `stdout_delivery u8` (0 for eager, 1 for batch). Each host applies the
-  settings that concern its roles. Last, `quiet u8` and `human_readable
-  u8`: the client's `-q`, and the opposite of its `--no-human-readable`,
-  which the server applies to its own notes.
-- HELLO, receiver to sender: `block_size u32`, `weak_hash_id string`,
-  `strong_hash_id string`, `account_id [u8; 16]`, and `index_id [u8; 16]`.
-  It names no target, so the receiver sends it before its export, and the
+  (bytes; `2^64 − 1` for `unlimited`), `stdin_delivery u8` and
+  `stdout_delivery u8` (0 for eager, 1 for batch), and `wait u8`, 1 with
+  `--wait`. Each host applies the settings that concern its roles. Last,
+  `quiet u8` and `human_readable u8`: the client's `-q`, and the opposite
+  of its `--no-human-readable`, which the server applies to its own notes.
+- HELLO, from the receiver of a deduplicated stream, on the data session:
+  `block_size u32`, `weak_hash_id string`, and `strong_hash_id string`,
+  from its configuration, so it needs no index: the client sends it right
+  after REQUEST, and the server right after it has read REQUEST.
+- INDEX: `account_id [u8; 16]` and `index_id [u8; 16]`, the receiver's
+  account and the ID of its index, which partition the list caches. It
+  names no target, so the receiver sends it before its export, and the
   sender prepares its cached list meanwhile (section 5.6).
-- HELLO, sender to receiver: `account_id [u8; 16]`, and `lists`, a list of
-  the IDs `[u8; S]` of the advertised lists (section 5.6).
-- HASHLIST: `target [u8; S], length u64`. That many encoded bytes of the
-  target follow the frame directly.
+- ADVERTISE: `account_id [u8; 16]`, and `lists`, a list of the IDs
+  `[u8; S]` of the advertised lists (section 5.6).
+- HASHLIST: `target [u8; S], length u64`. HASHDATA frames with that many
+  encoded bytes of the target follow.
 - HASHDELTA: `target [u8; S], base [u8; S], removed_length u64,
-  added_length u64`. The removed and added encoded lists follow the frame
-  directly. They change the base, one of the advertised lists, into the
-  target.
+  added_length u64`. HASHDATA frames with the removed and then the added
+  encoded list follow, as one sequence of bytes. They change the base, one
+  of the advertised lists, into the target.
 - HASHKEEP: `target [u8; S]`. The target is one of the advertised lists;
   no data follows.
-- List bytes after HASHLIST and HASHDELTA are not frames. Enforce exact
-  lengths and canonical encoding, including ordering and padding.
+- HASHNONE: empty. In place of INDEX, or of the target after ADVERTISE:
+  the receiver's stream has ended or stopped, and the exchange ends
+  without a list (section 5.6).
+- HASHDATA: the next list bytes of HASHLIST or HASHDELTA, at least one and
+  at most 16 KiB. The receiver sends nothing else of its exchange until
+  they are all out. Enforce exact lengths and canonical encoding,
+  including ordering and padding.
 - HASHFULL: empty. Request a full list once when the listed list that
   HASHDELTA or HASHKEEP names is invalid, or after a delta digest
-  mismatch, before the streams start (section 5.6). The response is
-  HASHLIST, which names the same target.
+  mismatch (section 5.6). The response is HASHLIST, which names the same
+  target.
 - CACHE_RESULT: empty. The sender's single acknowledgement of the target
   of its exchange (section 5.6). A second one in the same exchange is a
-  protocol error. Both streams start after the CACHE_RESULT of the last
-  exchange.
-- CHUNK: the next bytes of the stream's zstd frame, or of its stream frames
-  when compression is disabled, at least one. A CHUNK goes out when it
-  holds 256 KiB, and at each flush of the stream: the idle points of eager
-  delivery, every `lookahead` bytes of a deduplicated stream, and the end
-  of the stream.
+  protocol error.
+- UPDATED: empty. With both streams deduplicated and without
+  `--no-update`, the host's update is done, and its lock released
+  (section 4.4, steps L1 and L2). At most once in each direction.
+- CHUNK: on the data session, the next bytes of the stream's zstd frame,
+  or of its stream frames when compression is disabled, at least one. A
+  CHUNK goes out when it holds 256 KiB, and at each flush of the stream:
+  the idle points of eager delivery, every `lookahead` bytes of a
+  deduplicated stream, and the end of the stream. On the control session,
+  the next bytes of the control stream, at least one, at each flush of the
+  control writer (below).
 - STREAM_END: empty. The end of the stream: its zstd frame ended exactly
   with the last CHUNK. An empty stream is an empty zstd frame and
   STREAM_END; without compression, STREAM_END alone. A stopped stream has
@@ -1187,36 +1259,37 @@ Payloads:
   stream. At most once in each direction.
 
 The receiver's HELLO sets the block size, weak hash, and strong hash of
-its stream. The sender uses them, or it ends the run with `die` before
-command startup if it does not support them. It checks the strong hash as
-soon as it reads its name: the length of every list ID of the exchange
-depends on it. Its HELLO does not repeat them. In the same way, the server
-ends the run before command startup if it does not support a setting of
-REQUEST, such as a compression level. And the sender of a deduplicated
-stream reserves the scanner's lookahead buffer and starts its probe
-threads before its HELLO. The client sets their sizes to any value, so a
-host that cannot provide them ends the run there (section 6.3).
+its stream. The sender uses them, or it ends the run with `die` if it does
+not support them: in a pull, the server reads the client's HELLO before
+it starts the command. It checks the strong hash as soon as it reads its
+name: the length of every list ID of the exchange depends on it. In the
+same way, the server ends the run before command startup if it does not
+support a setting of REQUEST, such as a compression level. And the sender
+of a deduplicated stream reserves the scanner's lookahead buffer and
+starts its probe threads at the receiver's HELLO. The client sets their
+sizes to any value, so a host that cannot provide them ends the run there
+(section 6.3).
 
-The data handshake is the version exchange, the features, REQUEST, and the
-list exchange of each deduplicated stream, the forward stream's first, so
-that their frames need no stream ID. A list exchange is receiver HELLO,
-sender HELLO during the receiver's export, durable receiver publication
-with sender caching, then HASHLIST/HASHDELTA/HASHKEEP and its data. The
-sender replies with CACHE_RESULT, possibly after one HASHFULL fallback.
-The receiver handles the result and cache cleanup. Then both streams
-start: the server starts the command, and the client starts the forward
-stream. In a pull, the client sends its HELLO right after REQUEST, without
-waiting for the server. The server, as the receiver of the forward stream,
-sends its HELLO after its update. With both streams deduplicated, the
-client sends its HELLO after the forward stream's CACHE_RESULT, and after
-an update, only once it has opened its index again (section 4.4).
+The data handshake is the version exchange, the features, REQUEST, and
+the HELLO of each deduplicated stream, which its receiver sends at once.
+Then the server starts the command, and both streams start, while the
+list exchanges run on the control session. A list exchange is INDEX, once
+the receiver's index is ready; ADVERTISE during the receiver's export;
+durable receiver publication with sender caching; then HASHLIST,
+HASHDELTA, or HASHKEEP, and its HASHDATA frames. The sender replies with
+CACHE_RESULT, possibly after one HASHFULL fallback. The receiver handles
+the result and cache cleanup. HASHNONE in place of INDEX or of the target
+ends an exchange early (section 5.6). The lists travel on the control
+session, because nothing there waits for a stream. On the data session, a
+list would wait behind the other stream of its direction, whose spool on
+the peer is full while the command reads none of its stdin, and with
+`--wait`, the run would hang (section 10).
 
-Each session frame goes to SSH in a single write, together with any list
-bytes that follow HASHLIST or HASHDELTA. SSH puts the bytes of each read
-of its stdin into packets of their own, so a header that arrived ahead of
-its payload could cost an extra packet. A side flushes before it waits for
-a reply. The session frames of the handshake are not compressed: zstd
-cannot make the hash list smaller (section 10).
+Each session frame goes to SSH in a single write. SSH puts the bytes of
+each read of its stdin into packets of their own, so a header that arrived
+ahead of its payload could cost an extra packet. A side flushes before it
+waits for a reply. The frames of the list exchanges are not compressed:
+zstd cannot make the hash list smaller (section 10).
 
 **Delivery.** The run gives each stream a delivery (section 8). Eager
 delivery, the default, works as SSH does: a command that waits for its
@@ -1238,14 +1311,26 @@ after every `lookahead` bytes, so that the references and runs of a source
 that never pauses, such as a file, do not wait in the buffers until the
 end of the stream (section 6.3).
 
-After the features, each direction of the control session is also one
-zstd stream at the same level, unless compression is disabled. The
-frames are small, so the stream uses no long-distance matching and no
-worker threads. A control writer flushes its stream each time its queue
-becomes empty, because the scanner waits for answers, and the sending host
-of a stream must stop it as soon as the receiving host has stopped it.
-When a slow link makes the writer wait, more frames share each flush and
-compress better. No frame ends the stream: the closure of the session ends it
+The control stream of each direction of the control session is one zstd
+stream at the level of the streams, unless compression is disabled. Its
+frames are small, so it uses no long-distance matching and no worker
+threads. The start of a zstd frame on either side takes milliseconds, tens
+of them on a busy host, in allocations and page faults, which also wait
+for the other threads of the process that map memory then, such as a
+stream decoder that takes a window of 128 MiB. So the control writer
+starts its frame at its own start, and the control reader decodes a frame
+of its own first, then starts afresh with the memory that it took: the
+first frame of the session, such as STOP, waits for neither. It flushes the stream into a CHUNK each
+time its queue of control frames becomes empty, because the scanner waits
+for answers, and the sending host of a stream must stop it as soon as the
+receiving host has stopped it. When a slow link makes the writer wait,
+more frames share each flush and compress better. While that queue is
+empty, the writer sends the frames of the list exchanges of its host, one
+at a time, from one queue for each side that the host plays, so that
+neither exchange waits behind the list of the other: a control frame that
+comes while a HASHDATA frame goes out waits for it alone. The reader
+passes each frame of an exchange to its side as soon as it arrives. No
+frame ends the control stream: the closure of the session ends it
 (section 6.9).
 
 ### 6.3 The sender's scanner
@@ -1264,9 +1349,9 @@ for the scanner. Let `B = block_size`.
   B`; the lookahead reader, which takes the stream's bytes from the spool
   of its source (section 6.5), the command's stdout for the backward stream
   and the client's stdin for the forward stream, pauses when the buffer is
-  full. The sender reserves the buffer whole, at twice its capacity, before
-  its HELLO (section 6.2). Scanning starts a step only while `p - e <
-  lookahead`; a full-window step may advance `p` by `B`.
+  full. The sender reserves the buffer whole, at twice its capacity, at
+  the receiver's HELLO (section 6.2). Scanning starts a step only while
+  `p - e < lookahead`; a full-window step may advance `p` by `B`.
 - `f`: in eager delivery (section 6.2), the end of the bytes before the
   last idle point of the source, initially zero, with `f <= r`. The
   lookahead reader passes each idle point that the spool reports after the
@@ -1292,10 +1377,26 @@ require a yes for their exact offset; equal hashes at different offsets do
 not share permission to emit REF. A last Literal or Run can grow, and its
 ready prefix can be emitted before it stops growing.
 
+**The table.**
+
+The scanner starts at the receiver's HELLO with an empty table, which the
+sender's side of the list exchange fills while the list arrives (section
+5.5). A window scanned before its weak hash is in the table stays
+literal: the scanner does not scan it again when the table grows. So
+deduplication grows with the part of the list that the sender has, and
+the bytes before the list cost bandwidth. With `--wait`, the scanner scans
+only once its table is whole, so that the run sends the fewest bytes,
+however long it takes: the bytes of the stream wait in the lookahead
+buffer, and then in the spool of the source (section 6.5). An empty
+stream ends without a table. An exchange that HASHNONE ends gives no
+table: with `--wait`, the scanner then waits for the stop of its stream,
+which has stopped already or stops soon (section 6.6).
+
 **Scanning.**
 
-Each iteration processes available answers, resolves Query records in
-offset order, and emits ready records before scanning more bytes.
+Each iteration takes the updates of the table that have come, processes
+available answers, resolves Query records in offset order, and emits ready
+records before scanning more bytes.
 
 With a full window at `p`:
 
@@ -1349,7 +1450,7 @@ or a hit that the check rejects, neither doubles nor shortens the next
 stretch. Short gaps between matches thus stay on one thread, and a long
 run of misses soon uses all probe threads. `--probe-threads` sets the
 thread count; 0 selects half the sender's cores, at least one. The sender
-starts them before its HELLO (section 6.2).
+starts them at the receiver's HELLO (section 6.2).
 
 **Answers and rescanning.**
 
@@ -1401,9 +1502,10 @@ queue and remain ordered even when offsets go backwards. Discarded records
 can leave obsolete requests; lookahead is not a bound on all outstanding
 queries or receiver pins.
 
-When progress requires more bytes of the stream, answers, data-queue
-space, or, while a tail before `f` waits, an idle data writer, wait on
-notifications for those events, continuing to prioritize answers.
+When progress requires more bytes of the stream, answers, updates of the
+table, data-queue space, or, while a tail before `f` waits, an idle data
+writer, wait on notifications for those events, continuing to prioritize
+answers.
 Backpressure propagates from the data writer through the lookahead buffer
 to the spool of the source (section 6.5).
 
@@ -1596,11 +1698,11 @@ Data structures:
   creates it if necessary and keeps it open through the run. When it opens
   it, it creates a segment and closes it at once, to make sure that
   segments can be created: the client before the SSH sessions start, and
-  the server once it has read REQUEST and its configuration, before the
-  list exchanges. So an unusable directory ends the run before command
-  startup. A disk-backed directory moves the data out of RAM, where tmpfs
-  would keep it in memory or swap. Avoid NFS: its client writes the data
-  of a file to the server before it closes the file (section 10).
+  the server once it has read REQUEST and its configuration. So an
+  unusable directory ends the run before command startup. A disk-backed
+  directory moves the data out of RAM, where tmpfs would keep it in
+  memory or swap. Avoid NFS: its client writes the data of a file to the
+  server before it closes the file (section 10).
 - **Segment**: one open, unlinked file in the tmp_data directory, with its
   size and its count of extents in use. The size is the bytes of the
   extents appended to the segment. The file is read/write (0600) and
@@ -1779,7 +1881,8 @@ forward stream is, with the server as its receiver; and with
 `--dedup-stdin --dedup-stdout`, both are (section 8). A stream always uses
 the same directions of both sessions: the data session from its sending
 end to its receiving end, for its CHUNK frames, and for a deduplicated
-stream, the control session in both directions, for QUERY and ANSWER.
+stream, the control session in both directions, for its list exchange,
+QUERY and ANSWER.
 
 Both streams are built from the same blocks. Deduplication is one more
 block, which a deduplicated stream has and a plain stream does not: the
@@ -1838,9 +1941,10 @@ Data structures:
   sessions start, and the server at REQUEST, each with the pins of the
   deduplicated stream that it receives.
 
-The client's **stdin reader**, once the list exchanges are done, reads
-stdin. With `-n` (section 8), the forward stream is empty: its spool ends
-before the sessions start, so before any stop, and no stdin reader runs. As
+The client's **stdin reader**, from the start of the run, once the client
+has sent REQUEST, reads stdin. With `-n` (section 8), the forward stream
+is empty: its spool ends before the sessions start, so before any stop,
+and no stdin reader runs. As
 `ssh` does, the stdin reader makes a stdin that is not a terminal
 non-blocking while it reads it, unless it is non-blocking already, so that
 no read waits. A terminal stays as it is, because the shell of the user
@@ -1965,13 +2069,13 @@ a startup failure. The client raises it at STOP, or at END when END comes
 first: the two sessions are independent. The client raises the stop of the
 backward stream when a write of the decoder fails with `EPIPE`, and the
 server raises it at STOP. A later STOP, or one that comes after the stream
-has ended, changes nothing. STOP can come before the client starts its
-forward stream: the server starts the command right after the list
-exchange, the command can exit at once, and STOP travels on the other
-session. So the client's stops exist from before the sessions start. After
-END, the server needs no STOP: the client's stop of the backward stream
-then gives up its place in the queue of the control writer (section 6.9,
-step N1), and a later raise stops the stream on the client alone.
+has ended, changes nothing. STOP can come before the client's stdin
+reader reads a byte: the server starts the command at once, the command
+can exit at once, and STOP travels on the other session. So the client's
+stops exist from before the sessions start. After END, the server needs
+no STOP: the client's stop of the backward stream then gives up its place
+in the queue of the control writer (section 6.9, step N1), and a later
+raise stops the stream on the client alone.
 
 A stopped end gives up at once. Every wait of its threads also waits for
 the stop: the waits of the source readers for their sources and for room in
@@ -2046,7 +2150,8 @@ run open, as it keeps a local pipeline open.
   Client SIGINT/SIGTERM give status `128 + signal` (section 6.8). These
   end the run with `die`: different protocol versions, features that the
   run needs and the peer does not have, and unsupported HELLO parameters,
-  before command startup; sessions that end or break before END; stderr
+  in a pull before command startup; sessions that end or break before END;
+  failed updates and indexes that do not match the configuration; stderr
   relay read, write, or flush failures; failed reads of the client's stdin
   and of command stdout; failed writes to the command's stdin or to the
   client's stdout other than `EPIPE`, which stops the stream (section 6.6);
@@ -2078,25 +2183,28 @@ SIGTERM during the end still give `128 + signal`.
 
 | Host | Thread | Responsibilities |
 |---|---|---|
-| Server | main | Run the handshake, reading the data session itself, and start the command. Then send the backward stream as its data writer, obtain the command's exit status without reaping, wait for the END conditions of section 6.9, and send END. |
+| Server | main | Run the handshake, reading the data session itself, and start the command. Then obtain the command's exit status without reaping, wait for the END conditions of section 6.9, and send END. |
 | Server | data reader | Read the data session once the handshake is done: the forward stream's CHUNK and STREAM_END, and EOF after END. |
+| Server | data writer | Send the backward stream (section 6.6). |
 | Server | session watcher | Until the stop of the forward stream, end the run at the hangup of the data session (section 6.6). |
 | Server | stdout reader | Copy command stdout into its spool until its EOF or the stop of the backward stream, in eager delivery with its idle points, then close command stdout (section 6.6). |
 | Server | decoder | Decode the forward stream into the command's stdin, with the pins when it is deduplicated, and raise its stop at `EPIPE` (section 6.6). |
 | Server | exit watcher | Raise the stop of the forward stream when the command exits (section 6.6). |
 | Server | stderr relay | Copy command stderr to server stderr through EOF and flush (section 6.1). |
-| Server | control reader/writer | Pass the queries for a deduplicated forward stream to its lookup workers, and the answers for a deduplicated backward stream to its scanner, and raise the stop of the backward stream at STOP; send answers, queries, and STOP promptly, independently of the streams. |
+| Server | control reader/writer | Pass the queries for a deduplicated forward stream to its lookup workers, the answers for a deduplicated backward stream to its scanner, and the frames of the list exchanges to their sides, and raise the stop of the backward stream at STOP; send answers, queries, and STOP promptly, independently of the streams, and the frames of the server's sides of the list exchanges between them (section 6.2). |
 | Client | main | Start SSH sessions, run the handshake, then wait for END, and end the run (section 6.9). |
 | Client | data reader | Read the data session once the handshake is done: the backward stream's CHUNK and STREAM_END, END, and EOF. |
 | Client | decoder | Decode the backward stream into stdout, with the pins when it is deduplicated, and raise its stop at `EPIPE` (section 6.6). |
 | Client | stdin reader | Copy stdin into the forward stream's spool (section 6.6). |
 | Client | data writer | Send the forward stream (section 6.6). |
-| Client | control reader/writer | Pass the queries for a deduplicated backward stream to its lookup workers, and the answers for a deduplicated forward stream to its scanner, and raise the stop of the forward stream at STOP; send answers, queries, and STOP promptly. |
+| Client | control reader/writer | Pass the queries for a deduplicated backward stream to its lookup workers, the answers for a deduplicated forward stream to its scanner, and the frames of the list exchanges to their sides, and raise the stop of the forward stream at STOP; send answers, queries, and STOP promptly, and the frames of the client's sides of the list exchanges between them. |
 | Client | signal thread | Handle SIGINT/SIGTERM with status `128 + signal`. |
 | Sender | lookahead reader | Fill the lookahead from the spool of the stream's source, and pass its idle points to the scanner, until its EOF or the stop; then close the spool at its end. |
 | Sender | scanner | Own records and query states; queue queries and frames (section 6.3). |
 | Sender | probe threads | Probe the parts of long stretches of windows for the scanner (section 6.3). |
-| Receiver | list export | Export the hash list, while the main thread reads the sender's HELLO and the base of a delta (section 5.6). |
+| Sender | list exchange | Run the sender's side of the list exchange, and give the scanner its table (section 5.6). |
+| Receiver | receiver | Update the index or open it, as section 4.4 orders it, start the lookup workers, and run the receiver's side of the list exchange (section 5.6). |
+| Receiver | list export | Export the hash list, while the receiver's thread reads ADVERTISE and the base of a delta (section 5.6). |
 | Receiver | lookup workers | Answer queries out of order, until Completing (section 6.4). |
 | Attach | relay | Copy both directions (section 6.1). |
 
@@ -2161,9 +2269,10 @@ objects under them. The index recovers from its write-ahead log, as after
 a crash.
 
 The client monitors both sessions and termination signals. The server
-monitors stdin and the control socket: its main thread reads stdin during
-the list exchanges, the data reader reads it afterwards, and the session
-watcher covers the stretches in which neither reads it (section 6.6).
+monitors stdin and the control socket: its main thread reads stdin until
+REQUEST, and in a pull the client's HELLO, the data reader reads it
+afterwards, and the session watcher covers the stretches in which neither
+reads it (section 6.6).
 Before END, EOF or the closure of a session means that the other host
 disappeared, which is fatal on both hosts, also during rendezvous and
 setup, when no stream flows. The server's fatal end then kills the
@@ -2182,11 +2291,24 @@ command's status, once it needs nothing more from the client:
   has an empty backward stream;
 - the forward stream has ended or stopped, and its decoder has ended;
 - command stderr has reached EOF, and the relay has forwarded and flushed
-  all its bytes to SSH.
+  all its bytes to SSH;
+- the server's sides of the list exchanges have ended: an exchange that
+  its receiver began with the target ends with CACHE_RESULT, and one that
+  it ended before with HASHNONE (section 5.6). So the exchanges never
+  outlive the run, and a short run sends no list that it has no use for;
+- the control writer has written the last frames of those sides, such as
+  CACHE_RESULT, HASHNONE and UPDATED, for which the client's sides wait:
+  the server shuts the control session down after END, once the data
+  session has ended, which the client can cause at once, and the shutdown
+  would cut them off. They usually went out long before. One that comes
+  last waits only behind the control frames queued before it, which go
+  first; the control frames that the writer still holds can still be cut
+  off.
 
 Before END, the server joins the threads whose work ends with these
-conditions. Its main thread is the backward stream's data writer. The exit
-watcher and the main thread both wait for the exit of the command, so only
+conditions, among them the backward stream's data writer and the threads
+of its sides of the list exchanges. The exit watcher and the main thread
+both wait for the exit of the command, so only
 the join of the exit watcher, which raises the stop of the forward stream,
 puts STOP before END in the control writer's queue; the control writer can
 still hold it when END goes out. The decoder ends at the end of the forward
@@ -2219,17 +2341,20 @@ The client, at END:
   that writer ends once its producers have dropped their senders of its
   queue, the pins of a deduplicated backward stream at Completing (section
   6.4), the scanner of a deduplicated forward stream at the end of its
-  scan or at the stop (section 6.3), and the stop of the backward stream
-  at its raise or at step N1. Neither close waits for the EOF of a stdout
-  pipe (section 10).
+  scan or at the stop (section 6.3), the stop of the backward stream at
+  its raise or at step N1, and the sides of the list exchanges at their
+  end. The server ended its sides and wrote their last frames before END,
+  so the client's sides end at once, or once those frames arrive. Neither
+  close waits for the EOF of a stdout pipe (section 10).
 - **N3.** Join the decoder, which writes the rest of the backward stream
   from its spool to stdout, and checks the end of the stream, or ends at
   the stop of the backward stream, also when stdout breaks after END; the
   data reader, which reads the data session to its EOF, and takes any
   byte after END as a protocol error; the control reader, which reads the
   control session to its EOF, so that SSH never fails with a broken pipe;
-  the stdin reader; and with a deduplicated forward stream, the output
-  reader and the scanner.
+  the stdin reader; with a deduplicated forward stream, the output reader,
+  the scanner, and the sender's side of its list exchange; and with a
+  deduplicated backward stream, the receiver's thread.
 - **N4.** Observe both SSH exits without reaping. Both must exit zero;
   otherwise the run failed even though END arrived. A failure in steps N2
   to N4 ends the client with `die`, also after END.
@@ -2393,6 +2518,15 @@ exclude = ['*.tmp', 'literal\x2Aname', 'back\\slash']
   - Both streams have eager delivery (section 6.2). `--batch-stdout`
     gives the backward stream batch delivery, and `--batch-stdin` the
     forward stream; `-n` with `--batch-stdin` is a usage error.
+  - The streams flow from the start, while each receiver updates its index
+    and sends its hash list, so a deduplicated stream finds more blocks as
+    more of its list arrives (section 6.3). `--wait` makes each
+    deduplicated stream wait for its whole list before its scanner scans,
+    while a plain stream flows as before, and the bytes of the waiting
+    stream gather in its spool. With both streams deduplicated, each stream
+    waits for its own list alone. `--wait`, with the batch delivery of the
+    deduplicated streams, sends the fewest bytes, however long the run
+    then takes.
   - `--no-update` skips the update of each receiver's index, takes
     read-only index access (section 4.4), and still resolves current roots
     (section 4.2).
@@ -2409,10 +2543,10 @@ exclude = ['*.tmp', 'literal\x2Aname', 'back\\slash']
     of 256 MiB and three blocks of the receiver, which leaves room for the
     probe threads. A `--lookahead` below one block of the receiver is a
     user error, which the client reports: for a deduplicated backward
-    stream before SSH starts, and for a deduplicated forward stream after
-    the server's HELLO, before the command starts. A lookahead buffer or
-    probe threads that the sender's host cannot provide end the run before
-    the sender's HELLO (section 6.2).
+    stream before SSH starts, and for a deduplicated forward stream at the
+    server's HELLO, before its scanner starts. A lookahead buffer or probe
+    threads that the sender's host cannot provide end the run at the
+    receiver's HELLO (section 6.2).
 
   After a successful transfer, also when the command fails, the client
   prints a summary to stderr:
@@ -2559,14 +2693,16 @@ decision history, including fuller measurements, is in version control.
 - **Removing only the advertised base after an exchange:** leaves the lists
   of failed exchanges until expiry. Removing every other list found after
   publication can remove the target of a later run, when a sender
-  outlives its failed receiver. A listing made before the sender's HELLO
-  needs no clock and holds no later target (section 5.6).
-- **The target in the receiver's HELLO:** the receiver had to export its
-  list before its HELLO, and the sender could start on its cached list
-  only after HASHKEEP or HASHDELTA, so the two sides worked one after the
-  other. With an index of 30.3M blocks (21.4M distinct weak hashes, a
-  110 MB list), a run took 6.6–7.2 s after its update with an unchanged
-  list, and 8.8–9.4 s with a changed one. With the target in HASHKEEP,
+  outlives its failed receiver. A listing made at INDEX, while the
+  receiver holds its lock, needs no clock and holds no later target
+  (section 5.6).
+- **The target in the receiver's first frame of the exchange:** the
+  receiver had to export its list before that frame, then HELLO, and the
+  sender could start on its cached list only after HASHKEEP or HASHDELTA,
+  so the two sides worked one after the other. With an index of 30.3M
+  blocks (21.4M distinct weak hashes, a 110 MB list), a run took 6.6–7.2 s
+  after its update with an unchanged list, and 8.8–9.4 s with a changed
+  one. With the target in HASHKEEP,
   HASHDELTA, and HASHLIST, the export overlapping the sender's
   preparation, and unchanged lists kept, it takes 3.4–4.0 s and
   5.6–6.4 s.
@@ -2859,20 +2995,68 @@ decision history, including fuller measurements, is in version control.
 - **A limit for each spool:** separate limits for the spools of the two
   hosts would need names after the roles, which are hard to tell apart;
   one `--spool-limit` sets every spool.
-- **Keeping the client's lock through the server's update, with both
-  streams deduplicated:** two such runs in opposite directions between the
-  same hosts would each hold one index and wait for the other (section
+- **Keeping the lock after the update, with both streams deduplicated:** a
+  host would hold it while the other host can still wait for the exclusive
+  lock of its own update, so two such runs in opposite directions between
+  the same hosts could each hold one index and wait for the other (section
   4.4).
+- **Updating the two indexes one after the other, with both streams
+  deduplicated:** the server updated its index only once the client's
+  update was done, and kept its lock from its update on, so only the
+  client's index had a gap between its update and its use. But each list
+  waited for both updates: with two indexes at full scale that need no
+  changes, about 13 s, twice the 6.5 s of one update, where it now waits
+  only for the slower update. An update waits for nothing else while it
+  holds its exclusive lock, so the two updates can overlap; the server's
+  index then has the gap too, with the check of step L2.
 - **Taking the two exclusive locks in the order of the indexes' IDs:** it
-  avoids that deadlock without releasing the client's lock, but both IDs
-  would have to be known before either update, so a message before the
-  server's update would carry the server's. `index_id` is stored in the
+  avoids that deadlock without releasing the locks, but both IDs would
+  have to be known before either update, so the hosts would have to
+  exchange them before their updates. `index_id` is stored in the
   database, so reading it takes a lock; a rebuild renews it, so it can
   change between the read and the lock; an index has none before its
   first update; and copies of an index directory share it, so two runs
   between such copies could not agree on an order.
 - **A lock attempt that fails at once instead of waiting:** contention
   would then fail runs.
+- **Starting the command after the list exchanges:** the command and both
+  streams waited for each receiver's update and for both exchanges. At
+  full scale, an update without changes took 6.5 s and an exchange with an
+  unchanged list 3.4–4.0 s, during which no byte flowed. Now the streams
+  flow from the start, and a stream deduplicates as much as the part of
+  its list that has arrived allows (section 6.3). `--wait` keeps the bytes
+  of the earlier design, also with both streams deduplicated, where each
+  stream waits only for its own list.
+- **The list exchanges on the data session:** a list would wait behind the
+  other stream of its direction, whose spool on the peer is full while the
+  command reads none of its stdin. In a pull, the client's list would then
+  reach the server only after the command had read the forward stream,
+  and with `--wait`, a command that writes all its output before it reads
+  its input would hang the run. On the control session, nothing waits for
+  a stream. Its control frames go first, and a frame of an exchange waits
+  for at most one HASHDATA frame of 16 KiB, about 16 ms at 1 MB/s.
+- **A hash table that the exchange fills under a lock:** the scanner
+  probes the table once for each byte of new output, the hottest loop of a
+  run, and a lock or atomic loads there would slow every probe. The
+  scanner's thread owns the table instead, and takes the values that have
+  arrived between scans, as owned updates on a channel, so the probes are
+  as they were (section 5.5).
+- **A second scanner with the whole table:** start with a scanner whose
+  table is empty, and replace it once the list is whole. It finds no block
+  until the whole list has arrived, while a table that fills finds each
+  block as soon as its value is in, with the same probes; and the new
+  scanner would have to take over the records, the query states, and the
+  lookahead buffer of the old one.
+- **Rescanning the windows that the table missed:** a window that was
+  scanned before its value arrived stays literal. Scanning it again would
+  need the bytes after it, which the scanner has emitted already, and the
+  emitted frames cannot be taken back. `--wait` gives the stream its whole
+  table instead.
+- **Scanning with the sender's cached list until the target arrives:** the
+  prepared list is usually close to the target, and would let the scanner
+  find blocks during the receiver's export. But its values that the target
+  no longer has would cost queries and rescans, and the table cannot
+  remove values, so a delta would need a new table. Not implemented.
 
 ## 11. Repository conventions
 
@@ -2886,7 +3070,7 @@ decision history, including fuller measurements, is in version control.
   change to frame layouts, frame order or meaning, the list encoding, or
   the frames that the zstd streams carry. New weak and strong hashes are the
   exception: HELLO names both, and a sender that does not support them
-  ends the run before command startup (section 6.2).
+  ends the run at that HELLO (section 6.2).
 - The name of every temporary file of this program is `.hashsync-` and
   16 random hexadecimal digits: the cache temporaries, the temporary of
   the account ID, and the segment files without `O_TMPFILE`. Then a file
@@ -2934,10 +3118,20 @@ decision history, including fuller measurements, is in version control.
     with `--no-update`; a stop of the forward stream while the backward
     one goes on; different block sizes and strong hashes on the two
     hosts; two runs in opposite directions whose servers wait until both
-    clients have updated, which must both end; a rebuild of the client's
-    index before its HELLO, which ends the run before the command; a
-    command and a consumer that answer each other; and `rsync -e` both
-    ways;
+    clients have updated, which must both end; on each host, an update that
+    ends while the other host's update waits for its lock, and a rebuild of
+    the host's index before it opens it again, which ends the run; with
+    `--wait`, a stream that deduplicates while the other waits for its
+    list; a command and a consumer that answer each other; and `rsync -e`
+    both ways;
+  - the start: a command that runs, and whose streams flow, while the
+    receiver's update waits for a lock, in both directions; with `--wait`,
+    a deduplicated stream that waits for its whole list and then finds
+    every block, and a plain stream that flows meanwhile; a table that
+    finds a block once its value has arrived; an exchange that ends with
+    HASHNONE, before INDEX and after ADVERTISE, which removes no listed
+    file and expires the cache; and a list on the control session while
+    the spool of a stream is full;
   - the streams: the forward stream with and without compression, in eager
     and batch delivery, and `-n`; a run that ends with its command while
     stdin stays open; a command that reads a part of its stdin, closes its

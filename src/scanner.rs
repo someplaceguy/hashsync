@@ -175,8 +175,8 @@ struct Known {
 /// stream starts. The buffer is twice as large as the bytes that it
 /// accepts, `lookahead + B` (`Scanner::push`). This type exists so that
 /// the reservation comes before the stream: the client sets the lookahead
-/// to any size, and a host that cannot hold its buffer must end the run
-/// before the command starts, not abort in the middle of the stream.
+/// to any size, and a host that cannot hold its buffer must end the run at
+/// the receiver's HELLO, not abort in the middle of the stream.
 pub struct Lookahead {
     bytes: u64,
     buffer: Vec<u8>,
@@ -343,6 +343,24 @@ impl<'a> Scanner<'a> {
     /// The stream's source reached EOF.
     pub fn end_input(&mut self) {
         self.ended = true;
+    }
+
+    /// Probe `table` from the next scan on: the hash table of the
+    /// receiver's list, whole, or for a full list that is still arriving,
+    /// sized for its values, which `insert` adds as they arrive (DESIGN.md
+    /// §6.3). A scanner starts with the empty table, so that a stream can
+    /// start before its list arrives. The windows that it scanned before
+    /// keep what it decided for them.
+    pub fn set_table(&mut self, table: HashTable) {
+        self.table = table;
+    }
+
+    /// Add `values` of the receiver's list to the table, which `set_table`
+    /// sized for them.
+    pub fn insert(&mut self, values: &[u64]) {
+        for &value in values {
+            self.table.insert(value);
+        }
     }
 
     /// An idle point of the stream's source, in eager delivery: it has no
@@ -1011,13 +1029,19 @@ pub(crate) mod tests {
             }
         }
 
-        /// The list the sender gets: the weak hashes of every block.
-        fn table(&self) -> HashTable {
+        /// The list the sender gets: the weak hashes of every block, sorted
+        /// and distinct.
+        fn values(&self) -> Vec<u64> {
             let weak = WeakHasher::new(BS as usize);
             let mut values: Vec<u64> = self.blocks.values().map(|b| weak.hash(b)).collect();
             values.sort_unstable();
             values.dedup();
-            HashTable::build(&values)
+            values
+        }
+
+        /// The table of the list.
+        fn table(&self) -> HashTable {
+            HashTable::build(&self.values())
         }
 
         fn query(&mut self, offset: u64, strong: Strong) {
@@ -1081,6 +1105,12 @@ pub(crate) mod tests {
         pushed: usize,
         /// `transfer` makes idle points now and then, as in eager delivery.
         idle_points: bool,
+        /// The values of the list that the table has yet to take, last
+        /// first, when the table grows while the stream goes on, as when the
+        /// list arrives after the stream has started (DESIGN.md §6.3).
+        arriving: Vec<u64>,
+        /// The table is sized for the list.
+        sized: bool,
     }
 
     impl<'a> Run<'a> {
@@ -1110,7 +1140,34 @@ pub(crate) mod tests {
                 input,
                 pushed: 0,
                 idle_points: false,
+                arriving: Vec::new(),
+                sized: true,
             }
+        }
+
+        /// Start the scanner with the empty table, which `grow` then sizes
+        /// and fills while the stream goes on.
+        fn growing(mut self) -> Self {
+            self.scanner.set_table(HashTable::empty());
+            self.arriving = self.receiver.values();
+            self.arriving.reverse();
+            self.sized = false;
+            self
+        }
+
+        /// The next step of a growing table: its size, then up to `n` more
+        /// values, in the order of the list. False when the table is whole.
+        fn grow(&mut self, n: usize) -> bool {
+            if !self.sized {
+                let size = self.arriving.len();
+                self.scanner.set_table(HashTable::for_values(size));
+                self.sized = true;
+                return true;
+            }
+            let start = self.arriving.len().saturating_sub(n);
+            let values: Vec<u64> = self.arriving.drain(start..).rev().collect();
+            self.scanner.insert(&values);
+            !values.is_empty()
         }
 
         /// Push up to `n` more input bytes, or end the input. False when
@@ -1176,6 +1233,9 @@ pub(crate) mod tests {
                     self.receiver.answer(index, &mut self.scanner);
                     progress = true;
                 }
+                if choose(4) == 0 {
+                    progress |= self.grow(1 + choose(3));
+                }
                 progress |= self.scan();
                 // A data queue with room for 0 to 3 frames.
                 for _ in 0..choose(4) {
@@ -1190,7 +1250,8 @@ pub(crate) mod tests {
                     self.receiver.answer(0, &mut self.scanner);
                     true
                 }) || self.push(1)
-                    || self.take_frame();
+                    || self.take_frame()
+                    || self.grow(1);
                 assert!(moved, "the scanner stalled");
             }
         }
@@ -1296,6 +1357,47 @@ pub(crate) mod tests {
         }
         assert_eq!(output, input);
         assert!(scanner.finished());
+    }
+
+    /// A scanner starts with the empty table, and a block becomes a
+    /// reference only once its weak hash is in the table: the block that it
+    /// scanned before stays literal (DESIGN.md §6.3).
+    #[test]
+    fn a_block_becomes_a_reference_once_its_weak_hash_is_in_the_table() {
+        let block = noise(BS as usize, 3);
+        let mut receiver = Receiver::new(std::slice::from_ref(&block), &[]);
+        let mut scanner = Scanner::new(
+            HashTable::empty(),
+            BS,
+            StrongHash::Blake3,
+            lookahead(1 << 20),
+            1 << 20,
+            None,
+        );
+        let first = [noise(5, 4), block.clone(), noise(5, 5)].concat();
+        scanner.push(&first);
+        while scanner.scan(&mut |offset, strong| receiver.query(offset, strong)) {}
+        assert!(receiver.queries.is_empty(), "a query without a list");
+        scanner.set_table(HashTable::for_values(1));
+        scanner.insert(&receiver.values());
+        scanner.push(&block);
+        scanner.end_input();
+        while !scanner.finished() {
+            while scanner.scan(&mut |offset, strong| receiver.query(offset, strong)) {}
+            while !receiver.pending.is_empty() {
+                receiver.answer(0, &mut scanner);
+            }
+            while let Some(frame) = scanner.next_frame() {
+                receiver.take(frame);
+            }
+        }
+        assert_eq!(receiver.output, [first.clone(), block].concat());
+        let offsets: Vec<u64> = receiver.queries.iter().map(|&(offset, _)| offset).collect();
+        assert_eq!(
+            offsets,
+            [first.len() as u64],
+            "the block before the table was queried"
+        );
     }
 
     #[test]
@@ -1954,8 +2056,8 @@ pub(crate) mod tests {
 
         /// Byte-exact reconstruction under any chunking, answer order and
         /// delay, rejection, rescan, runs across chunks, backpressure, scan
-        /// budget, idle points, and split of stretches among probe threads
-        /// (DESIGN.md §11).
+        /// budget, idle points, split of stretches among probe threads, and
+        /// a table that grows while the stream goes on (DESIGN.md §11).
         #[test]
         fn output_is_reproduced_exactly(
             (pieces, seed) in input_strategy(),
@@ -1965,6 +2067,7 @@ pub(crate) mod tests {
             part in proptest::option::of(1usize..100),
             min_budget in 1u64..300,
             idle_points in any::<bool>(),
+            growing in any::<bool>(),
         ) {
             let (valid, stale, piece) = overlapping_blocks(seed);
             let mut input = Vec::new();
@@ -2007,6 +2110,9 @@ pub(crate) mod tests {
             run.scanner.budget = min_budget;
             run.scanner.max_budget = if part.is_some() { 16 * min_budget } else { min_budget };
             run.idle_points = idle_points;
+            if growing {
+                run = run.growing();
+            }
             run.transfer(&choices);
             prop_assert_eq!(&run.receiver.output, &input);
             prop_assert!(run.scanner.records.is_empty() && run.scanner.entries.is_empty());

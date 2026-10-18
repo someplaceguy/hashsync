@@ -4,6 +4,12 @@
 //! value wait in a second array, which only `contains_value` reads: the
 //! scanner checks each hit with it, so that a false positive costs no
 //! strong hash and no query.
+//!
+//! A table can grow while it is in use: a table sized for the values of a
+//! list (`for_values`) takes them one at a time (`insert`), and a lookup
+//! between two insertions finds every value inserted before it. The
+//! scanner fills its table that way while the list arrives (DESIGN.md
+//! §6.3), on its own thread, between its scans, so the table needs no lock.
 
 use crate::hashlist;
 
@@ -54,8 +60,15 @@ impl HashTable {
         hashlist::decode_with(encoded, HashTable::for_values, HashTable::insert)
     }
 
-    /// An empty table for `n` values.
-    fn for_values(n: usize) -> Self {
+    /// The table of no values, in which every lookup misses.
+    pub fn empty() -> Self {
+        HashTable::for_values(0)
+    }
+
+    /// An empty table sized for `n` values, which `insert` adds. A table
+    /// takes at most `n` values: with more, an insertion could find no
+    /// empty slot.
+    pub fn for_values(n: usize) -> Self {
         // An empty list allocates no buckets, and every lookup misses
         // without computing a bucket address.
         if n == 0 {
@@ -74,8 +87,11 @@ impl HashTable {
     }
 
     /// Insert in the first empty slot, continuing to the next bucket when
-    /// full.
-    fn insert(&mut self, value: u64) {
+    /// full. An insertion never moves or empties a slot, so a value stays
+    /// where earlier lookups found its fingerprint, and no lookup of a value
+    /// inserted before it misses. The table must have been sized for this
+    /// value too (`for_values`).
+    pub fn insert(&mut self, value: u64) {
         let fingerprint = fingerprint(value);
         let mut bucket = self.bucket_of(value);
         loop {
@@ -323,6 +339,35 @@ mod tests {
             let values: Vec<u64> = values.into_iter().collect();
             let from_list = HashTable::from_list(&hashlist::encode(&values)).unwrap();
             prop_assert_eq!(slots(&from_list), slots(&HashTable::build(&values)));
+        }
+
+        /// A table that grows while it is in use finds every value that was
+        /// inserted before a lookup, whatever the order of the insertions,
+        /// and ends as the table that `build` makes of all the values
+        /// (DESIGN.md §6.3). Some values share buckets, so that the
+        /// insertions overflow into the buckets of later values.
+        #[test]
+        fn a_growing_table_finds_every_value_inserted_so_far(
+            values in proptest::collection::btree_set(
+                prop_oneof![0u64..4096, u64::MAX - 4095..=u64::MAX, any::<u64>()],
+                1..1000,
+            ),
+            sorted in any::<bool>(),
+        ) {
+            let mut values: Vec<u64> = values.into_iter().collect();
+            if !sorted {
+                values.reverse();
+            }
+            let mut table = HashTable::for_values(values.len());
+            for (i, &value) in values.iter().enumerate() {
+                table.insert(value);
+                let step = (i / 8).max(1);
+                for &inserted in values[..=i].iter().rev().step_by(step) {
+                    prop_assert!(look_up(&table, inserted), "{:#x} lost", inserted);
+                    prop_assert!(table.contains_value(inserted), "{:#x} lost", inserted);
+                }
+            }
+            prop_assert_eq!(slots(&table), slots(&HashTable::build(&values)));
         }
 
         /// No false negatives, whatever the values (DESIGN.md §11).
