@@ -1,4 +1,4 @@
-//! How the process ends, and what it reports on stderr (DESIGN.md §6.9).
+//! How the process ends (DESIGN.md §6.9).
 //!
 //! Every end goes through this module: `die` after an external failure,
 //! `finish` at the normal end, and the client's termination signals. So
@@ -13,15 +13,8 @@
 //! a core dump. A panic does not wait for another end in progress: it
 //! reports a bug. Only the normal end runs the C library's exit handlers
 //! (DESIGN.md §6.9).
-//!
-//! Diagnostics are best effort: a failed write to stderr is ignored. There
-//! is no other channel to report it on, and a panic would turn the failure
-//! into an abort with a core dump. `--quiet` removes the notes, which
-//! report progress and summaries, and keeps warnings and errors
-//! (DESIGN.md §8).
 
 use std::fmt::Display;
-use std::io::Write;
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::process::{Child, Command};
@@ -33,6 +26,7 @@ use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 use rustix::process::{Pid, Signal, kill_process, kill_process_group};
 
 use crate::fsops;
+use crate::report;
 use crate::sys;
 
 /// The exit status of configuration errors, traversal conflicts, failed
@@ -56,63 +50,6 @@ pub fn die(message: impl Display) -> ! {
 /// precedence, as for `die`.
 pub fn finish(status: i32) -> ! {
     end(End::Normal(status))
-}
-
-/// Report a local problem that does not stop the work, such as an entry
-/// that cannot be read and is therefore not indexed.
-pub fn warn(message: impl Display) {
-    report(format_args!("warning: {message}"));
-}
-
-/// Report a failure that does not end the process: the remote command's
-/// failure to start, after which the run ends normally with the
-/// command's status.
-pub fn error(message: impl Display) {
-    report(format_args!("{message}"));
-}
-
-/// Cleared by `--quiet`, before other threads start.
-static NOTES: AtomicBool = AtomicBool::new(true);
-
-/// Report no more progress or summaries.
-pub fn disable_notes() {
-    NOTES.store(false, Relaxed);
-}
-
-/// Report progress or a summary, unless `--quiet` disabled the notes.
-pub fn note(message: impl Display) {
-    if NOTES.load(Relaxed) {
-        report(format_args!("{message}"));
-    }
-}
-
-/// Set once this process is the server, by `serve` and `attach`. SSH
-/// carries the server's stderr to the client's, where its lines mix with
-/// the client's own: the marker tells the user which host a message comes
-/// from, and so on which host to act on it (DESIGN.md §8).
-static SERVER: AtomicBool = AtomicBool::new(false);
-
-/// Mark every later line of this process, and its panic reports, as the
-/// server's. Called first in the server's entry points, before any other
-/// thread starts.
-pub fn report_as_server() {
-    SERVER.store(true, Relaxed);
-}
-
-/// Write the prefix of this process's lines, `hashsync: ` or, on the
-/// server, `hashsync (server): `, then the message and a newline, to
-/// stderr as one write. A pipe keeps a write of up to `PIPE_BUF` (4 KiB)
-/// whole, so the line does not interleave with those of other threads or
-/// of the processes that share stderr, such as the SSH children. Failures
-/// are ignored (see the module documentation).
-fn report(message: std::fmt::Arguments<'_>) {
-    let host = if SERVER.load(Relaxed) {
-        " (server)"
-    } else {
-        ""
-    };
-    let line = format!("hashsync{host}: {message}\n");
-    let _ = fsops::stderr().write_all(line.as_bytes());
 }
 
 /// Why the process ends.
@@ -142,12 +79,12 @@ fn end(end: End<'_>) -> ! {
             std::process::exit(status)
         }
         End::Failure(message) => {
-            report(format_args!("{message}"));
+            report::error(message);
             fatal_cleanup();
             EXIT_FAILURE
         }
         End::Signal(signal) => {
-            report(format_args!("terminated by {}", signal_name(signal)));
+            report::error(format_args!("terminated by {}", signal_name(signal)));
             fatal_cleanup();
             128 + signal
         }
@@ -234,46 +171,15 @@ fn received_termination_signal() -> Option<i32> {
     sys::pending_termination_signal()
 }
 
-/// Run the fatal cleanup after the panic report: the default one, or on
-/// the server, the same content with the server's marker on every line.
+/// Run the fatal cleanup after the panic report (`report::panic`): the
+/// default one, or on the server, the same content with the server's
+/// marker on every line.
 pub fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        if SERVER.load(Relaxed) {
-            report_panic(info);
-        } else {
-            default_hook(info);
-        }
+        report::panic(info, &*default_hook);
         fatal_cleanup();
     }));
-}
-
-/// The server's panic report. A protocol error panics (DESIGN.md §6.7),
-/// and SSH carries the report to the client's stderr, so each of its
-/// lines goes through `report`, which marks it as the server's, as the
-/// default report would not. It gives what the default report gives: the
-/// thread, the location, the message, and the backtrace when
-/// `RUST_BACKTRACE` asks for one.
-fn report_panic(info: &std::panic::PanicHookInfo<'_>) {
-    let thread = std::thread::current();
-    let name = thread.name().unwrap_or("<unnamed>");
-    match info.location() {
-        Some(location) => report(format_args!("thread '{name}' panicked at {location}:")),
-        None => report(format_args!("thread '{name}' panicked:")),
-    }
-    for line in info.payload_as_str().unwrap_or("Box<dyn Any>").lines() {
-        report(format_args!("{line}"));
-    }
-    let backtrace = std::backtrace::Backtrace::capture();
-    if backtrace.status() == std::backtrace::BacktraceStatus::Captured {
-        for line in backtrace.to_string().lines() {
-            report(format_args!("{line}"));
-        }
-    } else {
-        report(format_args!(
-            "note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace"
-        ));
-    }
 }
 
 /// What an end must undo (DESIGN.md §6.9). A fatal end kills the children:

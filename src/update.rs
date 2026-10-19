@@ -6,10 +6,10 @@ use std::time::Instant;
 use bstr::ByteSlice;
 
 use crate::config::Config;
-use crate::die;
 use crate::fsid::FsCache;
 use crate::fsops;
 use crate::index::{self, Settings};
+use crate::report;
 use crate::roots::{self, Location};
 use crate::scan::{self, ScanRoot};
 use crate::units::Bytes;
@@ -42,7 +42,7 @@ pub fn perform(config: &Config, rebuild: bool, jobs: Option<u32>) -> (index::Ind
     let rebuild = rebuild
         || match index.read_meta() {
             None => {
-                die::note(format_args!(
+                report::note(format_args!(
                     "creating index {}",
                     config.index_path.as_bstr()
                 ));
@@ -50,7 +50,7 @@ pub fn perform(config: &Config, rebuild: bool, jobs: Option<u32>) -> (index::Ind
             }
             Some(meta) if meta.compatible(&settings) => false,
             Some(meta) => {
-                die::note(format_args!(
+                report::note(format_args!(
                     "index settings changed (schema {} -> {}, block size {} -> {}, \
                      weak hash {} -> {}, strong hash {} -> {}); rebuilding",
                     meta.schema_version,
@@ -68,7 +68,7 @@ pub fn perform(config: &Config, rebuild: bool, jobs: Option<u32>) -> (index::Ind
     if rebuild {
         // Warn only when the index gets its block size, not on each update.
         if settings.block_size < 4096 {
-            die::warn(format!(
+            report::warn(format!(
                 "block_size ({} bytes) is less than 4 KiB, so performance is much \
                  reduced; a block size of at least 4 KiB is strongly recommended",
                 settings.block_size
@@ -89,7 +89,7 @@ pub fn perform(config: &Config, rebuild: bool, jobs: Option<u32>) -> (index::Ind
 
     index.finish_update();
 
-    die::note(format_args!(
+    report::note(format_args!(
         "{} in {:.1}s: {} directories, {} files hashed ({}), \
          {} unchanged, {} hard links, {} small files, {} newly indexed blocks \
          (skipped: {} periodic, {} in holes), {} paths, {} stale inodes removed",

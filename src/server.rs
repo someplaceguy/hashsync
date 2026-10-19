@@ -80,6 +80,7 @@ use crate::protocol::{
     Request, SourceRead, die_data, flush_data, frame, lost, send_data,
 };
 use crate::rendezvous;
+use crate::report;
 use crate::segments::Directory;
 use crate::settings::RunSettings;
 use crate::spool::Spool;
@@ -97,7 +98,7 @@ const PEER: &str = "client";
 pub fn run(config_path: Option<&OsStr>, token: &str) -> ! {
     // SSH carries this process's stderr to the client's: mark its lines as
     // the server's before anything can report one (DESIGN.md §8).
-    die::report_as_server();
+    report::mark_as_server();
     // Listen before anything else, so `attach`'s retries can end.
     let listener = rendezvous::listen(token);
 
@@ -133,7 +134,7 @@ pub fn run(config_path: Option<&OsStr>, token: &str) -> ! {
     let settings = &request.settings;
     let deduplicated = request.deduplicated;
     if request.quiet {
-        die::disable_notes();
+        report::disable_notes();
     }
     if !request.human_readable {
         units::disable_human_readable();
@@ -161,7 +162,7 @@ pub fn run(config_path: Option<&OsStr>, token: &str) -> ! {
         .then(|| Receiving::new(&config, &tmp_data, &control_tx, receiver_out));
     let backward = deduplicated
         .stdout()
-        .then(|| Sending::new(&control_tx, sender_out));
+        .then(|| Sending::new("stdout", &control_tx, sender_out));
     // The spools of both streams and their stops exist from here on: STOP
     // can come once the control session runs. The stop of the forward
     // stream, which this side decides, holds the pins of a deduplicated

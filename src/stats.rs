@@ -8,9 +8,10 @@ use std::path::Path;
 use bstr::ByteSlice;
 
 use crate::config::Config;
-use crate::die::{die, warn};
+use crate::die::die;
 use crate::fsops;
 use crate::index::{self, Settings};
+use crate::report::warn;
 use crate::units::Bytes;
 
 pub fn run(config: &Config) {

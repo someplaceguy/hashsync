@@ -20,6 +20,7 @@ use std::os::unix::net::UnixStream;
 use crate::die::{self, die};
 use crate::fsops::{self, retry_interrupted};
 use crate::rendezvous;
+use crate::report;
 
 /// True when the peer closed the socket: the normal end of the relay.
 fn peer_closed(e: &std::io::Error) -> bool {
@@ -32,7 +33,7 @@ fn peer_closed(e: &std::io::Error) -> bool {
 pub fn run(token: &str) -> ! {
     // SSH carries this process's stderr to the client's: mark its lines as
     // the server's before anything can report one (DESIGN.md §8).
-    die::report_as_server();
+    report::mark_as_server();
     let socket = rendezvous::connect(token);
     let socket_in = match socket.try_clone() {
         Ok(clone) => clone,

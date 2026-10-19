@@ -51,12 +51,14 @@ use crate::lookup;
 use crate::pins::Pins;
 use crate::pool::Pool;
 use crate::protocol::{Answer, ControlFrame, ExchangeFrame, Query, frame};
+use crate::report;
 use crate::roots::{self, Location};
 use crate::scanner::{Frame, Lookahead, Scanner};
 use crate::segments::Directory;
 use crate::settings::{Deduplicated, RunSettings};
 use crate::spool::{Spool, Taken};
 use crate::stream::{Frames, Item, READ_SIZE, Stop};
+use crate::units::Bytes;
 use crate::update;
 
 /// The data queue holds `max(1, QUEUED_BYTES / B)` frames; each frame
@@ -135,11 +137,20 @@ struct Feed {
     /// A table came. An exchange that ended with HASHNONE gives none.
     has_table: bool,
     wait: bool,
+    /// The stream, `stdin` or `stdout`, which the notes about its list name.
+    stream: &'static str,
+    /// A note has said that the stream waits for its whole list.
+    waiting: bool,
 }
 
 impl Feed {
     /// Give `scanner` every update that has come. True when one came, or
-    /// when the exchange has given its last.
+    /// when the exchange has given its last. The last update makes the
+    /// table whole, and a note says so. From then on the scanner finds every
+    /// block of the list, and with `--wait`, it starts to scan. Without
+    /// `--wait`, the note also gives the bytes of the stream that the
+    /// scanner had emitted by then: they went out before the whole list
+    /// could help them. With `--wait`, the scanner has emitted none.
     fn apply(&mut self, scanner: &mut Scanner) -> bool {
         let Some(updates) = &self.updates else {
             return false;
@@ -155,10 +166,34 @@ impl Feed {
                 Err(TryRecvError::Empty) => return progress,
                 Err(TryRecvError::Disconnected) => {
                     self.updates = None;
+                    if self.has_table {
+                        if self.wait {
+                            report::note(format_args!("got {}'s full dedup metadata", self.stream));
+                        } else {
+                            report::note(format_args!(
+                                "got {}'s full dedup metadata after sending {} with partial dedup",
+                                self.stream,
+                                Bytes(scanner.emitted())
+                            ));
+                        }
+                    }
                     return true;
                 }
             }
             progress = true;
+        }
+    }
+
+    /// Report in a note that the stream waits for its whole list, so that
+    /// the wait does not look like a hang: it lasts at least until the
+    /// receiver's update is done, which can take long. The scanner calls
+    /// this when bytes of the stream arrive. With `--wait`, bytes that
+    /// arrive while the exchange still runs wait for the whole list, and
+    /// the first of them start the wait. `apply` reports its end.
+    fn bytes_arrived(&mut self) {
+        if self.wait && self.updates.is_some() && !self.waiting {
+            self.waiting = true;
+            report::note(format_args!("waiting for {}'s dedup metadata", self.stream));
         }
     }
 
@@ -447,7 +482,10 @@ fn transfer(
         }
         while reading && scanner.has_room() {
             match pieces.try_recv() {
-                Ok(Piece::Bytes(bytes)) => scanner.push(&bytes),
+                Ok(Piece::Bytes(bytes)) => {
+                    scanner.push(&bytes);
+                    table.bytes_arrived();
+                }
                 Ok(Piece::Idle) => scanner.idle(),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
@@ -561,19 +599,27 @@ pub struct Sending {
     frames: Sender<ExchangeFrame>,
     link: Link,
     control: Sender<ControlFrame>,
+    /// The stream, `stdin` or `stdout`, which the notes about its list name.
+    stream: &'static str,
 }
 
 impl Sending {
-    /// The sender's role, with its own sender of `control`, the queue of
-    /// this host's control writer, and `output`, the queue of that writer
-    /// for the frames of this side of the list exchange.
-    pub fn new(control: &Sender<ControlFrame>, output: Sender<ExchangeFrame>) -> Sending {
+    /// The sender's role in `stream`, `stdin` or `stdout`, with its own
+    /// sender of `control`, the queue of this host's control writer, and
+    /// `output`, the queue of that writer for the frames of this side of
+    /// the list exchange.
+    pub fn new(
+        stream: &'static str,
+        control: &Sender<ControlFrame>,
+        output: Sender<ExchangeFrame>,
+    ) -> Sending {
         let (frames, input) = unbounded();
         Sending {
             answers: unbounded(),
             frames,
             link: Link::new(input, output),
             control: control.clone(),
+            stream,
         }
     }
 
@@ -622,6 +668,8 @@ impl Sending {
                 updates: Some(table_rx),
                 has_table: false,
                 wait: settings.wait,
+                stream: self.stream,
+                waiting: false,
             },
             answers: self.answers.1,
             control: self.control,
@@ -930,6 +978,8 @@ mod tests {
             updates: None,
             has_table: true,
             wait: false,
+            stream: "stdout",
+            waiting: false,
         }
     }
 
@@ -1188,6 +1238,8 @@ mod tests {
                     updates: Some(table_rx),
                     has_table: false,
                     wait: true,
+                    stream: "stdout",
+                    waiting: false,
                 };
                 let ended = transfer(
                     &mut scanner,

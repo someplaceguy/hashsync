@@ -479,8 +479,10 @@ directory excludes other processes:
   contention. A process first tries the lock without a wait
   (`F_OFD_SETLK`), and when another process holds it, says in a note that
   it waits for the lock of the index, which it names, before it waits: a
-  long wait must not look like a hang. An update's time counts from the
-  moment it holds the lock.
+  long wait must not look like a hang. When it gets the lock, a second
+  note says so and names the index again, so that the work that follows,
+  such as an update, does not look like more waiting. An update's time
+  counts from the moment it holds the lock.
 - All threads of a process share one database handle. Reads of a
   modifying process see its latest committed transaction.
 - Keep the lock until the database handle has closed. A run uses an index
@@ -1384,10 +1386,19 @@ sender's side of the list exchange fills while the list arrives (section
 5.5). A window scanned before its weak hash is in the table stays
 literal: the scanner does not scan it again when the table grows. So
 deduplication grows with the part of the list that the sender has, and
-the bytes before the list cost bandwidth. With `--wait`, the scanner scans
-only once its table is whole, so that the run sends the fewest bytes,
-however long it takes: the bytes of the stream wait in the lookahead
-buffer, and then in the spool of the source (section 6.5). An empty
+the bytes before the list cost bandwidth. When the table is whole, the
+sender says so in a note that names the stream, unless the scanner has
+already emitted the whole stream or stopped: from then on, the stream is
+deduplicated against the whole list. Without `--wait`, the note also
+gives the bytes of the stream that the scanner had emitted by then,
+which went out before the whole list could help them. With `--wait`, the
+scanner scans only once its table is whole, so that the run sends the
+fewest bytes, however long it takes: the bytes of the stream wait in the
+lookahead buffer, and then in the spool of the source (section 6.5). That
+wait lasts at least until the receiver's update is done, so it must not
+look like a hang: if the first bytes of the stream arrive while its list
+exchange is still running, the sender says in another note, which names
+the stream too, that the stream waits for its whole list. An empty
 stream ends without a table. An exchange that HASHNONE ends gives no
 table: with `--wait`, the scanner then waits for the stop of its stream,
 which has stopped already or stops soon (section 6.6).
@@ -2629,13 +2640,13 @@ which host to act on it. Only a usage error of their command line, which
 comes before either runs, has no marker. The command's stderr passes
 through unchanged.
 
-Summaries and statistics show an amount of bytes below 1 KiB as whole
-bytes, such as `512 B`, and a larger one with two decimal digits, rounded
-half up, such as `1.50 KiB`, in the first of KiB, MiB, GiB, TiB, and PiB
-in which its rounded value is less than 1024, else in PiB. So 1048575
-bytes, which round to 1024.00 KiB, show as `1.00 MiB`. Settings, limits,
-and messages that help to debug show exact byte counts, because rounding
-could make them unclear.
+Progress messages, summaries, and statistics show an amount of bytes
+below 1 KiB as whole bytes, such as `512 B`, and a larger one with two
+decimal digits, rounded half up, such as `1.50 KiB`, in the first of KiB,
+MiB, GiB, TiB, and PiB in which its rounded value is less than 1024, else
+in PiB. So 1048575 bytes, which round to 1024.00 KiB, show as `1.00 MiB`.
+Settings, limits, and messages that help to debug show exact byte counts,
+because rounding could make them unclear.
 
 ```sh
 hashsync ssh -n backup@nas tar -C /srv/data -cf - . | tar -C /srv/data -xf -
@@ -3127,12 +3138,13 @@ decision history, including fuller measurements, is in version control.
     both ways;
   - the start: a command that runs, and whose streams flow, while the
     receiver's update waits for a lock, in both directions; with `--wait`,
-    a deduplicated stream that waits for its whole list and then finds
-    every block, and a plain stream that flows meanwhile; a table that
-    finds a block once its value has arrived; an exchange that ends with
-    HASHNONE, before INDEX and after ADVERTISE, which removes no listed
-    file and expires the cache; and a list on the control session while
-    the spool of a stream is full;
+    a deduplicated stream that waits for its whole list, with the notes of
+    that wait, and then finds every block, and a plain stream that flows
+    meanwhile; a table that finds a block once its value has arrived, and
+    the note once it is whole while the stream runs; an exchange that ends
+    with HASHNONE, before INDEX and after ADVERTISE, which removes no
+    listed file and expires the cache; and a list on the control session
+    while the spool of a stream is full;
   - the streams: the forward stream with and without compression, in eager
     and batch delivery, and `-n`; a run that ends with its command while
     stdin stays open; a command that reads a part of its stdin, closes its
@@ -3178,11 +3190,11 @@ decision history, including fuller measurements, is in version control.
     whitespace, quotes, shell metacharacters, and non-UTF-8 bytes; a
     different protocol version on either side, detected before the
     features; feature bits that a side does not know, on either side;
-  - crash recovery, process exclusion, the note of a process that waits for
-    a lock, and reads of later commits; the shared lock of a run after its
-    update, and the index closed at Completing while the run goes on; cache
-    races, also a publication whose directory is gone and a listed name
-    that a later run published again; fatal cache I/O failures, and a
+  - crash recovery, process exclusion, the notes of a process that waits
+    for a lock, and reads of later commits; the shared lock of a run after
+    its update, and the index closed at Completing while the run goes on;
+    cache races, also a publication whose directory is gone and a listed
+    name that a later run published again; fatal cache I/O failures, and a
     warning for an empty directory that stays; the advertisement and
     removal of listed files, hidden names that are not temporaries, and the
     removal of empty directories; and invalid cached lists;

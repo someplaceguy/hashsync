@@ -37,6 +37,7 @@ mod pins;
 mod pool;
 mod protocol;
 mod rendezvous;
+mod report;
 mod roots;
 mod scan;
 mod scanner;
@@ -220,7 +221,7 @@ fn main() {
     die::block_file_size_signal();
     let cli = Cli::parse();
     if cli.quiet {
-        die::disable_notes();
+        report::disable_notes();
     }
     if cli.no_human_readable {
         units::disable_human_readable();

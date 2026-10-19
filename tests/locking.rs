@@ -6,8 +6,9 @@
 
 mod common;
 
+use std::io::Read;
 use std::os::fd::OwnedFd;
-use std::process::{Child, Stdio};
+use std::process::{Child, ChildStderr, Stdio};
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -88,10 +89,33 @@ fn waiting_note(env: &Env) -> String {
     )
 }
 
+/// The note of a process that got the lock of the index of `env` after a
+/// wait.
+fn acquired_note(env: &Env) -> String {
+    format!(
+        "hashsync: acquired the lock of index {}\n",
+        env.index_path().display()
+    )
+}
+
+/// The text that the child has written to `stderr` so far, read without
+/// waiting for more.
+fn written_so_far(stderr: &mut ChildStderr) -> String {
+    rustix::fs::fcntl_setfl(&*stderr, OFlags::NONBLOCK).unwrap();
+    let mut text = Vec::new();
+    let error = stderr.read_to_end(&mut text).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock, "{error}");
+    rustix::fs::fcntl_setfl(&*stderr, OFlags::empty()).unwrap();
+    String::from_utf8(text).unwrap()
+}
+
 #[test]
 fn update_waits_for_a_read_only_process() {
     // The update says that it waits, and for which index, so that a long
-    // wait does not look like a hang.
+    // wait does not look like a hang. Once it has the lock, it says so
+    // before it updates, so that the update does not look like more
+    // waiting. The first note is written before the wait starts, so while
+    // the child waits, stderr holds that note alone.
     let env = indexed_env();
     let reader = lock(&env, FlockOperation::LockShared);
 
@@ -101,14 +125,17 @@ fn update_waits_for_a_read_only_process() {
         .spawn()
         .unwrap();
     wait_for_waiter(&mut child, &reader);
+    let mut stderr = child.stderr.take().unwrap();
+    assert_eq!(written_so_far(&mut stderr), waiting_note(&env));
 
     drop(reader);
-    let output = child.wait_with_output().unwrap();
-    assert!(output.status.success());
+    let mut rest = String::new();
+    stderr.read_to_string(&mut rest).unwrap();
+    assert!(child.wait().unwrap().success(), "{rest}");
     assert_eq!(env.count("paths"), 1);
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.starts_with(&waiting_note(&env)), "{stderr}");
-    assert_eq!(stderr.matches("waiting").count(), 1, "{stderr}");
+    assert!(rest.starts_with(&acquired_note(&env)), "{rest}");
+    assert!(rest.contains("updated index"), "{rest}");
+    assert!(!rest.contains("waiting"), "{rest}");
 }
 
 #[test]
@@ -127,13 +154,13 @@ fn stats_waits_for_a_modifying_process() {
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success());
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert_eq!(stderr, waiting_note(&env));
+    assert_eq!(stderr, waiting_note(&env) + &acquired_note(&env));
 }
 
 #[test]
 fn a_quiet_process_waits_for_the_lock_without_a_note() {
-    // The note of a lock wait is a progress message, which `--quiet` keeps
-    // off stderr (DESIGN.md §4.4 and §8).
+    // The notes of a lock wait are progress messages, which `--quiet`
+    // keeps off stderr (DESIGN.md §4.4 and §8).
     let env = indexed_env();
     let reader = lock(&env, FlockOperation::LockShared);
 
@@ -152,7 +179,7 @@ fn a_quiet_process_waits_for_the_lock_without_a_note() {
 
 #[test]
 fn a_lock_taken_without_a_wait_takes_no_note() {
-    // Only a wait takes the note (DESIGN.md §4.4): `stats` shares the lock
+    // Only a wait takes the notes (DESIGN.md §4.4): `stats` shares the lock
     // with a reader, and `update` finds no holder.
     let env = indexed_env();
     let reader = lock(&env, FlockOperation::LockShared);
@@ -160,7 +187,8 @@ fn a_lock_taken_without_a_wait_takes_no_note() {
     assert!(output.status.success());
     assert_eq!(String::from_utf8(output.stderr).unwrap(), "");
     drop(reader);
-    assert!(!env.update().contains("waiting"));
+    let stderr = env.update();
+    assert!(!stderr.contains("the lock of index"), "{stderr}");
 }
 
 #[test]

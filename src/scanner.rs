@@ -804,6 +804,13 @@ impl<'a> Scanner<'a> {
     pub fn finished(&self) -> bool {
         self.ended && self.e == self.end()
     }
+
+    /// `e`: the bytes of the stream that the scanner has emitted. Their
+    /// frames are final, unlike those of the scanned bytes after them,
+    /// which a rejection can scan again.
+    pub fn emitted(&self) -> u64 {
+        self.e
+    }
 }
 
 /// The length of the run of equal bytes at the end of `window`, which must

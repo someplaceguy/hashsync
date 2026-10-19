@@ -24,12 +24,13 @@ use rustix::io::Errno;
 
 use crate::blocks::BlockHasher;
 use crate::config::{Config, RootConfig};
-use crate::die::{die, warn};
+use crate::die::die;
 use crate::fsid::{FsCache, Identity, identify};
 use crate::fsops::{self, Meta};
 use crate::index::Index;
 use crate::index::changes::{Changes, Claim, Owner, RelPath, Summary};
 use crate::pool::Pool;
+use crate::report::warn;
 use crate::roots::{self, Location};
 
 /// A root location to scan and its index row.

@@ -62,6 +62,7 @@ use crate::protocol::{
     lost, send_data,
 };
 use crate::rendezvous;
+use crate::report;
 use crate::segments::Directory;
 use crate::spool::Spool;
 use crate::ssh;
@@ -122,7 +123,7 @@ pub fn run(config: Config, remote: &ssh::Remote, request: &Request, no_stdin: bo
         .then(|| Receiving::new(&config, &tmp_data, &control_tx, receiver_out));
     let forward = deduplicated
         .stdin()
-        .then(|| Sending::new(&control_tx, sender_out));
+        .then(|| Sending::new("stdin", &control_tx, sender_out));
 
     // The spools of both streams, and their stops, which exist before the
     // sessions start: STOP can come at any time, and the stop of the
@@ -383,7 +384,7 @@ pub fn run(config: Config, remote: &ssh::Remote, request: &Request, no_stdin: bo
     });
     // N6.
     if end_frame.status == 127 && !end_frame.error.is_empty() {
-        die::error(format!(
+        report::error(format!(
             "remote command failed to start: {}",
             end_frame.error
         ));
@@ -560,7 +561,7 @@ fn print_summary(start: Instant, compressed: bool, streams: &[(&str, Line)]) {
     let elapsed = start.elapsed().as_secs_f64();
     for (name, line) in streams {
         match *line {
-            Line::Whole(ref counts, Some(lists)) => die::note(format_args!(
+            Line::Whole(ref counts, Some(lists)) => report::note(format_args!(
                 "{name} -- {} ({} literal, {} -> {} refs, {} -> {} RLE, \
                  {} false positives, {} not found){} --> {} wire{}",
                 Bytes(counts.bytes),
@@ -575,7 +576,7 @@ fn print_summary(start: Instant, compressed: bool, streams: &[(&str, Line)]) {
                 Bytes(counts.wire + lists.full + lists.delta),
                 how_sent(true, compressed),
             )),
-            Line::Whole(ref counts, None) => die::note(format_args!(
+            Line::Whole(ref counts, None) => report::note(format_args!(
                 "{name} -- {} --> {} wire{}",
                 Bytes(counts.bytes),
                 Bytes(counts.wire),
@@ -586,7 +587,7 @@ fn print_summary(start: Instant, compressed: bool, streams: &[(&str, Line)]) {
                 decoded,
                 dropped,
                 written,
-            } => die::note(format_args!(
+            } => report::note(format_args!(
                 "{name} -- {} read, pipe closed, {} wire, {} dropped, {} written",
                 Bytes(read),
                 Bytes(decoded),
@@ -605,7 +606,7 @@ fn print_summary(start: Instant, compressed: bool, streams: &[(&str, Line)]) {
         Some(saved) => Bytes(saved).to_string(),
         None => format!("-{}", Bytes(traffic - carried)),
     };
-    die::note(format_args!(
+    report::note(format_args!(
         "total -- sent {} and received {} in {elapsed:.1}s ({}/s), \
          data shrinkage factor: {:.2}, saved {saved} of data transfer",
         Bytes(sent),

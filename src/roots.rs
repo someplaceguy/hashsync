@@ -26,10 +26,11 @@ use rustix::fs::FileType;
 use rustix::io::Errno;
 
 use crate::config::{Config, RootConfig};
-use crate::die::{die, warn};
+use crate::die::die;
 use crate::fsid::{FsCache, Identity, identify};
 use crate::fsops::{self, Meta};
 use crate::glob::{self, Component};
+use crate::report::warn;
 
 /// One current location of a configured root: a directory entry whose
 /// name matched the pattern. Its scan task finds out whether it is a

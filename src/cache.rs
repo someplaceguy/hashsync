@@ -39,11 +39,12 @@ use rustix::fs::{AtFlags, Mode, OFlags, RenameFlags, Timespec, Timestamps, UTIME
 use rustix::io::{Errno, retry_on_intr};
 
 use crate::config;
-use crate::die::{die, warn};
+use crate::die::die;
 use crate::fsops::retry_interrupted;
 use crate::hash::{Strong, StrongHash};
 use crate::hashlist::{self, ListId};
 use crate::names::{hex, is_temporary, parse_hex, random_bytes, temporary_name};
+use crate::report::warn;
 
 /// A cache operation failed for a reason other than absence
 /// (DESIGN.md §5.6 and §6.7).

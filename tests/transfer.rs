@@ -1386,6 +1386,15 @@ fn empty_output_and_command_failure_status() {
     let output = transfer.run_ok(&refs(&command));
     assert!(output.stdout.is_empty());
 
+    // With `--wait`, no byte of the empty stream waits for the list, so no
+    // note says that the stream waits (DESIGN.md §6.3).
+    let output = succeeded(transfer.run(&["--wait"], &refs(&command)));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("waiting for stdout's dedup metadata"),
+        "{stderr}"
+    );
+
     // A failing command still transfers its output and returns its
     // status (DESIGN.md §6.7).
     let command = args(&["echo partial; exit 3"]);
@@ -5344,6 +5353,71 @@ fn the_command_runs_while_the_receivers_update_waits() {
         drop(lock);
         let output = succeeded(output_of(client));
         assert_eq!(summary(&output), [7, 7, 0, 0], "{direction:?}");
+        // Without `--wait`, the stream does not wait for its list, and no
+        // note says that it does (DESIGN.md §6.3).
+        let stream = match direction {
+            Direction::Pull => "stdout",
+            Direction::Push => "stdin",
+        };
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains(&format!("waiting for {stream}'s dedup metadata")),
+            "{direction:?}:\n{stderr}"
+        );
+    }
+}
+
+#[test]
+fn a_note_says_how_much_of_the_stream_went_before_its_whole_list() {
+    // Without `--wait`, the stream flows before its list is whole, and the
+    // sender says in a note when the list is whole, with the bytes of the
+    // stream that it had sent by then (DESIGN.md §6.3). This test holds a
+    // shared lock on the receiver's index, so the receiver's update, and
+    // so the list, wait, while `cat` copies a line, which reaches the
+    // client's stdout. Then this test lets the update go. The client's
+    // stdin stays open, so the stream still runs when the list is whole,
+    // and has sent the line alone. No deadline: a sender that never writes
+    // the note hangs the test.
+    for direction in DIRECTIONS {
+        let transfer = Transfer::new(&[]);
+        transfer.configure_receiver(direction, "");
+        let indexed = transfer.indexed(direction, "blocks");
+        transfer.env.write(indexed, &tiled(4, 76));
+        transfer.update_receiver(direction, &[]);
+        let lock = shared_lock(&transfer.receiver_index(direction));
+        let stderr = transfer.env.path("stderr");
+        let (stdin, mut producer) = std::io::pipe().unwrap();
+        let client = transfer
+            .invocation_in(direction, &[EXACT], &refs(&args(&["cat"])))
+            .stdin(stdin)
+            .stdout(Stdio::piped())
+            .stderr(File::create(&stderr).unwrap())
+            .spawn()
+            .unwrap();
+        let mut client = KillOnDrop(client);
+        let receiver = match direction {
+            Direction::Pull => client.0.id(),
+            Direction::Push => server_of(client.0.id()),
+        };
+        wait_for_lock_wait(receiver);
+        producer.write_all(b"a line\n").unwrap();
+        let mut line = [0; 7];
+        let stdout = client.0.stdout.as_mut().unwrap();
+        stdout.read_exact(&mut line).unwrap();
+        drop(lock);
+        let note = match direction {
+            Direction::Pull => {
+                "hashsync (server): got stdout's full dedup metadata after sending 7 B with partial dedup\n"
+            }
+            Direction::Push => {
+                "hashsync: got stdin's full dedup metadata after sending 7 B with partial dedup\n"
+            }
+        };
+        wait_for_bytes(&stderr, std::slice::from_mut(&mut client), |bytes| {
+            holds(bytes, note.as_bytes())
+        });
+        drop(producer);
+        succeeded(output_of(client));
     }
 }
 
@@ -5355,7 +5429,11 @@ fn with_wait_a_deduplicated_stream_waits_for_its_whole_list() {
     // the stream gives indexed blocks and ends, and then every thread of
     // the sender sleeps. Only then does this test let the update go, and
     // every block becomes a reference: a scanner that did not wait would
-    // have scanned them with an empty table, as literals.
+    // have scanned them with an empty table, as literals. The sender says
+    // in a note that the stream waits once its bytes have arrived, so
+    // before the receiver gets its lock, and says in another one when the
+    // list is whole, which only the update can give. With `--wait`, nothing
+    // of the stream went out before, so that note gives no count.
     for direction in DIRECTIONS {
         let transfer = Transfer::new(&[]);
         transfer.configure_receiver(direction, "");
@@ -5400,6 +5478,22 @@ fn with_wait_a_deduplicated_stream_waits_for_its_whole_list() {
         assert!(output.stdout == blocks, "{direction:?}: the output differs");
         let counts = [blocks.len(), 0, blocks.len(), 0];
         assert_eq!(summary(&output), counts, "{direction:?}");
+        let (from_sender, from_receiver, stream) = match direction {
+            Direction::Pull => ("hashsync (server): ", "hashsync: ", "stdout"),
+            Direction::Push => ("hashsync: ", "hashsync (server): ", "stdin"),
+        };
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let at = |line: String| {
+            stderr
+                .find(&line)
+                .unwrap_or_else(|| panic!("{direction:?}: no {line:?}:\n{stderr}"))
+        };
+        let waiting = at(format!(
+            "{from_sender}waiting for {stream}'s dedup metadata\n"
+        ));
+        let locked = at(format!("{from_receiver}acquired the lock of index "));
+        let got = at(format!("{from_sender}got {stream}'s full dedup metadata\n"));
+        assert!(waiting < locked && locked < got, "{direction:?}:\n{stderr}");
     }
 }
 

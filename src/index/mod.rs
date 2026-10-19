@@ -31,10 +31,11 @@ use rustix::fs::{Mode, OFlags};
 use rustix::io::Errno;
 
 use crate::config::Config;
-use crate::die::{self, die};
+use crate::die::die;
 use crate::fsops;
 use crate::hash::{PREFIX_LEN, weak};
 use crate::pool::Pool;
+use crate::report;
 use crate::sys;
 use layout::{Cf, ID_LEN, InodeRow, RootRow, id_key, u64_at};
 
@@ -135,7 +136,10 @@ pub struct Reader {
 /// modifying process, which creates the file, shared and read-only for the
 /// others. A lock that another process holds makes this process say, in a
 /// note, that it waits, and for which index: a wait can be long, and
-/// without the note it looks like a hang.
+/// without the note it looks like a hang. A second note says when the wait
+/// is over. Without it, the wait note would stay the last line on stderr
+/// while the process goes on with its work, such as an update, which can
+/// take long too, and the process would seem to be still waiting.
 ///
 /// The lock belongs to the open file description (`F_OFD_SETLKW`), not to
 /// the process as a classic POSIX lock does. Closing another descriptor of
@@ -163,11 +167,15 @@ fn lock(path: &[u8], exclusive: bool) -> Result<OwnedFd, Errno> {
         )
     })?;
     if !sys::try_lock_file(file.as_fd(), exclusive)? {
-        die::note(format_args!(
+        report::note(format_args!(
             "waiting for the lock of index {}",
             path.as_bstr()
         ));
         sys::lock_file(file.as_fd(), exclusive)?;
+        report::note(format_args!(
+            "acquired the lock of index {}",
+            path.as_bstr()
+        ));
     }
     Ok(file)
 }
