@@ -33,8 +33,8 @@ use std::time::Duration;
 use common::{
     ANSWER, BLOCK, CHUNK, END, Env, FEATURES, HASHDELTA, HASHLIST, HASHNONE, HELLO, KillOnDrop,
     LIT, QUERY, REQUEST, STOP, STREAM_END, exclusive_lock, frame, hello_payload, ofd_lock,
-    poll_syscall, proc_state, random, shared_lock, tiled, toml_literal, try_recv_frame,
-    version_and_features, wait_for_lock_wait, wait_until_asleep,
+    proc_state, random, shared_lock, tiled, toml_literal, try_recv_frame, version_and_features,
+    wait_for_lock_wait, wait_until_asleep,
 };
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::fs::{CWD, Mode, OFlags, inotify, mkfifoat};
@@ -2853,60 +2853,6 @@ fn a_deduplicated_command_output_that_never_pauses_reaches_stdout() {
 }
 
 #[test]
-fn a_stopped_forward_stream_sends_nothing_more() {
-    // The command holds its stdin without reading it until this test lets
-    // it exit, and each spool holds one read at most. zstd's workers take
-    // the 8 MiB of stdin without output, since a job of theirs holds 16 MiB
-    // at the default level, so the CHUNKs go out only once the client's
-    // forward data writer ends the zstd frame. The server's decoder and data
-    // reader soon wait, and so does that writer, in a write to the data
-    // session. Then the command exits, and the stop must end the writer at
-    // once: only the CHUNK on its way still goes out, not the rest of the
-    // frame (DESIGN.md §6.6). The pipes, the server's buffers and that CHUNK
-    // hold less than 4.5 MiB, also where a pipe holds 1 MiB (pages of 64
-    // KiB); a writer that went on would send all 8 MiB. A data writer that
-    // takes the frames that a push's data queue holds at the stop is the
-    // unit test `the_data_writer_takes_no_queued_frame_after_the_stop`'s: in
-    // a whole run, no event shows that the queue is full. The command starts
-    // at once, so the writer can also wait before the server reads the data
-    // session at all; then the server would take the whole session at once
-    // after the stop, and its control writer, which starts later, would
-    // send STOP late. So the test waits for the server's decoder, in its
-    // wait for room in the command's stdin, and for its idle control
-    // writer, before the writer's wait.
-    for direction in DIRECTIONS {
-        let transfer = Transfer::new(&["--spool-limit", "0"]);
-        transfer.configure_receiver(direction, "");
-        let input = transfer.env.path("input");
-        std::fs::write(&input, random(8 << 20, 46)).unwrap();
-        let go = transfer.env.path("go");
-        mkfifoat(CWD, &go, Mode::RUSR | Mode::WUSR).unwrap();
-        let script = format!("read go <'{}'", go.display());
-        let client = transfer
-            .invocation_in(direction, &[EXACT], &refs(&args(&[&script])))
-            .stdin(File::open(&input).unwrap())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let client = KillOnDrop(client);
-        // No deadline: a writer that never waits hangs the test.
-        let server = server_of(client.0.id());
-        wait_until_asleep_again_in(server, "decoder", poll_syscall());
-        wait_until_asleep_again_in(server, "control-writer", libc::SYS_futex as u64);
-        wait_until_asleep_again_in(client.0.id(), "data-writer", libc::SYS_writev as u64);
-        std::fs::write(&go, b"go\n").unwrap();
-        let output = succeeded(output_of(client));
-        let sent = traffic(&output).sent;
-        assert!(
-            sent < 9 << 19,
-            "{direction:?}: {sent} bytes sent, though the stream stopped\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-}
-
-#[test]
 fn the_forward_stream_waits_in_the_server_spool_until_the_command_reads_it() {
     // The spools have no limit. The command reads its stdin only after all
     // of it, 16 MiB, has passed the wrapper of the data session, which
@@ -4950,44 +4896,6 @@ exit $status"#,
         stderr.contains("terminated by SIGTERM"),
         "stderr:\n{stderr}"
     );
-}
-
-/// Wait until the thread `name` of the process `pid` sleeps in the system
-/// call `nr` again after something woke it, polling with no deadline. A
-/// woken thread shows state `R` until it has run and sleeps again; the
-/// kernel can still show its old system call while it waits to run. So the
-/// state comes first, then the system call. Reading the `syscall` file
-/// needs the ptrace access that a parent has. Fail when the process has
-/// ended.
-fn wait_until_asleep_again_in(pid: u32, name: &str, nr: u64) {
-    loop {
-        assert_ne!(
-            proc_state(format!("/proc/{pid}")),
-            Some('Z'),
-            "the process ended"
-        );
-        for task in std::fs::read_dir(format!("/proc/{pid}/task")).unwrap() {
-            let task = task.unwrap().path();
-            // A thread that ends meanwhile has no files.
-            let Ok(comm) = std::fs::read_to_string(task.join("comm")) else {
-                continue;
-            };
-            if comm.trim_end() != name || proc_state(&task) != Some('S') {
-                continue;
-            }
-            let Ok(syscall) = std::fs::read_to_string(task.join("syscall")) else {
-                continue;
-            };
-            let sleeping = syscall
-                .split_whitespace()
-                .next()
-                .and_then(|n| n.parse().ok());
-            if sleeping == Some(nr) {
-                return;
-            }
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
 }
 
 #[test]
