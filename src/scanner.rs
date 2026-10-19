@@ -56,7 +56,14 @@ const SCAN_BUDGET: u64 = 64 << 10;
 
 /// With probe threads, each stretch without a hit doubles the budget, up to
 /// this many bytes per thread.
-const PART_BUDGET: u64 = 1 << 20;
+const THREAD_BUDGET: u64 = 1 << 20;
+
+/// The windows of one part of a long stretch, or `B`, if that is more. A
+/// search lasts until the parts before its first stop are done, and the
+/// probe threads without such a part wait meanwhile, so smaller parts keep
+/// more of them busy. Each part begins with the polynomial of its first
+/// window, which costs much less than probing `B` windows.
+const PART_WINDOWS: u64 = 16 << 10;
 
 /// The memory that one hash in the negative cache costs: the digest, the
 /// links of the recency list, and the slot of the hash table.
@@ -238,7 +245,8 @@ pub struct Scanner<'a> {
     /// The bytes that a call of `scan` examines at most. Each weak hit sets
     /// it to `min_budget` and limits the rest of that call to it; each
     /// stretch that reaches its limit without a hit or a constant window
-    /// doubles it, up to `max_budget`.
+    /// doubles it, to at least one part per probe thread and at most
+    /// `max_budget`.
     budget: u64,
     min_budget: u64,
     max_budget: u64,
@@ -267,9 +275,11 @@ impl<'a> Scanner<'a> {
         assert!(block_size > 0 && lookahead >= u64::from(block_size));
         let negative_hashes =
             usize::try_from(negative_cache / NEGATIVE_ENTRY_BYTES).unwrap_or(usize::MAX);
-        let part = SCAN_BUDGET.max(u64::from(block_size));
+        let part = PART_WINDOWS.max(u64::from(block_size));
         let max_budget = match pool {
-            Some(pool) => (pool.current_num_threads() as u64).saturating_mul(PART_BUDGET.max(part)),
+            Some(pool) => {
+                (pool.current_num_threads() as u64).saturating_mul(THREAD_BUDGET.max(part))
+            }
             None => SCAN_BUDGET,
         };
         Scanner {
@@ -477,7 +487,16 @@ impl<'a> Scanner<'a> {
                         continue;
                     }
                     Stop::Neither(_) => {
-                        self.budget = self.budget.saturating_mul(2).min(self.max_budget);
+                        // A stretch of one part per probe thread takes as
+                        // long to search as one part, so a doubled budget is
+                        // never less.
+                        let round =
+                            self.pool.map_or(0, ThreadPool::current_num_threads) * self.part;
+                        self.budget = self
+                            .budget
+                            .saturating_mul(2)
+                            .max(round as u64)
+                            .min(self.max_budget);
                         continue;
                     }
                 }
@@ -538,8 +557,11 @@ impl<'a> Scanner<'a> {
         let at = (start - self.base) as usize;
         let n = (limit - start) as usize;
         let bytes = &self.buffer[at..at + n - 1 + window];
+        // The probe threads search a stretch of two parts at least, but not
+        // the short stretch after a weak hit, which stays on this thread
+        // (DESIGN.md §6.3).
         let stop = match self.pool {
-            Some(pool) if n >= 2 * self.part => {
+            Some(pool) if n >= 2 * self.part && n as u64 > self.min_budget => {
                 first_stop_in_parts(pool, self.part, &self.table, &self.weak, bytes, first)
             }
             _ => first_stop(&self.table, &self.weak, bytes, first, || false),
@@ -1898,6 +1920,26 @@ pub(crate) mod tests {
         );
     }
 
+    /// A stretch without a hit doubles the budget, to at least one part per
+    /// probe thread, whose search takes as long as one part (DESIGN.md
+    /// §6.3).
+    #[test]
+    fn a_doubled_budget_has_a_part_for_each_probe_thread() {
+        let input = noise(4000, 45);
+        let mut run = Run::new(&input, Receiver::new(&[], &[]), 1 << 20, 0, Some(100));
+        run.scanner.min_budget = 64;
+        run.scanner.budget = 64;
+        run.scanner.max_budget = 1000;
+        run.push(input.len());
+        let mut budgets = Vec::new();
+        while run.scanner.budget < run.scanner.max_budget {
+            assert!(run.scan(), "the scanner stalled");
+            budgets.push(run.scanner.budget);
+        }
+        // Three probe threads, with parts of 100 windows.
+        assert_eq!(budgets, [300, 600, 1000]);
+    }
+
     /// A window answered no records one literal byte, and the rolling
     /// state moves to it, so that the next window rolls on from it
     /// (DESIGN.md §6.3). The rescan here reaches the window's entry at the
@@ -2065,7 +2107,9 @@ pub(crate) mod tests {
             lookahead_windows in 1u64..6,
             negative in any::<bool>(),
             part in proptest::option::of(1usize..100),
-            min_budget in 1u64..300,
+            // The probe threads take only stretches longer than this, and
+            // the lookahead limits a stretch to 160 windows here.
+            min_budget in 1u64..100,
             idle_points in any::<bool>(),
             growing in any::<bool>(),
         ) {

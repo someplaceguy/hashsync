@@ -1445,12 +1445,13 @@ it may stop early, so the result equals checking each window in order.
 After each weak hit, new or known, the scanner scans at most a short
 stretch on its own thread before it processes answers again. With more
 than one probe thread, each following stretch without a hit or a constant
-window doubles the next one, up to a bound per thread. A constant window,
-or a hit that the check rejects, neither doubles nor shortens the next
-stretch. Short gaps between matches thus stay on one thread, and a long
-run of misses soon uses all probe threads. `--probe-threads` sets the
-thread count; 0 selects half the sender's cores, at least one. The sender
-starts them at the receiver's HELLO (section 6.2).
+window doubles the next one, to at least one part per probe thread and up
+to a bound per thread. A constant window, or a hit that the check rejects,
+neither doubles nor shortens the next stretch. Short gaps between matches
+thus stay on one thread, and a long run of misses soon uses all probe
+threads. `--probe-threads` sets the thread count; 0 selects half the
+sender's cores, at least one. The sender starts them at the receiver's
+HELLO (section 6.2).
 
 **Answers and rescanning.**
 
