@@ -35,6 +35,7 @@ use std::ops::RangeInclusive;
 
 use zstd_sys::ZSTD_EndDirective;
 
+use crate::config::{self, Source};
 use crate::die::die;
 use crate::hash::{Strong, StrongHash};
 use crate::settings::{Deduplicated, RemoteCommand, RunSettings};
@@ -118,6 +119,10 @@ pub struct Request {
     /// The opposite of the client's global `--no-human-readable`, which the
     /// server applies to its own notes too.
     pub human_readable: bool,
+    /// The server's configuration file: by default its own file of the
+    /// profile `default`, else the one that `--server-profile` or
+    /// `--server-config` names (DESIGN.md §7).
+    pub config: Source,
 }
 
 impl Request {
@@ -161,6 +166,17 @@ impl Request {
         enc.u8(settings.wait.into());
         enc.u8(self.quiet.into());
         enc.u8(self.human_readable.into());
+        match &self.config {
+            Source::Default => enc.u8(0),
+            Source::Profile(name) => {
+                enc.u8(1);
+                enc.bytes(name);
+            }
+            Source::File(path) => {
+                enc.u8(2);
+                enc.bytes(path);
+            }
+        }
         enc.buf
     }
 
@@ -205,12 +221,27 @@ impl Request {
             batch_stdout: dec.flag(),
             wait: dec.flag(),
         };
+        let (quiet, human_readable) = (dec.flag(), dec.flag());
+        let config = match dec.u8() {
+            0 => Source::Default,
+            1 => Source::Profile(dec.string_bytes()),
+            2 => Source::File(dec.string_bytes()),
+            v => panic!("protocol error: invalid configuration kind {v} in REQUEST frame"),
+        };
+        // The client's options accept only profile names, which become part
+        // of a path on this host.
+        if let Source::Profile(name) = &config
+            && let Err(e) = config::check_profile_name(name)
+        {
+            panic!("protocol error: {e} in REQUEST frame");
+        }
         let request = Request {
             command,
             deduplicated,
             settings,
-            quiet: dec.flag(),
-            human_readable: dec.flag(),
+            quiet,
+            human_readable,
+            config,
         };
         dec.done();
         request
@@ -1859,6 +1890,7 @@ mod tests {
             settings: crate::settings::tests::settings(&[]),
             quiet: false,
             human_readable: true,
+            config: Source::Default,
         }
     }
 
@@ -1902,6 +1934,50 @@ mod tests {
         // The default lookahead travels as 0.
         let defaults = request(RemoteCommand::Shell(b"true".to_vec()));
         assert_eq!(Request::decode(&defaults.encode()), defaults);
+        // The server's configuration file, as each option selects it.
+        for config in [
+            Source::Profile(b"\xff.b".to_vec()),
+            Source::File(b"relative/\xff path".to_vec()),
+            Source::File(Vec::new()),
+        ] {
+            let request = Request {
+                config,
+                ..request(RemoteCommand::Shell(b"true".to_vec()))
+            };
+            assert_eq!(Request::decode(&request.encode()), request);
+        }
+    }
+
+    /// The server's configuration file is its profile `default`, a profile
+    /// that `--server-profile` names, or a file that `--server-config`
+    /// names: no other kind exists, and a profile name is one nonempty file
+    /// name, as the client's options require (DESIGN.md §6.2 and §7).
+    #[test]
+    fn the_server_reads_a_profile_or_a_file() {
+        let payload = request(RemoteCommand::Shell(b"true".to_vec())).encode();
+        // The kind of the profile `default` ends the payload.
+        let at = payload.len() - 1;
+        assert_eq!(payload[at], 0, "the profile default");
+        for value in [3, 255] {
+            let mut payload = payload.clone();
+            payload[at] = value;
+            let message = caught(|| Request::decode(&payload)).unwrap_err();
+            let expected = format!("protocol error: invalid configuration kind {value} in REQUEST");
+            assert!(message.contains(&expected), "{message}");
+        }
+        for config in [
+            Source::Profile(Vec::new()),
+            Source::Profile(b"a/b".to_vec()),
+            Source::Profile(b"/".to_vec()),
+        ] {
+            let request = Request {
+                config,
+                ..request(RemoteCommand::Shell(b"true".to_vec()))
+            };
+            let message = caught(|| Request::decode(&request.encode())).unwrap_err();
+            let expected = "protocol error: a profile name must not be empty or contain '/'";
+            assert!(message.contains(expected), "{message}");
+        }
     }
 
     #[test]
@@ -2535,14 +2611,25 @@ mod tests {
                     wait,
                 }
             });
-        let request = (command, deduplicated, settings, any::<[bool; 2]>()).prop_map(
-            |(command, deduplicated, settings, [quiet, human_readable])| {
+        let profile = || {
+            vec(any::<u8>(), 1..6).prop_filter("a profile name", |name| {
+                config::check_profile_name(name).is_ok()
+            })
+        };
+        let config = prop_oneof![
+            Just(Source::Default),
+            profile().prop_map(Source::Profile),
+            word().prop_map(Source::File),
+        ];
+        let request = (command, deduplicated, settings, any::<[bool; 2]>(), config).prop_map(
+            |(command, deduplicated, settings, [quiet, human_readable], config)| {
                 let request = Request {
                     command,
                     deduplicated,
                     settings,
                     quiet,
                     human_readable,
+                    config,
                 };
                 (Payload::Request, request.encode())
             },

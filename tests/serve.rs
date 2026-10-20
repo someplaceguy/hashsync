@@ -127,7 +127,8 @@ struct Settings {
 
 /// The client's REQUEST payload for `command`, run without a shell, as `-s`
 /// sends it, with the `deduplicated` stream and `settings`. The other
-/// settings have their defaults (DESIGN.md §6.2).
+/// settings have their defaults, and the server uses its profile `default`
+/// (DESIGN.md §6.2).
 fn request_payload(command: &[&str], deduplicated: u8, settings: Settings) -> Vec<u8> {
     let mut request = vec![1]; // the command's words, without a shell
     request.extend_from_slice(&(command.len() as u32).to_le_bytes());
@@ -149,6 +150,7 @@ fn request_payload(command: &[&str], deduplicated: u8, settings: Settings) -> Ve
     request.push(settings.wait.into()); // wait
     request.push(0); // quiet
     request.push(1); // human_readable
+    request.push(0); // the configuration file: the profile `default`
     request
 }
 

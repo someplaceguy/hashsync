@@ -55,9 +55,11 @@ mod update;
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStrExt;
 
+use clap::builder::{OsStringValueParser, TypedValueParser};
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser, Subcommand};
 
+use crate::config::Source;
 use crate::die::die;
 use crate::protocol::Request;
 use crate::settings::{Deduplicated, RemoteCommand, RunSettings};
@@ -76,7 +78,7 @@ struct Cli {
     /// The profile: the configuration file $XDG_CONFIG_HOME/hashsync/NAME.toml,
     /// whose index is $XDG_CACHE_HOME/hashsync/NAME.db unless it sets
     /// index_path [default: default]
-    #[arg(long, global = true, value_name = "NAME")]
+    #[arg(long, global = true, value_name = "NAME", value_parser = profile_name())]
     profile: Option<OsString>,
 
     /// A configuration file anywhere, in place of a profile; unless it sets
@@ -101,18 +103,45 @@ impl Cli {
     /// `--profile` and `--config` both select it, so together they are a
     /// usage error. clap's `conflicts_with` misses a global option before
     /// the command with the other one after it, so this checks them
-    /// wherever they are.
-    fn source(&self) -> Result<config::Source<'_>, clap::Error> {
-        match (&self.profile, &self.config) {
-            (Some(_), Some(_)) => Err(Cli::command().error(
+    /// wherever they are. `serve` reads the file that the client names in
+    /// REQUEST, so either option is a usage error there.
+    fn source(&self) -> Result<Source, clap::Error> {
+        let (option, source) = match (&self.profile, &self.config) {
+            (Some(_), Some(_)) => {
+                return Err(Cli::command().error(
+                    ErrorKind::ArgumentConflict,
+                    "the argument '--profile <NAME>' cannot be used with '--config <PATH>'",
+                ));
+            }
+            (Some(name), None) => ("--profile <NAME>", Source::Profile(bytes(name))),
+            (None, Some(path)) => ("--config <PATH>", Source::File(bytes(path))),
+            (None, None) => return Ok(Source::Default),
+        };
+        if let Command::Serve { .. } = self.command {
+            return Err(Cli::command().error(
                 ErrorKind::ArgumentConflict,
-                "the argument '--profile <NAME>' cannot be used with '--config <PATH>'",
-            )),
-            (Some(name), None) => Ok(config::Source::Profile(name)),
-            (None, Some(path)) => Ok(config::Source::File(path)),
-            (None, None) => Ok(config::Source::Default),
+                format!(
+                    "the argument '{option}' cannot be used with 'serve', \
+                     which reads the configuration file that the client names"
+                ),
+            ));
         }
+        Ok(source)
     }
+}
+
+/// The value parser of the options that name a profile, `--profile` and
+/// `--server-profile`: a profile name becomes part of the path of the
+/// profile's file, so a bad one is a usage error (DESIGN.md §7).
+fn profile_name() -> impl TypedValueParser<Value = OsString> {
+    OsStringValueParser::new()
+        .try_map(|name| config::check_profile_name(name.as_bytes()).map(|()| name))
+}
+
+/// The bytes of a command-line argument, as the configuration and the
+/// protocol keep names and paths.
+fn bytes(arg: &OsString) -> Vec<u8> {
+    arg.as_bytes().to_vec()
 }
 
 #[derive(Subcommand)]
@@ -132,7 +161,7 @@ enum Command {
     /// Run a remote command through SSH, as ssh does, deduplicating its
     /// stdout against the local index, or with --dedup-stdin, stdin against
     /// the remote one, or both
-    Ssh(SshArgs),
+    Ssh(Box<SshArgs>),
     /// Internal server entry point: serve one transfer (DESIGN.md §6.1)
     #[command(hide = true)]
     Serve {
@@ -188,10 +217,19 @@ struct SshArgs {
     ssh: Option<OsString>,
 
     /// The hashsync executable on the remote host, a name or a path; a
-    /// wrapper script there can pass it options or set its environment
-    /// [default: hashsync]
+    /// wrapper script there can set its environment [default: hashsync]
     #[arg(long, value_name = "PATH")]
     hashsync_path: Option<OsString>,
+
+    /// The profile of the remote host, whose file there is
+    /// $XDG_CONFIG_HOME/hashsync/NAME.toml [default: default]
+    #[arg(long, value_name = "NAME", value_parser = profile_name(), conflicts_with = "server_config")]
+    server_profile: Option<OsString>,
+
+    /// A configuration file on the remote host, in place of a profile; a
+    /// relative path starts at the remote home directory
+    #[arg(long, value_name = "PATH")]
+    server_config: Option<OsString>,
 
     #[command(flatten)]
     settings: RunSettings,
@@ -208,7 +246,8 @@ struct SshArgs {
 impl SshArgs {
     /// What the client sends to the server in REQUEST: the command and the
     /// settings of the run, with the global `-q` and `--no-human-readable`,
-    /// which the server applies to its own notes.
+    /// which the server applies to its own notes, and the server's
+    /// configuration file, by default its profile `default` (DESIGN.md §7).
     fn request(&self, quiet: bool, no_human_readable: bool) -> Request {
         Request {
             command: RemoteCommand::from_words(&self.command, self.no_shell),
@@ -220,21 +259,20 @@ impl SshArgs {
             settings: self.settings.clone(),
             quiet,
             human_readable: !no_human_readable,
+            config: match (&self.server_profile, &self.server_config) {
+                (Some(name), _) => Source::Profile(bytes(name)),
+                (_, Some(path)) => Source::File(bytes(path)),
+                (None, None) => Source::Default,
+            },
         }
     }
 
     fn remote(&self) -> ssh::Remote {
-        let bytes = |arg: &Option<OsString>| arg.as_ref().map(|arg| arg.as_bytes().to_vec());
-        let (ssh, login, path) = (
-            bytes(&self.ssh),
-            bytes(&self.login),
-            bytes(&self.hashsync_path),
-        );
         ssh::Remote::new(
-            ssh.as_deref(),
-            login.as_deref(),
+            self.ssh.as_deref().map(OsStrExt::as_bytes),
+            self.login.as_deref().map(OsStrExt::as_bytes),
             self.host.as_bytes(),
-            path.as_deref(),
+            self.hashsync_path.as_deref().map(OsStrExt::as_bytes),
         )
         .unwrap_or_else(|e| die(e))
     }
@@ -254,7 +292,7 @@ fn main() {
     if cli.no_human_readable {
         units::disable_human_readable();
     }
-    let load_config = || config::load(source);
+    let load_config = || config::load(&source, true);
     match &cli.command {
         Command::Update { rebuild, jobs } => update::run(&load_config(), *rebuild, *jobs),
         Command::Stats => stats::run(&load_config()),
@@ -263,13 +301,12 @@ fn main() {
         // (DESIGN.md §7).
         Command::Ssh(args) => {
             let request = args.request(cli.quiet, cli.no_human_readable);
-            let config = config::load_for_run(source, request.deduplicated.stdout());
+            let config = config::load(&source, request.deduplicated.stdout());
             client::run(config, &args.remote(), &request, args.no_stdin)
         }
-        // The server reads its configuration once REQUEST has told it its
-        // roles. Its own options select the file, not the client's: a
-        // configuration file describes only its own host.
-        Command::Serve { token } => server::run(source, token),
+        // The server reads the configuration file that REQUEST names, once
+        // REQUEST has told it its roles.
+        Command::Serve { token } => server::run(token),
         Command::Attach { token } => attach::run(token),
     }
 }
@@ -289,7 +326,7 @@ mod tests {
         let Command::Ssh(args) = parse(&words).unwrap().command else {
             panic!("not ssh");
         };
-        args
+        *args
     }
 
     fn words(args: &SshArgs) -> Vec<&str> {
@@ -354,16 +391,18 @@ mod tests {
     /// error (DESIGN.md §7).
     #[test]
     fn the_options_select_the_configuration_file() {
-        let source = |words: &[&str]| format!("{:?}", parse(words).unwrap().source().unwrap());
-        assert_eq!(source(&["stats"]), "Default");
+        let source = |words: &[&str]| parse(words).unwrap().source().unwrap();
+        assert_eq!(source(&["stats"]), Source::Default);
         for words in [
             &["--profile", "work", "stats"][..],
             &["stats", "--profile", "work"],
             &["update", "--profile=work"],
         ] {
-            assert_eq!(source(words), r#"Profile("work")"#, "{words:?}");
+            let work = Source::Profile(b"work".to_vec());
+            assert_eq!(source(words), work, "{words:?}");
         }
-        assert_eq!(source(&["update", "--config", "/c"]), r#"File("/c")"#);
+        let file = Source::File(b"/c".to_vec());
+        assert_eq!(source(&["update", "--config", "/c"]), file);
         for words in [
             &["--profile", "work", "--config", "/c", "stats"][..],
             &["--config", "/c", "stats", "--profile", "work"],
@@ -371,6 +410,56 @@ mod tests {
         ] {
             let error = parse(words).unwrap().source().err().map(|e| e.kind());
             assert_eq!(error, Some(ErrorKind::ArgumentConflict), "{words:?}");
+        }
+        // A profile name becomes part of a file name.
+        for name in ["", "a/b", "/"] {
+            let error = parse(&["--profile", name, "stats"]).err().map(|e| e.kind());
+            assert_eq!(error, Some(ErrorKind::ValueValidation), "{name:?}");
+        }
+    }
+
+    /// `serve` reads the configuration file that the client names in
+    /// REQUEST, so an option of its own that selects one would have no
+    /// meaning (DESIGN.md §7). `attach` reads no file.
+    #[test]
+    fn serve_takes_its_configuration_file_from_the_client() {
+        let serve = ["serve", "--token", "t"];
+        assert_eq!(parse(&serve).unwrap().source().unwrap(), Source::Default);
+        for option in [["--profile", "work"], ["--config", "/c"]] {
+            let words = [&option[..], &serve].concat();
+            let error = parse(&words).unwrap().source().err().map(|e| e.kind());
+            assert_eq!(error, Some(ErrorKind::ArgumentConflict), "{words:?}");
+        }
+    }
+
+    /// By default, the server uses its profile `default`, whatever file the
+    /// client's own options select. `--server-profile` and `--server-config`
+    /// select another profile or a file anywhere on the server, and together
+    /// they are a usage error (DESIGN.md §7).
+    #[test]
+    fn the_client_names_the_configuration_file_of_the_server() {
+        let config = |words: &[&str]| {
+            let cli = parse(&[words, &["nas", "true"]].concat()).unwrap();
+            let Command::Ssh(args) = &cli.command else {
+                panic!("not ssh");
+            };
+            args.request(false, false).config
+        };
+        assert_eq!(config(&["ssh", "--profile", "work"]), Source::Default);
+        for client in [&[][..], &["--profile", "work"], &["--config", "/c"]] {
+            assert_eq!(config(&[client, &["ssh"]].concat()), Source::Default);
+            let words = [client, &["ssh", "--server-profile", "nas"]].concat();
+            assert_eq!(config(&words), Source::Profile(b"nas".to_vec()));
+            let words = [client, &["ssh", "--server-config", "nas.toml"]].concat();
+            assert_eq!(config(&words), Source::File(b"nas.toml".to_vec()));
+        }
+        let both = ["--server-profile", "a", "--server-config", "/b"];
+        assert!(parse(&[&["ssh"], &both[..], &["nas", "true"]].concat()).is_err());
+        assert!(parse(&[&["ssh", "nas"], &both[..], &["true"]].concat()).is_err());
+        for name in ["", "a/b"] {
+            let words = ["ssh", "--server-profile", name, "nas", "true"];
+            let error = parse(&words).err().map(|e| e.kind());
+            assert_eq!(error, Some(ErrorKind::ValueValidation), "{name:?}");
         }
     }
 

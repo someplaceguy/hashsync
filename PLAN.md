@@ -50,8 +50,11 @@ can carry it, unless `--batch-stdout` or `--batch-stdin` asks for batch
 delivery (DESIGN.md §6.2). Either stream stops once no process reads its
 destination, and the run then ends with the command's status; the summary
 shows what each stream read, decoded, dropped, and wrote (DESIGN.md §6.6
-and §8). The server marks its lines with `hashsync (server): `.
-Step 7 is the next milestone.
+and §8). The server marks its lines with `hashsync (server): `, and
+reads its own file of the profile `default`, unless `--server-profile` or
+`--server-config` selects another; every command names its file and
+index in a note, on both hosts of a run (DESIGN.md §7). Step 7 is the next
+milestone.
 
 ## 1. Build and inspect a local index
 
@@ -112,9 +115,10 @@ disabled. Block references and compressed output follow in steps 4 and 5.
   user's shell as sshd does, or with `-s` its words without a shell, and
   return the specified exit or startup-failure status.
 - Support `--ssh` and `--hashsync-path`; per-host SSH options belong in
-  the user's SSH configuration. Preserve SSH aliases and the user's
-  authentication and host configuration, with the session options required
-  by the design.
+  the user's SSH configuration. Let the client select the server's
+  configuration file, by default the server's profile `default`.
+  Preserve SSH aliases and the user's authentication and host
+  configuration, with the session options required by the design.
 - Allow the same installed binary to serve both receiver and sender roles.
   Reject incompatible peers before starting the command.
 - Update before normal runs, then keep a shared lock until the run's

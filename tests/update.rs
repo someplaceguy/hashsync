@@ -1010,9 +1010,11 @@ fn missing_configuration_fails() {
 
 /// Each profile has its own configuration file and, unless the file sets
 /// `index_path`, its own index, named after it: the profile `default`
-/// without `--profile`, and the one that it names otherwise. A message
+/// without `--profile`, and the one that it names otherwise. A note of
+/// each command names the profile, its file, and its index, and a message
 /// that asks for an update names the profile. A named profile needs its
-/// file, and a profile name is one nonempty path component (DESIGN.md §7).
+/// file, and a profile name is one nonempty path component, else it is a
+/// usage error (DESIGN.md §7).
 #[test]
 fn profiles_have_their_own_files_and_indexes() {
     let env = Env::new();
@@ -1022,20 +1024,34 @@ fn profiles_have_their_own_files_and_indexes() {
     let config = |root: &str| format!("block_size = {BLOCK}\n{}", env.root(root, ""));
     env.write_profile("default", &config("tree"));
     env.write_profile("work", &config("work"));
-    for args in [&["update"][..], &["--profile", "work", "update"]] {
+    let indexes = ["default", "work"].map(|name| env.path(format!("cache/hashsync/{name}.db")));
+    let note = |name: &str, index: &std::path::Path| {
+        format!(
+            "hashsync: using profile `{name}` [{}] and index {}\n",
+            env.profile_path(name).display(),
+            index.display()
+        )
+    };
+    for (args, name, index) in [
+        (&["update"][..], "default", &indexes[0]),
+        (&["--profile", "work", "update"], "work", &indexes[1]),
+    ] {
         let output = env.bare_command(args).output().unwrap();
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(output.status.success(), "{args:?}: {stderr}");
         assert!(!stderr.contains("warning"), "{args:?}: {stderr}");
+        assert!(stderr.starts_with(&note(name, index)), "{args:?}: {stderr}");
     }
-    let indexes = ["default", "work"].map(|name| env.path(format!("cache/hashsync/{name}.db")));
     for (index, blocks) in indexes.iter().zip([1, 2]) {
         assert_eq!(IndexView::open(index, false).count("blocks"), blocks);
     }
     let output = env.bare_command(&["--profile", "work", "stats"]).output();
-    let stats = String::from_utf8(output.unwrap().stdout).unwrap();
+    let output = output.unwrap();
+    let stats = String::from_utf8(output.stdout).unwrap();
     let line = format!("index path:       {}\n", indexes[1].display());
     assert!(stats.contains(&line), "{stats}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(stderr, note("work", &indexes[1]));
 
     env.write_profile("new", &config("work"));
     let output = env.bare_command(&["--profile", "new", "stats"]).output();
@@ -1061,11 +1077,12 @@ fn profiles_have_their_own_files_and_indexes() {
         let output = env.bare_command(&["--profile", name, "stats"]).output();
         let output = output.unwrap();
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert_eq!(output.status.code(), Some(1), "{name:?}: {stderr}");
-        assert!(
-            stderr.contains("invalid profile name"),
-            "{name:?}: {stderr}"
+        assert_eq!(output.status.code(), Some(2), "{name:?}: {stderr}");
+        let message = format!(
+            "invalid value '{name}' for '--profile <NAME>': \
+             a profile name must not be empty or contain '/'"
         );
+        assert!(stderr.contains(&message), "{name:?}: {stderr}");
     }
 }
 
@@ -1074,9 +1091,9 @@ fn profiles_have_their_own_files_and_indexes() {
 /// the index of a profile is. So files of the same name share an index,
 /// such as this file and the file of the profile of that name, and a
 /// command that uses the index of a file that `--config` names without
-/// `index_path` warns about that. A message that asks for an update
-/// repeats `--config`. `--profile` and `--config` together are a usage
-/// error (DESIGN.md §7).
+/// `index_path` warns about that, after the note that names the file and
+/// the index. A message that asks for an update repeats `--config`.
+/// `--profile` and `--config` together are a usage error (DESIGN.md §7).
 #[test]
 fn a_file_that_config_names_has_an_index_named_after_it() {
     let env = Env::new();
@@ -1094,7 +1111,11 @@ fn a_file_that_config_names_has_an_index_named_after_it() {
         "hashsync: warning: {file} sets no index_path, so its index is {}, ",
         index.display()
     );
-    assert!(stderr.contains(&warning), "{stderr}");
+    let note = format!(
+        "hashsync: using config {file} and index {}\n",
+        index.display()
+    );
+    assert!(stderr.starts_with(&(note + &warning)), "{stderr}");
     assert_eq!(IndexView::open(&index, false).count("blocks"), 1);
 
     // The profile `nas` uses the same index, without a warning.

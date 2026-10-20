@@ -2,7 +2,9 @@
 //!
 //! Each command reads one configuration file: the file of a profile, the
 //! one that `--profile` names or `default`, or a file anywhere, which
-//! `--config` names. Unless the file sets `index_path`, its index is named after it.
+//! `--config` names. The server of a run reads the file that the client
+//! names in REQUEST, by default its own file of the profile `default`.
+//! Unless the file sets `index_path`, its index is named after it.
 //! A configuration file describes only its own host: its roots and its
 //! index, and where it keeps temporary data and cached lists. Everything
 //! about a run is an option of `hashsync ssh` (`settings.rs`). Keys of
@@ -21,7 +23,7 @@ use crate::fsops;
 use crate::glob;
 use crate::hash::StrongHash;
 use crate::names;
-use crate::report::warn;
+use crate::report::{note, warn};
 
 pub const MIN_BLOCK_SIZE: u64 = 512;
 pub const DEFAULT_BLOCK_SIZE: u32 = 16 * 1024;
@@ -126,27 +128,41 @@ enum Size {
     Text(String),
 }
 
-/// The configuration file of a command, as its options select it
-/// (DESIGN.md §7).
-#[derive(Clone, Copy, Debug)]
-pub enum Source<'a> {
-    /// Neither `--profile` nor `--config`: the file of the profile
-    /// `default`.
+/// The configuration file of a host, as the options of the run or the
+/// command select it (DESIGN.md §7). A profile name is one nonempty file
+/// name, as `check_profile_name` requires: the options that name profiles
+/// check it, and so does the server's decoder of REQUEST.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Source {
+    /// The profile `default`, which a host uses when no option selects its
+    /// file: a command without `--profile` or `--config`, and the server of
+    /// a run without `--server-profile` or `--server-config`. A host that
+    /// needs no file can do without it.
     Default,
-    /// `--profile NAME`: the file of the profile NAME.
-    Profile(&'a OsStr),
-    /// `--config PATH`: a file anywhere.
-    File(&'a OsStr),
+    /// The profile that `--profile` or `--server-profile` names.
+    Profile(Vec<u8>),
+    /// A file anywhere, which `--config` or `--server-config` names.
+    File(Vec<u8>),
 }
 
-impl Source<'_> {
+impl Source {
+    /// The name of the profile, `default` without an option, or `None` for
+    /// a file anywhere.
+    fn profile(&self) -> Option<&[u8]> {
+        match self {
+            Source::Default => Some(DEFAULT_PROFILE),
+            Source::Profile(name) => Some(name),
+            Source::File(_) => None,
+        }
+    }
+
     /// The path of the file: `$XDG_CONFIG_HOME/hashsync/NAME.toml` for the
     /// profile NAME.
-    fn path(self) -> Vec<u8> {
-        let profile = match self {
+    fn path(&self) -> Vec<u8> {
+        let profile: &[u8] = match self {
             Source::Default => DEFAULT_PROFILE,
-            Source::Profile(name) => name.as_bytes(),
-            Source::File(path) => return path.as_bytes().to_vec(),
+            Source::Profile(name) => name,
+            Source::File(path) => return path.clone(),
         };
         let mut path = xdg_dir("XDG_CONFIG_HOME", ".config");
         path.extend_from_slice(b"/hashsync/");
@@ -156,50 +172,48 @@ impl Source<'_> {
     }
 
     /// The option that selects the file, for the commands that messages
-    /// tell the user to run; none for the default profile. The name or path
-    /// follows `=`, so that one that starts with `-` stays the value of the
-    /// option, as one shell word that gives back its bytes.
-    fn option(self) -> Option<String> {
+    /// tell the user to run on this host; none for the profile `default`.
+    /// The name or path follows `=`, so that one that starts with `-` stays
+    /// the value of the option, as one shell word that gives back its bytes.
+    fn option(&self) -> Option<String> {
         let (option, value) = match self {
             Source::Default => return None,
+            Source::Profile(name) if name == DEFAULT_PROFILE => return None,
             Source::Profile(name) => ("--profile", name),
             Source::File(path) => ("--config", path),
         };
-        Some(format!("{option}={}", shell_word(value.as_bytes())))
+        Some(format!("{option}={}", shell_word(value)))
     }
+}
+
+/// Check that `name` is a profile name: one nonempty file name, which
+/// becomes part of the path of the profile's file (DESIGN.md §7).
+pub fn check_profile_name(name: &[u8]) -> Result<(), String> {
+    if name.is_empty() || name.contains(&b'/') {
+        return Err("a profile name must not be empty or contain '/'".into());
+    }
+    Ok(())
 }
 
 /// Load the configuration file that `source` selects, or die with a
-/// message. The commands that use the index need the file, for the roots
-/// and the index.
-pub fn load(source: Source) -> Config {
-    load_from(source, true)
-}
-
-/// Load the configuration of one host of `hashsync ssh` (DESIGN.md §7), as
-/// `load` does. A host that `receives` no deduplicated stream uses no
-/// index, only `tmp_data_dir` and `hashlist_max_age`, which have defaults,
-/// so it can do without the file of the default profile. A file that
-/// `--profile` or `--config` names must exist, so that a mistyped name
-/// fails instead of quietly giving the defaults.
-pub fn load_for_run(source: Source, receives: bool) -> Config {
-    load_from(source, receives)
-}
-
-fn load_from(source: Source, uses_index: bool) -> Config {
-    if let Source::Profile(name) = source {
-        check_profile(name.as_bytes());
-    }
+/// message. A host that `uses_index` needs the file, for its roots and its
+/// index. Otherwise the host uses only `tmp_data_dir` and
+/// `hashlist_max_age`, which have defaults, so it can do without the file
+/// of the profile `default`, which it uses when no option selects one. A
+/// file that an option names must exist, so that a mistyped name fails
+/// instead of quietly giving the defaults. A note then names the file, and
+/// the index if the host uses it (`note_files`).
+pub fn load(source: &Source, uses_index: bool) -> Config {
     let path = source.path();
     let shown = path.as_bstr();
-    let text = match fsops::retry_interrupted(|| std::fs::read(OsStr::from_bytes(&path))) {
-        Ok(bytes) => bytes,
+    let (text, found) = match fsops::retry_interrupted(|| std::fs::read(OsStr::from_bytes(&path))) {
+        Ok(bytes) => (bytes, true),
         Err(e)
             if !uses_index
                 && matches!(source, Source::Default)
                 && e.kind() == std::io::ErrorKind::NotFound =>
         {
-            Vec::new()
+            (Vec::new(), false)
         }
         Err(e) => die(format!("cannot read configuration file {shown}: {e}")),
     };
@@ -211,6 +225,8 @@ fn load_from(source: Source, uses_index: bool) -> Config {
         Ok(config) => config,
         Err(message) => die(format!("{shown}: {message}")),
     };
+    let index = uses_index.then_some(config.index_path.as_slice());
+    note_files(source, &path, found, index);
     // The files of profiles share one directory, so their names are
     // distinct, and so are the names of their indexes. A file anywhere can
     // have the name of another one, such as the file of a profile, and then
@@ -225,14 +241,25 @@ fn load_from(source: Source, uses_index: bool) -> Config {
     config
 }
 
-/// Die unless `name`, a profile name from `--profile`, is one nonempty
-/// path component: it becomes part of a file name (DESIGN.md §7).
-fn check_profile(name: &[u8]) {
-    if name.is_empty() || name.contains(&b'/') {
-        die(format!(
-            "invalid profile name {:?}: it must not be empty or contain '/'",
-            name.as_bstr()
-        ));
+/// Say in a note which configuration file a command uses, the one at `path`
+/// that `source` selects, and the `index` that it uses, if any. Every
+/// command says so when it loads its file, on both hosts of a run, so that
+/// the user sees which files the options selected (DESIGN.md §7). A file
+/// that is not `found` is one of `default` that a host without an index
+/// does without. Paths in the home directory start with `~`, which keeps
+/// the line short.
+fn note_files(source: &Source, path: &[u8], found: bool, index: Option<&[u8]>) {
+    let home = std::env::var_os("HOME").unwrap_or_default();
+    let shown = |path: &[u8]| with_tilde(path, home.as_bytes());
+    let path = shown(path);
+    let file = match source.profile() {
+        None => format!("config {path}"),
+        Some(name) if found => format!("profile `{}` [{path}]", name.as_bstr()),
+        Some(name) => format!("profile `{}` [{path} not found]", name.as_bstr()),
+    };
+    match index {
+        Some(index) => note(format_args!("using {file} and index {}", shown(index))),
+        None => note(format_args!("using {file}")),
     }
 }
 
@@ -289,7 +316,7 @@ fn shell_word(bytes: &[u8]) -> String {
 
 /// Parse and validate the text of the configuration file that `source`
 /// selects.
-pub fn parse(text: &str, source: Source) -> Result<Config, String> {
+pub fn parse(text: &str, source: &Source) -> Result<Config, String> {
     let raw: RawConfig = toml::from_str(text).map_err(|e| e.to_string())?;
     let block_size = match raw.block_size {
         None => DEFAULT_BLOCK_SIZE,
@@ -525,6 +552,20 @@ pub fn parse_size(text: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("size too large: {text:?}"))
 }
 
+/// `path` with `~` in place of `home`, the home directory, when the path
+/// is in it. With a home of `/`, paths stay as they are, or every absolute
+/// path would start with `~`.
+fn with_tilde(path: &[u8], home: &[u8]) -> String {
+    let home = home.trim_end_with(|c| c == '/');
+    if home.first() == Some(&b'/')
+        && let Some(rest) = path.strip_prefix(home)
+        && (rest.is_empty() || rest.first() == Some(&b'/'))
+    {
+        return format!("~{}", rest.as_bstr());
+    }
+    path.as_bstr().to_string()
+}
+
 fn home_dir() -> Vec<u8> {
     match std::env::var_os("HOME") {
         Some(home) if !home.is_empty() => home.as_bytes().to_vec(),
@@ -550,7 +591,7 @@ pub fn xdg_dir(var: &str, fallback: &str) -> Vec<u8> {
 /// so `NAME.db` for the profile NAME. The index holds only hints, which an
 /// update rebuilds from the roots, so it goes in the cache with the other
 /// files that hashsync creates (DESIGN.md §10).
-fn default_index_path(source: Source) -> Result<Vec<u8>, String> {
+fn default_index_path(source: &Source) -> Result<Vec<u8>, String> {
     let file = source.path();
     let Some(stem) = Path::new(OsStr::from_bytes(&file)).file_stem() else {
         return Err("the file has no name to give its index; set index_path".into());
@@ -589,7 +630,7 @@ mod tests {
 
     /// The configuration of `text` as the file of the default profile.
     fn parse(text: &str) -> Result<Config, String> {
-        super::parse(text, Source::Default)
+        super::parse(text, &Source::Default)
     }
 
     #[test]
@@ -801,36 +842,69 @@ one_filesystem = true
         );
     }
 
+    fn profile(name: &str) -> Source {
+        Source::Profile(name.as_bytes().to_vec())
+    }
+
     /// A profile names its configuration file. Unless a file sets
     /// `index_path`, its index is named after it, without its extension,
-    /// and the messages that ask for an update repeat the option that
-    /// selected the file (DESIGN.md §7).
+    /// and the messages that ask for an update name the option that selects
+    /// the file, none for the profile `default` (DESIGN.md §7).
     #[test]
     fn indexes_are_named_after_their_files() {
-        let profile = |name: &'static str| Source::Profile(OsStr::new(name));
         assert!(profile("work").path().ends_with(b"/hashsync/work.toml"));
         assert!(Source::Default.path().ends_with(b"/hashsync/default.toml"));
         let default = parse("").unwrap();
         assert!(default.index_path.ends_with(b"/hashsync/default.db"));
         assert_eq!(default.update_command(), "hashsync update");
-        let work = super::parse("", profile("work")).unwrap();
+        let named_default = super::parse("", &profile("default")).unwrap();
+        assert_eq!(named_default.update_command(), "hashsync update");
+        let work = super::parse("", &profile("work")).unwrap();
         assert!(work.index_path.ends_with(b"/hashsync/work.db"));
         assert_eq!(work.update_command(), "hashsync --profile=work update");
         // A name with dots keeps them.
-        let dotted = super::parse("", profile(".a.b")).unwrap();
+        let dotted = super::parse("", &profile(".a.b")).unwrap();
         assert!(dotted.index_path.ends_with(b"/hashsync/.a.b.db"));
 
-        let file = Source::File(OsStr::new("/etc/hashsync/nas.conf"));
-        let nas = super::parse("", file).unwrap();
+        let file = Source::File(b"/etc/hashsync/nas.conf".to_vec());
+        let nas = super::parse("", &file).unwrap();
         assert!(nas.index_path.ends_with(b"/hashsync/nas.db"));
         assert!(nas.index_named_after_file);
         assert_eq!(
             nas.update_command(),
             "hashsync --config=/etc/hashsync/nas.conf update"
         );
-        let set = super::parse("index_path = '/srv/nas.db'", file).unwrap();
+        let set = super::parse("index_path = '/srv/nas.db'", &file).unwrap();
         assert_eq!(set.index_path, b"/srv/nas.db");
         assert!(!set.index_named_after_file);
+    }
+
+    /// The note of a run shows a path in the home directory with `~`, but
+    /// not one in another directory whose name starts with the same bytes.
+    #[test]
+    fn notes_show_the_home_directory_as_a_tilde() {
+        let home = b"/home/u";
+        let cache = b"/home/u/.cache/hashsync/a.db";
+        assert_eq!(with_tilde(cache, home), "~/.cache/hashsync/a.db");
+        assert_eq!(with_tilde(b"/home/u", home), "~");
+        assert_eq!(with_tilde(b"/home/u/x", b"/home/u//"), "~/x");
+        assert_eq!(with_tilde(b"/home/user/x", home), "/home/user/x");
+        assert_eq!(with_tilde(b"x.toml", home), "x.toml");
+        assert_eq!(with_tilde(b"/etc/x", b"/"), "/etc/x");
+        assert_eq!(with_tilde(b"/etc/x", b""), "/etc/x");
+        assert_eq!(with_tilde(b"/home/u/\xff", home), "~/\u{fffd}");
+    }
+
+    /// A profile name becomes part of the path of its file, so it is one
+    /// nonempty file name (DESIGN.md §7).
+    #[test]
+    fn profile_names_are_file_names() {
+        for name in [&b"work"[..], b"a.b", b"..", b"\xff", b"-x"] {
+            assert_eq!(check_profile_name(name), Ok(()), "{:?}", name.as_bstr());
+        }
+        for name in [&b""[..], b"a/b", b"/", b"../x"] {
+            assert!(check_profile_name(name).is_err(), "{:?}", name.as_bstr());
+        }
     }
 
     /// The command of a message is one that the user can copy into a
@@ -847,13 +921,13 @@ one_filesystem = true
             (b"a\xffb", r"$'a\377b'"),
             (b"tab\there\\'", r"$'tab\011here\\\''"),
         ] {
-            let profile = Source::Profile(OsStr::from_bytes(name));
-            let config = super::parse("index_path = '/i'", profile).unwrap();
+            let profile = Source::Profile(name.to_vec());
+            let config = super::parse("index_path = '/i'", &profile).unwrap();
             let command = format!("hashsync --profile={word} update");
             assert_eq!(config.update_command(), command);
         }
-        let file = Source::File(OsStr::new("my dir/nas.conf"));
-        let config = super::parse("index_path = '/i'", file).unwrap();
+        let file = Source::File(b"my dir/nas.conf".to_vec());
+        let config = super::parse("index_path = '/i'", &file).unwrap();
         let command = "hashsync --config='my dir/nas.conf' update";
         assert_eq!(config.update_command(), command);
     }

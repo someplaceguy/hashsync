@@ -20,7 +20,7 @@ use std::cell::RefCell;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::ExitStatusExt;
@@ -96,9 +96,11 @@ impl Transfer {
         ] {
             env.mkdir(dir);
         }
-        // As sshd does, the fake ssh sets `$SHELL` for the remote command,
-        // here to `/bin/sh` unless a test names another shell, and tells
-        // the remote command the user that `-l` gave, if any.
+        // As sshd does, the fake ssh starts the remote command in the home
+        // directory, where relative paths such as that of `--server-config`
+        // start, sets `$SHELL` for it, here to `/bin/sh` unless a test
+        // names another shell, and tells it the user that `-l` gave, if
+        // any.
         let script = format!(
             r#"#!/bin/sh
 set -eu
@@ -122,6 +124,7 @@ export XDG_CACHE_HOME="$HOME/.cache"
 export XDG_RUNTIME_DIR="$HASHSYNC_TEST_SERVER_RUNTIME"
 export HASHSYNC_TEST_LOGIN="$login"
 export SHELL="${{HASHSYNC_TEST_SHELL:-/bin/sh}}"
+cd "$HOME"
 exec /bin/sh -c "$1"
 "#
         );
@@ -173,13 +176,20 @@ exec /bin/sh -c "$1"
     }
 
     /// `hashsync ssh --dedup-stdin [options] [flags] HOST -- command...`,
-    /// a push, as `invocation` prepares it, but without `--config`: the
-    /// client of a push needs no configuration file, and the default one
-    /// does not exist (DESIGN.md §7). The server needs one
-    /// (`configure_server`).
+    /// a push, as `profile_invocation` prepares it: the client of a push
+    /// needs no configuration file, and the default one does not exist
+    /// (DESIGN.md §7). The server needs one (`configure_server`).
     fn push(&self, flags: &[&str], command: &[&OsStr]) -> Command {
+        self.profile_invocation(&[&["--dedup-stdin"], flags].concat(), command)
+    }
+
+    /// `hashsync ssh [options] [flags] HOST -- command...`, as `invocation`
+    /// prepares it, but without `--config`: the client uses its profile in
+    /// its configuration directory, `default`, or the one that `flags`
+    /// select with `--profile`.
+    fn profile_invocation(&self, flags: &[&str], command: &[&OsStr]) -> Command {
         let mut invocation = Command::new(env!("CARGO_BIN_EXE_hashsync"));
-        invocation.args(["ssh", "--dedup-stdin"]);
+        invocation.arg("ssh");
         self.add_options(&mut invocation, flags);
         invocation.arg(HOST).arg("--").args(command);
         invocation
@@ -232,9 +242,16 @@ exec /bin/sh -c "$1"
         std::fs::write(self.server_config(), text).unwrap();
     }
 
-    /// The configuration file of the server's default profile.
+    /// The configuration file of the server's profile `default`, which it
+    /// reads unless the client names another file.
     fn server_config(&self) -> PathBuf {
-        self.env.path("server/home/.config/hashsync/default.toml")
+        self.server_profile("default")
+    }
+
+    /// The configuration file of the server's profile `name`.
+    fn server_profile(&self, name: &str) -> PathBuf {
+        self.env
+            .path(format!("server/home/.config/hashsync/{name}.toml"))
     }
 
     /// The index of the server of a push.
@@ -1130,7 +1147,8 @@ fn the_client_keeps_its_temporary_data_in_the_configured_directory() {
     // one that `--config` or `--profile` names, for its tmp_data
     // directory, and that file must exist. It uses no index, so a file that
     // `--config` names without `index_path` gets no warning about the name
-    // of its index (DESIGN.md §7).
+    // of its index (DESIGN.md §7). The server, the receiver, reads its own
+    // file of the profile `default`, whatever file the client reads.
     let transfer = Transfer::new(&[]);
     transfer.configure_server("");
     let tmp_data = transfer.env.path("tmp/pushed");
@@ -1576,10 +1594,10 @@ fn summaries_show_scale_units() {
 
 #[test]
 fn quiet_runs_print_only_the_command_stderr() {
-    // `--quiet` removes the summary and the notes of the update, which
-    // creates the receiver's index here. In a push, the server updates its
-    // index, and its notes follow the `--quiet` that REQUEST carries. The
-    // command's stderr still arrives (DESIGN.md §8).
+    // `--quiet` removes the summary, the notes that name the files of each
+    // host, and the notes of the update, which creates the receiver's index
+    // here. The server's notes follow the `--quiet` that REQUEST carries.
+    // The command's stderr still arrives (DESIGN.md §8).
     for direction in DIRECTIONS {
         let transfer = Transfer::new(&[]);
         transfer.configure_receiver(direction, "");
@@ -1748,14 +1766,18 @@ fn a_command_line_runs_in_the_remote_users_shell() {
 }
 
 #[test]
-fn the_server_reads_its_own_configuration() {
+fn the_server_reads_the_configuration_file_that_the_client_names() {
     // The server of a pull, the sender of the command's stdout, needs no
     // configuration file, as every other test shows. With one, it keeps
     // the segments of its spools in its own `tmp_data_dir`, and its list
     // cache expires lists after its own `hashlist_max_age`, while the
-    // client keeps its default of 30 days (DESIGN.md §5.6 and §7). A
-    // `--hashsync-path` wrapper can name another file with `--config`, or
-    // select another profile with `--profile`.
+    // client keeps its default of 30 days (DESIGN.md §5.6 and §7). By
+    // default, the server reads its own file of the profile `default`.
+    // `--server-config` names another file, and `--server-profile` another
+    // profile, whose files must exist. Their names need not be UTF-8, and a
+    // relative path starts at the server's home directory, where SSH starts
+    // `serve`. The note of each host names its file as the option gave it,
+    // and the client's names its index too.
     let transfer = Transfer::new(&[]);
     // A stale list in another peer/index directory of the cache of each
     // host.
@@ -1816,43 +1838,205 @@ fn the_server_reads_its_own_configuration() {
         "the client expired a list with the hashlist_max_age of the server"
     );
 
+    // A run with `option` and its `value`, bytes that need not be UTF-8.
+    // The client starts in a directory of its own, which holds none of the
+    // server's files: a relative path that the client resolved would name
+    // no file.
+    let run_with = |option: &str, value: &[u8]| {
+        let mut run = transfer.bare_invocation(&[EXACT]);
+        run.arg(option)
+            .arg(OsStr::from_bytes(value))
+            .arg(HOST)
+            .arg("--");
+        let run = run.args(&command).current_dir(transfer.env.path("client"));
+        succeeded(run.output().unwrap())
+    };
     let other = transfer.env.path("other-tmp-data");
-    transfer
-        .env
-        .write("other-config.toml", tmp_data_dir(&other).as_bytes());
-    let wrapper = transfer.env.path("hashsync-with-config");
-    let script = format!(
-        "#!/bin/sh\nexec '{}' --config '{}' \"$@\"\n",
-        env!("CARGO_BIN_EXE_hashsync"),
-        transfer.env.path("other-config.toml").display()
+    transfer.env.write(
+        OsStr::from_bytes(b"server/home/other-\xff.toml"),
+        tmp_data_dir(&other).as_bytes(),
     );
-    write_script(&wrapper, script);
-    transfer.set_hashsync_path(wrapper.as_os_str());
-    succeeded(transfer.run(&[], &refs(&command)));
+    let output = run_with("--server-config", b"other-\xff.toml");
     assert_eq!(mode(&other), 0o700);
     assert!(
         !default_dir.exists(),
         "the server used its default directory"
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let client = format!(
+        "hashsync: using config {} and index {}\n",
+        transfer.env.config_path().display(),
+        transfer.env.index_path().display()
+    );
+    let server = "hashsync (server): using config other-\u{fffd}.toml\n";
+    for note in [&client[..], server] {
+        assert!(stderr.contains(note), "{note}{stderr}");
+    }
 
     let profile = transfer.env.path("profile-tmp-data");
     transfer.env.write(
-        "server/home/.config/hashsync/other.toml",
+        OsStr::from_bytes(b"server/home/.config/hashsync/other-\xff.toml"),
         tmp_data_dir(&profile).as_bytes(),
     );
-    let wrapper = transfer.env.path("hashsync-with-profile");
-    let script = format!(
-        "#!/bin/sh\nexec '{}' --profile other \"$@\"\n",
-        env!("CARGO_BIN_EXE_hashsync")
-    );
-    write_script(&wrapper, script);
-    transfer.set_hashsync_path(wrapper.as_os_str());
-    succeeded(transfer.run(&[], &refs(&command)));
+    let output = run_with("--server-profile", b"other-\xff");
     assert_eq!(mode(&profile), 0o700);
     assert!(
         !default_dir.exists(),
         "the server used its default directory"
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let note = "hashsync (server): using profile `other-\u{fffd}` \
+                [~/.config/hashsync/other-\u{fffd}.toml]\n";
+    assert!(stderr.contains(note), "{stderr}");
+
+    // A file that an option names must exist, on the server too, which
+    // then ends the run before the command starts.
+    let marker = transfer.env.path("marker");
+    let touch = args(&["touch", marker.to_str().unwrap()]);
+    let missing = transfer.env.path("missing.toml");
+    for (flags, file) in [
+        (
+            ["--server-profile", "missing"],
+            transfer.server_profile("missing"),
+        ),
+        (
+            ["--server-config", missing.to_str().unwrap()],
+            missing.clone(),
+        ),
+    ] {
+        let output = transfer.run(&flags, &refs(&touch));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{flags:?}: {stderr}");
+        let message = format!(
+            "hashsync (server): cannot read configuration file {}: ",
+            file.display()
+        );
+        assert!(stderr.contains(&message), "{flags:?}: {stderr}");
+        assert!(!marker.exists(), "{flags:?}: the command ran");
+    }
+}
+
+#[test]
+fn the_server_ignores_the_profile_of_the_client() {
+    // Without `--server-profile` or `--server-config`, the server reads its
+    // own file of the profile `default`, whatever file the client reads
+    // (DESIGN.md §7). Here both hosts also have a file of the profile
+    // `work`, which the client selects with `--profile`, and the server
+    // reads only when `--server-profile` names it. When the run starts,
+    // each host says in a note which file it uses, and which index when it
+    // uses one, with `~` for its home directory: the server's home holds
+    // its configuration and cache directories, and the client's does not.
+    let transfer = Transfer::new(&[]);
+    let blocks = tiled(8, 71);
+    transfer.env.write("server-tree/blocks", &blocks);
+    let tmp_data_dir = |path: &std::path::Path| {
+        format!(
+            "tmp_data_dir = '{}'\n",
+            toml_literal(path.as_os_str().as_bytes())
+        )
+    };
+    let default_tmp_data = transfer.env.path("default-tmp-data");
+    transfer.configure_server(&tmp_data_dir(&default_tmp_data));
+    let work_tmp_data = transfer.env.path("work-tmp-data");
+    transfer.env.write(
+        transfer.server_profile("work"),
+        format!(
+            "block_size = {BLOCK}\n{}{}",
+            tmp_data_dir(&work_tmp_data),
+            transfer.env.root("server-tree", "")
+        )
+        .as_bytes(),
+    );
+    let work_index = transfer.env.path("server/home/.cache/hashsync/work.db");
+    let client_file = |name: &str| {
+        let path = transfer
+            .env
+            .path(format!("client/config/hashsync/{name}.toml"));
+        path.display().to_string()
+    };
+    let has_notes = |stderr: &str, notes: &[String]| {
+        for note in notes {
+            assert!(stderr.contains(note.as_str()), "{note}{stderr}");
+        }
+    };
+
+    // In a push, the server is the receiver. The client's own file of the
+    // profile must exist, as `--profile` names it, but the client of a push
+    // uses no index, and needs no file of `default`.
+    transfer.env.write("client/config/hashsync/work.toml", b"");
+    let push = |flags: &[&str]| {
+        let flags = [flags, &Direction::Push.counted()].concat();
+        let output = transfer.run_push(&flags, &refs(&args(&["cat"])), &blocks);
+        let output = succeeded(output);
+        assert_eq!(output.stdout, blocks);
+        assert_eq!(summary(&output), [blocks.len(), 0, blocks.len(), 0]);
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    };
+    let stderr = push(&["--profile", "work"]);
+    let server_index = transfer.server_index().display().to_string();
+    has_notes(
+        &stderr,
+        &[
+            format!("hashsync: using profile `work` [{}]\n", client_file("work")),
+            format!(
+                "hashsync (server): using profile `default` \
+                 [~/.config/hashsync/default.toml] and index {server_index}\n"
+            ),
+        ],
+    );
+    assert_eq!(mode(&default_tmp_data), 0o700);
+    for path in [&work_index, &work_tmp_data] {
+        assert!(!path.exists(), "the server used the client's profile");
+    }
+    let stderr = push(&["--profile", "work", "--server-profile", "work"]);
+    has_notes(
+        &stderr,
+        &[
+            "hashsync (server): using profile `work` [~/.config/hashsync/work.toml] \
+           and index ~/.cache/hashsync/work.db\n"
+                .to_string(),
+        ],
+    );
+    assert!(work_index.is_dir(), "no index of the named profile");
+    assert_eq!(mode(&work_tmp_data), 0o700);
+    let stderr = push(&[]);
+    has_notes(
+        &stderr,
+        &[format!(
+            "hashsync: using profile `default` [{} not found]\n",
+            client_file("default")
+        )],
+    );
+
+    // In a pull, the client is the receiver. The server, a sender only,
+    // uses no index, and keeps its spools in the `tmp_data_dir` of its file
+    // of `default`.
+    let client = format!("block_size = {BLOCK}\n{}", transfer.env.root("tree", ""));
+    transfer
+        .env
+        .write("client/config/hashsync/work.toml", client.as_bytes());
+    for dir in [&default_tmp_data, &work_tmp_data] {
+        std::fs::remove_dir(dir).unwrap();
+    }
+    let command = args(&["printf", "%s", "pulled"]);
+    let mut invocation = transfer.profile_invocation(&["--profile", "work"], &refs(&command));
+    let output = succeeded(invocation.output().unwrap());
+    assert_eq!(output.stdout, b"pulled");
+    let client_index = transfer.env.path("client/cache/hashsync/work.db");
+    has_notes(
+        &String::from_utf8_lossy(&output.stderr),
+        &[
+            format!(
+                "hashsync: using profile `work` [{}] and index {}\n",
+                client_file("work"),
+                client_index.display()
+            ),
+            "hashsync (server): using profile `default` [~/.config/hashsync/default.toml]\n"
+                .to_string(),
+        ],
+    );
+    assert_eq!(mode(&default_tmp_data), 0o700);
+    assert!(!work_tmp_data.exists(), "the server used the profile work");
 }
 
 #[test]
@@ -5291,14 +5475,15 @@ fn a_reader_that_waits_during_a_runs_update_gets_in_while_the_run_goes_on() {
     // a shared one, so a `stats` that waits for the lock during the update
     // gets in once the update ends, while the run goes on (DESIGN.md §4.4).
     // The receiver is the client in a pull, and the server in a push, whose
-    // stderr is the client's. That stderr is a full pipe, so the note at the
-    // end of the update, which the receiver writes while it still holds its
-    // exclusive lock, waits in its write. Meanwhile `stats` starts, and
-    // waits for the lock. Then this test empties the pipe, and `stats` must
-    // end before the command, which waits for this test. A run that kept
-    // its exclusive lock would make `stats` wait for the run, and hang the
-    // test. The index exists already, so the update writes no note before
-    // that one. The receiver's stream stays open meanwhile: the command
+    // stderr is the client's. This test holds the lock of the index until
+    // the receiver waits for it, after the notes that both hosts write when
+    // the run starts. Then it fills that stderr, a pipe, and releases the
+    // lock, so the note that the receiver has the lock waits in its write,
+    // while the receiver holds its exclusive lock. Meanwhile `stats` starts,
+    // and waits for the lock. Then this test empties the pipe, and `stats`
+    // must end before the command, which waits for this test. A run that
+    // kept its exclusive lock would make `stats` wait for the run, and hang
+    // the test. The receiver's stream stays open meanwhile: the command
     // writes nothing before it exits, and stdin stays open; else the lookups
     // would end, and close the index, whatever its lock.
     for direction in DIRECTIONS {
@@ -5307,34 +5492,39 @@ fn a_reader_that_waits_during_a_runs_update_gets_in_while_the_run_goes_on() {
         let indexed = transfer.indexed(direction, "blocks");
         transfer.env.write(indexed, &tiled(16, 42));
         transfer.update_receiver(direction, &[]);
+        let index = transfer.receiver_index(direction);
+        let held = exclusive_lock(&index);
         let go = transfer.env.path("go");
         mkfifoat(CWD, &go, Mode::RUSR | Mode::WUSR).unwrap();
-        let (mut stderr, filled) = std::io::pipe().unwrap();
-        rustix::fs::fcntl_setfl(&filled, OFlags::NONBLOCK).unwrap();
-        while rustix::io::write(&filled, &[b'.'; 4096]).is_ok() {}
-        rustix::fs::fcntl_setfl(&filled, OFlags::empty()).unwrap();
+        let (mut stderr, stderr_writer) = std::io::pipe().unwrap();
+        // Another open file description of the pipe, whose O_NONBLOCK leaves
+        // the writes of the run blocking.
+        let filler = rustix::fs::open(
+            format!("/proc/self/fd/{}", stderr_writer.as_raw_fd()),
+            OFlags::WRONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
         let script = format!("read go <'{}'", go.display());
         let (stdin, producer) = std::io::pipe().unwrap();
         let client = transfer
             .invocation_in(direction, &[EXACT], &refs(&args(&[&script])))
             .stdin(stdin)
             .stdout(Stdio::piped())
-            .stderr(filled)
+            .stderr(stderr_writer)
             .spawn()
             .unwrap();
         let mut client = KillOnDrop(client);
-        let (receiver, config, index) = match direction {
-            Direction::Pull => (
-                client.0.id(),
-                transfer.env.config_path(),
-                transfer.env.index_path(),
-            ),
-            Direction::Push => (
-                server_of(client.0.id()),
-                transfer.server_config(),
-                transfer.server_index(),
-            ),
+        let (receiver, config) = match direction {
+            Direction::Pull => (client.0.id(), transfer.env.config_path()),
+            Direction::Push => (server_of(client.0.id()), transfer.server_config()),
         };
+        wait_for_lock_wait(receiver);
+        // The pipe stays full, and the drain below then reads to the end of
+        // the run's stderr.
+        while rustix::io::write(&filler, &[b'.'; 4096]).is_ok() {}
+        drop(filler);
+        drop(held);
         wait_for_stderr_write(receiver);
         let lock = ofd_lock(receiver, &index.join("hashsync.lock"));
         assert_eq!(lock, Some("WRITE"), "{direction:?}: no exclusive lock");
@@ -6078,14 +6268,13 @@ fn each_stream_uses_the_block_size_and_strong_hash_of_its_receiver() {
     assert!(lists[1][0].starts_with("sha256-"), "{lists:?}");
 }
 
-/// A `--hashsync-path` wrapper that runs this build with the configuration
-/// file `config`. For `serve`, it first creates `mark`, and waits until
-/// `go` exists, with no deadline. It also stops waiting once `mark` is gone
-/// with the test's directory, so that it ends when the test fails first.
+/// A `--hashsync-path` wrapper that runs this build. For `serve`, it first
+/// creates `mark`, and waits until `go` exists, with no deadline. It also
+/// stops waiting once `mark` is gone with the test's directory, so that it
+/// ends when the test fails first.
 fn held_server(
     transfer: &Transfer,
     name: &str,
-    config: &std::path::Path,
     mark: &std::path::Path,
     go: &std::path::Path,
 ) -> PathBuf {
@@ -6096,12 +6285,11 @@ if [ "$1" = serve ]; then
     : >'{mark}'
     until [ -e '{go}' ] || [ ! -e '{mark}' ]; do sleep 0.01; done
 fi
-exec '{hashsync}' --config '{config}' "$@"
+exec '{hashsync}' "$@"
 "#,
         mark = mark.display(),
         go = go.display(),
         hashsync = env!("CARGO_BIN_EXE_hashsync"),
-        config = config.display()
     );
     write_script(&wrapper, script);
     wrapper
@@ -6198,14 +6386,9 @@ fn two_runs_in_opposite_directions_with_both_streams_deduplicated_both_end() {
     let stderrs = [0, 1].map(|i| transfer.env.path(format!("stderr-{i}")));
     let mut clients = Vec::new();
     for (i, input) in inputs.iter().enumerate() {
-        // The client of run `i` is on host `i`, and its server on the other.
-        let server = held_server(
-            &transfer,
-            &format!("server-{i}"),
-            &configs[1 - i],
-            &marks[i],
-            &go,
-        );
+        // The client of run `i` is on host `i`, and its server on the other,
+        // whose configuration file it names.
+        let server = held_server(&transfer, &format!("server-{i}"), &marks[i], &go);
         transfer.set_hashsync_path(server.as_os_str());
         let path = transfer.env.path(format!("input-{i}"));
         std::fs::write(&path, input).unwrap();
@@ -6213,7 +6396,8 @@ fn two_runs_in_opposite_directions_with_both_streams_deduplicated_both_end() {
         client
             .arg("--config")
             .arg(&configs[i])
-            .args(["ssh", "--dedup-stdin", "--dedup-stdout"]);
+            .args(["ssh", "--dedup-stdin", "--dedup-stdout", "--server-config"])
+            .arg(&configs[1 - i]);
         transfer.add_options(&mut client, &[EXACT, "--wait"]);
         let client = client
             .arg(HOST)

@@ -77,9 +77,17 @@ impl Env {
         std::fs::create_dir_all(self.path(rel)).unwrap();
     }
 
+    /// `hashsync --config CONFIG ARGS...` with the configuration file of this
+    /// environment. Its home directory holds none of the files of the
+    /// environment, so the notes show their paths in full, whatever the
+    /// home directory of the test (DESIGN.md §7).
     pub fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_hashsync"));
-        command.arg("--config").arg(self.config_path()).args(args);
+        command
+            .env("HOME", self.path("home"))
+            .arg("--config")
+            .arg(self.config_path())
+            .args(args);
         command
     }
 
@@ -105,9 +113,10 @@ impl Env {
     }
 
     /// `command` with the configuration and cache directories of this
-    /// environment.
+    /// environment, and the home directory of `command`.
     fn in_home<'a>(&self, command: &'a mut Command) -> &'a mut Command {
         command
+            .env("HOME", self.path("home"))
             .env("XDG_CONFIG_HOME", self.path("config"))
             .env("XDG_CACHE_HOME", self.path("cache"))
     }

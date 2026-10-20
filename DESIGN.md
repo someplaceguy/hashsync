@@ -102,10 +102,11 @@ system calls, with no asynchronous runtime or event loop.
    command and the settings of the run, without waiting for the server's.
    When the client receives a deduplicated stream, its HELLO follows at
    once: the block size and the hashes of that stream, from its
-   configuration. The server reads its own configuration file: it needs
-   one when it receives a deduplicated stream, and otherwise uses one only
-   if it has one (section 7). It opens its tmp_data directory, and sends
-   its own HELLO at once when it receives a deduplicated stream.
+   configuration. The server reads the configuration file that REQUEST
+   names, by default its own file of the profile `default`: it needs one
+   when it receives a deduplicated stream (section 7). It opens its
+   tmp_data directory, and sends its own HELLO at once when it receives a
+   deduplicated stream.
 2. The server starts the command, in a pull once it has read the client's
    HELLO, and both streams start (section 6.6). The source of each stream,
    the command's stdout or the client's stdin, goes through a spool: it
@@ -1027,8 +1028,9 @@ and stdout, and execute the specified remote command.
 SSH executes its remote command through the remote login shell, which must
 support POSIX shell quoting for this bootstrap. Treat `--hashsync-path` as
 one executable name or path, not a shell fragment: a wrapper script there
-does what a fragment would, such as selecting the server's configuration
-file with `--profile` or `--config`, or setting its environment. Construct
+does what a fragment would, such as setting the server's environment. The
+client names the server's configuration file in REQUEST (section 7), so
+`serve` takes no `--profile` or `--config` of its own. Construct
 a remote `exec` command by single-quoting each argument, replacing
 embedded single quotes with `'\''`, and preserving all other bytes,
 including non-UTF-8 bytes. Passing separate local argv elements to SSH
@@ -1043,11 +1045,12 @@ the signal mask that the client started with (section 6.9):
 
 `serve` first listens on `$XDG_RUNTIME_DIR/hashsync/T.sock` (fallback: a
 private directory under `/tmp`), mode 0600. It exchanges protocol
-versions, reads REQUEST and then its configuration file (section 7),
-sends its HELLO when it receives a deduplicated stream, reads the client's
-HELLO when it sends one, and starts the command. Then it starts its
-update when it receives a deduplicated stream (section 3), and accepts
-`attach`, whose session carries the list exchanges.
+versions, reads REQUEST and then the configuration file that REQUEST
+names (section 7), sends its HELLO when it receives a deduplicated
+stream, reads the client's HELLO when it sends one, and starts the
+command. Then it starts its update when it receives a deduplicated stream
+(section 3), and accepts `attach`, whose session carries the list
+exchanges.
 
 `attach` retries a not-yet-listening socket while its stdin remains open,
 with no deadline. It relays stdin to the socket and the socket to stdout,
@@ -1185,9 +1188,14 @@ Payloads:
   0 for the default), `negative_cache u64` (bytes), `spool_limit u64`
   (bytes; `2^64 − 1` for `unlimited`), `stdin_delivery u8` and
   `stdout_delivery u8` (0 for eager, 1 for batch), and `wait u8`, 1 with
-  `--wait`. Each host applies the settings that concern its roles. Last,
+  `--wait`. Each host applies the settings that concern its roles. Then
   `quiet u8` and `human_readable u8`: the client's `-q`, and the opposite
   of its `--no-human-readable`, which the server applies to its own notes.
+  Last, the server's configuration file (section 7): `config_kind u8`, 0
+  for its profile `default`, 1 for the profile of `--server-profile`, and
+  2 for the file of `--server-config`, and for 1 and 2, `config`, a byte
+  string, the profile name or the path. A profile name is one that the
+  client's options accept.
 - HELLO, from the receiver of a deduplicated stream, on the data session:
   `block_size u32`, `weak_hash_id string`, and `strong_hash_id string`,
   from its configuration, so it needs no index: the client sends it right
@@ -2404,7 +2412,7 @@ file of the **profile** NAME, `$XDG_CONFIG_HOME/hashsync/NAME.toml`
 (fallback `~/.config/hashsync/NAME.toml`), and `--config PATH` a file
 anywhere. Without either, a command uses the profile `default`, and both
 together are a usage error. A profile name is a nonempty file name, so it
-contains no `/`.
+contains no `/`; any other name is a usage error.
 
 Unless the file sets `index_path`, its index is named after it:
 `$XDG_CACHE_HOME/hashsync/STEM.db` (fallback `~/.cache/hashsync/STEM.db`),
@@ -2417,15 +2425,30 @@ configuration files of an account share its account ID, its list cache,
 and by default its tmp_data directory.
 
 A configuration file describes only its own host, whatever roles the host
-plays in a run. Each host reads its own file, which its own options
-select: the client when it starts, and `serve` once REQUEST has told it
-its roles. The receiver needs a file, for its roots and its index. A
-sender uses only `tmp_data_dir`, where its spools go, and
-`hashlist_max_age`, how long its list cache keeps lists; without a file of
-the profile `default`, it uses their defaults. So the server of a pull and
-the client of a push need no file, and with both streams deduplicated,
-both hosts need one. A file that `--profile` or `--config` names must
-exist.
+plays in a run. Each host reads its own file: the client the one that its
+options select, when it starts, and `serve` the one that the client names
+in REQUEST, once REQUEST has told it its roles. In a run, `--profile`
+and `--config` select only the client's file. The server uses its
+profile `default`, unless `--server-profile NAME` or
+`--server-config PATH`, options of `hashsync ssh`, select another
+profile or a file anywhere on the server; a relative PATH starts at the
+directory where SSH starts `serve`, the remote user's home directory.
+
+Every command says in a note which file it uses once it has read it, on
+both hosts of a run, and which index when it uses one, with `~` for the
+home directory: ``using profile `work` [~/.config/hashsync/work.toml]
+and index ~/.cache/hashsync/work.db``, or `using config PATH` for a file
+that an option names. A host without a file of `default` says
+`[~/.config/hashsync/default.toml not found]`.
+
+The receiver needs a file, for its roots and its index. A sender uses only
+`tmp_data_dir`, where its spools go, and `hashlist_max_age`, how long its
+list cache keeps lists. A file that an option names must exist, so that a
+mistyped name fails instead of quietly giving the defaults. But a sender
+uses the defaults of these two keys when it has no file of the profile
+`default`, which it uses without such an option. So the server of a pull
+and the client of a push need no file, and with both streams
+deduplicated, both hosts need one.
 
 Everything about a run is an option of `hashsync ssh` (section 8), which
 the client sends to the server in REQUEST, so it is never ambiguous which
@@ -2563,6 +2586,9 @@ exclude = ['*.tmp', 'literal\x2Aname', 'back\\slash']
     (section 4.2).
   - `--ssh CMD` (default `ssh`) and `--hashsync-path PATH` (default
     `hashsync`) say how the client starts the server (section 6.1).
+  - `--server-profile NAME` and `--server-config PATH` select the server's
+    configuration file in place of its profile `default` (section 7);
+    together they are a usage error.
   - The other options set the transfer: `--lookahead SIZE` (section 6.3),
     `--negative-cache SIZE` (128 MiB), `--probe-threads N` (0 for half the
     cores of the sender), `--compression-level N` (9; from 1 to 19, and 0
@@ -2636,7 +2662,8 @@ exclude = ['*.tmp', 'literal\x2Aname', 'back\\slash']
   not found, so these counts are final once the stream has ended or
   stopped.
 - `hashsync serve --token T` and `hashsync attach --token T`: internal
-  server entry points.
+  server entry points. `serve` reads the configuration file that REQUEST
+  names, so `--profile` and `--config` are a usage error there.
 - `hashsync stats`: report index statistics.
 - `hashsync prune`: remove the paths and roots that no configured copy
   holds any more (section 4.2).
@@ -3103,6 +3130,24 @@ decision history, including fuller measurements, is in version control.
   everything again. Each file names its index after itself instead. Only
   files of the same name in different directories still share one, hence
   the warning of section 7.
+- **The server's own options select its configuration file:** a run with
+  a profile other than `default` needed a `--hashsync-path` wrapper that
+  passed `--profile` to `serve`, one for each profile. The remote command
+  cannot carry the option, since it never changes (section 6.2). So the
+  client names the file in REQUEST, and `serve` takes no option for it:
+  with both, a rule would have to say which one wins.
+- **A key in the client's configuration file that names the server's
+  file:** it would be a run setting in a configuration file (above), and
+  it would name the same file on every server that the client reaches.
+- **The client's profile as the server's default:** one profile name
+  would stand for the same data on both hosts, but the client's own option
+  would then choose the server's file. The server of a pull only sends,
+  and reads only `tmp_data_dir` and `hashlist_max_age`, which describe its
+  host, not the client's data. Without a file of the client's profile, it
+  would take their built-in defaults and skip its file of `default`, so
+  its spools would leave the tmp_data directory that this file sets. Each
+  host names its profiles on its own, so the server uses `default` unless
+  an option of `hashsync ssh` names another file.
 
 ## 11. Repository conventions
 
@@ -3215,10 +3260,16 @@ decision history, including fuller measurements, is in version control.
     directory conflict; conflicting copy policies; a pruned immutable root
     that returns;
   - configuration byte escapes, TOML quoting, literal glob metacharacters,
-    and non-UTF-8 values; the server's own configuration file, and none;
-    the files of profiles and of `--config`, their indexes named after
-    them, the warning for a file of `--config` without `index_path`, a
-    named file that does not exist, and both options together;
+    and non-UTF-8 values; the server's configuration file: its file of
+    the profile `default`, also when the client has `--profile` or
+    `--config`, and without that file in a pull and in a push, the files
+    of `--server-profile` and `--server-config`, also when they do not
+    exist, and `--profile` or `--config` given to `serve`; the files of
+    profiles and of `--config`, their indexes named after them, the note
+    that names the file and the index of `update`, `stats`, and both hosts
+    of a run, also without a file of `default`, the warning for a file of
+    `--config` without `index_path`, a named file that does not exist, an
+    invalid profile name, and both options together;
   - the command line of `hashsync ssh`: options after HOST, a command
     without `--`, `-l`, a command line for the user's shell and the words
     of `-s`, and `rsync -e 'hashsync ssh'` with a path with spaces, also

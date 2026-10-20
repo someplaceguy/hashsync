@@ -3,7 +3,8 @@
 //!
 //! `serve` first listens on the rendezvous socket, exchanges protocol
 //! versions, reads REQUEST, with the command and the settings of the run,
-//! and reads its own configuration. It receives the client's stdin, the
+//! and reads the configuration file that REQUEST names, by default its own
+//! file of the profile `default`. It receives the client's stdin, the
 //! forward stream, and sends the command's stdout, the backward stream.
 //! In a pull, the backward stream is deduplicated against the client's
 //! index, so this side is the sender of that stream; in a push, the forward
@@ -90,11 +91,8 @@ use crate::units;
 /// The other host, as the messages about it name it.
 const PEER: &str = "client";
 
-/// Serve one run. `source` is the configuration file that this process's
-/// own options select, which a `--hashsync-path` wrapper can pass; without
-/// them, the file of the default profile, which the server needs only when
-/// it receives a deduplicated forward stream (DESIGN.md §7).
-pub fn run(source: config::Source, token: &str) -> ! {
+/// Serve one run.
+pub fn run(token: &str) -> ! {
     // SSH carries this process's stderr to the client's: mark its lines as
     // the server's before anything can report one (DESIGN.md §8).
     report::mark_as_server();
@@ -120,11 +118,12 @@ pub fn run(source: config::Source, token: &str) -> ! {
 
     // REQUEST, with the command and the settings of the run, which this
     // side applies to its roles (DESIGN.md §6.2). Its notes follow the
-    // client's `-q` and `--no-human-readable`. Then this host's own
-    // configuration. The receiver of a deduplicated forward stream needs
-    // the file, for its roots and its index; otherwise this side uses only
-    // its `tmp_data_dir` and `hashlist_max_age`, so it needs none
-    // (DESIGN.md §7).
+    // client's `-q` and `--no-human-readable`. Then this host's
+    // configuration file, which REQUEST names: by default its own file of
+    // the profile `default`. The receiver of a deduplicated forward stream
+    // needs the file, for its roots and its index; otherwise this side uses
+    // only its `tmp_data_dir` and `hashlist_max_age`, so it can do without
+    // the file of `default` (DESIGN.md §7).
     let payload = data_in
         .expect(frame::REQUEST, "REQUEST")
         .unwrap_or_else(|e| die_data(PEER, &e));
@@ -138,7 +137,7 @@ pub fn run(source: config::Source, token: &str) -> ! {
     if !request.human_readable {
         units::disable_human_readable();
     }
-    let config = Arc::new(config::load_for_run(source, deduplicated.stdin()));
+    let config = Arc::new(config::load(&request.config, deduplicated.stdin()));
     let compressed = settings.compression_level != 0;
 
     // This side's tmp_data directory, for the pins and the spools of both

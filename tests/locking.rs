@@ -81,6 +81,16 @@ fn indexed_env() -> Env {
     env
 }
 
+/// The note of a command that names the configuration file of `env` and
+/// its index, the first that it writes (DESIGN.md §7).
+fn files_note(env: &Env) -> String {
+    format!(
+        "hashsync: using config {} and index {}\n",
+        env.config_path().display(),
+        env.index_path().display()
+    )
+}
+
 /// The note of a process that waits for the lock of the index of `env`.
 fn waiting_note(env: &Env) -> String {
     format!(
@@ -114,8 +124,9 @@ fn update_waits_for_a_read_only_process() {
     // The update says that it waits, and for which index, so that a long
     // wait does not look like a hang. Once it has the lock, it says so
     // before it updates, so that the update does not look like more
-    // waiting. The first note is written before the wait starts, so while
-    // the child waits, stderr holds that note alone.
+    // waiting. The note that names the files and the note of the wait are
+    // written before the wait starts, so while the child waits, stderr
+    // holds these two notes alone.
     let env = indexed_env();
     let reader = lock(&env, FlockOperation::LockShared);
 
@@ -126,7 +137,8 @@ fn update_waits_for_a_read_only_process() {
         .unwrap();
     wait_for_waiter(&mut child, &reader);
     let mut stderr = child.stderr.take().unwrap();
-    assert_eq!(written_so_far(&mut stderr), waiting_note(&env));
+    let notes = files_note(&env) + &waiting_note(&env);
+    assert_eq!(written_so_far(&mut stderr), notes);
 
     drop(reader);
     let mut rest = String::new();
@@ -154,7 +166,8 @@ fn stats_waits_for_a_modifying_process() {
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success());
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert_eq!(stderr, waiting_note(&env) + &acquired_note(&env));
+    let notes = files_note(&env) + &waiting_note(&env) + &acquired_note(&env);
+    assert_eq!(stderr, notes);
 }
 
 #[test]
@@ -179,13 +192,14 @@ fn a_quiet_process_waits_for_the_lock_without_a_note() {
 
 #[test]
 fn a_lock_taken_without_a_wait_takes_no_note() {
-    // Only a wait takes the notes (DESIGN.md §4.4): `stats` shares the lock
-    // with a reader, and `update` finds no holder.
+    // Only a wait takes the notes of the lock (DESIGN.md §4.4): `stats`
+    // shares the lock with a reader, and writes only the note that names
+    // its files, and `update` finds no holder.
     let env = indexed_env();
     let reader = lock(&env, FlockOperation::LockShared);
     let output = env.run(&["stats"]);
     assert!(output.status.success());
-    assert_eq!(String::from_utf8(output.stderr).unwrap(), "");
+    assert_eq!(String::from_utf8(output.stderr).unwrap(), files_note(&env));
     drop(reader);
     let stderr = env.update();
     assert!(!stderr.contains("the lock of index"), "{stderr}");
