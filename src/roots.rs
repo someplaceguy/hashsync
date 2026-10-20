@@ -21,12 +21,12 @@ use std::collections::HashMap;
 use std::os::fd::{AsFd, OwnedFd};
 use std::sync::Arc;
 
-use bstr::ByteSlice;
 use rustix::fs::FileType;
 use rustix::io::Errno;
 
 use crate::config::{Config, RootConfig};
 use crate::die::die;
+use crate::escapes::{quoted, quoted_pattern};
 use crate::fsid::{FsCache, Identity, identify};
 use crate::fsops::{self, Meta};
 use crate::glob::{self, Component};
@@ -90,7 +90,7 @@ pub fn expand(config: &Config, fs_cache: &FsCache) -> Vec<Location> {
         if locations.len() == before {
             warn(format!(
                 "root pattern {} matched nothing",
-                root.pattern.as_bstr()
+                quoted_pattern(&root.pattern)
             ));
         }
     }
@@ -184,7 +184,7 @@ struct Walker<'a> {
 impl Walker<'_> {
     /// Report an entry that cannot be examined, and continue.
     fn error(&mut self, path: &[u8], what: &str, e: Errno) {
-        warn(format!("{}: {what}: {e}", path.as_bstr()));
+        warn(format!("{}: {what}: {e}", quoted(path)));
     }
 
     /// Match the pattern positions against the entries of `node`.
@@ -313,9 +313,9 @@ impl Walker<'_> {
         if let Some(earlier) = self.visited.insert(identity, node.path.clone()) {
             die(format!(
                 "root pattern {}: {} and {} are the same directory (cycle or mount alias)",
-                self.root.pattern.as_bstr(),
-                earlier.as_bstr(),
-                node.path.as_bstr()
+                quoted_pattern(&self.root.pattern),
+                quoted(&earlier),
+                quoted(&node.path)
             ));
         }
         true
@@ -343,9 +343,9 @@ fn check_nesting(locations: &[Location], config: &Config) {
         if let Some(earlier) = by_path.insert(&location.path, location) {
             die(format!(
                 "{} is matched by both root patterns {} and {}",
-                location.path.as_bstr(),
-                config.roots[earlier.root].pattern.as_bstr(),
-                config.roots[location.root].pattern.as_bstr()
+                quoted(&location.path),
+                quoted_pattern(&config.roots[earlier.root].pattern),
+                quoted_pattern(&config.roots[location.root].pattern)
             ));
         }
     }
@@ -362,8 +362,8 @@ fn check_nesting(locations: &[Location], config: &Config) {
             if let Some(outer) = by_path.get(ancestor) {
                 die(format!(
                     "root {} is inside root {}",
-                    path.as_bstr(),
-                    outer.path.as_bstr()
+                    quoted(path),
+                    quoted(&outer.path)
                 ));
             }
         }

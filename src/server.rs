@@ -63,7 +63,6 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
-use bstr::ByteSlice;
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use rustix::event::{PollFd, PollFlags};
 use rustix::process::Pid;
@@ -72,6 +71,7 @@ use crate::config;
 use crate::control::{self, Dispatch, EndFlag};
 use crate::dedup::{Receiving, Sending};
 use crate::die::{self, die};
+use crate::escapes::quoted;
 use crate::fsops::{self, poll_fds, retry_interrupted};
 use crate::list_exchange;
 use crate::pins::Pins;
@@ -315,7 +315,7 @@ pub fn run(token: &str) -> ! {
         Err(e) => {
             forward_stop.raise();
             drop((forward_spool, backward_writer));
-            let program = command.get_program().as_bytes().as_bstr();
+            let program = quoted(command.get_program().as_bytes());
             Err(format!("{program}: {e}"))
         }
     };

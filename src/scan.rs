@@ -17,7 +17,6 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 
-use bstr::ByteSlice;
 use rayon::Scope;
 use rustix::fs::FileType;
 use rustix::io::Errno;
@@ -25,6 +24,7 @@ use rustix::io::Errno;
 use crate::blocks::BlockHasher;
 use crate::config::{Config, RootConfig};
 use crate::die::die;
+use crate::escapes::quoted;
 use crate::fsid::{FsCache, Identity, identify};
 use crate::fsops::{self, Meta};
 use crate::index::Index;
@@ -179,7 +179,7 @@ impl Scanner<'_> {
             Err(Skip::OtherKind) => "root is not a directory or a regular file".to_string(),
             Err(Skip::Failed(message)) => message,
         };
-        warn(format!("{}: {message}", self.abs_path(root, b"").as_bstr()));
+        warn(format!("{}: {message}", quoted(&self.abs_path(root, b""))));
     }
 
     fn entry_task<'s>(&'s self, scope: &Scope<'s>, ctx: Arc<DirCtx>, name: Vec<u8>) {
@@ -199,7 +199,7 @@ impl Scanner<'_> {
         if let Err(Skip::Failed(message)) = result {
             warn(format!(
                 "{}: {message}",
-                self.abs_path(ctx.root, &rel).as_bstr()
+                quoted(&self.abs_path(ctx.root, &rel))
             ));
         }
     }
@@ -281,8 +281,8 @@ impl Scanner<'_> {
         if let Some(earlier) = self.visited_dirs.lock().unwrap().insert(identity, path) {
             die(format!(
                 "{} and {} are the same directory (cycle or mount alias)",
-                earlier.as_bstr(),
-                self.abs_path(root, rel).as_bstr()
+                quoted(&earlier),
+                quoted(&self.abs_path(root, rel))
             ));
         }
     }

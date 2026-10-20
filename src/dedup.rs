@@ -36,11 +36,11 @@
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use bstr::ByteSlice;
 use crossbeam_channel::{Receiver, Select, Sender, TryRecvError, TrySendError, bounded, unbounded};
 
 use crate::config::{Config, thread_count};
 use crate::die::die;
+use crate::escapes::quoted;
 use crate::fsid::FsCache;
 use crate::fsops;
 use crate::hash::StrongHash;
@@ -913,7 +913,7 @@ fn prepare(config: &Config, preparation: Preparation, link: &Link) -> (Index, Ve
 /// holds this lock, so the index must exist and still match the
 /// configuration, else the run ends with `die`.
 fn open_read_only(config: &Config) -> Index {
-    let path = config.index_path.as_bstr();
+    let path = quoted(&config.index_path);
     let update = config.update_command();
     let Some(index) = index::open_read_only(&config.index_path) else {
         die(format!("no index at {path}; run `{update}`"));

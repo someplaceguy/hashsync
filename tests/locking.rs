@@ -86,8 +86,8 @@ fn indexed_env() -> Env {
 fn files_note(env: &Env) -> String {
     format!(
         "hashsync: using config {} and index {}\n",
-        env.config_path().display(),
-        env.index_path().display()
+        quoted(env.config_path()),
+        quoted(env.index_path())
     )
 }
 
@@ -95,7 +95,7 @@ fn files_note(env: &Env) -> String {
 fn waiting_note(env: &Env) -> String {
     format!(
         "hashsync: waiting for the lock of index {}\n",
-        env.index_path().display()
+        quoted(env.index_path())
     )
 }
 
@@ -104,7 +104,7 @@ fn waiting_note(env: &Env) -> String {
 fn acquired_note(env: &Env) -> String {
     format!(
         "hashsync: acquired the lock of index {}\n",
-        env.index_path().display()
+        quoted(env.index_path())
     )
 }
 

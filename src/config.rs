@@ -11,18 +11,16 @@
 //! later milestones are unknown fields and are rejected.
 
 use std::ffi::OsStr;
-use std::fmt::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
-use bstr::ByteSlice;
 use serde::Deserialize;
 
 use crate::die::die;
+use crate::escapes::{self, Syntax, quoted};
 use crate::fsops;
 use crate::glob;
 use crate::hash::StrongHash;
-use crate::names;
 use crate::report::{note, warn};
 
 pub const MIN_BLOCK_SIZE: u64 = 512;
@@ -98,7 +96,7 @@ impl Exclusions {
 #[serde(deny_unknown_fields)]
 struct RawConfig {
     block_size: Option<Size>,
-    strong_hash: Option<StrongHash>,
+    strong_hash: Option<String>,
     index_path: Option<String>,
     threads: Option<u32>,
     hashlist_max_age: Option<String>,
@@ -182,17 +180,18 @@ impl Source {
             Source::Profile(name) => ("--profile", name),
             Source::File(path) => ("--config", path),
         };
-        Some(format!("{option}={}", shell_word(value)))
+        Some(format!("{option}={}", escapes::shell_word(value)))
     }
 }
 
 /// Check that `name` is a profile name: one nonempty file name, which
-/// becomes part of the path of the profile's file (DESIGN.md §7).
+/// becomes part of the path of the profile's file (DESIGN.md §7). No
+/// command-line argument holds a NUL byte, but REQUEST could.
 pub fn check_profile_name(name: &[u8]) -> Result<(), String> {
     if name.is_empty() || name.contains(&b'/') {
         return Err("a profile name must not be empty or contain '/'".into());
     }
-    Ok(())
+    check_no_nul(name)
 }
 
 /// Load the configuration file that `source` selects, or die with a
@@ -205,7 +204,7 @@ pub fn check_profile_name(name: &[u8]) -> Result<(), String> {
 /// the index if the host uses it (`note_files`).
 pub fn load(source: &Source, uses_index: bool) -> Config {
     let path = source.path();
-    let shown = path.as_bstr();
+    let shown = quoted(&path);
     let (text, found) = match fsops::retry_interrupted(|| std::fs::read(OsStr::from_bytes(&path))) {
         Ok(bytes) => (bytes, true),
         Err(e)
@@ -235,7 +234,7 @@ pub fn load(source: &Source, uses_index: bool) -> Config {
         warn(format!(
             "{shown} sets no index_path, so its index is {}, as for any other \
              configuration file of the same name; set index_path to avoid sharing it by accident",
-            config.index_path.as_bstr()
+            quoted(&config.index_path)
         ));
     }
     config
@@ -250,12 +249,12 @@ pub fn load(source: &Source, uses_index: bool) -> Config {
 /// the line short.
 fn note_files(source: &Source, path: &[u8], found: bool, index: Option<&[u8]>) {
     let home = std::env::var_os("HOME").unwrap_or_default();
-    let shown = |path: &[u8]| with_tilde(path, home.as_bytes());
+    let shown = |path| escapes::quoted_from_home(path, home.as_bytes());
     let path = shown(path);
     let file = match source.profile() {
         None => format!("config {path}"),
-        Some(name) if found => format!("profile `{}` [{path}]", name.as_bstr()),
-        Some(name) => format!("profile `{}` [{path} not found]", name.as_bstr()),
+        Some(name) if found => format!("profile {} [{path}]", quoted(name)),
+        Some(name) => format!("profile {} [{path} not found]", quoted(name)),
     };
     match index {
         Some(index) => note(format_args!("using {file} and index {}", shown(index))),
@@ -274,50 +273,10 @@ impl Config {
     }
 }
 
-/// `bytes` as one POSIX shell word that gives back exactly these bytes, for
-/// the commands that messages tell the user to run. Bytes that need no
-/// quoting stay as they are, and printable text goes in single quotes.
-/// Anything else goes in `$'...'` quotes, with octal escapes for control
-/// characters and for bytes that are not UTF-8: a message is text, which
-/// cannot hold such bytes, and it stays one line that a copy loses nothing
-/// of.
-fn shell_word(bytes: &[u8]) -> String {
-    let plain = |b: &u8| b.is_ascii_alphanumeric() || b"_@%+=:,./-".contains(b);
-    if !bytes.is_empty() && bytes.iter().all(plain) {
-        return bytes.iter().copied().map(char::from).collect();
-    }
-    if let Ok(text) = std::str::from_utf8(bytes)
-        && !text.contains(char::is_control)
-    {
-        return format!("'{}'", text.replace('\'', r"'\''"));
-    }
-    let mut word = String::from("$'");
-    let escape = |word: &mut String, bytes: &[u8]| {
-        for byte in bytes {
-            write!(word, "\\{byte:03o}").unwrap();
-        }
-    };
-    for chunk in bytes.utf8_chunks() {
-        for c in chunk.valid().chars() {
-            match c {
-                '\\' | '\'' => {
-                    word.push('\\');
-                    word.push(c);
-                }
-                c if c.is_control() => escape(&mut word, c.encode_utf8(&mut [0; 4]).as_bytes()),
-                c => word.push(c),
-            }
-        }
-        escape(&mut word, chunk.invalid());
-    }
-    word.push('\'');
-    word
-}
-
 /// Parse and validate the text of the configuration file that `source`
 /// selects.
 pub fn parse(text: &str, source: &Source) -> Result<Config, String> {
-    let raw: RawConfig = toml::from_str(text).map_err(|e| e.to_string())?;
+    let raw: RawConfig = toml::from_str(text).map_err(|e| toml_error(text, &e))?;
     let block_size = match raw.block_size {
         None => DEFAULT_BLOCK_SIZE,
         Some(size) => {
@@ -330,6 +289,17 @@ pub fn parse(text: &str, source: &Source) -> Result<Config, String> {
             u32::try_from(bytes)
                 .map_err(|_| format!("block_size must be at most {} bytes", u32::MAX))?
         }
+    };
+    // The name is parsed here and not by serde, so that the error shows it
+    // as messages show every value of the file (DESIGN.md §8).
+    let strong_hash = match raw.strong_hash {
+        None => StrongHash::DEFAULT,
+        Some(name) => StrongHash::from_id(&name).ok_or_else(|| {
+            format!(
+                "strong_hash: unknown hash {}, expected `blake3` or `sha256`",
+                quoted(name.as_bytes())
+            )
+        })?,
     };
     let index_named_after_file = raw.index_path.is_none();
     let index_path = match raw.index_path {
@@ -356,7 +326,7 @@ pub fn parse(text: &str, source: &Source) -> Result<Config, String> {
         selected_by: source.option(),
         index_named_after_file,
         block_size,
-        strong_hash: raw.strong_hash.unwrap_or(StrongHash::DEFAULT),
+        strong_hash,
         index_path,
         threads: raw.threads.unwrap_or(0),
         hashlist_max_age,
@@ -386,11 +356,42 @@ impl Size {
     }
 }
 
-/// A configured path: byte escapes, no NUL, and a leading `~` for HOME.
+/// A TOML error in `text` as one line: its line and column, then what it
+/// is. Every report is one line (`report`), and the error's own text
+/// quotes the line of the file on lines of their own.
+fn toml_error(text: &str, e: &toml::de::Error) -> String {
+    let Some(span) = e.span() else {
+        return e.message().to_string();
+    };
+    let before = &text.as_bytes()[..span.start.min(text.len())];
+    let line = before.iter().filter(|&&b| b == b'\n').count() + 1;
+    let start = before
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(0, |i| i + 1);
+    // The column counts characters: a byte that continues a UTF-8
+    // character starts none.
+    let column = before[start..]
+        .iter()
+        .filter(|&&b| b & 0xC0 != 0x80)
+        .count()
+        + 1;
+    format!("line {line}, column {column}: {}", e.message())
+}
+
+/// A configured path: byte escapes and no NUL. A path that is `~` or that
+/// starts with `~/` starts at the home directory. Only a `~` as it is does:
+/// `\x7E` is a literal `~`, as every escape gives a literal byte, so that a
+/// relative path whose first directory is named `~` can be written as
+/// messages show it (DESIGN.md §7 and §8).
 fn parse_path(text: &str) -> Result<Vec<u8>, String> {
-    let decoded = decode_escapes(text, Escapes::Plain)?;
-    check_no_nul(&decoded)?;
-    Ok(expand_tilde(decoded))
+    let (mut path, rest) = match escapes::starts_at_home(text.as_bytes()) {
+        true => (home_dir(), &text[1..]),
+        false => (Vec::new(), text),
+    };
+    path.extend(escapes::decode(rest, Syntax::Plain)?);
+    check_no_nul(&path)?;
+    Ok(path)
 }
 
 /// Parse a duration such as `90d`, `12h`, `30m`, or `3600` (seconds).
@@ -401,28 +402,28 @@ pub fn parse_duration(text: &str) -> Result<u64, String> {
         .position(|b| !b.is_ascii_digit())
         .unwrap_or(text.len());
     if digits_end == 0 {
-        return Err(format!("expected a number: {text:?}"));
+        return Err(format!("expected a number: {}", quoted(text.as_bytes())));
     }
     let number: u64 = text[..digits_end]
         .parse()
-        .map_err(|_| format!("number too large: {text:?}"))?;
+        .map_err(|_| format!("number too large: {}", quoted(text.as_bytes())))?;
     let multiplier: u64 = match text[digits_end..].trim() {
         "" | "s" => 1,
         "m" => 60,
         "h" => 3600,
         "d" => 24 * 3600,
-        unit => return Err(format!("unknown unit {unit:?}")),
+        unit => return Err(format!("unknown unit {}", quoted(unit.as_bytes()))),
     };
     number
         .checked_mul(multiplier)
-        .ok_or_else(|| format!("duration too large: {text:?}"))
+        .ok_or_else(|| format!("duration too large: {}", quoted(text.as_bytes())))
 }
 
 fn parse_root(raw: RawRoot) -> Result<RootConfig, String> {
     if raw.immutable || raw.identifier.is_some() {
         return Err("immutable roots are not supported by this version".into());
     }
-    let pattern = decode_escapes(&raw.path, Escapes::Glob).map_err(|e| format!("path: {e}"))?;
+    let pattern = escapes::decode(&raw.path, Syntax::Glob).map_err(|e| format!("path: {e}"))?;
     check_no_nul(&pattern).map_err(|e| format!("path: {e}"))?;
     if pattern.first() != Some(&b'/') {
         return Err("path: root patterns must be absolute".into());
@@ -440,7 +441,7 @@ fn parse_root(raw: RawRoot) -> Result<RootConfig, String> {
     }
     let mut exclude = Exclusions::default();
     for text in &raw.exclude {
-        let pattern = decode_escapes(text, Escapes::Glob).map_err(|e| format!("exclude: {e}"))?;
+        let pattern = escapes::decode(text, Syntax::Glob).map_err(|e| format!("exclude: {e}"))?;
         check_no_nul(&pattern).map_err(|e| format!("exclude: {e}"))?;
         if pattern.is_empty() {
             return Err("exclude: empty pattern".into());
@@ -458,62 +459,6 @@ fn parse_root(raw: RawRoot) -> Result<RootConfig, String> {
     })
 }
 
-/// How to decode a byte-string field.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Escapes {
-    /// `\xHH` and `\\` only.
-    Plain,
-    /// Also `\*`, `\?`, `\[`, `\]`, `\-`, `\!`, and `\^`, kept as glob
-    /// quoting. Decoded bytes that are glob metacharacters are quoted.
-    Glob,
-}
-
-/// Decode the byte escapes of DESIGN.md §7 after TOML parsing.
-pub fn decode_escapes(text: &str, mode: Escapes) -> Result<Vec<u8>, String> {
-    let bytes = text.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] != b'\\' {
-            out.push(bytes[i]);
-            i += 1;
-            continue;
-        }
-        let Some(&next) = bytes.get(i + 1) else {
-            return Err("trailing backslash".into());
-        };
-        let value = match next {
-            b'x' => {
-                let [value] = bytes
-                    .get(i + 2..i + 4)
-                    .and_then(names::parse_hex)
-                    .ok_or_else(|| {
-                        "malformed \\x escape: expected two hexadecimal digits".to_string()
-                    })?;
-                i += 4;
-                value
-            }
-            b'\\' => {
-                i += 2;
-                b'\\'
-            }
-            c if mode == Escapes::Glob && glob::QUOTABLE.contains(&c) => {
-                i += 2;
-                c
-            }
-            _ => {
-                let shown = text[i + 1..].chars().next().unwrap();
-                return Err(format!("unsupported escape \\{shown}"));
-            }
-        };
-        match mode {
-            Escapes::Glob => glob::push_quoted(&mut out, value),
-            Escapes::Plain => out.push(value),
-        }
-    }
-    Ok(out)
-}
-
 fn check_no_nul(bytes: &[u8]) -> Result<(), String> {
     if bytes.contains(&0) {
         return Err("NUL byte is not allowed".into());
@@ -529,11 +474,11 @@ pub fn parse_size(text: &str) -> Result<u64, String> {
         .position(|b| !b.is_ascii_digit())
         .unwrap_or(text.len());
     if digits_end == 0 {
-        return Err(format!("expected a number: {text:?}"));
+        return Err(format!("expected a number: {}", quoted(text.as_bytes())));
     }
     let number: u64 = text[..digits_end]
         .parse()
-        .map_err(|_| format!("number too large: {text:?}"))?;
+        .map_err(|_| format!("number too large: {}", quoted(text.as_bytes())))?;
     let unit = text[digits_end..].trim();
     let multiplier: u64 = match unit.to_ascii_lowercase().as_str() {
         "" | "b" => 1,
@@ -545,25 +490,11 @@ pub fn parse_size(text: &str) -> Result<u64, String> {
         "mb" => 1_000_000,
         "gb" => 1_000_000_000,
         "tb" => 1_000_000_000_000,
-        _ => return Err(format!("unknown unit {unit:?}")),
+        _ => return Err(format!("unknown unit {}", quoted(unit.as_bytes()))),
     };
     number
         .checked_mul(multiplier)
-        .ok_or_else(|| format!("size too large: {text:?}"))
-}
-
-/// `path` with `~` in place of `home`, the home directory, when the path
-/// is in it. With a home of `/`, paths stay as they are, or every absolute
-/// path would start with `~`.
-fn with_tilde(path: &[u8], home: &[u8]) -> String {
-    let home = home.trim_end_with(|c| c == '/');
-    if home.first() == Some(&b'/')
-        && let Some(rest) = path.strip_prefix(home)
-        && (rest.is_empty() || rest.first() == Some(&b'/'))
-    {
-        return format!("~{}", rest.as_bstr());
-    }
-    path.as_bstr().to_string()
+        .ok_or_else(|| format!("size too large: {}", quoted(text.as_bytes())))
 }
 
 fn home_dir() -> Vec<u8> {
@@ -611,21 +542,10 @@ fn default_tmp_data_dir() -> Vec<u8> {
     path
 }
 
-fn expand_tilde(path: Vec<u8>) -> Vec<u8> {
-    if path == b"~" {
-        return home_dir();
-    }
-    if let Some(rest) = path.strip_prefix(b"~/") {
-        let mut expanded = home_dir();
-        expanded.push(b'/');
-        expanded.extend_from_slice(rest);
-        return expanded;
-    }
-    path
-}
-
 #[cfg(test)]
 mod tests {
+    use bstr::ByteSlice;
+
     use super::*;
 
     /// The configuration of `text` as the file of the default profile.
@@ -644,67 +564,6 @@ mod tests {
         assert!(parse_size("KiB").is_err());
         assert!(parse_size("1XB").is_err());
         assert!(parse_size("99999999999999999999KiB").is_err());
-    }
-
-    #[test]
-    fn plain_escapes() {
-        assert_eq!(decode_escapes("abc", Escapes::Plain).unwrap(), b"abc");
-        assert_eq!(
-            decode_escapes(r"a\xFFb", Escapes::Plain).unwrap(),
-            b"a\xffb"
-        );
-        assert_eq!(
-            decode_escapes(r"a\xffb", Escapes::Plain).unwrap(),
-            b"a\xffb"
-        );
-        assert_eq!(decode_escapes(r"a\\b", Escapes::Plain).unwrap(), b"a\\b");
-        assert_eq!(decode_escapes("é", Escapes::Plain).unwrap(), "é".as_bytes());
-        assert!(decode_escapes(r"a\", Escapes::Plain).is_err());
-        assert!(decode_escapes(r"a\xF", Escapes::Plain).is_err());
-        assert!(decode_escapes(r"a\xGG", Escapes::Plain).is_err());
-        assert!(decode_escapes(r"a\*", Escapes::Plain).is_err());
-        assert!(decode_escapes(r"a\n", Escapes::Plain).is_err());
-        assert!(decode_escapes(r"\101", Escapes::Plain).is_err());
-        // Decoded bytes are never decoded again.
-        assert_eq!(
-            decode_escapes(r"\x5Cx41", Escapes::Plain).unwrap(),
-            b"\\x41"
-        );
-    }
-
-    #[test]
-    fn glob_escapes_keep_quoting() {
-        assert_eq!(decode_escapes(r"\x2A", Escapes::Glob).unwrap(), b"\\*");
-        assert_eq!(decode_escapes(r"\*", Escapes::Glob).unwrap(), b"\\*");
-        assert_eq!(
-            decode_escapes(r"\?\[\]\-\!\^", Escapes::Glob).unwrap(),
-            b"\\?\\[\\]\\-\\!\\^"
-        );
-        assert_eq!(
-            decode_escapes(r"back\\slash", Escapes::Glob).unwrap(),
-            b"back\\\\slash"
-        );
-        assert_eq!(decode_escapes(r"\x5C", Escapes::Glob).unwrap(), b"\\\\");
-        assert_eq!(decode_escapes(r"\x2F", Escapes::Glob).unwrap(), b"/");
-        assert_eq!(decode_escapes(r"\xFF*", Escapes::Glob).unwrap(), b"\xff*");
-        assert!(decode_escapes(r"a\n", Escapes::Glob).is_err());
-        // The quoted forms match literally.
-        assert!(glob::matches(
-            &decode_escapes(r"literal\x2Aname", Escapes::Glob).unwrap(),
-            b"literal*name"
-        ));
-        assert!(!glob::matches(
-            &decode_escapes(r"literal\x2Aname", Escapes::Glob).unwrap(),
-            b"literalXname"
-        ));
-        assert!(glob::matches(
-            &decode_escapes(r"back\\slash", Escapes::Glob).unwrap(),
-            b"back\\slash"
-        ));
-        assert!(glob::matches(
-            &decode_escapes(r"[\x2D]", Escapes::Glob).unwrap(),
-            b"-"
-        ));
     }
 
     #[test]
@@ -786,7 +645,10 @@ one_filesystem = true
                 .unwrap_err()
                 .contains("at most")
         );
-        assert!(parse("strong_hash = \"md5\"").is_err());
+        assert_eq!(
+            parse("strong_hash = \"md5\\u001b\"").unwrap_err(),
+            r"strong_hash: unknown hash 'md5\x1B', expected `blake3` or `sha256`"
+        );
         assert!(parse("threads = -1").is_err());
         assert!(
             parse("candidate_attempts = 0")
@@ -842,6 +704,40 @@ one_filesystem = true
         );
     }
 
+    /// A TOML error is one line, which says where the error is, so that it
+    /// stays one report (DESIGN.md §8).
+    #[test]
+    fn toml_errors_are_one_line() {
+        for (text, expected) in [
+            ("bogus = 1", "line 1, column 1: unknown field `bogus`"),
+            (
+                "block_size = 512\n\n[[roots]]\npath = 5",
+                "line 4, column 8: invalid type: integer `5`, expected a string",
+            ),
+            // The column counts characters, not bytes.
+            ("index_path = 'é' x", "line 1, column 18: "),
+        ] {
+            let error = parse(text).unwrap_err();
+            assert!(error.starts_with(expected), "{text:?}: {error}");
+            assert!(!error.contains('\n'), "{text:?}: {error}");
+        }
+    }
+
+    /// A path that is `~` or that starts with `~/` starts at the home
+    /// directory, but not one that spells its `~` as `\x7E`, which is the
+    /// literal byte, as messages show it (DESIGN.md §7 and §8).
+    #[test]
+    fn only_a_tilde_as_it_is_starts_at_home() {
+        let home = std::env::var_os("HOME").unwrap().as_bytes().to_vec();
+        let index = |text: &str| parse(&format!("index_path = '{text}'")).unwrap().index_path;
+        assert_eq!(index("~"), home);
+        assert_eq!(index("~/x"), [&home[..], b"/x"].concat());
+        assert_eq!(index(r"\x7E/x"), b"~/x");
+        assert_eq!(index(r"\x7E"), b"~");
+        assert_eq!(index("~x/y"), b"~x/y");
+        assert_eq!(index("/a/~/b"), b"/a/~/b");
+    }
+
     fn profile(name: &str) -> Source {
         Source::Profile(name.as_bytes().to_vec())
     }
@@ -879,30 +775,14 @@ one_filesystem = true
         assert!(!set.index_named_after_file);
     }
 
-    /// The note of a run shows a path in the home directory with `~`, but
-    /// not one in another directory whose name starts with the same bytes.
-    #[test]
-    fn notes_show_the_home_directory_as_a_tilde() {
-        let home = b"/home/u";
-        let cache = b"/home/u/.cache/hashsync/a.db";
-        assert_eq!(with_tilde(cache, home), "~/.cache/hashsync/a.db");
-        assert_eq!(with_tilde(b"/home/u", home), "~");
-        assert_eq!(with_tilde(b"/home/u/x", b"/home/u//"), "~/x");
-        assert_eq!(with_tilde(b"/home/user/x", home), "/home/user/x");
-        assert_eq!(with_tilde(b"x.toml", home), "x.toml");
-        assert_eq!(with_tilde(b"/etc/x", b"/"), "/etc/x");
-        assert_eq!(with_tilde(b"/etc/x", b""), "/etc/x");
-        assert_eq!(with_tilde(b"/home/u/\xff", home), "~/\u{fffd}");
-    }
-
     /// A profile name becomes part of the path of its file, so it is one
     /// nonempty file name (DESIGN.md §7).
     #[test]
     fn profile_names_are_file_names() {
-        for name in [&b"work"[..], b"a.b", b"..", b"\xff", b"-x"] {
+        for name in [&b"work"[..], b"a.b", b"..", b"\xff", b"-x", b"a\nb"] {
             assert_eq!(check_profile_name(name), Ok(()), "{:?}", name.as_bstr());
         }
-        for name in [&b""[..], b"a/b", b"/", b"../x"] {
+        for name in [&b""[..], b"a/b", b"/", b"../x", b"a\0b"] {
             assert!(check_profile_name(name).is_err(), "{:?}", name.as_bstr());
         }
     }
@@ -918,8 +798,8 @@ one_filesystem = true
             (b"-x", "-x"),
             (b"it's", r"'it'\''s'"),
             ("café".as_bytes(), "'café'"),
-            (b"a\xffb", r"$'a\377b'"),
-            (b"tab\there\\'", r"$'tab\011here\\\''"),
+            (b"a\xffb", r"'a'$'\xFF''b'"),
+            (b"tab\there\\'", r"'tab'$'\x09''here\'\'"),
         ] {
             let profile = Source::Profile(name.to_vec());
             let config = super::parse("index_path = '/i'", &profile).unwrap();

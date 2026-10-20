@@ -14,10 +14,10 @@ use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
-use bstr::ByteSlice;
 use rustix::process::Pid;
 
 use crate::die::{self, die};
+use crate::escapes::quoted;
 
 /// Split a command string like a POSIX shell splits words, without any
 /// expansion: whitespace separates words; `\` quotes the next byte;
@@ -197,7 +197,7 @@ fn spawn(remote: &Remote, role: &[u8], token: &str) -> Session {
         Ok(child) => child,
         Err(e) => die(format!(
             "cannot start {}: {e}",
-            argv[0].as_encoded_bytes().as_bstr()
+            quoted(argv[0].as_encoded_bytes())
         )),
     };
     let stdin = child.stdin.take().unwrap();

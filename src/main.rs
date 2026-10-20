@@ -23,6 +23,7 @@ mod config;
 mod control;
 mod dedup;
 mod die;
+mod escapes;
 mod fsid;
 mod fsops;
 mod glob;
@@ -52,10 +53,10 @@ mod sys;
 mod units;
 mod update;
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 
-use clap::builder::{OsStringValueParser, TypedValueParser};
+use clap::builder::TypedValueParser;
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser, Subcommand};
 
@@ -78,7 +79,7 @@ struct Cli {
     /// The profile: the configuration file $XDG_CONFIG_HOME/hashsync/NAME.toml,
     /// whose index is $XDG_CACHE_HOME/hashsync/NAME.db unless it sets
     /// index_path [default: default]
-    #[arg(long, global = true, value_name = "NAME", value_parser = profile_name())]
+    #[arg(long, global = true, value_name = "NAME", value_parser = ProfileName)]
     profile: Option<OsString>,
 
     /// A configuration file anywhere, in place of a profile; unless it sets
@@ -132,10 +133,32 @@ impl Cli {
 
 /// The value parser of the options that name a profile, `--profile` and
 /// `--server-profile`: a profile name becomes part of the path of the
-/// profile's file, so a bad one is a usage error (DESIGN.md §7).
-fn profile_name() -> impl TypedValueParser<Value = OsString> {
-    OsStringValueParser::new()
-        .try_map(|name| config::check_profile_name(name.as_bytes()).map(|()| name))
+/// profile's file, so a bad one is a usage error (DESIGN.md §7). Its own
+/// message shows the name as every message shows one (DESIGN.md §8), which
+/// clap's message for a rejected value does not: it replaces the bytes that
+/// are not UTF-8.
+#[derive(Clone)]
+struct ProfileName;
+
+impl TypedValueParser for ProfileName {
+    type Value = OsString;
+
+    fn parse_ref(
+        &self,
+        cmd: &clap::Command,
+        arg: Option<&clap::Arg>,
+        value: &OsStr,
+    ) -> Result<OsString, clap::Error> {
+        match config::check_profile_name(value.as_bytes()) {
+            Ok(()) => Ok(value.to_owned()),
+            Err(e) => {
+                let arg = arg.map_or_else(|| "...".to_owned(), ToString::to_string);
+                let value = escapes::quoted(value.as_bytes());
+                let message = format!("invalid value {value} for '{arg}': {e}");
+                Err(cmd.clone().error(ErrorKind::ValueValidation, message))
+            }
+        }
+    }
 }
 
 /// The bytes of a command-line argument, as the configuration and the
@@ -223,7 +246,7 @@ struct SshArgs {
 
     /// The profile of the remote host, whose file there is
     /// $XDG_CONFIG_HOME/hashsync/NAME.toml [default: default]
-    #[arg(long, value_name = "NAME", value_parser = profile_name(), conflicts_with = "server_config")]
+    #[arg(long, value_name = "NAME", value_parser = ProfileName, conflicts_with = "server_config")]
     server_profile: Option<OsString>,
 
     /// A configuration file on the remote host, in place of a profile; a
@@ -416,6 +439,16 @@ mod tests {
             let error = parse(&["--profile", name, "stats"]).err().map(|e| e.kind());
             assert_eq!(error, Some(ErrorKind::ValueValidation), "{name:?}");
         }
+        // The message shows a rejected name as messages show names, with
+        // its bytes that are not UTF-8 and its control characters escaped
+        // (DESIGN.md §8).
+        let words = [&b"hashsync"[..], b"--profile", b"a/\xff\n", b"stats"];
+        let error = Cli::try_parse_from(words.map(OsStr::from_bytes))
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), ErrorKind::ValueValidation);
+        let message = r"invalid value 'a/\xFF\x0A' for '--profile <NAME>': a profile name";
+        assert!(error.to_string().contains(message), "{error}");
     }
 
     /// `serve` reads the configuration file that the client names in

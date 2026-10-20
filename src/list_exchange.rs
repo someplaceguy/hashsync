@@ -41,6 +41,7 @@ use crossbeam_channel::{Receiver, Sender};
 use crate::cache::{self, Base, Exchange};
 use crate::config::Config;
 use crate::die::die;
+use crate::escapes::quoted;
 use crate::hash::{Strong, StrongHash, weak};
 use crate::hashlist::{self, ListDecoder, ListId};
 use crate::hashtable::HashTable;
@@ -145,8 +146,8 @@ pub fn read_hello(payload: &[u8]) -> Hello {
     if hello.weak_hash_id != weak::ID {
         die(format!(
             "incompatible receiver: weak hash {} (this sender: {})",
-            hello.weak_hash_id,
-            weak::ID
+            quoted(hello.weak_hash_id.as_bytes()),
+            quoted(weak::ID.as_bytes())
         ));
     }
     hello

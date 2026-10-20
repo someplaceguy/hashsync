@@ -40,6 +40,7 @@ use rustix::io::{Errno, retry_on_intr};
 
 use crate::config;
 use crate::die::die;
+use crate::escapes::quoted_path;
 use crate::fsops::retry_interrupted;
 use crate::hash::{Strong, StrongHash};
 use crate::hashlist::{self, ListId};
@@ -49,7 +50,7 @@ use crate::report::warn;
 /// A cache operation failed for a reason other than absence
 /// (DESIGN.md §5.6 and §6.7).
 fn fatal(action: &str, path: &Path, error: impl std::fmt::Display) -> ! {
-    die(format!("cannot {action} {}: {error}", path.display()))
+    die(format!("cannot {action} {}: {error}", quoted_path(path)))
 }
 
 fn absent(e: &std::io::Error) -> bool {
@@ -248,7 +249,7 @@ fn sync_entries(base: &Path, path: &Path) -> bool {
 fn descend(base: &Path, dir: &Path) -> Vec<PathBuf> {
     let below = dir
         .strip_prefix(base)
-        .unwrap_or_else(|_| panic!("{} is not below {}", dir.display(), base.display()));
+        .unwrap_or_else(|_| panic!("{} is not below {}", quoted_path(dir), quoted_path(base)));
     let mut dirs = vec![base.to_path_buf()];
     for component in below.components() {
         dirs.push(dirs.last().unwrap().join(component));
@@ -1077,7 +1078,7 @@ fn expire_tree(tree: &Path, now: i64, max_age: u64) {
 fn remove_empty_dir(dir: &Path) {
     match retry_on_intr(|| rustix::fs::rmdir(dir)) {
         Ok(()) | Err(Errno::NOTEMPTY | Errno::EXIST | Errno::NOENT) => {}
-        Err(e) => warn(format!("cannot remove {}: {e}", dir.display())),
+        Err(e) => warn(format!("cannot remove {}: {e}", quoted_path(dir))),
     }
 }
 

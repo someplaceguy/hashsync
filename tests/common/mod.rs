@@ -520,6 +520,48 @@ impl IndexView {
     }
 }
 
+/// `path` as the messages of hashsync show a path that needs no escapes,
+/// such as most paths of the tests: between single quotes (DESIGN.md §8).
+pub fn quoted(path: impl AsRef<OsStr>) -> String {
+    let path = path.as_ref().to_str().expect("a UTF-8 path");
+    assert!(
+        !path.contains(['\'', '\\']) && !path.contains(char::is_control) && !path.starts_with('~'),
+        "{path:?} needs escapes"
+    );
+    format!("'{path}'")
+}
+
+/// The bytes of a byte string that a message of hashsync shows, `shown`
+/// with its single quotes: the text between them, with `\xHH` and `\\`
+/// decoded (DESIGN.md §8). This is how a program reads a path back from a
+/// message.
+pub fn unquote(shown: &str) -> Vec<u8> {
+    let inner = shown.strip_prefix('\'').and_then(|s| s.strip_suffix('\''));
+    let inner = inner.unwrap_or_else(|| panic!("{shown:?} is not quoted"));
+    assert!(!inner.contains('\''), "{shown:?}");
+    let mut bytes = Vec::new();
+    let mut rest = inner.as_bytes();
+    while let Some((&byte, tail)) = rest.split_first() {
+        rest = match (byte, tail) {
+            (b'\\', [b'\\', tail @ ..]) => {
+                bytes.push(b'\\');
+                tail
+            }
+            (b'\\', [b'x', high, low, tail @ ..]) => {
+                let digit = |d: u8| char::from(d).to_digit(16).unwrap() as u8;
+                bytes.push(digit(*high) << 4 | digit(*low));
+                tail
+            }
+            (b'\\', _) => panic!("a bad escape in {shown:?}"),
+            (byte, tail) => {
+                bytes.push(byte);
+                tail
+            }
+        };
+    }
+    bytes
+}
+
 /// A `[[roots]]` entry for an absolute path with non-ASCII bytes escaped.
 pub fn root_entry(path: &[u8], extra: &str) -> String {
     format!("\n[[roots]]\npath = '{}'\n{extra}\n", toml_literal(path))

@@ -1,7 +1,8 @@
 //! What the process reports on stderr (DESIGN.md §8): notes, which give
 //! progress and summaries, warnings, errors, and the server's panic
 //! reports. Each report is one line that starts with `hashsync: `, or on
-//! the server with `hashsync (server): `.
+//! the server with `hashsync (server): `. Messages show paths and names as
+//! `escapes::quoted` does.
 //!
 //! Reports are best effort: a failed write to stderr is ignored. There is
 //! no other channel to report it on, and a panic would turn the failure
@@ -13,6 +14,7 @@ use std::io::Write;
 use std::panic::PanicHookInfo;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
+use crate::escapes;
 use crate::fsops;
 
 /// Report progress or a summary, unless `--quiet` disabled the notes.
@@ -94,14 +96,18 @@ pub fn panic(info: &PanicHookInfo<'_>, default: &dyn Fn(&PanicHookInfo<'_>)) {
 /// server, `hashsync (server): `, then the message and a newline, to
 /// stderr as one write. A pipe keeps a write of up to `PIPE_BUF` (4 KiB)
 /// whole, so the line does not interleave with those of other threads or
-/// of the processes that share stderr, such as the SSH children. Failures
-/// are ignored (see the module documentation).
+/// of the processes that share stderr, such as the SSH children. A control
+/// character in the message, which the text of a library can hold, shows
+/// as an escape, so that the report stays one line, all of it after the
+/// prefix (`escapes::one_line`). Failures are ignored (see the module
+/// documentation).
 fn line(message: std::fmt::Arguments<'_>) {
     let host = if SERVER.load(Relaxed) {
         " (server)"
     } else {
         ""
     };
-    let line = format!("hashsync{host}: {message}\n");
+    let message = message.to_string();
+    let line = format!("hashsync{host}: {}\n", escapes::one_line(&message));
     let _ = fsops::stderr().write_all(line.as_bytes());
 }

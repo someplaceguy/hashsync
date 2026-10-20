@@ -33,8 +33,8 @@ use std::time::Duration;
 use common::{
     ANSWER, BLOCK, CHUNK, END, Env, FEATURES, HASHDELTA, HASHLIST, HASHNONE, HELLO, KillOnDrop,
     LIT, QUERY, REQUEST, STOP, STREAM_END, exclusive_lock, frame, hello_payload, ofd_lock,
-    proc_state, random, shared_lock, tiled, toml_literal, try_recv_frame, version_and_features,
-    wait_for_lock_wait, wait_until_asleep,
+    proc_state, quoted, random, shared_lock, tiled, toml_literal, try_recv_frame,
+    version_and_features, wait_for_lock_wait, wait_until_asleep,
 };
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::fs::{CWD, Mode, OFlags, inotify, mkfifoat};
@@ -1647,6 +1647,29 @@ fn a_push_to_a_server_without_a_configuration_file_fails() {
 }
 
 #[test]
+fn an_error_in_the_servers_configuration_file_is_one_line() {
+    // Every line that the server writes starts with its marker, also the
+    // report of an error in its configuration file, whose TOML text would
+    // quote the line of the file on lines of their own (DESIGN.md §8).
+    let transfer = Transfer::new(&[]);
+    let file = transfer.server_config();
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, "block_size = 4096\nbogus = 1\n").unwrap();
+    let output = transfer.run_push(&[], &refs(&args(&["true"])), b"");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    let error = format!(
+        "hashsync (server): {}: line 2, column 1: unknown field `bogus`",
+        quoted(&file)
+    );
+    assert!(
+        stderr.lines().any(|line| line.starts_with(&error)),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("bogus = 1"), "{stderr}");
+}
+
+#[test]
 fn command_killed_by_a_signal_reports_128_plus_signal() {
     let transfer = Transfer::new(&[]);
     let command = args(&["kill -KILL $$"]);
@@ -1865,10 +1888,12 @@ fn the_server_reads_the_configuration_file_that_the_client_names() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let client = format!(
         "hashsync: using config {} and index {}\n",
-        transfer.env.config_path().display(),
-        transfer.env.index_path().display()
+        quoted(transfer.env.config_path()),
+        quoted(transfer.env.index_path())
     );
-    let server = "hashsync (server): using config other-\u{fffd}.toml\n";
+    // The note shows the byte that is not UTF-8 as the configuration file
+    // spells it (DESIGN.md §8).
+    let server = "hashsync (server): using config 'other-\\xFF.toml'\n";
     for note in [&client[..], server] {
         assert!(stderr.contains(note), "{note}{stderr}");
     }
@@ -1885,8 +1910,8 @@ fn the_server_reads_the_configuration_file_that_the_client_names() {
         "the server used its default directory"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let note = "hashsync (server): using profile `other-\u{fffd}` \
-                [~/.config/hashsync/other-\u{fffd}.toml]\n";
+    let note = "hashsync (server): using profile 'other-\\xFF' \
+                ['~/.config/hashsync/other-\\xFF.toml']\n";
     assert!(stderr.contains(note), "{stderr}");
 
     // A file that an option names must exist, on the server too, which
@@ -1909,7 +1934,7 @@ fn the_server_reads_the_configuration_file_that_the_client_names() {
         assert_eq!(output.status.code(), Some(1), "{flags:?}: {stderr}");
         let message = format!(
             "hashsync (server): cannot read configuration file {}: ",
-            file.display()
+            quoted(&file)
         );
         assert!(stderr.contains(&message), "{flags:?}: {stderr}");
         assert!(!marker.exists(), "{flags:?}: the command ran");
@@ -1952,7 +1977,7 @@ fn the_server_ignores_the_profile_of_the_client() {
         let path = transfer
             .env
             .path(format!("client/config/hashsync/{name}.toml"));
-        path.display().to_string()
+        quoted(path)
     };
     let has_notes = |stderr: &str, notes: &[String]| {
         for note in notes {
@@ -1973,14 +1998,14 @@ fn the_server_ignores_the_profile_of_the_client() {
         String::from_utf8_lossy(&output.stderr).into_owned()
     };
     let stderr = push(&["--profile", "work"]);
-    let server_index = transfer.server_index().display().to_string();
+    let server_index = quoted(transfer.server_index());
     has_notes(
         &stderr,
         &[
-            format!("hashsync: using profile `work` [{}]\n", client_file("work")),
+            format!("hashsync: using profile 'work' [{}]\n", client_file("work")),
             format!(
-                "hashsync (server): using profile `default` \
-                 [~/.config/hashsync/default.toml] and index {server_index}\n"
+                "hashsync (server): using profile 'default' \
+                 ['~/.config/hashsync/default.toml'] and index {server_index}\n"
             ),
         ],
     );
@@ -1992,8 +2017,8 @@ fn the_server_ignores_the_profile_of_the_client() {
     has_notes(
         &stderr,
         &[
-            "hashsync (server): using profile `work` [~/.config/hashsync/work.toml] \
-           and index ~/.cache/hashsync/work.db\n"
+            "hashsync (server): using profile 'work' ['~/.config/hashsync/work.toml'] \
+           and index '~/.cache/hashsync/work.db'\n"
                 .to_string(),
         ],
     );
@@ -2003,7 +2028,7 @@ fn the_server_ignores_the_profile_of_the_client() {
     has_notes(
         &stderr,
         &[format!(
-            "hashsync: using profile `default` [{} not found]\n",
+            "hashsync: using profile 'default' [{} not found]\n",
             client_file("default")
         )],
     );
@@ -2027,11 +2052,11 @@ fn the_server_ignores_the_profile_of_the_client() {
         &String::from_utf8_lossy(&output.stderr),
         &[
             format!(
-                "hashsync: using profile `work` [{}] and index {}\n",
+                "hashsync: using profile 'work' [{}] and index {}\n",
                 client_file("work"),
-                client_index.display()
+                quoted(&client_index)
             ),
-            "hashsync (server): using profile `default` [~/.config/hashsync/default.toml]\n"
+            "hashsync (server): using profile 'default' ['~/.config/hashsync/default.toml']\n"
                 .to_string(),
         ],
     );
@@ -2260,7 +2285,7 @@ fn cache_failures_are_fatal_on_either_side() {
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("cannot create ") && stderr.contains("/hashsync/local-hashlists:"),
+        stderr.contains("cannot create ") && stderr.contains("/hashsync/local-hashlists':"),
         "receiver cache failure:\n{stderr}"
     );
     transfer.env.chmod("client/cache/hashsync", 0o755);
@@ -2273,7 +2298,7 @@ fn cache_failures_are_fatal_on_either_side() {
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("cannot create ") && stderr.contains("/hashsync/remote-hashlists:"),
+        stderr.contains("cannot create ") && stderr.contains("/hashsync/remote-hashlists':"),
         "sender cache failure:\n{stderr}"
     );
     transfer.env.chmod("server/home/.cache/hashsync", 0o755);
@@ -3830,7 +3855,7 @@ fn an_empty_cache_directory_that_cannot_be_removed_only_warns() {
     for tree in trees {
         transfer.env.chmod(tree, 0o755);
         let stale = transfer.env.path(format!("{tree}/stale"));
-        let warning = format!("warning: cannot remove {}: ", stale.display());
+        let warning = format!("warning: cannot remove {}: ", quoted(&stale));
         assert!(stderr.contains(&warning), "missing {warning:?}:\n{stderr}");
         assert!(stale.exists());
     }
@@ -6490,7 +6515,7 @@ fn a_rebuild_of_an_index_before_its_host_opens_it_again_ends_the_run() {
         assert_eq!(output.status.code(), Some(1), "{direction:?}: {stderr}");
         let message = format!(
             "{host}index {} does not match the configuration; run `{}`",
-            index.display(),
+            quoted(&index),
             transfer.update_command(direction)
         );
         assert!(stderr.contains(&message), "{direction:?}: {stderr}");

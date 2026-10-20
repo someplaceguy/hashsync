@@ -226,7 +226,7 @@ pub fn parse_spool_limit(text: &str) -> Result<u64, String> {
     if text.trim().eq_ignore_ascii_case("unlimited") {
         return Ok(u64::MAX);
     }
-    parse_size(text).map_err(|e| format!("{e} (or \"unlimited\")"))
+    parse_size(text).map_err(|e| format!("{e} (or `unlimited`)"))
 }
 
 #[cfg(test)]

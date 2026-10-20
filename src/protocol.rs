@@ -37,6 +37,7 @@ use zstd_sys::ZSTD_EndDirective;
 
 use crate::config::{self, Source};
 use crate::die::die;
+use crate::escapes::quoted;
 use crate::hash::{Strong, StrongHash};
 use crate::settings::{Deduplicated, RemoteCommand, RunSettings};
 use crate::sys::{ZstdCCtx, ZstdDCtx};
@@ -189,7 +190,7 @@ impl Request {
             1 => false,
             v => panic!("protocol error: invalid command kind {v} in REQUEST frame"),
         };
-        let mut words = dec.list(Dec::string_bytes);
+        let mut words = dec.list(Dec::argument);
         let command = if shell {
             assert!(
                 words.len() == 1,
@@ -224,8 +225,8 @@ impl Request {
         let (quiet, human_readable) = (dec.flag(), dec.flag());
         let config = match dec.u8() {
             0 => Source::Default,
-            1 => Source::Profile(dec.string_bytes()),
-            2 => Source::File(dec.string_bytes()),
+            1 => Source::Profile(dec.argument()),
+            2 => Source::File(dec.argument()),
             v => panic!("protocol error: invalid configuration kind {v} in REQUEST frame"),
         };
         // The client's options accept only profile names, which become part
@@ -280,7 +281,8 @@ impl Hello {
         let strong_hash_id = dec.string();
         let Some(strong_hash) = StrongHash::from_id(&strong_hash_id) else {
             die(format!(
-                "incompatible receiver: strong hash {strong_hash_id}"
+                "incompatible receiver: strong hash {}",
+                quoted(strong_hash_id.as_bytes())
             ));
         };
         dec.done();
@@ -870,6 +872,19 @@ impl<'a> Dec<'a> {
     pub fn string_bytes(&mut self) -> Vec<u8> {
         let len = self.u32() as usize;
         self.take(len).to_vec()
+    }
+
+    /// A byte string from a command-line argument of the client, such as a
+    /// word of the command or a path. A NUL byte, which no argument can
+    /// hold, is a protocol error (DESIGN.md §6.2).
+    fn argument(&mut self) -> Vec<u8> {
+        let bytes = self.string_bytes();
+        assert!(
+            !bytes.contains(&0),
+            "protocol error: a NUL byte in a byte string of the {} frame",
+            self.what
+        );
+        bytes
     }
 
     /// A length-prefixed UTF-8 string, such as an algorithm or error text.
@@ -1980,6 +1995,41 @@ mod tests {
         }
     }
 
+    /// The command and the server's configuration file come from the
+    /// client's command line, whose arguments hold no NUL byte, so one in
+    /// REQUEST is a protocol error (DESIGN.md §6.2). Any other byte is
+    /// valid.
+    #[test]
+    fn the_byte_strings_of_a_request_hold_no_nul() {
+        let shell = |line: &[u8]| request(RemoteCommand::Shell(line.to_vec()));
+        let argv = |word: &[u8]| request(RemoteCommand::Argv(vec![b"a".to_vec(), word.to_vec()]));
+        let config = |config| Request {
+            config,
+            ..shell(b"true")
+        };
+        for request in [
+            shell(b"echo a\0b"),
+            argv(b"\0"),
+            config(Source::Profile(b"a\0b".to_vec())),
+            config(Source::File(b"/a\0b".to_vec())),
+        ] {
+            let message = caught(|| Request::decode(&request.encode())).unwrap_err();
+            let expected = "protocol error: a NUL byte in a byte string of the REQUEST frame";
+            assert!(message.contains(expected), "{message}");
+        }
+        let all: Vec<u8> = (1..=255).collect();
+        for request in [
+            shell(&all),
+            argv(&all),
+            config(Source::Profile(
+                all.iter().copied().filter(|&b| b != b'/').collect(),
+            )),
+            config(Source::File(all.clone())),
+        ] {
+            assert_eq!(Request::decode(&request.encode()), request);
+        }
+    }
+
     #[test]
     #[should_panic(expected = "invalid command kind 2 in REQUEST")]
     fn a_command_is_a_line_or_words() {
@@ -2570,7 +2620,8 @@ mod tests {
     /// A valid encoding of a payload of each kind, from random values.
     fn any_payload() -> impl Strategy<Value = (Payload, Vec<u8>)> {
         use proptest::collection::vec;
-        let word = || vec(any::<u8>(), 0..6);
+        // The bytes of a command-line argument: any but NUL.
+        let word = || vec(1u8.., 0..6);
         let command = prop_oneof![
             word().prop_map(RemoteCommand::Shell),
             vec(word(), 1..4).prop_map(RemoteCommand::Argv),

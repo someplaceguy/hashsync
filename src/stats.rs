@@ -5,10 +5,9 @@ use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
-use bstr::ByteSlice;
-
 use crate::config::Config;
 use crate::die::die;
+use crate::escapes::quoted;
 use crate::fsops;
 use crate::index::{self, Settings};
 use crate::report::warn;
@@ -17,7 +16,7 @@ use crate::units::Bytes;
 pub fn run(config: &Config) {
     // RocksDB keeps every file of the index open (DESIGN.md §4.4).
     fsops::raise_descriptor_limit();
-    let path = config.index_path.as_bstr();
+    let path = quoted(&config.index_path);
     let update = config.update_command();
     let Some(index) = index::open_read_only(&config.index_path) else {
         die(format!("no index at {path}; run `{update}`"));
@@ -80,8 +79,7 @@ pub fn run(config: &Config) {
 /// failure.
 fn file_sizes(path: &[u8]) -> (u64, u64) {
     let dir = Path::new(OsStr::from_bytes(path));
-    let fail =
-        |e: std::io::Error| -> ! { die(format!("cannot list index {}: {e}", path.as_bstr())) };
+    let fail = |e: std::io::Error| -> ! { die(format!("cannot list index {}: {e}", quoted(path))) };
     let (mut database, mut wal) = (0, 0);
     for entry in fsops::retry_interrupted(|| std::fs::read_dir(dir)).unwrap_or_else(|e| fail(e)) {
         let entry = entry.unwrap_or_else(|e| fail(e));

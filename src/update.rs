@@ -3,9 +3,8 @@
 use std::sync::atomic::Ordering::Relaxed;
 use std::time::Instant;
 
-use bstr::ByteSlice;
-
 use crate::config::Config;
+use crate::escapes::quoted;
 use crate::fsid::FsCache;
 use crate::fsops;
 use crate::index::{self, Settings};
@@ -44,7 +43,7 @@ pub fn perform(config: &Config, rebuild: bool, jobs: Option<u32>) -> (index::Ind
             None => {
                 report::note(format_args!(
                     "creating index {}",
-                    config.index_path.as_bstr()
+                    quoted(&config.index_path)
                 ));
                 true
             }

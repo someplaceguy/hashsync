@@ -2,7 +2,6 @@
 
 pub mod weak;
 
-use serde::Deserialize;
 use sha2::Digest;
 
 /// Output length of every supported strong hash, in bytes.
@@ -14,8 +13,7 @@ pub const PREFIX_LEN: usize = 16;
 /// A full strong-hash digest.
 pub type Strong = [u8; STRONG_LEN];
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StrongHash {
     Blake3,
     Sha256,

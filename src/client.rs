@@ -49,13 +49,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::Instant;
 
-use bstr::ByteSlice;
 use crossbeam_channel::{Sender, bounded, unbounded};
 
 use crate::config::Config;
 use crate::control::{self, Dispatch, EndFlag};
 use crate::dedup::{Receiving, Sending};
 use crate::die::{self, die};
+use crate::escapes::quoted;
 use crate::list_exchange::{self, ListBytes};
 use crate::protocol::{
     self, Counts, End, FrameReader, FrameWriter, Request, SourceRead, die_data, flush_data, frame,
@@ -689,7 +689,7 @@ fn read_server_version_and_features<R: Read>(data_in: &mut FrameReader<R>, host:
         Ok(false) => die(format!(
             "the data session ended before the server's protocol version; \
              is a compatible hashsync installed on {}?",
-            host.as_bstr()
+            quoted(host)
         )),
         Err(e) => die_data(PEER, &e),
     }

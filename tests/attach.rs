@@ -90,7 +90,7 @@ fn attach_marks_its_lines_as_the_servers() {
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(stderr, "hashsync (server): invalid token \"bad\"\n");
+    assert_eq!(stderr, "hashsync (server): invalid token 'bad'\n");
 }
 
 #[test]

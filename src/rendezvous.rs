@@ -18,6 +18,7 @@ use rustix::fs::{FileType, Mode, OFlags};
 use rustix::io::retry_on_intr;
 
 use crate::die::{self, die};
+use crate::escapes::{quoted, quoted_path};
 use crate::fsops::{any_ready, retry_interrupted};
 use crate::names;
 
@@ -33,7 +34,7 @@ pub fn new_token() -> String {
 /// produces. Both entry points receive it from our own client.
 fn checked(token: &str) -> &str {
     if token.len() != 32 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
-        die(format!("invalid token {token:?}"));
+        die(format!("invalid token {}", quoted(token.as_bytes())));
     }
     token
 }
@@ -57,11 +58,11 @@ fn open_private(dir: &std::path::Path) -> OwnedFd {
     let flags = OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     let fd = match retry_on_intr(|| rustix::fs::open(dir, flags, Mode::empty())) {
         Ok(fd) => fd,
-        Err(e) => die(format!("cannot open {}: {e}", dir.display())),
+        Err(e) => die(format!("cannot open {}: {e}", quoted_path(dir))),
     };
     let stat = match rustix::fs::fstat(&fd) {
         Ok(stat) => stat,
-        Err(e) => die(format!("cannot stat {}: {e}", dir.display())),
+        Err(e) => die(format!("cannot stat {}: {e}", quoted_path(dir))),
     };
     let insecure = if stat.st_uid != rustix::process::geteuid().as_raw() {
         Some("is not owned by this user")
@@ -73,7 +74,7 @@ fn open_private(dir: &std::path::Path) -> OwnedFd {
         None
     };
     if let Some(problem) = insecure {
-        die(format!("{} {problem}", dir.display()));
+        die(format!("{} {problem}", quoted_path(dir)));
     }
     fd
 }
@@ -108,7 +109,7 @@ pub fn listen(token: &str) -> Listener {
     let dir = socket_dir();
     match retry_on_intr(|| rustix::fs::mkdir(&dir, Mode::from_raw_mode(0o700))) {
         Ok(()) | Err(rustix::io::Errno::EXIST) => {}
-        Err(e) => die(format!("cannot create {}: {e}", dir.display())),
+        Err(e) => die(format!("cannot create {}: {e}", quoted_path(&dir))),
     }
     let dir_fd = open_private(&dir);
     let name = format!("{}.sock", checked(token));
@@ -119,14 +120,14 @@ pub fn listen(token: &str) -> Listener {
     die::remove_at_exit(path.clone());
     let listener = match retry_interrupted(|| UnixListener::bind(&address)) {
         Ok(listener) => listener,
-        Err(e) => die(format!("cannot listen on {}: {e}", path.display())),
+        Err(e) => die(format!("cannot listen on {}: {e}", quoted_path(&path))),
     };
     // The directory already denies other users; make the socket itself
     // 0600 too.
     if let Err(e) = retry_interrupted(|| {
         std::fs::set_permissions(&address, std::fs::Permissions::from_mode(0o600))
     }) {
-        die(format!("cannot protect {}: {e}", path.display()));
+        die(format!("cannot protect {}: {e}", quoted_path(&path)));
     }
     Listener { listener }
 }
@@ -176,7 +177,7 @@ pub fn connect(token: &str) -> UnixStream {
             {
                 wait_for_serve(&path, &e);
             }
-            Err(e) => die(format!("cannot connect to {}: {e}", path.display())),
+            Err(e) => die(format!("cannot connect to {}: {e}", quoted_path(&path))),
         }
     }
 }
@@ -185,7 +186,7 @@ fn wait_for_serve(path: &std::path::Path, reason: &dyn std::fmt::Display) {
     if stdin_gone() {
         die(format!(
             "the client disappeared while waiting for {}: {reason}",
-            path.display()
+            quoted_path(path)
         ));
     }
     std::thread::sleep(RETRY_INTERVAL);

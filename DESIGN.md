@@ -238,7 +238,8 @@ directory or a single regular file. Root and exclusion globs use
 case-sensitive matching on bytes and leading dots included. `*`, `?`, and
 bracket classes cannot match `/`; `**` spans path components. Patterns and
 filenames may contain non-UTF-8 bytes, which section 7 spells in
-configuration; never reject them for that reason or convert them lossily.
+configuration, and section 8 in messages; never reject them for that
+reason or convert them lossily.
 Thus `/nix/store/*` also matches `/nix/store/.links` and non-UTF-8 names.
 
 `gix-glob` supplies matching, not filesystem expansion. Expand root
@@ -1195,7 +1196,9 @@ Payloads:
   for its profile `default`, 1 for the profile of `--server-profile`, and
   2 for the file of `--server-config`, and for 1 and 2, `config`, a byte
   string, the profile name or the path. A profile name is one that the
-  client's options accept.
+  client's options accept. The words of the command and `config` come
+  from the client's command line, whose arguments hold no NUL byte, so
+  REQUEST is invalid when one of them holds one.
 - HELLO, from the receiver of a deduplicated stream, on the data session:
   `block_size u32`, `weak_hash_id string`, and `strong_hash_id string`,
   from its configuration, so it needs no index: the client sends it right
@@ -2436,10 +2439,10 @@ directory where SSH starts `serve`, the remote user's home directory.
 
 Every command says in a note which file it uses once it has read it, on
 both hosts of a run, and which index when it uses one, with `~` for the
-home directory: ``using profile `work` [~/.config/hashsync/work.toml]
-and index ~/.cache/hashsync/work.db``, or `using config PATH` for a file
-that an option names. A host without a file of `default` says
-`[~/.config/hashsync/default.toml not found]`.
+home directory: `using profile 'work' ['~/.config/hashsync/work.toml']
+and index '~/.cache/hashsync/work.db'`, or `using config 'PATH'` for a
+file that an option names. A host without a file of `default` says
+`['~/.config/hashsync/default.toml' not found]`.
 
 The receiver needs a file, for its roots and its index. A sender uses only
 `tmp_data_dir`, where its spools go, and `hashlist_max_age`, how long its
@@ -2501,9 +2504,13 @@ Decode once, from left to right; never interpret decoded bytes as another
 escape. A trailing backslash, malformed hex escape, or unsupported escape,
 such as an octal one, is a configuration error. NUL is invalid in paths,
 path patterns, and process arguments; literal identifiers may contain it.
-Non-UTF-8 bytes are valid in all these byte-string fields. Do not apply
-configuration escapes to other fields, to names read from the filesystem,
-or to CLI arguments.
+Non-UTF-8 bytes are valid in all these byte-string fields. An
+`index_path` or `tmp_data_dir` that is `~` or that starts with `~/`
+starts at the home directory; `\x7E` there is a literal `~`, as every
+escape gives a literal byte. Do not apply configuration escapes to other
+fields, to names read from the filesystem, or to CLI arguments: a shell
+passes any bytes but NUL, such as bash's `$'\xFF'`. Messages show byte
+strings in this syntax (section 8).
 
 In globs, byte escapes produce literal bytes, not glob operators:
 `\x2A` matches a literal `*`, while an unescaped `*` is a wildcard.
@@ -2685,6 +2692,35 @@ write, notes, warnings, errors, and panic reports alike, starts with
 which host to act on it. Only a usage error of their command line, which
 comes before either runs, has no marker. The command's stderr passes
 through unchanged.
+
+Each note, warning, and error is one line, so that a program can read
+them line by line. Messages, and the report of `stats`, show each path,
+file name, profile name, pattern, and other value from outside the
+program, such as a host, a word of a command, or a value of the
+configuration file, between single quotes, in the byte-string syntax of
+the configuration file (section 7). So a program finds where each one
+ends, at the next single quote, and gets its bytes back, and a person can
+copy it into the file as a TOML literal string:
+
+| Bytes | Shown as |
+|---|---|
+| A backslash | `\\` |
+| A single quote | `\x27` |
+| A control character, U+2028, or U+2029, which some programs take for a line end | `\xHH` for each of its bytes |
+| A byte that is not part of a UTF-8 character | `\xHH` |
+| A `~` that starts a path, alone or before a `/` | `\x7E`: a `~` there stands for the home directory |
+| Any other character | Itself, also when it is not ASCII |
+
+A pattern keeps its glob quoting: `'/srv/\*'` is the root of the literal
+name `*`. A control character that another program's text, such as an
+error of RocksDB, puts into a message shows as `\xHH` too, and an error
+of the configuration file names its line and column instead of quoting
+its lines. A command that a message asks the user to run goes between
+backquotes, in words that a POSIX shell gives back exactly and that hold
+no backquote: a word of other characters than letters, digits, and
+`_@%+=:,./-` goes in single quotes, with `\'` for a single quote, and
+`$'\xHH'` for each byte of a control character, of a backquote, or that
+is not UTF-8, as in `hashsync --profile='a'$'\xFF' update`.
 
 Progress messages, summaries, and statistics show an amount of bytes
 below 1 KiB as whole bytes, such as `512 B`, and a larger one with two
@@ -3148,6 +3184,17 @@ decision history, including fuller measurements, is in version control.
   its spools would leave the tmp_data directory that this file sets. Each
   host names its profiles on its own, so the server uses `default` unless
   an option of `hashsync ssh` names another file.
+- **Paths in messages as they are, or between double quotes:** as they
+  are, the bytes that are not UTF-8 would show as U+FFFD, so that
+  different names would look the same, and a newline in a name would split
+  a report in two. Double quotes, as Rust and Git escape strings, would
+  show apostrophes as they are, but TOML reads a basic string's `\xFF` as
+  U+00FF, so a path copied from a message into the configuration file
+  would quietly name another file. Octal escapes in the commands that
+  messages ask for would read the same in every shell, but differ from the
+  `\xHH` of the rest of the messages; a `$'...'` part that holds only
+  `\xHH` escapes reads the same in every shell too, since no hexadecimal
+  digit follows an escape.
 
 ## 11. Repository conventions
 
@@ -3260,7 +3307,14 @@ decision history, including fuller measurements, is in version control.
     directory conflict; conflicting copy policies; a pruned immutable root
     that returns;
   - configuration byte escapes, TOML quoting, literal glob metacharacters,
-    and non-UTF-8 values; the server's configuration file: its file of
+    and non-UTF-8 values; a `~` that starts a path, also as `\x7E`;
+    messages that show paths, names, patterns, and values of the
+    configuration file with control characters, quotes, backslashes, a
+    leading `~`, and bytes that are not UTF-8, which a program reads back
+    from its line; an error of the configuration file in one line, also on
+    the server; commands in messages for names and paths with backquotes,
+    newlines, and bytes that are not UTF-8, which a shell runs; a NUL byte
+    in REQUEST; the server's configuration file: its file of
     the profile `default`, also when the client has `--profile` or
     `--config`, and without that file in a pull and in a push, the files
     of `--server-profile` and `--server-config`, also when they do not

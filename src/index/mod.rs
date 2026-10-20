@@ -19,7 +19,6 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::Arc;
 
-use bstr::ByteSlice;
 use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use rayon::slice::ParallelSliceMut;
 use rocksdb::{
@@ -32,6 +31,7 @@ use rustix::io::Errno;
 
 use crate::config::Config;
 use crate::die::die;
+use crate::escapes::quoted;
 use crate::fsops;
 use crate::hash::{PREFIX_LEN, weak};
 use crate::pool::Pool;
@@ -169,13 +169,10 @@ fn lock(path: &[u8], exclusive: bool) -> Result<OwnedFd, Errno> {
     if !sys::try_lock_file(file.as_fd(), exclusive)? {
         report::note(format_args!(
             "waiting for the lock of index {}",
-            path.as_bstr()
+            quoted(path)
         ));
         sys::lock_file(file.as_fd(), exclusive)?;
-        report::note(format_args!(
-            "acquired the lock of index {}",
-            path.as_bstr()
-        ));
+        report::note(format_args!("acquired the lock of index {}", quoted(path)));
     }
     Ok(file)
 }
@@ -244,13 +241,13 @@ pub fn open_modifying(path: &[u8]) -> Index {
     if let Err(e) = fsops::create_dir_all(os_path(path), 0o777) {
         die(format!(
             "cannot create index directory {}: {e}",
-            path.as_bstr()
+            quoted(path)
         ));
     }
     let lock = lock(path, true)
-        .unwrap_or_else(|e| die(format!("cannot lock index {}: {e}", path.as_bstr())));
+        .unwrap_or_else(|e| die(format!("cannot lock index {}: {e}", quoted(path))));
     let db = DB::open_cf_descriptors(&db_options(), os_path(path), column_families())
-        .unwrap_or_else(|e| die(format!("cannot open index {}: {e}", path.as_bstr())));
+        .unwrap_or_else(|e| die(format!("cannot open index {}: {e}", quoted(path))));
     Index {
         shared: Arc::new(Shared { db, _lock: lock }),
     }
@@ -264,17 +261,17 @@ pub fn open_read_only(path: &[u8]) -> Option<Index> {
     let lock = match lock(path, false) {
         Ok(lock) => lock,
         Err(Errno::NOENT) => return None,
-        Err(e) => die(format!("cannot open index {}: {e}", path.as_bstr())),
+        Err(e) => die(format!("cannot open index {}: {e}", quoted(path))),
     };
     match rustix::io::retry_on_intr(|| rustix::fs::stat(os_path(path).join("CURRENT"))) {
         Ok(_) => {}
         Err(Errno::NOENT) => return None,
-        Err(e) => die(format!("cannot open index {}: {e}", path.as_bstr())),
+        Err(e) => die(format!("cannot open index {}: {e}", quoted(path))),
     }
     // A database without every column family: the first update ended
     // before it created them all.
     let names = DB::list_cf(&Options::default(), os_path(path))
-        .unwrap_or_else(|e| die(format!("cannot open index {}: {e}", path.as_bstr())));
+        .unwrap_or_else(|e| die(format!("cannot open index {}: {e}", quoted(path))));
     if Cf::ALL
         .iter()
         .any(|cf| !names.iter().any(|name| name == cf.name()))
@@ -283,7 +280,7 @@ pub fn open_read_only(path: &[u8]) -> Option<Index> {
     }
     let db =
         DB::open_cf_descriptors_read_only(&db_options(), os_path(path), column_families(), false)
-            .unwrap_or_else(|e| die(format!("cannot open index {}: {e}", path.as_bstr())));
+            .unwrap_or_else(|e| die(format!("cannot open index {}: {e}", quoted(path))));
     Some(Index {
         shared: Arc::new(Shared { db, _lock: lock }),
     })
@@ -671,14 +668,14 @@ impl Index {
             Arc::into_inner(self.shared).expect("a reader outlives the index");
         drop(db);
         sys::lock_file(lock.as_fd(), false)
-            .unwrap_or_else(|e| die(format!("cannot lock index {}: {e}", path.as_bstr())));
+            .unwrap_or_else(|e| die(format!("cannot lock index {}: {e}", quoted(path))));
         let db = DB::open_cf_descriptors_read_only(
             &db_options(),
             os_path(path),
             column_families(),
             false,
         )
-        .unwrap_or_else(|e| die(format!("cannot open index {}: {e}", path.as_bstr())));
+        .unwrap_or_else(|e| die(format!("cannot open index {}: {e}", quoted(path))));
         Index {
             shared: Arc::new(Shared { db, _lock: lock }),
         }
@@ -962,6 +959,7 @@ mod tests {
     use std::os::unix::ffi::OsStrExt;
     use std::process::Command;
 
+    use bstr::ByteSlice;
     use rustix::fs::FlockOperation;
 
     use super::*;

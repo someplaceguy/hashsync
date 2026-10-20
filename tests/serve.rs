@@ -1137,7 +1137,7 @@ fn an_unknown_strong_hash_is_rejected_at_hello() {
     let request = request_payload(&["true"], BACKWARD, serve.settings);
     serve.send(REQUEST, &request);
     serve.send(HELLO, &hello_payload(4096, b"future-hash"));
-    serve.expect_death("incompatible receiver: strong hash future-hash");
+    serve.expect_death("incompatible receiver: strong hash 'future-hash'");
 }
 
 #[test]

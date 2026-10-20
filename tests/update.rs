@@ -5,7 +5,7 @@ mod common;
 
 use std::ffi::OsStr;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::process::{Command, Output};
 
 use common::*;
@@ -353,6 +353,64 @@ fn non_utf8_names_and_literal_metacharacters() {
     assert!(roots[0].ends_with(b"/arch-\xff"));
 }
 
+/// Messages show paths and patterns between single quotes, as the
+/// configuration file spells byte strings, so that a program can find each
+/// one in its line and get its bytes back, whatever they are: here a
+/// directory whose name holds a newline, a byte that is not UTF-8, quotes,
+/// a backslash, a terminal escape, and a letter that is not ASCII, with a
+/// file that cannot be read in it, a root pattern of such bytes that
+/// matches nothing, and a relative configuration file in a directory named
+/// `~`, which is not the home directory. Every report stays one line
+/// (DESIGN.md §8).
+#[test]
+fn messages_show_paths_that_a_program_can_read_back() {
+    if rustix::process::geteuid().is_root() {
+        eprintln!("skipped: root ignores permissions");
+        return;
+    }
+    let env = Env::new();
+    let name = b"odd\n\xff'\"\\ \x1b[1m\xc3\xa9";
+    let dir = env.tree().join(os(name));
+    std::fs::create_dir(&dir).unwrap();
+    let file = dir.join("unreadable");
+    std::fs::write(&file, random(BLOCK, 1)).unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let tree = env.tree().into_os_string().into_string().unwrap();
+    env.configure(&format!(
+        "{}[[roots]]\npath = '{tree}/missing-\\xFF\\x0A\\*/*'\n",
+        env.root("tree", "")
+    ));
+    let output = env.run(&["update"]);
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(output.status.success(), "{stderr}");
+    for line in stderr.lines() {
+        assert!(line.starts_with("hashsync: "), "{line:?}");
+        assert!(!line.contains(char::is_control), "{line:?}");
+    }
+    let shown = format!(r#"'{tree}/odd\x0A\xFF\x27"\\ \x1B[1mé/unreadable'"#);
+    let warning = format!("hashsync: warning: {shown}: reopen: ");
+    let line = stderr.lines().find(|line| line.starts_with(&warning));
+    let line = line.unwrap_or_else(|| panic!("no {warning:?}:\n{stderr}"));
+    // The path ends at the first single quote after its start.
+    let rest = line.strip_prefix("hashsync: warning: ").unwrap();
+    let end = rest[1..].find('\'').unwrap() + 2;
+    assert_eq!(unquote(&rest[..end]), file.as_os_str().as_bytes());
+    let pattern = format!(r"root pattern '{tree}/missing-\xFF\x0A\*/*' matched nothing");
+    assert!(stderr.contains(&pattern), "{stderr}");
+
+    env.write("cwd/~/c.toml", b"");
+    let output = env
+        .bare_command(&["--config", "~/c.toml", "stats"])
+        .current_dir(env.path("cwd"))
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let index = quoted(env.path("cache/hashsync/c.db"));
+    let note = format!("hashsync: using config '\\x7E/c.toml' and index {index}\n");
+    assert!(stderr.starts_with(&note), "{stderr}");
+}
+
 #[test]
 fn root_pattern_expansion() {
     let env = Env::new();
@@ -394,9 +452,9 @@ fn missing_and_non_indexable_roots_only_warn() {
         env.root("link", "")
     ));
     let stderr = env.update();
-    assert!(stderr.contains("missing: root does not exist"), "{stderr}");
+    assert!(stderr.contains("missing': root does not exist"), "{stderr}");
     assert!(
-        stderr.contains("link: root is not a directory or a regular file"),
+        stderr.contains("link': root is not a directory or a regular file"),
         "{stderr}"
     );
     assert_eq!(env.tree_paths(), vec!["f"]);
@@ -489,7 +547,7 @@ fn unlistable_directories_are_abandoned_under_any_depth() {
     let stderr = env.update();
     env.chmod("tree", 0o755);
     assert!(
-        stderr.contains("tree: identity: Permission denied"),
+        stderr.contains("tree': identity: Permission denied"),
         "{stderr}"
     );
     assert!(stderr.contains("matched nothing"), "{stderr}");
@@ -508,7 +566,7 @@ fn unlistable_directories_are_abandoned_under_any_depth() {
     let stderr = env.update();
     env.chmod("tree/x", 0o755);
     assert!(
-        stderr.contains("tree/x: reopen: Permission denied"),
+        stderr.contains("tree/x': reopen: Permission denied"),
         "{stderr}"
     );
     assert_eq!(root_paths(&env), vec![format!("{tree}/leaf")]);
@@ -543,7 +601,7 @@ fn the_slash_root_can_be_excluded() {
     ));
     let stderr = env.update();
     assert!(
-        stderr.contains("root pattern / matched nothing"),
+        stderr.contains("root pattern '/' matched nothing"),
         "{stderr}"
     );
     assert_eq!(env.count("roots"), 1);
@@ -947,11 +1005,11 @@ fn unreadable_entries_are_skipped_with_a_warning() {
     let stderr = env.update();
     env.chmod("tree/secret", 0o755);
     assert!(
-        stderr.contains("secret: reopen: Permission denied"),
+        stderr.contains("secret': reopen: Permission denied"),
         "{stderr}"
     );
     assert!(
-        stderr.contains("unreadable: reopen: Permission denied"),
+        stderr.contains("unreadable': reopen: Permission denied"),
         "{stderr}"
     );
     assert_eq!(env.tree_paths(), vec!["ok"]);
@@ -1027,9 +1085,9 @@ fn profiles_have_their_own_files_and_indexes() {
     let indexes = ["default", "work"].map(|name| env.path(format!("cache/hashsync/{name}.db")));
     let note = |name: &str, index: &std::path::Path| {
         format!(
-            "hashsync: using profile `{name}` [{}] and index {}\n",
-            env.profile_path(name).display(),
-            index.display()
+            "hashsync: using profile '{name}' [{}] and index {}\n",
+            quoted(env.profile_path(name)),
+            quoted(index)
         )
     };
     for (args, name, index) in [
@@ -1048,7 +1106,7 @@ fn profiles_have_their_own_files_and_indexes() {
     let output = env.bare_command(&["--profile", "work", "stats"]).output();
     let output = output.unwrap();
     let stats = String::from_utf8(output.stdout).unwrap();
-    let line = format!("index path:       {}\n", indexes[1].display());
+    let line = format!("index path:       {}\n", quoted(&indexes[1]));
     assert!(stats.contains(&line), "{stats}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(stderr, note("work", &indexes[1]));
@@ -1070,7 +1128,7 @@ fn profiles_have_their_own_files_and_indexes() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(1), "{stderr}");
     let missing = env.profile_path("missing");
-    let message = format!("cannot read configuration file {}", missing.display());
+    let message = format!("cannot read configuration file {}", quoted(missing));
     assert!(stderr.contains(&message), "{stderr}");
 
     for name in ["", "a/b", "/"] {
@@ -1108,12 +1166,14 @@ fn a_file_that_config_names_has_an_index_named_after_it() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stderr}");
     let warning = format!(
-        "hashsync: warning: {file} sets no index_path, so its index is {}, ",
-        index.display()
+        "hashsync: warning: {} sets no index_path, so its index is {}, ",
+        quoted(file),
+        quoted(&index)
     );
     let note = format!(
-        "hashsync: using config {file} and index {}\n",
-        index.display()
+        "hashsync: using config {} and index {}\n",
+        quoted(file),
+        quoted(&index)
     );
     assert!(stderr.starts_with(&(note + &warning)), "{stderr}");
     assert_eq!(IndexView::open(&index, false).count("blocks"), 1);
@@ -1126,7 +1186,7 @@ fn a_file_that_config_names_has_an_index_named_after_it() {
     assert!(output.status.success(), "{stderr}");
     assert!(!stderr.contains("warning"), "{stderr}");
     let stats = String::from_utf8(output.stdout).unwrap();
-    let line = format!("index path:       {}\n", index.display());
+    let line = format!("index path:       {}\n", quoted(&index));
     assert!(stats.contains(&line), "{stats}");
 
     env.write("elsewhere/new.toml", text.as_bytes());
@@ -1162,7 +1222,8 @@ fn a_file_that_config_names_has_an_index_named_after_it() {
 /// The update that a message asks for is a command line that the user can
 /// copy into a shell as it is. It gives back a profile name or a path that
 /// starts with `-`, or that holds spaces, quotes, control characters, or
-/// bytes that are not UTF-8, and updates the index of that file.
+/// bytes that are not UTF-8, and updates the index of that file. It holds
+/// no backquote, which would end the command in the message.
 #[test]
 fn the_update_that_a_message_asks_for_runs_as_it_is() {
     let env = Env::new();
@@ -1173,9 +1234,18 @@ fn the_update_that_a_message_asks_for_runs_as_it_is() {
         let stderr = String::from_utf8(output.stderr).unwrap();
         let line = stderr.lines().find(|line| line.contains("; run `"));
         let (_, rest) = line.expect(&stderr).split_once("; run `").unwrap();
-        rest.strip_suffix('`').unwrap().to_string()
+        let hint = rest.strip_suffix('`').unwrap();
+        assert!(!hint.contains('`'), "{hint}");
+        hint.to_string()
     };
-    let profiles: [&[u8]; 4] = [b"work files", b"-x", b"it's", b"a\xff\tb"];
+    let profiles: [&[u8]; 6] = [
+        b"work files",
+        b"-x",
+        b"it's",
+        b"a\xff\tb",
+        b"back`quote",
+        b"new\nline",
+    ];
     for name in profiles {
         let name = OsStr::from_bytes(name);
         let file = [name.as_bytes(), b".toml"].concat();

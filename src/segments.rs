@@ -23,11 +23,11 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::{Arc, Weak};
 
-use bstr::ByteSlice;
 use rustix::fs::{AtFlags, Mode, OFlags};
 use rustix::io::{Errno, retry_on_intr};
 
 use crate::die::die;
+use crate::escapes::quoted;
 use crate::fsops;
 use crate::names;
 
@@ -52,7 +52,7 @@ impl Directory {
     /// a directory that cannot hold segments ends the run here, before the
     /// command starts (DESIGN.md §6.5).
     pub fn open(path: &[u8]) -> Self {
-        let shown = path.as_bstr();
+        let shown = quoted(path);
         let dir = Path::new(OsStr::from_bytes(path));
         if let Err(e) = fsops::create_dir_all(dir, 0o700) {
             die(format!("cannot create tmp_data directory {shown}: {e}"));
@@ -89,7 +89,7 @@ impl Directory {
     pub fn fail(&self, action: &str, error: impl std::fmt::Display) -> ! {
         die(format!(
             "cannot {action} a segment in tmp_data directory {}: {error}",
-            self.path.as_bstr()
+            quoted(&self.path)
         ))
     }
 }
