@@ -1,12 +1,17 @@
 //! Configuration (DESIGN.md §7).
 //!
+//! Each command reads one configuration file: the file of a profile, the
+//! one that `--profile` names or `default`, or a file anywhere, which
+//! `--config` names. Unless the file sets `index_path`, its index is named after it.
 //! A configuration file describes only its own host: its roots and its
 //! index, and where it keeps temporary data and cached lists. Everything
 //! about a run is an option of `hashsync ssh` (`settings.rs`). Keys of
 //! later milestones are unknown fields and are rejected.
 
 use std::ffi::OsStr;
+use std::fmt::Write;
 use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 
 use bstr::ByteSlice;
 use serde::Deserialize;
@@ -16,6 +21,7 @@ use crate::fsops;
 use crate::glob;
 use crate::hash::StrongHash;
 use crate::names;
+use crate::report::warn;
 
 pub const MIN_BLOCK_SIZE: u64 = 512;
 pub const DEFAULT_BLOCK_SIZE: u32 = 16 * 1024;
@@ -25,8 +31,19 @@ pub const DEFAULT_HASHLIST_MAX_AGE: u64 = 30 * 24 * 3600;
 
 const DEFAULT_CANDIDATE_ATTEMPTS: u32 = 128;
 
+/// The profile of a command without `--profile` or `--config` (DESIGN.md
+/// §7).
+const DEFAULT_PROFILE: &[u8] = b"default";
+
 #[derive(Debug)]
 pub struct Config {
+    /// The option that selected this file, `--profile NAME` or `--config
+    /// PATH`, for the messages that tell the user what to run; `None` for
+    /// the default profile.
+    selected_by: Option<String>,
+    /// True when the file sets no `index_path`, so that its index is named
+    /// after the file.
+    index_named_after_file: bool,
     pub block_size: u32,
     pub strong_hash: StrongHash,
     /// Path bytes of the index database.
@@ -109,45 +126,170 @@ enum Size {
     Text(String),
 }
 
-/// Load the configuration file, `path` or the default one, or die with a
+/// The configuration file of a command, as its options select it
+/// (DESIGN.md §7).
+#[derive(Clone, Copy, Debug)]
+pub enum Source<'a> {
+    /// Neither `--profile` nor `--config`: the file of the profile
+    /// `default`.
+    Default,
+    /// `--profile NAME`: the file of the profile NAME.
+    Profile(&'a OsStr),
+    /// `--config PATH`: a file anywhere.
+    File(&'a OsStr),
+}
+
+impl Source<'_> {
+    /// The path of the file: `$XDG_CONFIG_HOME/hashsync/NAME.toml` for the
+    /// profile NAME.
+    fn path(self) -> Vec<u8> {
+        let profile = match self {
+            Source::Default => DEFAULT_PROFILE,
+            Source::Profile(name) => name.as_bytes(),
+            Source::File(path) => return path.as_bytes().to_vec(),
+        };
+        let mut path = xdg_dir("XDG_CONFIG_HOME", ".config");
+        path.extend_from_slice(b"/hashsync/");
+        path.extend_from_slice(profile);
+        path.extend_from_slice(b".toml");
+        path
+    }
+
+    /// The option that selects the file, for the commands that messages
+    /// tell the user to run; none for the default profile. The name or path
+    /// follows `=`, so that one that starts with `-` stays the value of the
+    /// option, as one shell word that gives back its bytes.
+    fn option(self) -> Option<String> {
+        let (option, value) = match self {
+            Source::Default => return None,
+            Source::Profile(name) => ("--profile", name),
+            Source::File(path) => ("--config", path),
+        };
+        Some(format!("{option}={}", shell_word(value.as_bytes())))
+    }
+}
+
+/// Load the configuration file that `source` selects, or die with a
 /// message. The commands that use the index need the file, for the roots
 /// and the index.
-pub fn load(path: Option<&OsStr>) -> Config {
-    load_from(path, false)
+pub fn load(source: Source) -> Config {
+    load_from(source, true)
 }
 
 /// Load the configuration of one host of `hashsync ssh` (DESIGN.md §7), as
-/// `load` does, unless the host `receives` no deduplicated stream: such a
-/// host uses only `tmp_data_dir` and `hashlist_max_age`, which have
-/// defaults, so a missing default file gives the default configuration. A
-/// file that `--config` names must exist.
-pub fn load_for_run(path: Option<&OsStr>, receives: bool) -> Config {
-    load_from(path, !receives)
+/// `load` does. A host that `receives` no deduplicated stream uses no
+/// index, only `tmp_data_dir` and `hashlist_max_age`, which have defaults,
+/// so it can do without the file of the default profile. A file that
+/// `--profile` or `--config` names must exist, so that a mistyped name
+/// fails instead of quietly giving the defaults.
+pub fn load_for_run(source: Source, receives: bool) -> Config {
+    load_from(source, receives)
 }
 
-fn load_from(path: Option<&OsStr>, optional: bool) -> Config {
-    let (path, default) = match path {
-        Some(p) => (p.as_bytes().to_vec(), false),
-        None => (default_config_path(), true),
-    };
+fn load_from(source: Source, uses_index: bool) -> Config {
+    if let Source::Profile(name) = source {
+        check_profile(name.as_bytes());
+    }
+    let path = source.path();
     let shown = path.as_bstr();
     let text = match fsops::retry_interrupted(|| std::fs::read(OsStr::from_bytes(&path))) {
         Ok(bytes) => bytes,
-        Err(e) if optional && default && e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e)
+            if !uses_index
+                && matches!(source, Source::Default)
+                && e.kind() == std::io::ErrorKind::NotFound =>
+        {
+            Vec::new()
+        }
         Err(e) => die(format!("cannot read configuration file {shown}: {e}")),
     };
     let text = match String::from_utf8(text) {
         Ok(text) => text,
         Err(_) => die(format!("configuration file {shown} is not UTF-8")),
     };
-    match parse(&text) {
+    let config = match parse(&text, source) {
         Ok(config) => config,
         Err(message) => die(format!("{shown}: {message}")),
+    };
+    // The files of profiles share one directory, so their names are
+    // distinct, and so are the names of their indexes. A file anywhere can
+    // have the name of another one, such as the file of a profile, and then
+    // shares its index.
+    if uses_index && config.index_named_after_file && matches!(source, Source::File(_)) {
+        warn(format!(
+            "{shown} sets no index_path, so its index is {}, as for any other \
+             configuration file of the same name; set index_path to avoid sharing it by accident",
+            config.index_path.as_bstr()
+        ));
+    }
+    config
+}
+
+/// Die unless `name`, a profile name from `--profile`, is one nonempty
+/// path component: it becomes part of a file name (DESIGN.md §7).
+fn check_profile(name: &[u8]) {
+    if name.is_empty() || name.contains(&b'/') {
+        die(format!(
+            "invalid profile name {:?}: it must not be empty or contain '/'",
+            name.as_bstr()
+        ));
     }
 }
 
-/// Parse and validate configuration text.
-pub fn parse(text: &str) -> Result<Config, String> {
+impl Config {
+    /// The command that updates the index of this configuration, for the
+    /// messages that tell the user to run it.
+    pub fn update_command(&self) -> String {
+        match &self.selected_by {
+            None => "hashsync update".into(),
+            Some(option) => format!("hashsync {option} update"),
+        }
+    }
+}
+
+/// `bytes` as one POSIX shell word that gives back exactly these bytes, for
+/// the commands that messages tell the user to run. Bytes that need no
+/// quoting stay as they are, and printable text goes in single quotes.
+/// Anything else goes in `$'...'` quotes, with octal escapes for control
+/// characters and for bytes that are not UTF-8: a message is text, which
+/// cannot hold such bytes, and it stays one line that a copy loses nothing
+/// of.
+fn shell_word(bytes: &[u8]) -> String {
+    let plain = |b: &u8| b.is_ascii_alphanumeric() || b"_@%+=:,./-".contains(b);
+    if !bytes.is_empty() && bytes.iter().all(plain) {
+        return bytes.iter().copied().map(char::from).collect();
+    }
+    if let Ok(text) = std::str::from_utf8(bytes)
+        && !text.contains(char::is_control)
+    {
+        return format!("'{}'", text.replace('\'', r"'\''"));
+    }
+    let mut word = String::from("$'");
+    let escape = |word: &mut String, bytes: &[u8]| {
+        for byte in bytes {
+            write!(word, "\\{byte:03o}").unwrap();
+        }
+    };
+    for chunk in bytes.utf8_chunks() {
+        for c in chunk.valid().chars() {
+            match c {
+                '\\' | '\'' => {
+                    word.push('\\');
+                    word.push(c);
+                }
+                c if c.is_control() => escape(&mut word, c.encode_utf8(&mut [0; 4]).as_bytes()),
+                c => word.push(c),
+            }
+        }
+        escape(&mut word, chunk.invalid());
+    }
+    word.push('\'');
+    word
+}
+
+/// Parse and validate the text of the configuration file that `source`
+/// selects.
+pub fn parse(text: &str, source: Source) -> Result<Config, String> {
     let raw: RawConfig = toml::from_str(text).map_err(|e| e.to_string())?;
     let block_size = match raw.block_size {
         None => DEFAULT_BLOCK_SIZE,
@@ -162,8 +304,9 @@ pub fn parse(text: &str) -> Result<Config, String> {
                 .map_err(|_| format!("block_size must be at most {} bytes", u32::MAX))?
         }
     };
+    let index_named_after_file = raw.index_path.is_none();
     let index_path = match raw.index_path {
-        None => default_index_path(),
+        None => default_index_path(source)?,
         Some(text) => parse_path(&text).map_err(|e| format!("index_path: {e}"))?,
     };
     let candidate_attempts = raw.candidate_attempts.unwrap_or(DEFAULT_CANDIDATE_ATTEMPTS);
@@ -183,6 +326,8 @@ pub fn parse(text: &str) -> Result<Config, String> {
         roots.push(parse_root(root).map_err(|e| format!("roots[{i}]: {e}"))?);
     }
     Ok(Config {
+        selected_by: source.option(),
+        index_named_after_file,
         block_size,
         strong_hash: raw.strong_hash.unwrap_or(StrongHash::DEFAULT),
         index_path,
@@ -400,16 +545,21 @@ pub fn xdg_dir(var: &str, fallback: &str) -> Vec<u8> {
     dir
 }
 
-pub fn default_config_path() -> Vec<u8> {
-    let mut path = xdg_dir("XDG_CONFIG_HOME", ".config");
-    path.extend_from_slice(b"/hashsync/config.toml");
-    path
-}
-
-pub fn default_index_path() -> Vec<u8> {
-    let mut path = xdg_dir("XDG_STATE_HOME", ".local/state");
-    path.extend_from_slice(b"/hashsync/default.db");
-    path
+/// `$XDG_CACHE_HOME/hashsync/STEM.db`: the index of a configuration file
+/// that sets no `index_path`, named after the file without its extension,
+/// so `NAME.db` for the profile NAME. The index holds only hints, which an
+/// update rebuilds from the roots, so it goes in the cache with the other
+/// files that hashsync creates (DESIGN.md §10).
+fn default_index_path(source: Source) -> Result<Vec<u8>, String> {
+    let file = source.path();
+    let Some(stem) = Path::new(OsStr::from_bytes(&file)).file_stem() else {
+        return Err("the file has no name to give its index; set index_path".into());
+    };
+    let mut path = xdg_dir("XDG_CACHE_HOME", ".cache");
+    path.extend_from_slice(b"/hashsync/");
+    path.extend_from_slice(stem.as_bytes());
+    path.extend_from_slice(b".db");
+    Ok(path)
 }
 
 /// `$XDG_CACHE_HOME/hashsync/tmp-data`: the default tmp_data directory
@@ -436,6 +586,11 @@ fn expand_tilde(path: Vec<u8>) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The configuration of `text` as the file of the default profile.
+    fn parse(text: &str) -> Result<Config, String> {
+        super::parse(text, Source::Default)
+    }
 
     #[test]
     fn sizes() {
@@ -629,15 +784,6 @@ one_filesystem = true
         );
         assert!(parse("[[roots]]\npath = \"/a\"\nbogus = 1").is_err());
         assert!(parse("bogus = 1").unwrap_err().contains("unknown field"));
-        // Every setting of a run is an option of `hashsync ssh`, never a key
-        // (DESIGN.md §7), so a file that holds one fails like any other
-        // unknown key.
-        for setting in ["compression_level = 3", "lookahead = \"1MiB\""] {
-            assert!(
-                parse(setting).unwrap_err().contains("unknown field"),
-                "{setting}"
-            );
-        }
         assert!(
             parse("[[roots]]\npath = '/a\\x00b'")
                 .unwrap_err()
@@ -653,6 +799,63 @@ one_filesystem = true
                 .unwrap_err()
                 .contains("trailing")
         );
+    }
+
+    /// A profile names its configuration file. Unless a file sets
+    /// `index_path`, its index is named after it, without its extension,
+    /// and the messages that ask for an update repeat the option that
+    /// selected the file (DESIGN.md §7).
+    #[test]
+    fn indexes_are_named_after_their_files() {
+        let profile = |name: &'static str| Source::Profile(OsStr::new(name));
+        assert!(profile("work").path().ends_with(b"/hashsync/work.toml"));
+        assert!(Source::Default.path().ends_with(b"/hashsync/default.toml"));
+        let default = parse("").unwrap();
+        assert!(default.index_path.ends_with(b"/hashsync/default.db"));
+        assert_eq!(default.update_command(), "hashsync update");
+        let work = super::parse("", profile("work")).unwrap();
+        assert!(work.index_path.ends_with(b"/hashsync/work.db"));
+        assert_eq!(work.update_command(), "hashsync --profile=work update");
+        // A name with dots keeps them.
+        let dotted = super::parse("", profile(".a.b")).unwrap();
+        assert!(dotted.index_path.ends_with(b"/hashsync/.a.b.db"));
+
+        let file = Source::File(OsStr::new("/etc/hashsync/nas.conf"));
+        let nas = super::parse("", file).unwrap();
+        assert!(nas.index_path.ends_with(b"/hashsync/nas.db"));
+        assert!(nas.index_named_after_file);
+        assert_eq!(
+            nas.update_command(),
+            "hashsync --config=/etc/hashsync/nas.conf update"
+        );
+        let set = super::parse("index_path = '/srv/nas.db'", file).unwrap();
+        assert_eq!(set.index_path, b"/srv/nas.db");
+        assert!(!set.index_named_after_file);
+    }
+
+    /// The command of a message is one that the user can copy into a
+    /// shell: the name or path follows `=`, so that a leading `-` stays its
+    /// value, in one shell word that gives back every byte of it.
+    #[test]
+    fn update_commands_give_back_names_and_paths() {
+        for (name, word) in [
+            (&b"work"[..], "work"),
+            (b"work files", "'work files'"),
+            (b"-x", "-x"),
+            (b"it's", r"'it'\''s'"),
+            ("café".as_bytes(), "'café'"),
+            (b"a\xffb", r"$'a\377b'"),
+            (b"tab\there\\'", r"$'tab\011here\\\''"),
+        ] {
+            let profile = Source::Profile(OsStr::from_bytes(name));
+            let config = super::parse("index_path = '/i'", profile).unwrap();
+            let command = format!("hashsync --profile={word} update");
+            assert_eq!(config.update_command(), command);
+        }
+        let file = Source::File(OsStr::new("my dir/nas.conf"));
+        let config = super::parse("index_path = '/i'", file).unwrap();
+        let command = "hashsync --config='my dir/nas.conf' update";
+        assert_eq!(config.update_command(), command);
     }
 
     #[test]

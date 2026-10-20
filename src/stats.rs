@@ -18,11 +18,12 @@ pub fn run(config: &Config) {
     // RocksDB keeps every file of the index open (DESIGN.md §4.4).
     fsops::raise_descriptor_limit();
     let path = config.index_path.as_bstr();
+    let update = config.update_command();
     let Some(index) = index::open_read_only(&config.index_path) else {
-        die(format!("no index at {path}; run `hashsync update`"));
+        die(format!("no index at {path}; run `{update}`"));
     };
     let Some(meta) = index.read_meta() else {
-        die(format!("index {path} has no schema; run `hashsync update`"));
+        die(format!("index {path} has no schema; run `{update}`"));
     };
     let stats = index.stats();
     // The lock keeps modifying processes away while the files are listed.
@@ -68,9 +69,9 @@ pub fn run(config: &Config) {
     }
 
     if !meta.compatible(&Settings::from_config(config)) {
-        warn(
-            "the index settings differ from the configuration; run `hashsync update` to rebuild it",
-        );
+        warn(format!(
+            "the index settings differ from the configuration; run `{update}` to rebuild it"
+        ));
     }
 }
 

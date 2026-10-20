@@ -58,7 +58,8 @@ Step 7 is the next milestone.
 Deliver `hashsync update [--rebuild]` and `hashsync stats` for mutable roots.
 
 - Support configured file and directory roots, root and exclusion globs,
-  `one_filesystem`, and the configuration and index locations.
+  `one_filesystem`, and the configuration and index locations: profiles,
+  `--config`, and indexes named after their configuration files.
 - Preserve arbitrary filename bytes, including configuration byte escapes
   and literal glob metacharacters.
 - Index the complete, useful blocks defined in the design, honoring

@@ -88,13 +88,16 @@ fn cache_root() -> PathBuf {
 }
 
 /// This UNIX account's persistent random 128-bit ID, in
-/// `$XDG_CONFIG_HOME/hashsync/account-id` (fallback
-/// `~/.config/hashsync/account-id`), independent of `--config`. The first
-/// use initializes it with atomic no-replace publication; concurrent
-/// initializers use the winner's ID. Every use makes it durable first.
-/// Failures die: HELLO cannot be built without an identity.
+/// `$XDG_CACHE_HOME/hashsync/account-id` (fallback
+/// `~/.cache/hashsync/account-id`), which all its configuration files
+/// share. The ID only names this account's directories in the list caches
+/// of its peers, so it lives in the cache too: a new ID just starts new
+/// directories, and the old ones expire. The first use initializes it with
+/// atomic no-replace publication; concurrent initializers use the winner's
+/// ID. Every use makes it durable first. Failures die: HELLO cannot be
+/// built without an identity.
 pub fn account_id() -> [u8; 16] {
-    let base = os_path(&config::xdg_dir("XDG_CONFIG_HOME", ".config"));
+    let base = cache_base();
     let dir = base.join("hashsync");
     let path = dir.join("account-id");
     loop {
@@ -1091,14 +1094,13 @@ pub(crate) mod tests {
     /// state.
     static ENV: Mutex<()> = Mutex::new(());
 
-    /// Run `test` in a fresh home: `XDG_CONFIG_HOME` and `XDG_CACHE_HOME`
-    /// point into a new temporary directory, which `test` receives. Every
-    /// test that touches the cache runs this way, one at a time, because
-    /// the variables belong to the whole process.
+    /// Run `test` in a fresh home: `XDG_CACHE_HOME` points into a new
+    /// temporary directory, which `test` receives. Every test that touches
+    /// the cache runs this way, one at a time, because the variable belongs
+    /// to the whole process.
     pub(crate) fn with_home<T>(test: impl FnOnce(&Path) -> T) -> T {
         let _guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
-        crate::sys::set_var_for_tests("XDG_CONFIG_HOME", dir.path().join("config").as_os_str());
         crate::sys::set_var_for_tests("XDG_CACHE_HOME", dir.path().join("cache").as_os_str());
         test(dir.path())
     }
@@ -1107,11 +1109,11 @@ pub(crate) mod tests {
     fn account_id_is_created_once_and_reread() {
         with_home(|home| {
             let id = account_id();
-            let stored = std::fs::read(home.join("config/hashsync/account-id")).unwrap();
+            let stored = std::fs::read(home.join("cache/hashsync/account-id")).unwrap();
             assert_eq!(stored, format!("{}\n", hex(&id)).into_bytes());
             assert_eq!(account_id(), id, "a second read must return the same ID");
             // No abandoned temporary is left behind.
-            let names: Vec<_> = std::fs::read_dir(home.join("config/hashsync"))
+            let names: Vec<_> = std::fs::read_dir(home.join("cache/hashsync"))
                 .unwrap()
                 .map(|e| e.unwrap().file_name())
                 .collect();

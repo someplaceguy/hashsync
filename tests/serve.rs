@@ -683,7 +683,6 @@ impl Serve {
             .env("HOME", home.path())
             .env("XDG_CONFIG_HOME", home.path().join("config"))
             .env("XDG_CACHE_HOME", home.path().join("cache"))
-            .env("XDG_STATE_HOME", home.path().join("state"))
             .env("XDG_RUNTIME_DIR", home.path().join("runtime"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -845,7 +844,7 @@ impl Serve {
             toml_literal(home.join("tree").as_os_str().as_bytes())
         );
         std::fs::create_dir_all(home.join("config/hashsync")).unwrap();
-        std::fs::write(home.join("config/hashsync/config.toml"), config).unwrap();
+        std::fs::write(home.join("config/hashsync/default.toml"), config).unwrap();
     }
 
     /// The index of `serve` in a push.
@@ -2067,7 +2066,7 @@ fn a_push_whose_stream_ends_during_the_update_sends_no_list() {
     // §5.6). The client's side ends with it, and sends nothing.
     let mut serve = Serve::start();
     serve.configure_push(&[("block", &indexed_block())]);
-    let config = serve.home.path().join("config/hashsync/config.toml");
+    let config = serve.home.path().join("config/hashsync/default.toml");
     let update = Command::new(env!("CARGO_BIN_EXE_hashsync"))
         .arg("--config")
         .arg(&config)
@@ -2098,7 +2097,7 @@ fn client_loss_during_the_index_update_of_a_push_is_fatal() {
     // starts at REQUEST (DESIGN.md §4.4 and §6.6).
     let mut serve = Serve::start();
     serve.configure_push(&[("block", &indexed_block())]);
-    let config = serve.home.path().join("config/hashsync/config.toml");
+    let config = serve.home.path().join("config/hashsync/default.toml");
     let update = Command::new(env!("CARGO_BIN_EXE_hashsync"))
         .arg("--config")
         .arg(&config)

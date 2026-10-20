@@ -914,15 +914,16 @@ fn prepare(config: &Config, preparation: Preparation, link: &Link) -> (Index, Ve
 /// configuration, else the run ends with `die`.
 fn open_read_only(config: &Config) -> Index {
     let path = config.index_path.as_bstr();
+    let update = config.update_command();
     let Some(index) = index::open_read_only(&config.index_path) else {
-        die(format!("no index at {path}; run `hashsync update`"));
+        die(format!("no index at {path}; run `{update}`"));
     };
     let Some(meta) = index.read_meta() else {
-        die(format!("index {path} has no schema; run `hashsync update`"));
+        die(format!("index {path} has no schema; run `{update}`"));
     };
     if !meta.compatible(&Settings::from_config(config)) {
         die(format!(
-            "index {path} does not match the configuration; run `hashsync update`"
+            "index {path} does not match the configuration; run `{update}`"
         ));
     }
     index

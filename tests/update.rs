@@ -3,9 +3,10 @@
 
 mod common;
 
-use std::os::unix::ffi::OsStringExt;
+use std::ffi::OsStr;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::symlink;
-use std::process::Command;
+use std::process::{Command, Output};
 
 use common::*;
 use rocksdb::WriteBatch;
@@ -1005,6 +1006,180 @@ fn missing_configuration_fails() {
     let output = env.run(&["update"]);
     assert_eq!(output.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&output.stderr).contains("cannot read configuration file"));
+}
+
+/// Each profile has its own configuration file and, unless the file sets
+/// `index_path`, its own index, named after it: the profile `default`
+/// without `--profile`, and the one that it names otherwise. A message
+/// that asks for an update names the profile. A named profile needs its
+/// file, and a profile name is one nonempty path component (DESIGN.md §7).
+#[test]
+fn profiles_have_their_own_files_and_indexes() {
+    let env = Env::new();
+    env.write("tree/a", &random(BLOCK, 1));
+    env.write("work/b", &random(BLOCK, 2));
+    env.write("work/c", &random(BLOCK, 3));
+    let config = |root: &str| format!("block_size = {BLOCK}\n{}", env.root(root, ""));
+    env.write_profile("default", &config("tree"));
+    env.write_profile("work", &config("work"));
+    for args in [&["update"][..], &["--profile", "work", "update"]] {
+        let output = env.bare_command(args).output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{args:?}: {stderr}");
+        assert!(!stderr.contains("warning"), "{args:?}: {stderr}");
+    }
+    let indexes = ["default", "work"].map(|name| env.path(format!("cache/hashsync/{name}.db")));
+    for (index, blocks) in indexes.iter().zip([1, 2]) {
+        assert_eq!(IndexView::open(index, false).count("blocks"), blocks);
+    }
+    let output = env.bare_command(&["--profile", "work", "stats"]).output();
+    let stats = String::from_utf8(output.unwrap().stdout).unwrap();
+    let line = format!("index path:       {}\n", indexes[1].display());
+    assert!(stats.contains(&line), "{stats}");
+
+    env.write_profile("new", &config("work"));
+    let output = env.bare_command(&["--profile", "new", "stats"]).output();
+    let output = output.unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("; run `hashsync --profile=new update`"),
+        "{stderr}"
+    );
+
+    let output = env
+        .bare_command(&["--profile", "missing", "update"])
+        .output();
+    let output = output.unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    let missing = env.profile_path("missing");
+    let message = format!("cannot read configuration file {}", missing.display());
+    assert!(stderr.contains(&message), "{stderr}");
+
+    for name in ["", "a/b", "/"] {
+        let output = env.bare_command(&["--profile", name, "stats"]).output();
+        let output = output.unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{name:?}: {stderr}");
+        assert!(
+            stderr.contains("invalid profile name"),
+            "{name:?}: {stderr}"
+        );
+    }
+}
+
+/// `--config` names a configuration file anywhere. Unless the file sets
+/// `index_path`, its index is named after it, without its extension, as
+/// the index of a profile is. So files of the same name share an index,
+/// such as this file and the file of the profile of that name, and a
+/// command that uses the index of a file that `--config` names without
+/// `index_path` warns about that. A message that asks for an update
+/// repeats `--config`. `--profile` and `--config` together are a usage
+/// error (DESIGN.md §7).
+#[test]
+fn a_file_that_config_names_has_an_index_named_after_it() {
+    let env = Env::new();
+    env.write("tree/a", &random(BLOCK, 1));
+    let text = format!("block_size = {BLOCK}\n{}", env.root("tree", ""));
+    env.write("elsewhere/nas.conf", text.as_bytes());
+    let file = env.path("elsewhere/nas.conf");
+    let file = file.to_str().unwrap();
+    let index = env.path("cache/hashsync/nas.db");
+    let output = env.bare_command(&["--config", file, "update"]).output();
+    let output = output.unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    let warning = format!(
+        "hashsync: warning: {file} sets no index_path, so its index is {}, ",
+        index.display()
+    );
+    assert!(stderr.contains(&warning), "{stderr}");
+    assert_eq!(IndexView::open(&index, false).count("blocks"), 1);
+
+    // The profile `nas` uses the same index, without a warning.
+    env.write_profile("nas", &text);
+    let output = env.bare_command(&["--profile", "nas", "stats"]).output();
+    let output = output.unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(!stderr.contains("warning"), "{stderr}");
+    let stats = String::from_utf8(output.stdout).unwrap();
+    let line = format!("index path:       {}\n", index.display());
+    assert!(stats.contains(&line), "{stats}");
+
+    env.write("elsewhere/new.toml", text.as_bytes());
+    let new = env.path("elsewhere/new.toml");
+    let new = new.to_str().unwrap();
+    let output = env.bare_command(&["--config", new, "stats"]).output();
+    let stderr = String::from_utf8_lossy(&output.as_ref().unwrap().stderr);
+    assert!(
+        stderr.contains("; run `hashsync --config=") && stderr.contains("/new.toml update`"),
+        "{stderr}"
+    );
+
+    let set = format!(
+        "index_path = '{}'\n{text}",
+        toml_literal(index.to_str().unwrap().as_bytes())
+    );
+    env.write("elsewhere/nas.conf", set.as_bytes());
+    let output = env.bare_command(&["--config", file, "update"]).output();
+    let output = output.unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(!stderr.contains("warning"), "{stderr}");
+
+    for words in [
+        &["--profile", "nas", "--config", file, "stats"][..],
+        &["--config", file, "stats", "--profile", "nas"],
+    ] {
+        let output = env.bare_command(words).output().unwrap();
+        assert_eq!(output.status.code(), Some(2), "{words:?}: {output:?}");
+    }
+}
+
+/// The update that a message asks for is a command line that the user can
+/// copy into a shell as it is. It gives back a profile name or a path that
+/// starts with `-`, or that holds spaces, quotes, control characters, or
+/// bytes that are not UTF-8, and updates the index of that file.
+#[test]
+fn the_update_that_a_message_asks_for_runs_as_it_is() {
+    let env = Env::new();
+    env.write("tree/a", &random(BLOCK, 1));
+    let text = format!("block_size = {BLOCK}\n{}", env.root("tree", ""));
+    // The hint of a message such as `no index at PATH; run `COMMAND``.
+    let hint = |output: Output| -> String {
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        let line = stderr.lines().find(|line| line.contains("; run `"));
+        let (_, rest) = line.expect(&stderr).split_once("; run `").unwrap();
+        rest.strip_suffix('`').unwrap().to_string()
+    };
+    let profiles: [&[u8]; 4] = [b"work files", b"-x", b"it's", b"a\xff\tb"];
+    for name in profiles {
+        let name = OsStr::from_bytes(name);
+        let file = [name.as_bytes(), b".toml"].concat();
+        env.write(env.path("config/hashsync").join(os(&file)), text.as_bytes());
+        let mut stats = env.bare_command(&[]);
+        let option = [b"--profile=", name.as_bytes()].concat();
+        let output = stats.arg(os(&option)).arg("stats").output();
+        let line = hint(output.unwrap());
+        let output = env.shell(&line).output().unwrap();
+        assert!(output.status.success(), "{line}: {output:?}");
+        let index = env
+            .path("cache/hashsync")
+            .join(os(&[name.as_bytes(), b".db"].concat()));
+        assert_eq!(IndexView::open(&index, false).count("blocks"), 1, "{line}");
+    }
+
+    // A path that starts with `-`, relative to the current directory.
+    let dir = env.path("elsewhere");
+    env.write("elsewhere/-it's here.conf", text.as_bytes());
+    let mut stats = env.bare_command(&["--config=-it's here.conf", "stats"]);
+    let line = hint(stats.current_dir(&dir).output().unwrap());
+    let output = env.shell(&line).current_dir(&dir).output().unwrap();
+    assert!(output.status.success(), "{line}: {output:?}");
+    let index = env.path("cache/hashsync/-it's here.db");
+    assert_eq!(IndexView::open(&index, false).count("blocks"), 1, "{line}");
 }
 
 #[test]

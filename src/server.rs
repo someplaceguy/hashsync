@@ -52,7 +52,6 @@
 //! process group. After END, the client closes both sessions, and this side
 //! joins every thread and exits (steps F1 to F3).
 
-use std::ffi::OsStr;
 use std::io::{BufReader, Read, Write};
 use std::net::Shutdown;
 use std::os::fd::AsFd;
@@ -91,11 +90,11 @@ use crate::units;
 /// The other host, as the messages about it name it.
 const PEER: &str = "client";
 
-/// Serve one run. `config_path` is `--config`, which a `--hashsync-path`
-/// wrapper can pass; without it, the default configuration file, which the
-/// server needs only when it receives a deduplicated forward stream
-/// (DESIGN.md §7).
-pub fn run(config_path: Option<&OsStr>, token: &str) -> ! {
+/// Serve one run. `source` is the configuration file that this process's
+/// own options select, which a `--hashsync-path` wrapper can pass; without
+/// them, the file of the default profile, which the server needs only when
+/// it receives a deduplicated forward stream (DESIGN.md §7).
+pub fn run(source: config::Source, token: &str) -> ! {
     // SSH carries this process's stderr to the client's: mark its lines as
     // the server's before anything can report one (DESIGN.md §8).
     report::mark_as_server();
@@ -139,7 +138,7 @@ pub fn run(config_path: Option<&OsStr>, token: &str) -> ! {
     if !request.human_readable {
         units::disable_human_readable();
     }
-    let config = Arc::new(config::load_for_run(config_path, deduplicated.stdin()));
+    let config = Arc::new(config::load_for_run(source, deduplicated.stdin()));
     let compressed = settings.compression_level != 0;
 
     // This side's tmp_data directory, for the pins and the spools of both

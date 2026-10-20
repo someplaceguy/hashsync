@@ -231,14 +231,14 @@ signal thread (section 6.8). A fatal end joins nothing (section 6.9).
 
 ### 4.2 Roots and change detection
 
-Roots come from `config.toml`; a glob match can be a directory or a single
-regular file. Root and exclusion globs use `gix-glob`'s raw `wildmatch`
-interface in pathname mode, with case-sensitive matching on bytes and
-leading dots included. `*`, `?`, and bracket classes cannot match `/`; `**`
-spans path components. Patterns and filenames may contain non-UTF-8 bytes,
-which section 7 spells in configuration; never reject them for that reason
-or convert them lossily. Thus `/nix/store/*` also matches
-`/nix/store/.links` and non-UTF-8 names.
+Roots come from the configuration file (section 7); a glob match can be a
+directory or a single regular file. Root and exclusion globs use
+`gix-glob`'s raw `wildmatch` interface in pathname mode, with
+case-sensitive matching on bytes and leading dots included. `*`, `?`, and
+bracket classes cannot match `/`; `**` spans path components. Patterns and
+filenames may contain non-UTF-8 bytes, which section 7 spells in
+configuration; never reject them for that reason or convert them lossily.
+Thus `/nix/store/*` also matches `/nix/store/.links` and non-UTF-8 names.
 
 `gix-glob` supplies matching, not filesystem expansion. Expand root
 patterns by walking directories relative to open descriptors, with the
@@ -382,13 +382,14 @@ and is not a persistent identity.
 
 ### 4.4 Storage
 
-The index is one RocksDB database: a directory, defaulting to
-`$XDG_STATE_HOME/hashsync/default.db`. Each table below is a column
-family, which holds entries (keys with values) in key order. A **row** is
-one entry of `roots`, `inodes`, `paths`, or `blocks`. `identities`,
-`inode_paths`, and `strong` hold one more entry for each row of `inodes`,
-`paths`, and `blocks`, keyed for another lookup; the transaction that
-changes a row changes that entry too.
+The index is one RocksDB database: a directory, by default named after the
+configuration file (section 7), such as
+`$XDG_CACHE_HOME/hashsync/default.db` for the profile `default`. Each table
+below is a column family, which holds entries (keys with values) in key
+order. A **row** is one entry of `roots`, `inodes`, `paths`, or `blocks`.
+`identities`, `inode_paths`, and `strong` hold one more entry for each row
+of `inodes`, `paths`, and `blocks`, keyed for another lookup; the
+transaction that changes a row changes that entry too.
 
 | Column family | Key | Value |
 |---|---|---|
@@ -798,12 +799,12 @@ delta chains.
 **Identity and storage.**
 
 Each UNIX account has one random 128-bit `account_id` in
-`$XDG_CONFIG_HOME/hashsync/account-id` (fallback
-`~/.config/hashsync/account-id`), independent of `--config`. Initialize it
-durably with atomic no-replace publication; concurrent initializers use the
-winner's ID. Never overwrite an existing ID. INDEX and ADVERTISE exchange
-account IDs, and INDEX names the receiver's index ID; the sender needs no
-index for the exchange.
+`$XDG_CACHE_HOME/hashsync/account-id` (fallback
+`~/.cache/hashsync/account-id`), which all its configuration files share.
+Initialize it durably with atomic no-replace publication; concurrent
+initializers use the winner's ID. Never overwrite an existing ID. INDEX and
+ADVERTISE exchange account IDs, and INDEX names the receiver's index ID;
+the sender needs no index for the exchange.
 
 Let `A` be the receiver account, `B` the sender account, and `I` the
 receiver index, encoded as fixed-width lowercase hex. Under
@@ -1026,13 +1027,13 @@ and stdout, and execute the specified remote command.
 SSH executes its remote command through the remote login shell, which must
 support POSIX shell quoting for this bootstrap. Treat `--hashsync-path` as
 one executable name or path, not a shell fragment: a wrapper script there
-does what a fragment would, such as passing `--config` to the server or
-setting its environment. Construct a remote `exec` command by
-single-quoting each argument, replacing embedded single quotes with
-`'\''`, and preserving all other bytes, including non-UTF-8 bytes. Passing
-separate local argv elements to SSH does not quote them for the remote
-shell. The server needs a compatible `hashsync` in PATH or at
-`--hashsync-path`.
+does what a fragment would, such as selecting the server's configuration
+file with `--profile` or `--config`, or setting its environment. Construct
+a remote `exec` command by single-quoting each argument, replacing
+embedded single quotes with `'\''`, and preserving all other bytes,
+including non-UTF-8 bytes. Passing separate local argv elements to SSH
+does not quote them for the remote shell. The server needs a compatible
+`hashsync` in PATH or at `--hashsync-path`.
 
 The client generates token `T` and starts both sessions together, with
 the signal mask that the client started with (section 6.9):
@@ -2398,15 +2399,33 @@ and will get a broken pipe on its next write to either closed output pipe.
 
 ## 7. Configuration
 
-Use `$XDG_CONFIG_HOME/hashsync/config.toml`, or `--config PATH`. A
-configuration file describes only its own host, whatever roles the host
-plays in a run. Each host reads its own file: the client when it starts,
-and `serve` once REQUEST has told it its roles. The receiver needs a file,
-for its roots and its index. A sender uses only `tmp_data_dir`, where its
-spools go, and `hashlist_max_age`, how long its list cache keeps lists;
-without a file, it uses their defaults. So the server of a pull and the
-client of a push need no file, and with both streams deduplicated, both
-hosts need one. A file that `--config` names must exist.
+Each command reads one configuration file. `--profile NAME` selects the
+file of the **profile** NAME, `$XDG_CONFIG_HOME/hashsync/NAME.toml`
+(fallback `~/.config/hashsync/NAME.toml`), and `--config PATH` a file
+anywhere. Without either, a command uses the profile `default`, and both
+together are a usage error. A profile name is a nonempty file name, so it
+contains no `/`.
+
+Unless the file sets `index_path`, its index is named after it:
+`$XDG_CACHE_HOME/hashsync/STEM.db` (fallback `~/.cache/hashsync/STEM.db`),
+where STEM is the name of the file without its extension, NAME for the
+profile NAME. The files of the profiles share one directory, so no two
+profiles share an index, but two files of the same name in different
+directories do. So a command that uses the index of a file that
+`--config` names warns when the file sets no `index_path`. All the
+configuration files of an account share its account ID, its list cache,
+and by default its tmp_data directory.
+
+A configuration file describes only its own host, whatever roles the host
+plays in a run. Each host reads its own file, which its own options
+select: the client when it starts, and `serve` once REQUEST has told it
+its roles. The receiver needs a file, for its roots and its index. A
+sender uses only `tmp_data_dir`, where its spools go, and
+`hashlist_max_age`, how long its list cache keeps lists; without a file of
+the profile `default`, it uses their defaults. So the server of a pull and
+the client of a push need no file, and with both streams deduplicated,
+both hosts need one. A file that `--profile` or `--config` names must
+exist.
 
 Everything about a run is an option of `hashsync ssh` (section 8), which
 the client sends to the server in REQUEST, so it is never ambiguous which
@@ -2417,7 +2436,7 @@ block_size     = "16KiB"   # at least 512 bytes; changes rebuild the index
 strong_hash    = "blake3"  # blake3 or sha256
 candidate_attempts = 128  # candidates tried per query, at least 1
 hashlist_max_age = "30d"   # how long this host's list cache keeps a list
-index_path     = "~/.local/state/hashsync/default.db"  # a directory
+index_path     = "~/.cache/hashsync/default.db"  # a directory, named after this file by default
 threads        = 0         # 0 = 4 × cores, clamped to 16–64
 tmp_data_dir   = "~/.cache/hashsync/tmp-data"  # segments of pins and spools; any filesystem
 
@@ -2622,8 +2641,8 @@ exclude = ['*.tmp', 'literal\x2Aname', 'back\\slash']
 - `hashsync prune`: remove the paths and roots that no configured copy
   holds any more (section 4.2).
 
-Every command also accepts these options, besides `--config PATH`
-(section 7):
+Every command also accepts these options, besides `--profile NAME` and
+`--config PATH`, which select its configuration file (section 7):
 
 - `-q` (`--quiet`): do not print progress messages and summaries to
   stderr. Warnings and errors stay.
@@ -3069,10 +3088,25 @@ decision history, including fuller measurements, is in version control.
   find blocks during the receiver's export. But its values that the target
   no longer has would cost queries and rescans, and the table cannot
   remove values, so a delta would need a new table. Not implemented.
+- **The index under `$XDG_STATE_HOME`, and the account ID under
+  `$XDG_CONFIG_HOME`:** hashsync can make both again. An update rebuilds
+  an index from the roots (section 3), and a new account ID starts new
+  peer/index directories, while the old ones expire (section 5.6). That is
+  what `$XDG_CACHE_HOME` is for, and backups commonly skip it, which suits
+  an index of gigabytes. So every file that hashsync creates is there,
+  besides its sockets, and the configuration directory holds only what the
+  user writes. A cleaner that empties the cache costs one full update, and
+  one full list for each peer and index.
+- **One default index for all configuration files:** two files with
+  different roots would share it, and the update of each would remove the
+  roots of the other, so that the next update of the other would hash
+  everything again. Each file names its index after itself instead. Only
+  files of the same name in different directories still share one, hence
+  the warning of section 7.
 
 ## 11. Repository conventions
 
-- One crate, one binary, committed `Cargo.lock`. All profiles use
+- One crate, one binary, committed `Cargo.lock`. All Cargo profiles use
   `panic = "abort"`; install cleanup hooks before starting threads.
 - Isolate unsafe syscall wrappers and SIMD code; deny unsafe code elsewhere.
 - Share protocol definitions between both hosts. Until the first release,
@@ -3182,6 +3216,9 @@ decision history, including fuller measurements, is in version control.
     that returns;
   - configuration byte escapes, TOML quoting, literal glob metacharacters,
     and non-UTF-8 values; the server's own configuration file, and none;
+    the files of profiles and of `--config`, their indexes named after
+    them, the warning for a file of `--config` without `index_path`, a
+    named file that does not exist, and both options together;
   - the command line of `hashsync ssh`: options after HOST, a command
     without `--`, `-l`, a command line for the user's shell and the words
     of `-s`, and `rsync -e 'hashsync ssh'` with a path with spaces, also

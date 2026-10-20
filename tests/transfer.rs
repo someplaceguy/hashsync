@@ -119,7 +119,6 @@ fi
 export HOME="$HASHSYNC_TEST_SERVER_HOME"
 export XDG_CONFIG_HOME="$HOME/.config"
 export XDG_CACHE_HOME="$HOME/.cache"
-export XDG_STATE_HOME="$HOME/.local/state"
 export XDG_RUNTIME_DIR="$HASHSYNC_TEST_SERVER_RUNTIME"
 export HASHSYNC_TEST_LOGIN="$login"
 export SHELL="${{HASHSYNC_TEST_SHELL:-/bin/sh}}"
@@ -233,9 +232,9 @@ exec /bin/sh -c "$1"
         std::fs::write(self.server_config(), text).unwrap();
     }
 
-    /// The server's default configuration file.
+    /// The configuration file of the server's default profile.
     fn server_config(&self) -> PathBuf {
-        self.env.path("server/home/.config/hashsync/config.toml")
+        self.env.path("server/home/.config/hashsync/default.toml")
     }
 
     /// The index of the server of a push.
@@ -267,6 +266,20 @@ exec /bin/sh -c "$1"
         match direction {
             Direction::Pull => self.env.index_path(),
             Direction::Push => self.server_index(),
+        }
+    }
+
+    /// The update that the messages of the receiver of `direction` ask for.
+    /// It repeats the option that selected the receiver's configuration
+    /// file: `--config` on the client, and none for the default profile of
+    /// the server (DESIGN.md §7).
+    fn update_command(&self, direction: Direction) -> String {
+        match direction {
+            Direction::Pull => format!(
+                "hashsync --config={} update",
+                self.env.config_path().display()
+            ),
+            Direction::Push => "hashsync update".into(),
         }
     }
 
@@ -344,12 +357,11 @@ exec /bin/sh -c "$1"
     /// environment is one of the test's own, on both sides, so that no run
     /// can touch the files of the user who runs the tests, such as the
     /// default index.
-    fn client_environment(&self) -> [(&str, PathBuf); 6] {
+    fn client_environment(&self) -> [(&str, PathBuf); 5] {
         [
             ("HOME", self.env.path("client/home")),
             ("XDG_CONFIG_HOME", self.env.path("client/config")),
             ("XDG_CACHE_HOME", self.env.path("client/cache")),
-            ("XDG_STATE_HOME", self.env.path("client/state")),
             ("HASHSYNC_TEST_SERVER_HOME", self.env.path("server/home")),
             (
                 "HASHSYNC_TEST_SERVER_RUNTIME",
@@ -848,8 +860,8 @@ fn output_reproduces_byte_for_byte_and_lists_are_cached() {
         assert_eq!(receiver, sender, "both sides store the same list name");
         assert!(receiver[0].starts_with("blake3-") && receiver[0].ends_with(".cache"));
         for identity in [
-            "client/config/hashsync/account-id",
-            "server/home/.config/hashsync/account-id",
+            "client/cache/hashsync/account-id",
+            "server/home/.cache/hashsync/account-id",
         ] {
             assert!(transfer.env.path(identity).exists(), "{identity}");
         }
@@ -900,11 +912,11 @@ fn indexed_blocks_become_references_at_any_offset() {
             assert_eq!(std::fs::read_dir(&tmp_data).unwrap().count(), 0);
         }
         // Without a configuration file, the client's index would be the
-        // default one, under its `XDG_STATE_HOME`.
+        // one of its default profile, under its `XDG_CACHE_HOME`.
         if direction == Direction::Push {
             assert!(transfer.server_index().exists(), "the server has no index");
-            let state = transfer.env.path("client/state/hashsync");
-            assert!(!state.exists(), "the client has an index");
+            let index = transfer.env.path("client/cache/hashsync/default.db");
+            assert!(!index.exists(), "the client has an index");
         }
     }
 }
@@ -1115,17 +1127,48 @@ fn the_client_keeps_its_temporary_data_in_the_configured_directory() {
     }
 
     // The client of a push needs no configuration file, but it uses the
-    // one that `--config` names, for its tmp_data directory (DESIGN.md §7).
+    // one that `--config` or `--profile` names, for its tmp_data
+    // directory, and that file must exist. It uses no index, so a file that
+    // `--config` names without `index_path` gets no warning about the name
+    // of its index (DESIGN.md §7).
     let transfer = Transfer::new(&[]);
     transfer.configure_server("");
     let tmp_data = transfer.env.path("tmp/pushed");
-    transfer.configure(&configure(&tmp_data));
-    let config = transfer.env.config_path();
+    transfer
+        .env
+        .write("pushed.toml", configure(&tmp_data).as_bytes());
+    let config = transfer.env.path("pushed.toml");
     let flags = ["--config", config.to_str().unwrap()];
     let output = transfer.push(&flags, &refs(&args(&["cat"]))).output();
-    succeeded(output.unwrap());
+    let output = succeeded(output.unwrap());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("index_path"), "{stderr}");
     assert_eq!(mode(&tmp_data), 0o700);
     assert_eq!(std::fs::read_dir(&tmp_data).unwrap().count(), 0);
+    std::fs::remove_dir(&tmp_data).unwrap();
+    transfer.env.write(
+        "client/config/hashsync/pushed.toml",
+        configure(&tmp_data).as_bytes(),
+    );
+    let output = transfer
+        .push(&["--profile", "pushed"], &refs(&args(&["cat"])))
+        .output();
+    succeeded(output.unwrap());
+    assert_eq!(mode(&tmp_data), 0o700);
+    let missing = transfer.env.path("missing.toml");
+    for flags in [
+        ["--profile", "missing"],
+        ["--config", missing.to_str().unwrap()],
+    ] {
+        let output = transfer.push(&flags, &refs(&command)).output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{flags:?}: {stderr}");
+        assert!(
+            stderr.contains("cannot read configuration file"),
+            "{stderr}"
+        );
+        assert!(!marker.exists(), "the command ran");
+    }
 }
 
 #[test]
@@ -1711,7 +1754,8 @@ fn the_server_reads_its_own_configuration() {
     // the segments of its spools in its own `tmp_data_dir`, and its list
     // cache expires lists after its own `hashlist_max_age`, while the
     // client keeps its default of 30 days (DESIGN.md §5.6 and §7). A
-    // `--hashsync-path` wrapper can name another file with `--config`.
+    // `--hashsync-path` wrapper can name another file with `--config`, or
+    // select another profile with `--profile`.
     let transfer = Transfer::new(&[]);
     // A stale list in another peer/index directory of the cache of each
     // host.
@@ -1752,7 +1796,7 @@ fn the_server_reads_its_own_configuration() {
     };
     let server_config = format!("{}hashlist_max_age = \"0\"\n", tmp_data_dir(&configured));
     transfer.env.write(
-        "server/home/.config/hashsync/config.toml",
+        "server/home/.config/hashsync/default.toml",
         server_config.as_bytes(),
     );
     let command = args(&["printf", "%s", "configured"]);
@@ -1786,6 +1830,25 @@ fn the_server_reads_its_own_configuration() {
     transfer.set_hashsync_path(wrapper.as_os_str());
     succeeded(transfer.run(&[], &refs(&command)));
     assert_eq!(mode(&other), 0o700);
+    assert!(
+        !default_dir.exists(),
+        "the server used its default directory"
+    );
+
+    let profile = transfer.env.path("profile-tmp-data");
+    transfer.env.write(
+        "server/home/.config/hashsync/other.toml",
+        tmp_data_dir(&profile).as_bytes(),
+    );
+    let wrapper = transfer.env.path("hashsync-with-profile");
+    let script = format!(
+        "#!/bin/sh\nexec '{}' --profile other \"$@\"\n",
+        env!("CARGO_BIN_EXE_hashsync")
+    );
+    write_script(&wrapper, script);
+    transfer.set_hashsync_path(wrapper.as_os_str());
+    succeeded(transfer.run(&[], &refs(&command)));
+    assert_eq!(mode(&profile), 0o700);
     assert!(
         !default_dir.exists(),
         "the server used its default directory"
@@ -1945,7 +2008,8 @@ fn no_update_requires_a_current_index() {
     // `--no-update` applies to the index of the receiver: the client's in a
     // pull, and the server's in a push, whose hint reaches the client's
     // stderr marked as the server's, so that the user runs the update on
-    // the right host (DESIGN.md §8).
+    // the right host (DESIGN.md §8), with the option that selected the
+    // configuration file there (DESIGN.md §7).
     for direction in DIRECTIONS {
         let transfer = Transfer::new(&[]);
         transfer.configure_receiver(direction, "");
@@ -1958,10 +2022,11 @@ fn no_update_requires_a_current_index() {
             Direction::Pull => "hashsync: no index at ",
             Direction::Push => "hashsync (server): no index at ",
         };
+        let hint = format!("run `{}`", transfer.update_command(direction));
         assert!(
             stderr
                 .lines()
-                .any(|line| line.starts_with(prefix) && line.ends_with("run `hashsync update`")),
+                .any(|line| line.starts_with(prefix) && line.ends_with(&hint)),
             "{direction:?}: missing hint, or one from the wrong host:\n{stderr}"
         );
 
@@ -1985,15 +2050,27 @@ fn no_update_requires_a_current_index() {
 #[test]
 fn cache_failures_are_fatal_on_either_side() {
     // Receiver: an unwritable cache root fails the run at publication
-    // (DESIGN.md §5.6 and §6.7). The tmp_data directory is in the same
-    // root and opens earlier, so it exists already: else its creation
-    // would fail first, and the run would end before the publication. Each
-    // run waits for its list, and has a byte of output: the exchange of a
-    // stream that ends before its list ends without one, and publishes
-    // nothing.
+    // (DESIGN.md §5.6 and §6.7). The tmp_data directory and the account ID
+    // are in the same root, and the run needs them earlier, so they exist
+    // already: else their creation would fail first, and the run would end
+    // before the publication. Each run waits for its list, and has a byte
+    // of output: the exchange of a stream that ends before its list ends
+    // without one, and publishes nothing.
     let transfer = Transfer::new(&["--wait"]);
     let command = args(&["printf", "x"]);
-    transfer.env.mkdir("client/cache/hashsync/tmp-data");
+    for (root, id) in [
+        (
+            "client/cache/hashsync",
+            b"0123456789abcdef0123456789abcdef\n",
+        ),
+        (
+            "server/home/.cache/hashsync",
+            b"fedcba9876543210fedcba9876543210\n",
+        ),
+    ] {
+        transfer.env.mkdir(format!("{root}/tmp-data"));
+        transfer.env.write(format!("{root}/account-id"), id);
+    }
     transfer.env.chmod("client/cache/hashsync", 0o555);
     let output = transfer.run(&[], &refs(&command));
     assert_eq!(output.status.code(), Some(1));
@@ -2006,8 +2083,7 @@ fn cache_failures_are_fatal_on_either_side() {
 
     // Sender: the same policy; its death fails the whole run, and its
     // message reaches the client's stderr through SSH. Its tmp_data
-    // directory exists too.
-    transfer.env.mkdir("server/home/.cache/hashsync/tmp-data");
+    // directory and account ID exist too.
     transfer.env.chmod("server/home/.cache/hashsync", 0o555);
     let output = transfer.run(&[], &refs(&command));
     assert_eq!(output.status.code(), Some(1));
@@ -3242,8 +3318,8 @@ fn a_target_in_the_directory_of_another_sender_is_linked() {
         let full = full.expect("no full list");
         let target = kept_list(&transfer, direction);
         let account = match direction {
-            Direction::Pull => "server/home/.config/hashsync/account-id",
-            Direction::Push => "client/config/hashsync/account-id",
+            Direction::Pull => "server/home/.cache/hashsync/account-id",
+            Direction::Push => "client/cache/hashsync/account-id",
         };
         std::fs::remove_file(transfer.env.path(account)).unwrap();
         assert_eq!(cat_references(&transfer, direction, "first"), (None, None));
@@ -6229,8 +6305,9 @@ fn a_rebuild_of_an_index_before_its_host_opens_it_again_ends_the_run() {
         let stderr = String::from_utf8_lossy(&std::fs::read(&stderr).unwrap()).into_owned();
         assert_eq!(output.status.code(), Some(1), "{direction:?}: {stderr}");
         let message = format!(
-            "{host}index {} does not match the configuration; run `hashsync update`",
-            index.display()
+            "{host}index {} does not match the configuration; run `{}`",
+            index.display(),
+            transfer.update_command(direction)
         );
         assert!(stderr.contains(&message), "{direction:?}: {stderr}");
     }

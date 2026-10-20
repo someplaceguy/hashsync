@@ -55,7 +55,8 @@ mod update;
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStrExt;
 
-use clap::{Parser, Subcommand};
+use clap::error::ErrorKind;
+use clap::{CommandFactory, Parser, Subcommand};
 
 use crate::die::die;
 use crate::protocol::Request;
@@ -72,7 +73,14 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
     about = "Run a command through SSH, deduplicating its stdout, its stdin, or both against indexed blocks"
 )]
 struct Cli {
-    /// Configuration file [default: $XDG_CONFIG_HOME/hashsync/config.toml]
+    /// The profile: the configuration file $XDG_CONFIG_HOME/hashsync/NAME.toml,
+    /// whose index is $XDG_CACHE_HOME/hashsync/NAME.db unless it sets
+    /// index_path [default: default]
+    #[arg(long, global = true, value_name = "NAME")]
+    profile: Option<OsString>,
+
+    /// A configuration file anywhere, in place of a profile; unless it sets
+    /// index_path, its index is named after it, as a profile's is
     #[arg(long, global = true, value_name = "PATH")]
     config: Option<OsString>,
 
@@ -86,6 +94,25 @@ struct Cli {
 
     #[command(subcommand)]
     command: Command,
+}
+
+impl Cli {
+    /// The configuration file that the options select (DESIGN.md §7).
+    /// `--profile` and `--config` both select it, so together they are a
+    /// usage error. clap's `conflicts_with` misses a global option before
+    /// the command with the other one after it, so this checks them
+    /// wherever they are.
+    fn source(&self) -> Result<config::Source<'_>, clap::Error> {
+        match (&self.profile, &self.config) {
+            (Some(_), Some(_)) => Err(Cli::command().error(
+                ErrorKind::ArgumentConflict,
+                "the argument '--profile <NAME>' cannot be used with '--config <PATH>'",
+            )),
+            (Some(name), None) => Ok(config::Source::Profile(name)),
+            (None, Some(path)) => Ok(config::Source::File(path)),
+            (None, None) => Ok(config::Source::Default),
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -220,14 +247,14 @@ fn main() {
     // as a failure, in place of SIGXFSZ, which skips the cleanup.
     die::block_file_size_signal();
     let cli = Cli::parse();
+    let source = cli.source().unwrap_or_else(|e| e.exit());
     if cli.quiet {
         report::disable_notes();
     }
     if cli.no_human_readable {
         units::disable_human_readable();
     }
-    let config_path = cli.config.as_deref();
-    let load_config = || config::load(config_path);
+    let load_config = || config::load(source);
     match &cli.command {
         Command::Update { rebuild, jobs } => update::run(&load_config(), *rebuild, *jobs),
         Command::Stats => stats::run(&load_config()),
@@ -236,12 +263,13 @@ fn main() {
         // (DESIGN.md §7).
         Command::Ssh(args) => {
             let request = args.request(cli.quiet, cli.no_human_readable);
-            let config = config::load_for_run(config_path, request.deduplicated.stdout());
+            let config = config::load_for_run(source, request.deduplicated.stdout());
             client::run(config, &args.remote(), &request, args.no_stdin)
         }
         // The server reads its configuration once REQUEST has told it its
-        // roles.
-        Command::Serve { token } => server::run(config_path, token),
+        // roles. Its own options select the file, not the client's: a
+        // configuration file describes only its own host.
+        Command::Serve { token } => server::run(source, token),
         Command::Attach { token } => attach::run(token),
     }
 }
@@ -316,6 +344,34 @@ mod tests {
         let cli = parse(&["ssh", "nas", "-q", "--config", "/c", "true"]).unwrap();
         assert!(cli.quiet);
         assert_eq!(cli.config.unwrap(), "/c");
+        let cli = parse(&["ssh", "nas", "--profile", "work", "true"]).unwrap();
+        assert_eq!(cli.profile.unwrap(), "work");
+    }
+
+    /// `--profile NAME` selects the file of a profile, and `--config PATH` a
+    /// file anywhere, before or after the command. Without either, the
+    /// command uses the default profile, and both together are a usage
+    /// error (DESIGN.md §7).
+    #[test]
+    fn the_options_select_the_configuration_file() {
+        let source = |words: &[&str]| format!("{:?}", parse(words).unwrap().source().unwrap());
+        assert_eq!(source(&["stats"]), "Default");
+        for words in [
+            &["--profile", "work", "stats"][..],
+            &["stats", "--profile", "work"],
+            &["update", "--profile=work"],
+        ] {
+            assert_eq!(source(words), r#"Profile("work")"#, "{words:?}");
+        }
+        assert_eq!(source(&["update", "--config", "/c"]), r#"File("/c")"#);
+        for words in [
+            &["--profile", "work", "--config", "/c", "stats"][..],
+            &["--config", "/c", "stats", "--profile", "work"],
+            &["stats", "--profile=work", "--config=/c"],
+        ] {
+            let error = parse(words).unwrap().source().err().map(|e| e.kind());
+            assert_eq!(error, Some(ErrorKind::ArgumentConflict), "{words:?}");
+        }
     }
 
     /// `--` ends the options, so a command can start with `-`; without it,

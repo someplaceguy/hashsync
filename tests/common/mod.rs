@@ -83,6 +83,44 @@ impl Env {
         command
     }
 
+    /// `hashsync ARGS...` without the `--config` of `command`, in the
+    /// configuration and cache directories of this environment: the files
+    /// of its profiles are in `config/hashsync`, and the indexes named
+    /// after their files in `cache/hashsync` (DESIGN.md §7).
+    pub fn bare_command(&self, args: &[&str]) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_hashsync"));
+        self.in_home(&mut command).args(args);
+        command
+    }
+
+    /// `line` as bash runs a command line that the user types, in the
+    /// directories of `bare_command`, with this build as `hashsync`.
+    pub fn shell(&self, line: &str) -> Command {
+        let mut command = Command::new("bash");
+        self.in_home(&mut command)
+            .env("HASHSYNC", env!("CARGO_BIN_EXE_hashsync"))
+            .args(["-c", r#"hashsync() { "$HASHSYNC" "$@"; }; eval "$1""#])
+            .args(["bash", line]);
+        command
+    }
+
+    /// `command` with the configuration and cache directories of this
+    /// environment.
+    fn in_home<'a>(&self, command: &'a mut Command) -> &'a mut Command {
+        command
+            .env("XDG_CONFIG_HOME", self.path("config"))
+            .env("XDG_CACHE_HOME", self.path("cache"))
+    }
+
+    /// The configuration file of the profile `name`, for `bare_command`.
+    pub fn profile_path(&self, name: &str) -> PathBuf {
+        self.path(format!("config/hashsync/{name}.toml"))
+    }
+
+    pub fn write_profile(&self, name: &str, text: &str) {
+        self.write(self.profile_path(name), text.as_bytes());
+    }
+
     pub fn run(&self, args: &[&str]) -> Output {
         self.command(args).output().unwrap()
     }
