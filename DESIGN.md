@@ -245,7 +245,16 @@ Thus `/nix/store/*` also matches `/nix/store/.links` and non-UTF-8 names.
 `gix-glob` supplies matching, not filesystem expansion. Expand root
 patterns by walking directories relative to open descriptors, with the
 no-symlink rules of section 4.5, and detect directory cycles during the
-expansion.
+expansion. A pattern matches only entries that exist, also a pattern
+without wildcards: names come from directory listings, or a literal name
+is looked up, for existence only, and the scan task decides what the
+entry is (section 4.5). A root that is not there therefore has no root
+row, and a group whose copies are all missing is no longer configured.
+An entry whose lookup fails is reported and is no match either, like a
+directory on its path that cannot be opened: no scan or candidate read
+could reach it. A pattern without matches gets a warning; when the root
+of a pattern without wildcards is all that is missing, the warning says
+that the root does not exist.
 
 Resolve roots for every update, run (including `--no-update`), and prune.
 After exclusions, reject duplicate or nested absolute paths before changing
@@ -282,6 +291,7 @@ Per-root options:
 |---|---|
 | `exclude` | Globs using the same match options as roots. Patterns beginning with `/` match absolute paths, including root matches; others match basenames. Excluded entries and descendants are skipped. |
 | `one_filesystem` | Skip an entry and descendants when its mount ID differs from its parent's. |
+| `may_vanish` | The root need not exist: neither a pattern without matches nor a missing root gets a warning, and a copy that vanishes before its scan task opens it gives its place to the next one (below). Copies of a group can differ in it. |
 | `identifier = "path"` | Default for immutable roots: the absolute matched path. |
 | `identifier = "name"` | Use the last path component, allowing copies under different parent directories. |
 | `identifier = { strip_prefix = "/mnt/disk" }` | Remove that prefix from the absolute match; a missing prefix is a configuration error. |
@@ -330,11 +340,17 @@ change in one transaction:
 
 Schedule scan tasks for every mutable root and one chosen location per
 unfinished immutable group. Completed groups and unchosen copies have no
-scan tasks. After all scan tasks finish, publish immutable identifiers only
-for groups whose traversals and dependent inode and path results succeeded
-and committed (section 4.6). A failed chosen copy leaves the traversal
-unfinished; other copies remain available for candidate reads. After
-processing all results, remove every orphaned inode and its blocks.
+scan tasks. The chosen location is the first copy in the order of the
+configuration. A copy can vanish after root expansion: when the scan task
+does not find it and it may vanish, the task takes the next copy, until
+one is there or a copy that may not vanish is missing. A group without a
+copy left stays unfinished without a warning. After all scan tasks
+finish, publish immutable identifiers only for groups whose traversals
+and dependent inode and path results succeeded and committed (section
+4.6), with the path of the copy that the scan traversed. A failed chosen
+copy leaves the traversal unfinished; a missing copy that may not vanish
+is such a failure. Other copies remain available for candidate reads.
+After processing all results, remove every orphaned inode and its blocks.
 
 The same reconciliation recovers interrupted updates. Renames and identifier
 changes can reuse complete inodes with unchanged identity, size, and ctime.
@@ -3302,8 +3318,13 @@ decision history, including fuller measurements, is in version control.
     aliases in either traversal order; root replacement between expansion
     and scanning; links found before and after their owner's row commits;
     hard links within and across roots, also to a single-file root;
-  - immutable reuse after root-directory identity changes; no tasks or
-    opens solely for overlap checks; completion withheld after a late
+  - immutable reuse after root-directory identity changes; a missing root
+    of a pattern without wildcards, and one that cannot be looked up,
+    which are no copies of their groups, and a completed group whose
+    copies are all missing, which goes; a copy that vanishes after root
+    expansion and may vanish, which gives its place to the next copy, and
+    one that may not vanish, which leaves its group unfinished; no tasks
+    or scans solely for overlap checks; completion withheld after a late
     directory conflict; conflicting copy policies; a pruned immutable root
     that returns;
   - configuration byte escapes, TOML quoting, literal glob metacharacters,

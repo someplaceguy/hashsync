@@ -20,9 +20,15 @@ process-isolation tests, and protocol fuzzing from DESIGN.md §11. Run
 `cargo fmt`, `cargo clippy --all-targets`, and `cargo test` for implementation
 changes.
 
-**Status:** Steps 1 to 6 are implemented: `update` (with `--rebuild` and
-`-j`) and `stats` maintain the index for mutable roots, reuse unchanged
-files by identity, size, and ctime, and recover interrupted work; `ssh`
+**Status:** Steps 1 to 7 are implemented: `update` (with `--rebuild` and
+`-j`) and `stats` maintain the index for mutable and immutable roots,
+reuse unchanged files by identity, size, and ctime, and recover
+interrupted work. The copies of an immutable group share one root row: an
+update scans the first copy of an unfinished group that is there, the
+next one when a copy that may vanish disappears before its scan, marks
+the group complete once nothing failed, reuses a complete group without a
+scan, and removes a group whose copies are all missing, while candidate
+reads try every current copy (DESIGN.md §4.2 and §6.4); `ssh`
 (with `--no-update`, `--ssh`, `--hashsync-path`, and the run options),
 `serve`, and `attach` run a remote command as ssh does, over two SSH
 sessions. The client's stdin is the forward stream, and the command's
@@ -53,7 +59,7 @@ shows what each stream read, decoded, dropped, and wrote (DESIGN.md §6.6
 and §8). The server marks its lines with `hashsync (server): `, and
 reads its own file of the profile `default`, unless `--server-profile` or
 `--server-config` selects another; every command names its file and
-index in a note, on both hosts of a run (DESIGN.md §7). Step 7 is the next
+index in a note, on both hosts of a run (DESIGN.md §7). Step 8 is the next
 milestone.
 
 ## 1. Build and inspect a local index

@@ -11,6 +11,7 @@
 pub mod changes;
 mod layout;
 
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::mem;
 use std::ops::RangeInclusive;
@@ -37,7 +38,8 @@ use crate::hash::{PREFIX_LEN, weak};
 use crate::pool::Pool;
 use crate::report;
 use crate::sys;
-use layout::{Cf, ID_LEN, InodeRow, RootRow, id_key, u64_at};
+pub use layout::RootRow;
+use layout::{Cf, ID_LEN, InodeRow, id_key, u64_at};
 
 pub const SCHEMA_VERSION: u64 = 1;
 
@@ -439,6 +441,58 @@ impl Shared {
     }
 }
 
+/// One current location of a configured root, as the reconciliation of an
+/// update sees it (DESIGN.md §4.2): its path, and for an immutable root,
+/// the identifier of its group, which all copies of the group share.
+pub struct CurrentRoot<'a> {
+    pub path: &'a [u8],
+    pub identifier: Option<&'a [u8]>,
+}
+
+/// What the reconciliation of an update decided (DESIGN.md §4.2): which
+/// current roots the scan traverses, and the immutable groups, whose
+/// completion markers the changes of the scan maintain
+/// (`changes::Changes`).
+#[cfg_attr(test, derive(Default))]
+pub struct Reconciliation {
+    /// The roots to scan, in the order of the current roots: every mutable
+    /// root and every unfinished group.
+    scans: Vec<ScanRoot>,
+    /// The immutable groups of the configuration by root ID: the completed
+    /// groups, which the update keeps without a scan, and the unfinished
+    /// ones, which it scans.
+    groups: HashMap<u64, Group>,
+}
+
+/// A root that an update scans: a mutable root, or an unfinished group.
+pub struct ScanRoot {
+    /// The ID of its new row.
+    pub root_id: u64,
+    /// The current roots that the scan can traverse for it, as indexes
+    /// among the current roots that the reconciliation got, in the order in
+    /// which the scan tries them: the mutable root, or every copy of the
+    /// group. The row names the first one.
+    pub locations: Vec<usize>,
+}
+
+/// An immutable group of an update, with the row that its marker changes.
+struct Group {
+    identifier: Vec<u8>,
+    /// The path of the root row: the representative copy of a completed
+    /// group, and the first copy of an unfinished one, unless its scan
+    /// traverses another copy (`changes::Changes::scan_copy`).
+    path: Vec<u8>,
+    /// The group was completely indexed before the update.
+    complete: bool,
+}
+
+impl Reconciliation {
+    /// The roots to scan, in the order of the current roots.
+    pub fn scans(&self) -> &[ScanRoot] {
+        &self.scans
+    }
+}
+
 /// A candidate (DESIGN.md §6.4): an indexed block with one path of its
 /// inode.
 pub struct Candidate {
@@ -705,20 +759,12 @@ impl Index {
     }
 
     /// Every root row, by ID.
-    fn roots(&self) -> Vec<(u64, RootRow)> {
+    pub fn roots(&self) -> Vec<(u64, RootRow)> {
         let mut roots = Vec::new();
         self.shared.each(Cf::Roots, b"", |key, value| {
             roots.push((u64_at(key, 0), RootRow::decode(value)));
         });
         roots
-    }
-
-    /// Every root row: its ID and its representative path.
-    pub fn root_paths(&self) -> Vec<(u64, Vec<u8>)> {
-        self.roots()
-            .into_iter()
-            .map(|(root_id, row)| (root_id, row.path))
-            .collect()
     }
 
     /// The inode ID of an identity (an `identities` key).
@@ -816,23 +862,28 @@ impl Index {
         db(self.shared.db.wait_for_compact(&options));
     }
 
-    /// Reconcile roots before scanning (DESIGN.md §4.2): remove the paths
-    /// and rows of unfinished roots and of incomplete inodes, then create
-    /// rows for the roots to scan. Returns their IDs in order.
+    /// Reconcile the roots before the scan (DESIGN.md §4.2), with
+    /// `current`, the current locations of the configured roots. A
+    /// completed group stays, without a scan, while the configuration names
+    /// its identifier and none of its paths leads to an incomplete inode.
+    /// Every other root loses its paths and its row, and so do the
+    /// incomplete inodes. Then every mutable root, and the first copy of
+    /// each unfinished group, gets a new row without an identifier, for the
+    /// scan.
     ///
-    /// The blocks go first, in bounded transactions, and so do the paths
-    /// when some roots keep theirs. The rows then change in one
-    /// transaction, which also removes all paths when no root keeps its
-    /// paths.
-    pub fn reconcile_roots(&self, paths: &[&[u8]]) -> Vec<u64> {
-        // Every root without an identifier is unfinished; the others keep
-        // their paths.
-        let roots = self.roots();
-        let last_retained = roots
-            .iter()
-            .filter(|(_, row)| row.identifier.is_some())
-            .map(|&(root_id, _)| root_id)
-            .max();
+    /// The markers of the completed roots that do not stay go first, in one
+    /// transaction, so that no marker outlives a path of its root. The
+    /// blocks go next, in bounded transactions, and so do the paths when
+    /// some roots keep theirs. The rows then change in one transaction,
+    /// which also removes all paths when no root keeps its paths.
+    pub fn reconcile_roots(&self, current: &[CurrentRoot<'_>]) -> Reconciliation {
+        // The copies of each configured group, in order.
+        let mut copies: HashMap<&[u8], Vec<usize>> = HashMap::new();
+        for (i, root) in current.iter().enumerate() {
+            if let Some(identifier) = root.identifier {
+                copies.entry(identifier).or_default().push(i);
+            }
+        }
         let mut incomplete = Vec::new();
         self.shared.each(Cf::Inodes, b"", |key, value| {
             let row = InodeRow::decode(value);
@@ -840,9 +891,44 @@ impl Index {
                 incomplete.push((u64_at(key, 0), row));
             }
         });
+        let mut referring = HashSet::new();
+        for (inode_id, _) in &incomplete {
+            self.shared
+                .each(Cf::InodePaths, &id_key(*inode_id), |key, _| {
+                    referring.insert(u64_at(key, ID_LEN));
+                });
+        }
 
-        // A root can have many paths, and there can be many roots: the
-        // removals run on one thread per core. A path of an incomplete
+        // Step 1. A row of a configured group that some update scanned
+        // completely stays. The updates give a group one row, so a second
+        // row of a group could only come from a damaged index; it goes too.
+        let mut roots = self.roots();
+        let mut staying = HashSet::new();
+        let mut txn = self.transaction();
+        for (root_id, row) in &mut roots {
+            let Some(identifier) = &row.identifier else {
+                continue;
+            };
+            if copies.contains_key(identifier.as_slice())
+                && !referring.contains(root_id)
+                && staying.insert(identifier.clone())
+            {
+                continue;
+            }
+            row.identifier = None;
+            txn.put(Cf::Roots, &id_key(*root_id), &row.encode());
+        }
+        txn.commit();
+        // Every root without an identifier is unfinished now; the others
+        // keep their paths.
+        let last_retained = roots
+            .iter()
+            .filter(|(_, row)| row.identifier.is_some())
+            .map(|&(root_id, _)| root_id)
+            .max();
+
+        // Step 2. A root can have many paths, and there can be many roots:
+        // the removals run on one thread per core. A path of an incomplete
         // inode under an unfinished root is removed twice, which changes
         // nothing.
         let pool = Pool::start("reconcile", 0);
@@ -858,6 +944,7 @@ impl Index {
         });
         drop(pool);
 
+        // Step 3.
         let mut txn = self.transaction();
         if last_retained.is_none() {
             // No root keeps its paths: they all go, with one range
@@ -865,32 +952,81 @@ impl Index {
             txn.clear(Cf::Paths);
             txn.clear(Cf::InodePaths);
         }
+        let mut kept: HashMap<&[u8], (u64, &[u8])> = HashMap::new();
         for (root_id, row) in &roots {
-            if row.identifier.is_none() {
-                txn.delete(Cf::Roots, &id_key(*root_id));
+            match &row.identifier {
+                Some(identifier) => {
+                    kept.insert(identifier, (*root_id, &row.path));
+                }
+                None => txn.delete(Cf::Roots, &id_key(*root_id)),
             }
         }
         for (inode_id, row) in &incomplete {
             txn.delete(Cf::Inodes, &id_key(*inode_id));
             txn.delete(Cf::Identities, &row.identity);
         }
-        // IDs of removed roots can return: their paths are gone.
+        let mut reconciliation = Reconciliation {
+            scans: Vec::new(),
+            groups: HashMap::new(),
+        };
+        // IDs of removed roots can return: their paths are gone. Each new
+        // row takes the path of a current root, which no other row has: a
+        // kept group keeps a path of one of its own copies.
         let mut next = last_retained.unwrap_or(0) + 1;
-        let ids = paths
-            .iter()
-            .map(|path| {
-                let root_id = next;
-                next += 1;
-                let row = RootRow {
-                    identifier: None,
-                    path: path.to_vec(),
-                };
-                txn.put(Cf::Roots, &id_key(root_id), &row.encode());
-                root_id
-            })
-            .collect();
+        for (i, root) in current.iter().enumerate() {
+            let group = match root.identifier {
+                Some(identifier) if copies[identifier][0] != i => continue,
+                Some(identifier) => kept.get(identifier).map(|&kept| (identifier, kept)),
+                None => None,
+            };
+            if let Some((identifier, (root_id, stored))) = group {
+                // The representative path stays while it is a copy of the
+                // group: a moved copy, or one that went away, gives its
+                // place to the first copy.
+                let still_a_copy = copies[identifier]
+                    .iter()
+                    .any(|&copy| current[copy].path == stored);
+                let path = if still_a_copy { stored } else { root.path };
+                if path != stored {
+                    let row = RootRow {
+                        identifier: Some(identifier.to_vec()),
+                        path: path.to_vec(),
+                    };
+                    txn.put(Cf::Roots, &id_key(root_id), &row.encode());
+                }
+                reconciliation.groups.insert(
+                    root_id,
+                    Group {
+                        identifier: identifier.to_vec(),
+                        path: path.to_vec(),
+                        complete: true,
+                    },
+                );
+                continue;
+            }
+            let root_id = next;
+            next += 1;
+            let row = RootRow {
+                identifier: None,
+                path: root.path.to_vec(),
+            };
+            txn.put(Cf::Roots, &id_key(root_id), &row.encode());
+            let locations = match root.identifier {
+                None => vec![i],
+                Some(identifier) => {
+                    let group = Group {
+                        identifier: identifier.to_vec(),
+                        path: root.path.to_vec(),
+                        complete: false,
+                    };
+                    reconciliation.groups.insert(root_id, group);
+                    copies[identifier].clone()
+                }
+            };
+            reconciliation.scans.push(ScanRoot { root_id, locations });
+        }
         txn.commit();
-        ids
+        reconciliation
     }
 
     pub fn stats(&self) -> Stats {
@@ -1061,7 +1197,8 @@ mod tests {
     }
 
     /// Give root rows identifiers: they become completed immutable groups,
-    /// which keep their paths.
+    /// which keep their paths while the configuration names them
+    /// (`configured`).
     fn complete_roots(index: &Index, root_ids: &[u64]) {
         let mut txn = index.transaction();
         for &root_id in root_ids {
@@ -1072,6 +1209,54 @@ mod tests {
             txn.put(Cf::Roots, &id_key(root_id), &row.encode());
         }
         txn.commit();
+    }
+
+    /// The identifiers and paths of the groups that `complete_roots` makes
+    /// of `root_ids`, for `configured`.
+    fn group_names(root_ids: &[u64]) -> Vec<(Vec<u8>, Vec<u8>)> {
+        root_ids
+            .iter()
+            .map(|id| {
+                let name = format!("group{id}");
+                (name.clone().into_bytes(), format!("/{name}").into_bytes())
+            })
+            .collect()
+    }
+
+    /// The current roots of a configuration: the copies of the groups of
+    /// `groups`, as identifiers and paths, and the mutable roots of
+    /// `mutable`.
+    fn configured<'a>(
+        groups: &'a [(Vec<u8>, Vec<u8>)],
+        mutable: &[&'a [u8]],
+    ) -> Vec<CurrentRoot<'a>> {
+        let copies = groups.iter().map(|(identifier, path)| CurrentRoot {
+            path,
+            identifier: Some(identifier),
+        });
+        let mutable = mutable.iter().map(|&path| CurrentRoot {
+            path,
+            identifier: None,
+        });
+        copies.chain(mutable).collect()
+    }
+
+    /// The roots that a reconciliation gave the scan: their root IDs and
+    /// the indexes of their current roots.
+    pub fn scans(reconciliation: &Reconciliation) -> Vec<(u64, Vec<usize>)> {
+        let scans = reconciliation.scans().iter();
+        scans
+            .map(|scan| (scan.root_id, scan.locations.clone()))
+            .collect()
+    }
+
+    /// The root rows: IDs, identifiers, and paths.
+    fn root_rows(index: &Index) -> Vec<(u64, Option<Vec<u8>>, Vec<u8>)> {
+        index
+            .roots()
+            .into_iter()
+            .map(|(root_id, row)| (root_id, row.identifier, row.path))
+            .collect()
     }
 
     /// A path as `(root_id, rel_path, inode_id)`.
@@ -1373,10 +1558,11 @@ mod tests {
         );
         // The incomplete inode goes with its paths and blocks, the
         // unfinished roots with their paths; the complete inode stays.
-        assert_eq!(index.reconcile_roots(&[b"/s", b"/t"]), [1, 2]);
+        let reconciliation = index.reconcile_roots(&configured(&[], &[b"/s", b"/t"]));
+        assert_eq!(scans(&reconciliation), [(1, vec![0]), (2, vec![1])]);
         assert_eq!(
-            index.root_paths(),
-            [(1, b"/s".to_vec()), (2, b"/t".to_vec())]
+            root_rows(&index),
+            [(1, None, b"/s".to_vec()), (2, None, b"/t".to_vec())]
         );
         for (cf, n) in [
             (Cf::Inodes, 1),
@@ -1403,14 +1589,15 @@ mod tests {
         assert!(meta.compatible(&settings()));
         assert_ne!(meta.index_id, first_id);
         assert_eq!(index.next_inode_id(), 1);
-        assert_eq!(index.reconcile_roots(&[b"/u"]), [1]);
+        let reconciliation = index.reconcile_roots(&configured(&[], &[b"/u"]));
+        assert_eq!(scans(&reconciliation), [(1, vec![0])]);
     }
 
-    /// Roots that keep their paths lose only the paths of incomplete
-    /// inodes. The other roots lose both entries of every path, and their
-    /// rows; new roots get IDs after the kept ones (DESIGN.md §4.2). The
-    /// paths at the ends of each root's key range test the ends of the
-    /// range deletions.
+    /// Roots that keep their paths keep all of them. The other roots lose
+    /// both entries of every path, and their rows, and incomplete inodes
+    /// lose their paths and blocks; new roots get IDs after the kept ones
+    /// (DESIGN.md §4.2). The paths at the ends of each root's key range
+    /// test the ends of the range deletions.
     #[test]
     fn reconcile_keeps_the_paths_of_retained_roots() {
         let dir = tempfile::tempdir().unwrap();
@@ -1427,9 +1614,8 @@ mod tests {
         for &root_id in &root_ids {
             paths.extend([(1, root_id, &b""[..]), (2, root_id, b"\xff\xff")]);
         }
-        // Inode 3 is incomplete, with paths under a kept root and an
-        // unfinished one.
-        paths.extend([(3, 2, &b"i"[..]), (3, 3, b"i")]);
+        // Inode 3 is incomplete, with paths under two unfinished roots.
+        paths.extend([(3, 3, &b"i"[..]), (3, 4, b"i")]);
         insert(
             &index,
             &[
@@ -1447,8 +1633,10 @@ mod tests {
         );
         complete_roots(&index, &[2, 5]);
 
-        assert_eq!(index.reconcile_roots(&[b"/new"]), [6]);
-        let ids: Vec<u64> = index.root_paths().iter().map(|&(id, _)| id).collect();
+        let groups = group_names(&[2, 5]);
+        let reconciliation = index.reconcile_roots(&configured(&groups, &[b"/new"]));
+        assert_eq!(scans(&reconciliation), [(6, vec![2])]);
+        let ids: Vec<u64> = index.roots().iter().map(|&(id, _)| id).collect();
         assert_eq!(ids, [2, 5, 6]);
         let (rows, entries) = path_rows(&index);
         let kept = |root_id| {
@@ -1467,6 +1655,226 @@ mod tests {
         ] {
             assert_eq!(count(&index, cf), n, "{cf:?}");
         }
+    }
+
+    /// Give the root rows of `roots` their identifiers: they become
+    /// completed immutable groups, at the paths that they have.
+    pub fn give_identifiers(index: &Index, roots: &[(u64, &[u8])]) {
+        let rows: HashMap<u64, RootRow> = index.roots().into_iter().collect();
+        let mut txn = index.transaction();
+        for &(root_id, identifier) in roots {
+            let row = RootRow {
+                identifier: Some(identifier.to_vec()),
+                path: rows[&root_id].path.clone(),
+            };
+            txn.put(Cf::Roots, &id_key(root_id), &row.encode());
+        }
+        txn.commit();
+    }
+
+    /// The index of `kept_groups_follow_the_configuration`, before its
+    /// reconciliation: roots 1, 2, 4, and 5 are completed groups, and root
+    /// 3 is not. Root 4 has a path of the incomplete inode 3.
+    fn groups_to_reconcile(index: &Index) {
+        insert(
+            index,
+            &[
+                (1, b"\x01\x01", Some(4096)),
+                (2, b"\x01\x02", Some(4096)),
+                (3, b"\x01\x03", None),
+            ],
+            &[(1, b"/a"), (2, b"/b"), (3, b"/c"), (4, b"/d"), (5, b"/e")],
+            &[
+                (1, 1, b"f"),
+                (2, 2, b"f"),
+                (1, 3, b"f"),
+                (3, 4, b"f"),
+                (1, 4, b"g"),
+                (2, 5, b"f"),
+            ],
+            &[(3, 0, 5, [3; PREFIX_LEN])],
+        );
+        give_identifiers(
+            index,
+            &[(1, b"one"), (2, b"two"), (4, b"four"), (5, b"five")],
+        );
+    }
+
+    /// The configuration of `kept_groups_follow_the_configuration`: group
+    /// `one` with its stored copy second, group `two` without its stored
+    /// copy, the mutable root `/c`, group `four` as it was, a new group
+    /// `six`, and no group `five`.
+    fn reconciled_configuration() -> Vec<CurrentRoot<'static>> {
+        let copy = |identifier: &'static [u8], path: &'static [u8]| CurrentRoot {
+            path,
+            identifier: Some(identifier),
+        };
+        vec![
+            copy(b"one", b"/a1"),
+            copy(b"one", b"/a"),
+            copy(b"two", b"/b2"),
+            CurrentRoot {
+                path: b"/c",
+                identifier: None,
+            },
+            copy(b"four", b"/d"),
+            copy(b"six", b"/f"),
+        ]
+    }
+
+    /// A completed group stays, with its paths and without a scan, while
+    /// the configuration names its identifier and none of its paths leads
+    /// to an incomplete inode. It keeps its representative path while that
+    /// is one of its copies, and takes its first copy otherwise. Every
+    /// other root goes, with its paths, and the mutable roots and the first
+    /// copy of each other group get new rows, for the scan (DESIGN.md
+    /// §4.2).
+    #[test]
+    fn kept_groups_follow_the_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = new_index(dir.path());
+        groups_to_reconcile(&index);
+        let current = reconciled_configuration();
+        let reconciliation = index.reconcile_roots(&current);
+        assert_eq!(
+            scans(&reconciliation),
+            [(3, vec![3]), (4, vec![4]), (5, vec![5])]
+        );
+        let mut groups: Vec<(u64, &[u8], &[u8], bool)> = reconciliation
+            .groups
+            .iter()
+            .map(|(&root_id, group)| {
+                let (identifier, path) = (&group.identifier[..], &group.path[..]);
+                (root_id, identifier, path, group.complete)
+            })
+            .collect();
+        groups.sort();
+        let expected: [(u64, &[u8], &[u8], bool); 4] = [
+            (1, b"one", b"/a", true),
+            (2, b"two", b"/b2", true),
+            (4, b"four", b"/d", false),
+            (5, b"six", b"/f", false),
+        ];
+        assert_eq!(groups, expected);
+        let some = |identifier: &[u8]| Some(identifier.to_vec());
+        assert_eq!(
+            root_rows(&index),
+            [
+                (1, some(b"one"), b"/a".to_vec()),
+                (2, some(b"two"), b"/b2".to_vec()),
+                (3, None, b"/c".to_vec()),
+                (4, None, b"/d".to_vec()),
+                (5, None, b"/f".to_vec()),
+            ]
+        );
+        let (rows, entries) = path_rows(&index);
+        assert_eq!(rows, [(1, b"f".to_vec(), 1), (2, b"f".to_vec(), 2)]);
+        assert_eq!(entries, rows);
+        // The complete inodes stay for reuse, also without paths.
+        for (cf, n) in [(Cf::Inodes, 2), (Cf::Blocks, 0), (Cf::Strong, 0)] {
+            assert_eq!(count(&index, cf), n, "{cf:?}");
+        }
+    }
+
+    /// The markers of the groups that do not stay go in a transaction of
+    /// their own, before the paths of their groups go: an interruption
+    /// after it leaves those groups unfinished, without paths or with
+    /// them, but never a marker without all the paths of its group
+    /// (DESIGN.md §4.2). The next reconciliation finishes the work.
+    #[test]
+    fn markers_go_before_the_paths_of_their_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = new_index(dir.path());
+        groups_to_reconcile(&index);
+        let current = reconciled_configuration();
+
+        // An interruption before the first commit changes nothing.
+        let before = (root_rows(&index), path_rows(&index));
+        interrupt_after_commits(Some(0));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            index.reconcile_roots(&current)
+        }));
+        interrupt_after_commits(None);
+        assert!(result.is_err(), "the injected failure must stop it");
+        assert_eq!((root_rows(&index), path_rows(&index)), before);
+
+        // The interruption injects a failure into the commits of this
+        // thread, so the paths that the pool removes go.
+        interrupt_after_commits(Some(1));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            index.reconcile_roots(&current)
+        }));
+        interrupt_after_commits(None);
+        assert!(result.is_err(), "the injected failure must stop it");
+        let some = |identifier: &[u8]| Some(identifier.to_vec());
+        assert_eq!(
+            root_rows(&index),
+            [
+                (1, some(b"one"), b"/a".to_vec()),
+                (2, some(b"two"), b"/b".to_vec()),
+                (3, None, b"/c".to_vec()),
+                (4, None, b"/d".to_vec()),
+                (5, None, b"/e".to_vec()),
+            ]
+        );
+        let (rows, entries) = path_rows(&index);
+        assert_eq!(rows, [(1, b"f".to_vec(), 1), (2, b"f".to_vec(), 2)]);
+        assert_eq!(entries, rows);
+
+        let reconciliation = index.reconcile_roots(&current);
+        assert_eq!(
+            scans(&reconciliation),
+            [(3, vec![3]), (4, vec![4]), (5, vec![5])]
+        );
+        assert_eq!(root_rows(&index).len(), 5);
+        assert_eq!(path_rows(&index).0.len(), 2);
+    }
+
+    /// An unfinished group gets one row, at its first copy, and its scan
+    /// can take any of its copies, in their order (DESIGN.md §4.2).
+    #[test]
+    fn an_unfinished_group_is_scanned_at_one_of_its_copies() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = new_index(dir.path());
+        let copy = |path: &'static [u8]| CurrentRoot {
+            path,
+            identifier: Some(b"g"),
+        };
+        let mutable = CurrentRoot {
+            path: b"/m",
+            identifier: None,
+        };
+        let reconciliation = index.reconcile_roots(&[copy(b"/a"), mutable, copy(b"/b")]);
+        assert_eq!(scans(&reconciliation), [(1, vec![0, 2]), (2, vec![1])]);
+        assert_eq!(
+            root_rows(&index),
+            [(1, None, b"/a".to_vec()), (2, None, b"/m".to_vec())]
+        );
+    }
+
+    /// Kept groups that exchange their paths exchange them in their rows
+    /// too, so that no two rows share a path (DESIGN.md §4.2).
+    #[test]
+    fn kept_groups_can_exchange_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = new_index(dir.path());
+        insert(&index, &[], &[(1, b"/p"), (2, b"/q")], &[], &[]);
+        give_identifiers(&index, &[(1, b"x"), (2, b"y")]);
+        let groups = [
+            (b"x".to_vec(), b"/q".to_vec()),
+            (b"y".to_vec(), b"/p".to_vec()),
+        ];
+        let reconciliation = index.reconcile_roots(&configured(&groups, &[b"/r"]));
+        assert_eq!(scans(&reconciliation), [(3, vec![2])]);
+        let some = |identifier: &[u8]| Some(identifier.to_vec());
+        assert_eq!(
+            root_rows(&index),
+            [
+                (1, some(b"x"), b"/q".to_vec()),
+                (2, some(b"y"), b"/p".to_vec()),
+                (3, None, b"/r".to_vec()),
+            ]
+        );
     }
 
     /// Each transaction that removes root paths removes both entries of
@@ -1515,7 +1923,7 @@ mod tests {
         assert!(left.iter().all(|(root_id, ..)| *root_id == 2));
         assert_eq!(rows.len(), left.len() + 3);
 
-        index.reconcile_roots(&[]);
+        index.reconcile_roots(&configured(&group_names(&[3]), &[]));
         let (rows, entries) = path_rows(&index);
         assert_eq!(rows, [(3, b"".to_vec(), 1), (3, b"\xff\xff".to_vec(), 1)]);
         assert_eq!(entries, rows);

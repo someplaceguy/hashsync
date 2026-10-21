@@ -67,11 +67,94 @@ pub struct RootConfig {
     pub pattern: Vec<u8>,
     pub exclude: Exclusions,
     pub one_filesystem: bool,
+    /// How an immutable root names the group of each of its matches;
+    /// `None` for a mutable root (DESIGN.md §4.2).
+    pub identifier: Option<Identifier>,
+    /// A root that does not exist is normal: it gets no warning, and when
+    /// it vanishes after root expansion, the scan of its group takes the
+    /// next copy instead (DESIGN.md §4.2). It is not part of the indexing
+    /// policy, so copies can differ in it.
+    pub may_vanish: bool,
+}
+
+impl RootConfig {
+    /// What differs between the indexing policies of this root and
+    /// `other`: their exclusions, compared as sets of patterns, or their
+    /// `one_filesystem` values. This function exists because copies of an
+    /// immutable group must index the same content, whichever copy an
+    /// update scans (DESIGN.md §4.2). The patterns compare as bytes after
+    /// byte-escape decoding, with their glob quoting: two globs that match
+    /// the same names but differ in their bytes still differ.
+    pub fn policy_difference(&self, other: &RootConfig) -> Option<&'static str> {
+        if self.exclude != other.exclude {
+            Some("exclusions")
+        } else if self.one_filesystem != other.one_filesystem {
+            Some("one_filesystem values")
+        } else {
+            None
+        }
+    }
+}
+
+/// How an immutable root names the group of each match of its pattern
+/// (DESIGN.md §4.2). Matches with the same identifier are copies of one
+/// group, which the index holds once.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Identifier {
+    /// The absolute path of the match, the default.
+    Path,
+    /// The last component of the path, so that copies under different
+    /// parent directories share it.
+    Name,
+    /// The path of the match without this prefix, a normalized absolute
+    /// path, and still absolute: with the prefix `/mnt/disk`, the match
+    /// `/mnt/disk/nix/store/x` gives `/nix/store/x`, the identifier that
+    /// `Path` gives the copy at `/nix/store/x`. The prefix ends at a
+    /// component, and the prefix itself gives `/`.
+    StripPrefix(Vec<u8>),
+    /// The same bytes for every match, which stay when the tree moves.
+    Literal(Vec<u8>),
+}
+
+impl Identifier {
+    /// The identifier of the match at `path`, a normalized absolute path.
+    /// Identifiers are never empty, so a match that cannot have one is a
+    /// configuration error; the error says why, as the end of a sentence
+    /// about the match.
+    pub fn of(&self, path: &[u8]) -> Result<Vec<u8>, String> {
+        match self {
+            Identifier::Path => Ok(path.to_vec()),
+            Identifier::Name => match path.rsplit(|&b| b == b'/').next() {
+                Some(name) if !name.is_empty() => Ok(name.to_vec()),
+                _ => Err("has no name for its identifier".into()),
+            },
+            Identifier::StripPrefix(prefix) => {
+                // Every path is below `/`, and stays as it is.
+                let below = match prefix.as_slice() {
+                    b"/" => Some(path),
+                    prefix => path
+                        .strip_prefix(prefix)
+                        .filter(|rest| matches!(rest.first(), None | Some(b'/'))),
+                };
+                match below {
+                    Some(b"") => Ok(b"/".to_vec()),
+                    Some(rest) => Ok(rest.to_vec()),
+                    None => Err(format!(
+                        "is not below the strip_prefix {} of its identifier",
+                        quoted(prefix)
+                    )),
+                }
+            }
+            Identifier::Literal(bytes) => Ok(bytes.clone()),
+        }
+    }
 }
 
 /// The exclusion patterns of one root. Patterns beginning with `/` match
-/// absolute paths; others match basenames.
-#[derive(Default, Debug)]
+/// absolute paths; others match basenames. Each kind is sorted and without
+/// duplicates, so that equal sets of patterns compare equal
+/// (`RootConfig::policy_difference`).
+#[derive(Default, Debug, PartialEq, Eq)]
 pub struct Exclusions {
     names: Vec<Vec<u8>>,
     paths: Vec<Vec<u8>>,
@@ -117,6 +200,8 @@ struct RawRoot {
     #[serde(default)]
     immutable: bool,
     identifier: Option<toml::Value>,
+    #[serde(default)]
+    may_vanish: bool,
 }
 
 #[derive(Deserialize)]
@@ -420,25 +505,19 @@ pub fn parse_duration(text: &str) -> Result<u64, String> {
 }
 
 fn parse_root(raw: RawRoot) -> Result<RootConfig, String> {
-    if raw.immutable || raw.identifier.is_some() {
-        return Err("immutable roots are not supported by this version".into());
-    }
+    let identifier = match (raw.immutable, raw.identifier) {
+        (false, None) => None,
+        (false, Some(_)) => {
+            return Err("identifier: only immutable roots have identifiers".into());
+        }
+        (true, None) => Some(Identifier::Path),
+        (true, Some(value)) => {
+            Some(parse_identifier(value).map_err(|e| format!("identifier: {e}"))?)
+        }
+    };
     let pattern = escapes::decode(&raw.path, Syntax::Glob).map_err(|e| format!("path: {e}"))?;
     check_no_nul(&pattern).map_err(|e| format!("path: {e}"))?;
-    if pattern.first() != Some(&b'/') {
-        return Err("path: root patterns must be absolute".into());
-    }
-    let mut normalized = Vec::with_capacity(pattern.len());
-    for component in glob::components(&pattern) {
-        if component == b"." || component == b".." {
-            return Err("path: `.` and `..` components are not allowed".into());
-        }
-        normalized.push(b'/');
-        normalized.extend_from_slice(component);
-    }
-    if normalized.is_empty() {
-        normalized.push(b'/');
-    }
+    let normalized = normalize(&pattern).map_err(|e| format!("path: {e}"))?;
     let mut exclude = Exclusions::default();
     for text in &raw.exclude {
         let pattern = escapes::decode(text, Syntax::Glob).map_err(|e| format!("exclude: {e}"))?;
@@ -452,11 +531,87 @@ fn parse_root(raw: RawRoot) -> Result<RootConfig, String> {
             exclude.names.push(pattern);
         }
     }
+    for patterns in [&mut exclude.names, &mut exclude.paths] {
+        patterns.sort_unstable();
+        patterns.dedup();
+    }
     Ok(RootConfig {
         pattern: normalized,
         exclude,
         one_filesystem: raw.one_filesystem,
+        identifier,
+        may_vanish: raw.may_vanish,
     })
+}
+
+/// `path`, an absolute path or root pattern, without empty components and
+/// without a trailing `/`, and `/` alone for the root directory. `.` and
+/// `..` components are not allowed: the root checks compare paths as
+/// bytes (DESIGN.md §4.2).
+fn normalize(path: &[u8]) -> Result<Vec<u8>, String> {
+    if path.first() != Some(&b'/') {
+        return Err("must be an absolute path".into());
+    }
+    let mut normalized = Vec::with_capacity(path.len());
+    for component in glob::components(path) {
+        if component == b"." || component == b".." {
+            return Err("`.` and `..` components are not allowed".into());
+        }
+        normalized.push(b'/');
+        normalized.extend_from_slice(component);
+    }
+    if normalized.is_empty() {
+        normalized.push(b'/');
+    }
+    Ok(normalized)
+}
+
+/// The `identifier` of an immutable root (DESIGN.md §4.2): `"path"`,
+/// `"name"`, `{ strip_prefix = "..." }`, or `{ literal = "..." }`. Both
+/// strings take byte escapes (DESIGN.md §7), and a literal can hold any
+/// bytes, NUL included, but not none.
+fn parse_identifier(value: toml::Value) -> Result<Identifier, String> {
+    const EXPECTED: &str = "expected `\"path\"`, `\"name\"`, `{ strip_prefix = \"...\" }`, \
+                            or `{ literal = \"...\" }`";
+    let table = match value {
+        toml::Value::String(form) => {
+            return match form.as_str() {
+                "path" => Ok(Identifier::Path),
+                "name" => Ok(Identifier::Name),
+                _ => Err(format!(
+                    "unknown form {}, {EXPECTED}",
+                    quoted(form.as_bytes())
+                )),
+            };
+        }
+        toml::Value::Table(table) if table.len() == 1 => table,
+        _ => return Err(EXPECTED.into()),
+    };
+    let (key, value) = table.into_iter().next().unwrap();
+    let toml::Value::String(text) = value else {
+        return Err(format!("{}: expected a string", quoted(key.as_bytes())));
+    };
+    match key.as_str() {
+        "strip_prefix" => {
+            let prefix =
+                escapes::decode(&text, Syntax::Plain).map_err(|e| format!("strip_prefix: {e}"))?;
+            check_no_nul(&prefix).map_err(|e| format!("strip_prefix: {e}"))?;
+            let prefix = normalize(&prefix).map_err(|e| format!("strip_prefix: {e}"))?;
+            Ok(Identifier::StripPrefix(prefix))
+        }
+        "literal" => {
+            let literal =
+                escapes::decode(&text, Syntax::Plain).map_err(|e| format!("literal: {e}"))?;
+            if literal.is_empty() {
+                return Err("literal: an identifier must not be empty".into());
+            }
+            Ok(Identifier::Literal(literal))
+        }
+        _ => Err(format!(
+            "unknown key {}, {EXPECTED}",
+            quoted(key.as_bytes())
+        )),
+    }
 }
 
 fn check_no_nul(bytes: &[u8]) -> Result<(), String> {
@@ -675,16 +830,6 @@ one_filesystem = true
                 .unwrap_err()
                 .contains("..")
         );
-        assert!(
-            parse("[[roots]]\npath = \"/a\"\nimmutable = true")
-                .unwrap_err()
-                .contains("immutable")
-        );
-        assert!(
-            parse("[[roots]]\npath = \"/a\"\nidentifier = \"name\"")
-                .unwrap_err()
-                .contains("immutable")
-        );
         assert!(parse("[[roots]]\npath = \"/a\"\nbogus = 1").is_err());
         assert!(parse("bogus = 1").unwrap_err().contains("unknown field"));
         assert!(
@@ -816,6 +961,173 @@ one_filesystem = true
     fn root_slash() {
         let config = parse("[[roots]]\npath = \"/\"").unwrap();
         assert_eq!(config.roots[0].pattern, b"/");
+    }
+
+    /// The identifier of the root of `extra`, an immutable root.
+    fn identifier(extra: &str) -> Result<Identifier, String> {
+        let text = format!("[[roots]]\npath = '/a/*'\nimmutable = true\n{extra}");
+        let mut config = parse(&text)?;
+        Ok(config.roots.remove(0).identifier.unwrap())
+    }
+
+    /// Each form of `identifier`: an immutable root without one names its
+    /// group by its path. Literals and prefixes take byte escapes, and a
+    /// literal can hold NUL (DESIGN.md §4.2 and §7).
+    #[test]
+    fn identifier_forms() {
+        let mutable = parse("[[roots]]\npath = '/a'").unwrap();
+        assert_eq!(mutable.roots[0].identifier, None);
+        assert_eq!(identifier(""), Ok(Identifier::Path));
+        assert_eq!(identifier("identifier = 'path'"), Ok(Identifier::Path));
+        assert_eq!(identifier("identifier = 'name'"), Ok(Identifier::Name));
+        assert_eq!(
+            identifier(r"identifier = { strip_prefix = '/mnt//\xFF/' }"),
+            Ok(Identifier::StripPrefix(b"/mnt/\xff".to_vec()))
+        );
+        assert_eq!(
+            identifier("identifier = { strip_prefix = '/' }"),
+            Ok(Identifier::StripPrefix(b"/".to_vec()))
+        );
+        assert_eq!(
+            identifier(r"identifier = { literal = 'photos-\xFF\x00\\' }"),
+            Ok(Identifier::Literal(b"photos-\xff\0\\".to_vec()))
+        );
+        assert_eq!(
+            identifier("identifier.literal = \"double\\\\x41\""),
+            Ok(Identifier::Literal(b"doubleA".to_vec()))
+        );
+    }
+
+    #[test]
+    fn rejected_identifiers() {
+        let error = parse("[[roots]]\npath = '/a'\nidentifier = 'name'").unwrap_err();
+        assert_eq!(
+            error,
+            "roots[0]: identifier: only immutable roots have identifiers"
+        );
+        for (extra, expected) in [
+            (
+                "identifier = 'Name'",
+                "identifier: unknown form 'Name', expected",
+            ),
+            ("identifier = 5", "identifier: expected `\"path\"`"),
+            ("identifier = {}", "identifier: expected"),
+            (
+                "identifier = { literal = 'a', strip_prefix = '/' }",
+                "identifier: expected",
+            ),
+            (
+                "identifier = { prefix = '/' }",
+                "identifier: unknown key 'prefix'",
+            ),
+            (
+                "identifier = { literal = 1 }",
+                "identifier: 'literal': expected a string",
+            ),
+            (
+                "identifier = { literal = '' }",
+                "identifier: literal: an identifier must not be empty",
+            ),
+            (
+                r"identifier = { literal = '\q' }",
+                "identifier: literal: unsupported escape",
+            ),
+            (
+                "identifier = { strip_prefix = 'mnt' }",
+                "identifier: strip_prefix: must be an absolute path",
+            ),
+            (
+                "identifier = { strip_prefix = '/mnt/../x' }",
+                "identifier: strip_prefix: `.` and `..`",
+            ),
+            (
+                r"identifier = { strip_prefix = '/a\x00' }",
+                "identifier: strip_prefix: NUL byte is not allowed",
+            ),
+        ] {
+            let error = identifier(extra).unwrap_err();
+            assert!(
+                error.starts_with(&format!("roots[0]: {expected}")),
+                "{extra}: {error}"
+            );
+        }
+    }
+
+    /// `may_vanish` is off by default, and any root can have it. It is not
+    /// part of the indexing policy, so copies can differ in it (DESIGN.md
+    /// §4.2).
+    #[test]
+    fn roots_may_vanish() {
+        let root = |extra: &str| {
+            let mut config = parse(&format!("[[roots]]\npath = '/a'\n{extra}")).unwrap();
+            config.roots.remove(0)
+        };
+        assert!(!root("").may_vanish);
+        assert!(root("may_vanish = true").may_vanish);
+        let copy = root("immutable = true\nmay_vanish = true");
+        assert!(copy.may_vanish);
+        assert_eq!(copy.policy_difference(&root("immutable = true")), None);
+        assert!(parse("[[roots]]\npath = '/a'\nmay_vanish = 1").is_err());
+    }
+
+    /// The identifier of each match (DESIGN.md §4.2). `strip_prefix` takes
+    /// whole components, and gives an absolute path, `/` for the prefix
+    /// itself, so that a copy below it shares the identifier that `path`
+    /// gives the copy at that path.
+    #[test]
+    fn identifiers_of_matches() {
+        let of = |form: Identifier, path: &[u8]| form.of(path);
+        assert_eq!(of(Identifier::Path, b"/a/b"), Ok(b"/a/b".to_vec()));
+        assert_eq!(of(Identifier::Name, b"/a/b\xff"), Ok(b"b\xff".to_vec()));
+        assert_eq!(of(Identifier::Name, b"/a"), Ok(b"a".to_vec()));
+        assert!(of(Identifier::Name, b"/").unwrap_err().contains("no name"));
+        let strip = |prefix: &[u8]| Identifier::StripPrefix(prefix.to_vec());
+        assert_eq!(
+            of(strip(b"/mnt/disk"), b"/mnt/disk/nix/x"),
+            Ok(b"/nix/x".to_vec())
+        );
+        assert_eq!(of(strip(b"/mnt/disk"), b"/mnt/disk"), Ok(b"/".to_vec()));
+        assert_eq!(of(strip(b"/"), b"/nix/x"), Ok(b"/nix/x".to_vec()));
+        assert_eq!(of(strip(b"/"), b"/"), Ok(b"/".to_vec()));
+        for path in [&b"/mnt/disk2/x"[..], b"/mnt", b"/srv/x"] {
+            let error = of(strip(b"/mnt/disk"), path).unwrap_err();
+            assert_eq!(
+                error,
+                "is not below the strip_prefix '/mnt/disk' of its identifier"
+            );
+        }
+        let literal = Identifier::Literal(b"x\0".to_vec());
+        assert_eq!(of(literal, b"/anything"), Ok(b"x\0".to_vec()));
+    }
+
+    /// Copies must have the same exclusions, as sets of patterns after
+    /// byte-escape decoding, and the same `one_filesystem` (DESIGN.md
+    /// §4.2).
+    #[test]
+    fn indexing_policies_compare_as_sets() {
+        let root = |extra: &str| {
+            let mut config = parse(&format!("[[roots]]\npath = '/a'\n{extra}")).unwrap();
+            config.roots.remove(0)
+        };
+        let base = root(r"exclude = ['*.tmp', '/a/x', 'literal\*']");
+        for same in [
+            r"exclude = ['/a/x', 'literal\x2A', '*.tmp', '*.tmp']",
+            r"exclude = ['literal\*', '/a/x', '*.tmp']",
+        ] {
+            assert_eq!(base.policy_difference(&root(same)), None, "{same}");
+        }
+        for (other, difference) in [
+            (r"exclude = ['*.tmp', '/a/x']", "exclusions"),
+            (r"exclude = ['*.tmp', '/a/x', 'literal*']", "exclusions"),
+            (r"exclude = ['*.tmp', 'x', 'literal\*']", "exclusions"),
+            (
+                "exclude = ['*.tmp', '/a/x', 'literal\\*']\none_filesystem = true",
+                "one_filesystem values",
+            ),
+        ] {
+            let found = base.policy_difference(&root(other));
+            assert_eq!(found, Some(difference), "{other}");
+        }
     }
 
     #[test]

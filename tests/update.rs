@@ -459,6 +459,10 @@ fn missing_and_non_indexable_roots_only_warn() {
     );
     assert_eq!(env.tree_paths(), vec!["f"]);
     assert_eq!(env.count("paths"), 1);
+    // A root that is not there is no match: it has no root row, and its
+    // warning names the root instead of the pattern (DESIGN.md §4.2).
+    assert!(!stderr.contains("matched nothing"), "{stderr}");
+    assert_eq!(env.count("roots"), 2);
 }
 
 #[test]

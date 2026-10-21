@@ -1070,6 +1070,133 @@ fn candidate_attempts_bound_each_query() {
     }
 }
 
+/// Configure the receiver of `direction` with `extra` and an immutable
+/// group whose two copies, `copies/a/data` and `copies/b/data`, hold
+/// `content` in their file `file`, the copy at `a` first, so that an
+/// update scans it.
+fn configure_copies(transfer: &Transfer, direction: Direction, extra: &str, content: &[u8]) {
+    for copy in ["a", "b"] {
+        transfer
+            .env
+            .write(format!("copies/{copy}/data/file"), content);
+    }
+    let copy = "immutable = true\nidentifier = 'name'";
+    let roots = format!(
+        "{extra}{}{}",
+        transfer.env.root("copies/a/data", copy),
+        transfer.env.root("copies/b/data", copy)
+    );
+    transfer.configure_receiver(direction, &roots);
+}
+
+#[test]
+fn candidates_are_read_from_every_current_copy() {
+    // The receiver's index has a group with two copies, of which the
+    // update scanned the first. Then a block of the first copy changes,
+    // and later its root directory cannot be searched: each candidate is
+    // tried in the other copy too, and the two copies together use one of
+    // its `candidate_attempts`, in a run with an update, which reuses the
+    // group, and with `--no-update` (DESIGN.md §6.4).
+    for direction in DIRECTIONS {
+        let transfer = Transfer::new(&[]);
+        let original = tiled(8, 21);
+        configure_copies(&transfer, direction, "candidate_attempts = 1\n", &original);
+        transfer.update_receiver(direction, &[]);
+        let payload = transfer.env.path("payload");
+        std::fs::write(&payload, &original).unwrap();
+        let script = format!("cat '{}'", payload.display());
+
+        let mut changed = original.clone();
+        changed[3 * BLOCK + 100] ^= 1;
+        transfer.env.write("copies/a/data/file", &changed);
+        let no_update = [&["--no-update"][..], &direction.counted()].concat();
+        for flags in [&direction.counted()[..], &no_update] {
+            let output = succeeded(transfer.run_stream(direction, flags, &script));
+            assert_eq!(output.stdout, original);
+            let line = deduplicated(&output);
+            assert_eq!(line.bytes, [8 * BLOCK, 0, 8 * BLOCK, 0], "{direction:?}");
+            assert_eq!(line.misses, [0, 0], "{direction:?}");
+        }
+
+        transfer.env.chmod("copies/a/data", 0o000);
+        let output = transfer.run_stream(direction, &no_update, &script);
+        transfer.env.chmod("copies/a/data", 0o755);
+        let output = succeeded(output);
+        assert_eq!(output.stdout, original);
+        let line = deduplicated(&output);
+        assert_eq!(line.bytes, [8 * BLOCK, 0, 8 * BLOCK, 0], "{direction:?}");
+    }
+}
+
+#[test]
+fn an_unfinished_group_is_read_from_every_copy() {
+    // The scan of the first copy failed on a file that cannot be read, so
+    // the group is unfinished: its root row has no identifier. A run with
+    // `--no-update` finds the copies of the group through the stored path
+    // of the row and the configuration, and a changed block of the
+    // scanned copy is read from the other copy (DESIGN.md §4.2).
+    for direction in DIRECTIONS {
+        let transfer = Transfer::new(&[]);
+        let original = tiled(8, 22);
+        configure_copies(&transfer, direction, "", &original);
+        transfer
+            .env
+            .write("copies/a/data/secret", &random(BLOCK, 23));
+        transfer.env.chmod("copies/a/data/secret", 0o000);
+        transfer.update_receiver(direction, &[]);
+        transfer.env.chmod("copies/a/data/secret", 0o644);
+        let payload = transfer.env.path("payload");
+        std::fs::write(&payload, &original).unwrap();
+        let script = format!("cat '{}'", payload.display());
+
+        let mut changed = original.clone();
+        changed[5 * BLOCK] ^= 1;
+        transfer.env.write("copies/a/data/file", &changed);
+        let flags = [&["--no-update"][..], &direction.counted()].concat();
+        let output = succeeded(transfer.run_stream(direction, &flags, &script));
+        assert_eq!(output.stdout, original);
+        let line = deduplicated(&output);
+        assert_eq!(line.bytes, [8 * BLOCK, 0, 8 * BLOCK, 0], "{direction:?}");
+    }
+}
+
+#[test]
+fn copies_with_different_policies_end_a_run_without_an_update() {
+    // The copies of a group must have the same exclusions, also in a run
+    // with `--no-update`, which reads every copy (DESIGN.md §4.2). The
+    // receiver ends the run, and says why: the client in a pull, and the
+    // server in a push.
+    for direction in DIRECTIONS {
+        let transfer = Transfer::new(&[]);
+        configure_copies(&transfer, direction, "", &tiled(2, 24));
+        transfer.update_receiver(direction, &[]);
+        let copy = "immutable = true\nidentifier = 'name'";
+        let roots = format!(
+            "{}{}",
+            transfer.env.root("copies/a/data", copy),
+            transfer
+                .env
+                .root("copies/b/data", &format!("{copy}\nexclude = ['*.tmp']"))
+        );
+        transfer.configure_receiver(direction, &roots);
+        let command = args(&["true"]);
+        let mut invocation = transfer.invocation_in(direction, &["--no-update"], &refs(&command));
+        let output = invocation.output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{direction:?}: {stderr}");
+        let prefix = match direction {
+            Direction::Pull => "hashsync: root patterns ",
+            Direction::Push => "hashsync (server): root patterns ",
+        };
+        assert!(
+            stderr
+                .lines()
+                .any(|line| line.starts_with(prefix) && line.contains("have different exclusions")),
+            "{direction:?}:\n{stderr}"
+        );
+    }
+}
+
 #[test]
 fn a_rejected_window_does_not_hide_an_overlapping_match() {
     // The block of a changed file hides a valid block that starts 8 bytes

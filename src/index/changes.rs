@@ -12,8 +12,17 @@
 //! the owner of a file changes that file's inode, so the owner reads the
 //! committed rows of its inode without waiting for other threads. After the
 //! scan, the inodes that no path references any more are removed.
+//!
+//! The changes also keep the completion markers of the immutable groups
+//! (DESIGN.md §4.2). A root whose scan fails, because an entry under it
+//! cannot be indexed, is remembered until the scan ends, and so is every
+//! root with a path of a file whose processing fails. Once every
+//! transaction has committed, the unfinished groups that the scan
+//! traversed without a failure get their markers. A completed group, which
+//! the update does not scan, loses its marker when an owner abandons a
+//! file that the group shares, before the file's paths go.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Mutex, MutexGuard};
@@ -21,8 +30,8 @@ use std::sync::{Mutex, MutexGuard};
 use rayon::ThreadPool;
 use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 
-use super::layout::{self, Cf, InodeRow, id_key, u64_at};
-use super::{Index, Transaction};
+use super::layout::{self, Cf, ID_LEN, InodeRow, RootRow, id_key, u64_at};
+use super::{Group, Index, Reconciliation, Transaction};
 use crate::blocks::BlockRow;
 use crate::fsid::{FsCache, Identity};
 
@@ -38,6 +47,13 @@ pub struct Summary {
     pub blocks: u64,
     /// Inodes that ended the update without a path and were removed.
     pub orphans: u64,
+    /// The immutable groups of the configuration: those that were
+    /// complete before the update, which it reused without a scan, those
+    /// that its scan completed, and those that are unfinished after it:
+    /// scanned with a failure, or reused until they lost their markers.
+    pub groups_reused: u64,
+    pub groups_completed: u64,
+    pub groups_incomplete: u64,
 }
 
 /// The index changes of one update's scan.
@@ -58,11 +74,25 @@ pub struct Changes<'a> {
     next_inode_id: AtomicU64,
     paths: AtomicU64,
     blocks: AtomicU64,
+    /// The immutable groups of the update, by root ID.
+    groups: &'a HashMap<u64, Group>,
+    /// The IDs of the roots whose scan failed.
+    failed: Mutex<HashSet<u64>>,
+    /// The paths of the copies that the scan traverses for unfinished
+    /// groups, by root ID, where these are not the first copies, which the
+    /// rows name.
+    copies: Mutex<HashMap<u64, Vec<u8>>>,
 }
 
 impl<'a> Changes<'a> {
-    /// The changes of a scan whose tasks run on `pool`.
-    pub fn new(index: &'a Index, fs_cache: &'a FsCache, pool: &'a ThreadPool) -> Self {
+    /// The changes of a scan whose tasks run on `pool`, of the roots that
+    /// `reconciliation` gave the update.
+    pub fn new(
+        index: &'a Index,
+        fs_cache: &'a FsCache,
+        pool: &'a ThreadPool,
+        reconciliation: &'a Reconciliation,
+    ) -> Self {
         let next_inode_id = index.next_inode_id();
         Changes {
             index,
@@ -76,11 +106,34 @@ impl<'a> Changes<'a> {
             next_inode_id: AtomicU64::new(next_inode_id),
             paths: AtomicU64::new(0),
             blocks: AtomicU64::new(0),
+            groups: &reconciliation.groups,
+            failed: Mutex::default(),
+            copies: Mutex::default(),
         }
     }
 
+    /// Remember that the scan of the root `root_id` did not index all of
+    /// it: an entry under it could not be indexed, or no copy of its group
+    /// was there. An unfinished group of such a root stays unfinished, and
+    /// the next update scans it again (DESIGN.md §4.5).
+    pub fn fail_root(&self, root_id: u64) {
+        self.failed.lock().unwrap().insert(root_id);
+    }
+
+    /// Remember that the scan of the root `root_id` traverses the copy at
+    /// `path`, and not the first copy of its group, which was not there and
+    /// may vanish (DESIGN.md §4.2). The row of the group names the copy
+    /// whose paths it has once the group is complete.
+    pub fn scan_copy(&self, root_id: u64, path: &[u8]) {
+        self.copies.lock().unwrap().insert(root_id, path.to_vec());
+    }
+
     /// Claim a file too small to index (DESIGN.md §4.1). The first claim
-    /// removes the rows that the file had. No link adds a path.
+    /// removes the rows that the file had. No link adds a path. A completed
+    /// group with a path of the file keeps its marker, as it does when
+    /// another root's scan rehashes the file: the group's scan read this
+    /// file, which the user promised would not change, and a completed
+    /// group is never scanned again for such a change (DESIGN.md §4.2).
     pub fn claim_small(&self, identity: Identity) {
         if self.files.claim_small(&identity)
             && let Some(existing) = self.existing(&self.identity_key(&identity))
@@ -108,6 +161,10 @@ impl<'a> Changes<'a> {
             Found::Owner(path) => path,
             Found::Link(inode_id, path) => {
                 self.writer().insert_path(inode_id, &path);
+                return Claim::Linked;
+            }
+            Found::Failed(path) => {
+                self.fail_root(path.root_id);
                 return Claim::Linked;
             }
             Found::Deferred => return Claim::Linked,
@@ -141,9 +198,12 @@ impl<'a> Changes<'a> {
 
     /// End the scan (DESIGN.md §4.6): check that every claimed file has a
     /// result, and commit the transaction of every thread, in parallel on
-    /// the threads of the pool. Then remove the inodes without paths, and
-    /// their blocks, in bounded transactions, also on the threads of the
-    /// pool.
+    /// the threads of the pool. Only then do the unfinished groups that the
+    /// scan traversed without a failure get their completion markers, so
+    /// that a directory conflict that a late task finds ends the update
+    /// before any group is complete (DESIGN.md §4.2). Then remove the
+    /// inodes without paths, and their blocks, in bounded transactions,
+    /// also on the threads of the pool.
     pub fn finish(self) -> Summary {
         // `#[must_use]` does not catch an owner that an early return drops.
         let pending = self.files.pending();
@@ -153,11 +213,73 @@ impl<'a> Changes<'a> {
                 .par_iter()
                 .for_each(|txn| txn.lock().unwrap().commit());
         });
-        Summary {
+        let mut summary = Summary {
             paths: self.paths.into_inner(),
             blocks: self.blocks.into_inner(),
-            orphans: remove_orphans(self.index, self.pool),
+            ..Summary::default()
+        };
+        // A completed group fails only when it loses its marker.
+        let failed = self.failed.into_inner().unwrap();
+        let copies = self.copies.into_inner().unwrap();
+        let mut txn = self.index.transaction();
+        for (&root_id, group) in self.groups {
+            if failed.contains(&root_id) {
+                summary.groups_incomplete += 1;
+            } else if group.complete {
+                summary.groups_reused += 1;
+            } else {
+                let path = copies.get(&root_id).unwrap_or(&group.path);
+                let row = RootRow {
+                    identifier: Some(group.identifier.clone()),
+                    path: path.clone(),
+                };
+                txn.put(Cf::Roots, &id_key(root_id), &row.encode());
+                txn.checkpoint();
+                summary.groups_completed += 1;
+            }
         }
+        txn.commit();
+        summary.orphans = remove_orphans(self.index, self.pool);
+        summary
+    }
+
+    /// The processing of the file `identity`, which its owner found at
+    /// `path`, failed: no link adds a path, and the roots of all links,
+    /// those that waited and those that come later, are unsuccessful
+    /// (DESIGN.md §4.6).
+    fn drop_failed(&self, identity: &Identity, path: &RelPath) {
+        self.fail_root(path.root_id);
+        for path in self.files.discard(identity) {
+            self.fail_root(path.root_id);
+        }
+    }
+
+    /// Remove, in `txn`, the marker of every completed group with a path of
+    /// the inode `inode_id`, which an owner abandons (DESIGN.md §4.2 and
+    /// §4.6). The inode loses its rows although its file may still be
+    /// indexable, so the next update scans the group again, and its root
+    /// counts as failed. The marker goes before the paths, so that no
+    /// commit leaves the group complete without them. Reads the committed
+    /// entries of the inode, which only its owner changes. Several threads
+    /// can remove the marker of one group; they write the same row.
+    fn invalidate_groups(&self, txn: &mut Transaction<'_>, inode_id: u64) {
+        let mut done = HashSet::new();
+        self.index
+            .shared
+            .each(Cf::InodePaths, &id_key(inode_id), |key, _| {
+                let root_id = u64_at(key, ID_LEN);
+                if let Some(group) = self.groups.get(&root_id)
+                    && group.complete
+                    && done.insert(root_id)
+                {
+                    let row = RootRow {
+                        identifier: None,
+                        path: group.path.clone(),
+                    };
+                    txn.put(Cf::Roots, &id_key(root_id), &row.encode());
+                    self.fail_root(root_id);
+                }
+            });
     }
 
     /// The transaction of the calling thread, which must be a thread of the
@@ -268,11 +390,13 @@ impl<'c, 'a> Owner<'c, 'a> {
         }
     }
 
-    /// The file cannot be opened for reading: no link adds a path. The
-    /// existing row of the file, if any, gets no path either, so it goes
-    /// with the orphans after the scan.
+    /// The file cannot be opened for reading: no link adds a path, and the
+    /// roots of the links are unsuccessful. The existing row of the file,
+    /// if any, gets no path either, so it goes with the orphans after the
+    /// scan, unless a completed group, which the update does not scan,
+    /// keeps a path of it.
     pub fn fail(self) {
-        self.changes.files.discard(&self.identity);
+        self.changes.drop_failed(&self.identity, &self.path);
     }
 }
 
@@ -337,13 +461,17 @@ impl Hashing<'_, '_> {
 
     /// Hashing failed: remove the rows that `begin` and `blocks` wrote, and
     /// publish that the file has no rows, which drops the paths of the
-    /// other links. The removal reads committed entries, so the transaction
-    /// commits first.
+    /// other links and makes their roots unsuccessful. A completed group
+    /// with a path of the inode loses its marker before that path goes.
+    /// The removal reads committed entries, so the transaction commits
+    /// first.
     pub fn abandon(mut self) {
         self.writer.txn.commit();
+        let changes = self.writer.changes;
+        changes.invalidate_groups(&mut self.writer.txn, self.inode_id);
         delete_inode(&mut self.writer.txn, self.inode_id, self.row);
         self.writer.txn.checkpoint();
-        self.writer.changes.files.discard(&self.identity);
+        changes.drop_failed(&self.identity, &self.path);
     }
 }
 
@@ -393,15 +521,21 @@ impl Existing {
 #[derive(Default)]
 struct Files(Mutex<HashMap<Identity, FileState>>);
 
+/// The state of a claimed file. `Small` and `Failed` are the Dropped state
+/// of DESIGN.md §4.6, which keeps them apart only for the roots of later
+/// links.
 enum FileState {
     /// The owner has no result yet: the paths of other links wait here.
     Pending(Vec<RelPath>),
     /// The owner's inode row has committed: other links add their paths
     /// to it.
     Indexed(u64),
-    /// The file has no rows, because it is too small to index or its
-    /// processing failed: other links add nothing.
-    Dropped,
+    /// The file has no rows because it is too small to index: other links
+    /// add nothing.
+    Small,
+    /// The file has no rows because its processing failed: other links add
+    /// nothing, and their roots are unsuccessful.
+    Failed,
 }
 
 /// What the claim of a file that can be indexed finds.
@@ -411,8 +545,11 @@ enum Found {
     /// Another link of a file whose inode row has committed: the task adds
     /// this path to the row.
     Link(u64, RelPath),
+    /// Another link of a file whose processing failed: this path goes
+    /// nowhere, and its root is unsuccessful.
+    Failed(RelPath),
     /// Another link of a file without a committed row: the path waits for
-    /// the owner's result, or goes nowhere if the file has no rows.
+    /// the owner's result, or goes nowhere if the file is too small.
     Deferred,
 }
 
@@ -424,7 +561,7 @@ impl Files {
         if files.contains_key(identity) {
             return false;
         }
-        files.insert(identity.clone(), FileState::Dropped);
+        files.insert(identity.clone(), FileState::Small);
         true
     }
 
@@ -441,7 +578,8 @@ impl Files {
                 Found::Deferred
             }
             Some(FileState::Indexed(inode_id)) => Found::Link(*inode_id, path),
-            Some(FileState::Dropped) => Found::Deferred,
+            Some(FileState::Small) => Found::Deferred,
+            Some(FileState::Failed) => Found::Failed(path),
         }
     }
 
@@ -454,12 +592,13 @@ impl Files {
         }
     }
 
-    /// The owner's processing failed: drop the paths that waited, and
-    /// those of later links.
-    fn discard(&self, identity: &Identity) {
-        let FileState::Pending(_) = self.settle(identity, FileState::Dropped) else {
-            panic!("the result of a file was published twice");
-        };
+    /// The owner's processing failed: drop the paths of later links.
+    /// Returns the paths that waited, which go nowhere either.
+    fn discard(&self, identity: &Identity) -> Vec<RelPath> {
+        match self.settle(identity, FileState::Failed) {
+            FileState::Pending(paths) => paths,
+            _ => panic!("the result of a file was published twice"),
+        }
     }
 
     /// Replace the state of a claimed file; returns the old state.
@@ -571,7 +710,7 @@ mod tests {
     use super::*;
     use crate::fsid::{FsIndex, Triple};
     use crate::hash::PREFIX_LEN;
-    use crate::index::{self, tests as index_tests};
+    use crate::index::{self, CurrentRoot, tests as index_tests};
 
     /// Block rows enough that removing them commits mid-way: each row is
     /// two entries, and a transaction holds `COMMIT_WORK` changes.
@@ -586,6 +725,8 @@ mod tests {
         fs: FsIndex,
         /// One thread, so that one transaction collects all changes.
         pool: ThreadPool,
+        /// The roots of the scan: none, unless a test reconciles some.
+        reconciliation: Reconciliation,
         /// Declared last: it is removed after the index has closed.
         _dir: TempDir,
     }
@@ -618,12 +759,18 @@ mod tests {
                 fs_cache,
                 fs,
                 pool,
+                reconciliation: Reconciliation::default(),
                 _dir: dir,
             }
         }
 
         fn changes(&self) -> Changes<'_> {
-            Changes::new(&self.index, &self.fs_cache, &self.pool)
+            Changes::new(
+                &self.index,
+                &self.fs_cache,
+                &self.pool,
+                &self.reconciliation,
+            )
         }
 
         /// A file on the test's filesystem.
@@ -778,12 +925,18 @@ mod tests {
         assert_eq!(waiting, [b"b".to_vec()]);
         assert!(matches!(files.claim(&one, path("c")), Found::Link(7, p) if p.rel_path == b"c"));
 
-        // A failed owner drops the waiting paths and the later ones.
+        // A failed owner drops the waiting paths and the later ones, whose
+        // roots are then unsuccessful.
         let two = identity(2);
         assert!(matches!(files.claim(&two, path("a")), Found::Owner(_)));
         assert!(matches!(files.claim(&two, path("b")), Found::Deferred));
-        files.discard(&two);
-        assert!(matches!(files.claim(&two, path("c")), Found::Deferred));
+        let waited: Vec<_> = files
+            .discard(&two)
+            .into_iter()
+            .map(|p| p.rel_path)
+            .collect();
+        assert_eq!(waited, [b"b".to_vec()]);
+        assert!(matches!(files.claim(&two, path("c")), Found::Failed(p) if p.rel_path == b"c"));
 
         // Only the first claim of a small file owns it, and no link of it
         // adds a path, even one that finds the file large.
@@ -944,6 +1097,121 @@ mod tests {
         ] {
             assert_eq!(index_tests::count(&fixture.index, cf), 0, "{cf:?}");
         }
+    }
+
+    /// A current root at `path`: a copy of the group `identifier`, or a
+    /// mutable root for `None`.
+    fn current<'a>(path: &'a [u8], identifier: Option<&'a [u8]>) -> CurrentRoot<'a> {
+        CurrentRoot { path, identifier }
+    }
+
+    /// The identifier of each root row, by root ID.
+    fn identifiers(index: &Index) -> Vec<(u64, Option<Vec<u8>>)> {
+        let rows = index.roots().into_iter();
+        rows.map(|(root_id, row)| (root_id, row.identifier))
+            .collect()
+    }
+
+    /// An owner that abandons a file removes the marker of every completed
+    /// group with a path of the file, with the transaction that removes the
+    /// paths, so that the next update scans the group again (DESIGN.md
+    /// §4.2 and §4.6). Here a mutable root finds a file of a completed
+    /// group changed, and its hashing fails.
+    #[test]
+    fn abandoning_a_file_reopens_the_groups_that_hold_it() {
+        let mut fixture = Fixture::new();
+        index_tests::insert(
+            &fixture.index,
+            &[(1, &fixture.key(1), Some(4096))],
+            &[(1, b"/g")],
+            &[(1, 1, b"f"), (1, 1, b"h")],
+            &[(1, 0, 5, [5; PREFIX_LEN])],
+        );
+        index_tests::give_identifiers(&fixture.index, &[(1, b"g")]);
+        let roots = [current(b"/g", Some(b"g")), current(b"/m", None)];
+        fixture.reconciliation = fixture.index.reconcile_roots(&roots);
+        assert_eq!(index_tests::scans(&fixture.reconciliation), [(2, vec![1])]);
+        let changes = fixture.changes();
+        fixture.pool.install(|| {
+            let path = RelPath {
+                root_id: 2,
+                rel_path: b"f".to_vec(),
+            };
+            let Claim::Owner(owner) = changes.claim(fixture.identity(1), path, 4096, 124) else {
+                panic!("the first claim owns the file");
+            };
+            let mut hashing = owner.begin();
+            hashing.blocks(&[block(0)]);
+            hashing.abandon();
+        });
+        let summary = changes.finish();
+        assert_eq!((summary.groups_reused, summary.groups_incomplete), (0, 1));
+        assert_eq!(identifiers(&fixture.index), [(1, None), (2, None)]);
+        for cf in [
+            Cf::Inodes,
+            Cf::Identities,
+            Cf::Paths,
+            Cf::InodePaths,
+            Cf::Blocks,
+            Cf::Strong,
+        ] {
+            assert_eq!(index_tests::count(&fixture.index, cf), 0, "{cf:?}");
+        }
+    }
+
+    /// After the scan, an unfinished group gets its marker only if no entry
+    /// under its root failed and every file of it got its path: a link
+    /// that waited for an owner that failed, a link that came later, and a
+    /// failed entry of the traversal leave their groups unfinished
+    /// (DESIGN.md §4.2 and §4.6).
+    #[test]
+    fn groups_complete_only_without_failures() {
+        let mut fixture = Fixture::new();
+        let roots = [
+            current(b"/one", Some(b"one")),
+            current(b"/two", Some(b"two")),
+            current(b"/three", Some(b"three")),
+            current(b"/four", Some(b"four")),
+            current(b"/m", None),
+        ];
+        fixture.reconciliation = fixture.index.reconcile_roots(&roots);
+        let changes = fixture.changes();
+        let path = |root_id, name: &str| RelPath {
+            root_id,
+            rel_path: name.as_bytes().to_vec(),
+        };
+        fixture.pool.install(|| {
+            // The mutable root owns a file of groups one and two, and fails.
+            let claim = |root_id| changes.claim(fixture.identity(1), path(root_id, "a"), 4096, 1);
+            let Claim::Owner(owner) = claim(5) else {
+                panic!("the first claim owns the file");
+            };
+            assert!(matches!(claim(1), Claim::Linked));
+            owner.fail();
+            assert!(matches!(claim(2), Claim::Linked));
+            // Group three has a file of its own.
+            let Claim::Owner(owner) = changes.claim(fixture.identity(2), path(3, "b"), 4096, 1)
+            else {
+                panic!("the first claim owns the file");
+            };
+            owner.begin().end();
+        });
+        changes.fail_root(4);
+        let summary = changes.finish();
+        assert_eq!(
+            (summary.groups_completed, summary.groups_incomplete),
+            (1, 3)
+        );
+        assert_eq!(
+            identifiers(&fixture.index),
+            [
+                (1, None),
+                (2, None),
+                (3, Some(b"three".to_vec())),
+                (4, None),
+                (5, None)
+            ]
+        );
     }
 
     /// An owner that ends without a result is a bug, which `finish`

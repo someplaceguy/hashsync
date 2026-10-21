@@ -4,6 +4,7 @@
 
 mod common;
 
+use std::os::unix::ffi::OsStrExt;
 use std::process::{Command, Output};
 
 use common::*;
@@ -156,4 +157,88 @@ fn cycle_during_root_expansion_is_fatal() {
     assert_eq!(output.status.code(), Some(1), "{stderr}");
     assert!(stderr.contains("root pattern"), "{stderr}");
     assert!(stderr.contains(SAME_DIRECTORY), "{stderr}");
+}
+
+/// A directory conflict ends the update before any group completes, also
+/// one that a task finds after the scan of the group has ended: the
+/// markers come only once every task has finished (DESIGN.md §4.5). The
+/// group's own tree is small, and the alias is deep in the mutable root.
+#[test]
+fn a_directory_conflict_withholds_completion() {
+    if !namespaces_available() {
+        eprintln!("skipped: no unprivileged user namespaces");
+        return;
+    }
+    let env = Env::new();
+    env.write("tree/g/sub/f", &random(BLOCK, 1));
+    env.mkdir("other/a/b/c/d/x");
+    env.configure(&format!(
+        "{}{}",
+        env.root("tree/g", "immutable = true"),
+        env.root("other", "")
+    ));
+    let output = update_with_binds(&env, &[("tree/g/sub", "other/a/b/c/d/x")]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains(SAME_DIRECTORY), "{stderr}");
+    let roots = env.index().roots();
+    let group = roots
+        .iter()
+        .find(|root| root.path.ends_with(b"/tree/g"))
+        .expect("the group has a row");
+    assert_eq!(group.identifier, None, "the group must not be complete");
+
+    let output = update_with_binds(&env, &[]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("immutable roots: 0 reused, 1 completed"),
+        "{stderr}"
+    );
+}
+
+/// An update does not open a completed group or an unused copy only to
+/// look for aliases, so an alias of one of them inside a scanned root goes
+/// undetected (DESIGN.md §4.5).
+#[test]
+fn aliases_of_completed_groups_and_unused_copies_go_undetected() {
+    if !namespaces_available() {
+        eprintln!("skipped: no unprivileged user namespaces");
+        return;
+    }
+    let env = Env::new();
+    env.write("tree/g/f", &random(BLOCK, 1));
+    env.write("tree/h1/f", &random(BLOCK, 2));
+    env.write("tree/m/sub/f", &random(BLOCK, 2));
+    env.mkdir("tree/m/alias");
+    env.mkdir("tree/h2");
+    let copy = "immutable = true\nidentifier = { literal = 'h' }";
+    env.configure(&format!(
+        "{}{}{}{}",
+        env.root("tree/g", "immutable = true"),
+        env.root("tree/h1", copy),
+        env.root("tree/h2", copy),
+        env.root("tree/m", "")
+    ));
+    let output = update_with_binds(&env, &[]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+
+    let output = update_with_binds(
+        &env,
+        &[("tree/g", "tree/m/alias"), ("tree/m/sub", "tree/h2")],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains("immutable roots: 2 reused"), "{stderr}");
+    let tree = env.tree().as_os_str().as_bytes().to_vec();
+    let mutable = [&tree[..], b"/m"].concat();
+    let mut paths: Vec<Vec<u8>> = env
+        .paths()
+        .into_iter()
+        .filter(|(root, _)| *root == mutable)
+        .map(|(_, rel)| rel)
+        .collect();
+    paths.sort();
+    assert_eq!(paths, [b"alias/f".to_vec(), b"sub/f".to_vec()]);
 }

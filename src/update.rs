@@ -7,10 +7,10 @@ use crate::config::Config;
 use crate::escapes::quoted;
 use crate::fsid::FsCache;
 use crate::fsops;
-use crate::index::{self, Settings};
+use crate::index::{self, CurrentRoot, Settings};
 use crate::report;
 use crate::roots::{self, Location};
-use crate::scan::{self, ScanRoot};
+use crate::scan;
 use crate::units::Bytes;
 
 pub fn run(config: &Config, rebuild: bool, jobs: Option<u32>) {
@@ -31,7 +31,7 @@ pub fn perform(config: &Config, rebuild: bool, jobs: Option<u32>) -> (index::Ind
     // Resolve and validate the roots before the index is opened: a rejected
     // configuration must not change the index (DESIGN.md §3 and §4.2).
     let fs_cache = FsCache::new();
-    let locations = roots::expand(config, &fs_cache);
+    let locations = roots::resolve(config, &fs_cache);
 
     let index = index::open_modifying(&config.index_path);
     // The time of the update, in its note, starts once the index is
@@ -76,15 +76,17 @@ pub fn perform(config: &Config, rebuild: bool, jobs: Option<u32>) -> (index::Ind
         index.reset(&settings);
     }
 
-    let paths: Vec<&[u8]> = locations.iter().map(|l| l.path.as_slice()).collect();
-    let root_ids = index.reconcile_roots(&paths);
-    let roots: Vec<ScanRoot> = locations
+    let current: Vec<CurrentRoot> = locations
         .iter()
-        .zip(root_ids)
-        .map(|(location, root_id)| ScanRoot { location, root_id })
+        .map(|location| CurrentRoot {
+            path: &location.path,
+            identifier: location.identifier.as_deref(),
+        })
         .collect();
+    let reconciliation = index.reconcile_roots(&current);
 
-    let (counters, summary) = scan::run(config, roots, &fs_cache, &index, jobs);
+    let (counters, summary) =
+        scan::run(config, &locations, &reconciliation, &fs_cache, &index, jobs);
 
     index.finish_update();
 
@@ -110,5 +112,15 @@ pub fn perform(config: &Config, rebuild: bool, jobs: Option<u32>) -> (index::Ind
         summary.paths,
         summary.orphans
     ));
+    // A configuration with immutable roots says what became of their
+    // groups: the reuse of a completed group is what makes such a root
+    // cheap, and an incomplete one is scanned again by the next update.
+    let groups = summary.groups_reused + summary.groups_completed + summary.groups_incomplete;
+    if groups > 0 {
+        report::note(format_args!(
+            "immutable roots: {} reused, {} completed, {} incomplete",
+            summary.groups_reused, summary.groups_completed, summary.groups_incomplete
+        ));
+    }
     (index, locations)
 }

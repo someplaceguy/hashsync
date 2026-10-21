@@ -882,7 +882,7 @@ fn prepare(config: &Config, preparation: Preparation, link: &Link) -> (Index, Ve
         Preparation::Open => {
             fsops::raise_descriptor_limit();
             let fs_cache = FsCache::new();
-            let locations = roots::expand(config, &fs_cache);
+            let locations = roots::resolve(config, &fs_cache);
             (open_read_only(config), locations)
         }
         Preparation::UpdateAndKeep => {

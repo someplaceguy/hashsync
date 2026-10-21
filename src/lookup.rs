@@ -4,9 +4,12 @@
 //! The pins answer a query for a block that a pin or the cache of verified
 //! blocks holds, without the index. For any other query, a worker takes
 //! the candidate blocks with the query's strong-hash prefix from the
-//! index, reads each candidate from the root's current location, and
-//! verifies the full digest of the bytes it read. The first verified block
-//! goes to the pins. Every candidate counts against `candidate_attempts`,
+//! index, reads each candidate from the current locations of its root, and
+//! verifies the full digest of the bytes it read. A root of an immutable
+//! group has a location for each current copy of the group, and a
+//! candidate is tried in each of them until one verifies. The first
+//! verified block goes to the pins. Every candidate counts once against
+//! `candidate_attempts`, whatever number of copies it is tried in,
 //! including one without a usable location, so stale rows cannot make a
 //! lookup unbounded. Filesystem failures only reject a candidate.
 //!
@@ -33,13 +36,14 @@ use crate::hash::{PREFIX_LEN, Strong, StrongHash};
 use crate::index::{Index, Reader};
 use crate::pins::{Block, Miss, Pins};
 use crate::protocol::Query;
-use crate::roots::Location;
+use crate::roots::{self, Location};
 
 /// Start the lookup workers, which take over `index`, and answer the
 /// queries of `queue`. `locations` are the current root locations from
-/// this run's root resolution; an indexed root without one has no usable
-/// location. Returns the workers, which end at the Completing of `pins`, or
-/// once the queue is closed and empty.
+/// this run's root resolution, which give each indexed root its current
+/// copies (`roots::current_locations`); an indexed root without one has no
+/// usable location. Returns the workers, which end at the Completing of
+/// `pins`, or once the queue is closed and empty.
 pub fn start(
     index: Index,
     locations: Vec<Location>,
@@ -47,16 +51,7 @@ pub fn start(
     config: &Config,
     queue: Receiver<Query>,
 ) -> Vec<JoinHandle<()>> {
-    let mut by_path: HashMap<Vec<u8>, Location> = locations
-        .into_iter()
-        .map(|location| (location.path.clone(), location))
-        .collect();
-    let by_root: HashMap<u64, Location> = index
-        .root_paths()
-        .into_iter()
-        .filter_map(|(root_id, path)| Some((root_id, by_path.remove(&path)?)))
-        .collect();
-    let sources = Arc::new(by_root);
+    let sources = Arc::new(roots::current_locations(&locations, &index.roots()));
     // A pool of 4 to 8 workers (DESIGN.md §6.4).
     let workers = std::thread::available_parallelism().map_or(4, |n| n.get().clamp(4, 8));
     let mut threads = Vec::with_capacity(workers);
@@ -99,9 +94,10 @@ pub fn start(
 
 struct Worker {
     reader: Reader,
-    /// The current location of every indexed root that has one, by root
-    /// ID.
-    sources: Arc<HashMap<u64, Location>>,
+    /// The current locations of every indexed root that has one, by root
+    /// ID: one for a mutable root, and one for each current copy of an
+    /// immutable group.
+    sources: Arc<HashMap<u64, Vec<Location>>>,
     strong: StrongHash,
     block_size: u64,
     attempts: u32,
@@ -111,11 +107,12 @@ struct Worker {
 
 impl Worker {
     /// A verified block with the full digest `strong`, from the first of
-    /// at most `attempts` candidates that verifies (DESIGN.md §6.4, steps
-    /// 2 to 5). The block is the very buffer that was verified. Otherwise
-    /// the miss, which the summary counts: no candidate at all, so the
-    /// window of the query only shares its weak hash with a block of the
-    /// index, or candidates that did not verify.
+    /// at most `attempts` candidates that verifies at one of the current
+    /// locations of its root (DESIGN.md §6.4, steps 2 to 5). The block is
+    /// the very buffer that was verified. Otherwise the miss, which the
+    /// summary counts: no candidate at all, so the window of the query only
+    /// shares its weak hash with a block of the index, or candidates that
+    /// did not verify.
     fn find(&mut self, strong: &Strong) -> Result<Block, Miss> {
         let candidates = self.reader.candidates(&strong[..PREFIX_LEN], self.attempts);
         if candidates.is_empty() {
@@ -125,17 +122,22 @@ impl Worker {
             let Some((root_id, rel_path)) = candidate.path else {
                 continue;
             };
-            let Some(location) = self.sources.get(&root_id) else {
+            let Some(copies) = self.sources.get(&root_id) else {
                 continue;
             };
             let Some(offset) = candidate.block_no.checked_mul(self.block_size) else {
                 continue;
             };
-            if read_candidate(location, &rel_path, offset, &mut self.buffer).is_ok()
-                && self.strong.digest(&self.buffer) == *strong
-            {
-                let fresh = vec![0; self.buffer.len()];
-                return Ok(Arc::new(std::mem::replace(&mut self.buffer, fresh)));
+            // The copies of a group need not share the indexed inode, and
+            // any of them can have gone or changed: each one that fails
+            // gives way to the next (DESIGN.md §6.4, step 3).
+            for location in copies {
+                if read_candidate(location, &rel_path, offset, &mut self.buffer).is_ok()
+                    && self.strong.digest(&self.buffer) == *strong
+                {
+                    let fresh = vec![0; self.buffer.len()];
+                    return Ok(Arc::new(std::mem::replace(&mut self.buffer, fresh)));
+                }
             }
         }
         Err(Miss::Unverified)

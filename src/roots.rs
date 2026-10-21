@@ -4,10 +4,11 @@
 //! follows symlinks. The walk enters every directory once per pattern and
 //! carries the set of pattern positions that can be active there, so a
 //! pattern with several `**` components neither lists a directory twice nor
-//! mistakes the second visit for a cycle. A pattern without wildcards names
-//! its root as written. Otherwise names come from directory listings. A
-//! literal name is looked up instead, for existence only, when no wildcard
-//! is active in its directory. A directory that cannot be listed is
+//! mistakes the second visit for a cycle. Names come from directory
+//! listings. A literal name is looked up instead, for existence only, when
+//! no wildcard is active in its directory, so that a pattern matches only
+//! entries that exist, also a pattern without wildcards; a name that
+//! cannot be looked up is no match. A directory that cannot be listed is
 //! abandoned with its contents (DESIGN.md §4.5). A match is not examined:
 //! its `Location` keeps the directory holding it open, and the root's scan
 //! task opens and classifies the match when it starts (DESIGN.md §4.6).
@@ -16,6 +17,10 @@
 //! is fatal; one that cannot be identified is abandoned too. Exclusions
 //! apply to every name that a wildcard pattern selects and to the matches
 //! of every pattern; an excluded directory is not entered.
+//!
+//! Each match of an immutable root gets the identifier of its group, and
+//! the matches that share an identifier are the copies of that group,
+//! which must have the same indexing policy (DESIGN.md §4.2).
 
 use std::collections::HashMap;
 use std::os::fd::{AsFd, OwnedFd};
@@ -30,11 +35,13 @@ use crate::escapes::{quoted, quoted_pattern};
 use crate::fsid::{FsCache, Identity, identify};
 use crate::fsops::{self, Meta};
 use crate::glob::{self, Component};
+use crate::index::RootRow;
 use crate::report::warn;
 
 /// One current location of a configured root: a directory entry whose
 /// name matched the pattern. Its scan task finds out whether it is a
 /// directory, a regular file, or not a root at all.
+#[derive(Clone)]
 pub struct Location {
     /// Index of the `[[roots]]` entry.
     pub root: usize,
@@ -44,6 +51,9 @@ pub struct Location {
     pub dir: Arc<OwnedFd>,
     /// The root's name in `dir`; `.` when the root is `/` itself.
     pub name: Vec<u8>,
+    /// The identifier of the group of an immutable root, which all its
+    /// copies share; `None` for a mutable root.
+    pub identifier: Option<Vec<u8>>,
 }
 
 /// Positions in a pattern's component list, sorted and without duplicates.
@@ -52,8 +62,13 @@ pub struct Location {
 /// matched.
 type Positions = Vec<usize>;
 
-/// Expand every root pattern. Dies on duplicate or nested roots.
-pub fn expand(config: &Config, fs_cache: &FsCache) -> Vec<Location> {
+/// Resolve the roots of `config` (DESIGN.md §4.2): expand every root
+/// pattern, and give each match of an immutable root its identifier. Dies
+/// on a configuration error, before the index changes: duplicate or nested
+/// roots, a match that cannot have an identifier, or copies of a group
+/// with different indexing policies, also when the update would not scan
+/// them.
+pub fn resolve(config: &Config, fs_cache: &FsCache) -> Vec<Location> {
     let mut locations = Vec::new();
     for (index, root) in config.roots.iter().enumerate() {
         let components: Vec<Component> = glob::components(&root.pattern)
@@ -68,6 +83,7 @@ pub fn expand(config: &Config, fs_cache: &FsCache) -> Vec<Location> {
             exact: components
                 .iter()
                 .all(|c| matches!(c, Component::Literal(_))),
+            missing: None,
             locations: &mut locations,
             visited: HashMap::new(),
         };
@@ -87,15 +103,93 @@ pub fn expand(config: &Config, fs_cache: &FsCache) -> Vec<Location> {
             }
             Err(e) => walker.error(b"/", "open", e),
         }
-        if locations.len() == before {
-            warn(format!(
-                "root pattern {} matched nothing",
-                quoted_pattern(&root.pattern)
-            ));
+        let missing = walker.missing;
+        // A root that may vanish need not be there, so neither need its
+        // matches. When the root of an exact pattern is all that is
+        // missing, the warning says so.
+        if locations.len() == before && !root.may_vanish {
+            match missing {
+                Some(path) => warn(format!("{}: root does not exist", quoted(&path))),
+                None => warn(format!(
+                    "root pattern {} matched nothing",
+                    quoted_pattern(&root.pattern)
+                )),
+            }
         }
     }
     check_nesting(&locations, config);
+    check_policies(&locations, config);
     locations
+}
+
+/// Die unless all copies of each immutable group have the same indexing
+/// policy (DESIGN.md §4.2): the update scans only one of them, and its
+/// paths stand for all.
+fn check_policies(locations: &[Location], config: &Config) {
+    let mut first: HashMap<&[u8], &Location> = HashMap::new();
+    for location in locations {
+        let Some(identifier) = &location.identifier else {
+            continue;
+        };
+        let earlier = *first.entry(identifier).or_insert(location);
+        let (a, b) = (&config.roots[earlier.root], &config.roots[location.root]);
+        if let Some(difference) = a.policy_difference(b) {
+            die(format!(
+                "root patterns {} and {} have different {difference}, \
+                 but their matches {} and {} share the identifier {}",
+                quoted_pattern(&a.pattern),
+                quoted_pattern(&b.pattern),
+                quoted(&earlier.path),
+                quoted(&location.path),
+                quoted(identifier)
+            ));
+        }
+    }
+}
+
+/// The current locations of each indexed root of `rows`, by root ID
+/// (DESIGN.md §4.2), from which candidate reads take its files: for a root
+/// with an identifier, a completed group, every current copy of the group;
+/// for one without, the current location at its stored path, and when the
+/// configuration makes that location a copy of an immutable group, every
+/// copy of that group, whose relative paths are those of the location. The
+/// location at the stored path comes first: the update scanned it, or kept
+/// it for the group. A root without a current location has no entry.
+pub fn current_locations(
+    locations: &[Location],
+    rows: &[(u64, RootRow)],
+) -> HashMap<u64, Vec<Location>> {
+    let mut by_path: HashMap<&[u8], &Location> = HashMap::with_capacity(locations.len());
+    let mut groups: HashMap<&[u8], Vec<&Location>> = HashMap::new();
+    for location in locations {
+        by_path.insert(&location.path, location);
+        if let Some(identifier) = &location.identifier {
+            groups.entry(identifier).or_default().push(location);
+        }
+    }
+    rows.iter()
+        .filter_map(|(root_id, row)| {
+            let identifier = match &row.identifier {
+                Some(identifier) => identifier,
+                None => {
+                    let location = *by_path.get(row.path.as_slice())?;
+                    match &location.identifier {
+                        Some(identifier) => identifier,
+                        None => return Some((*root_id, vec![location.clone()])),
+                    }
+                }
+            };
+            let mut copies: Vec<Location> = groups
+                .get(identifier.as_slice())?
+                .iter()
+                .map(|&copy| copy.clone())
+                .collect();
+            if let Some(stored) = copies.iter().position(|copy| copy.path == row.path) {
+                copies[..=stored].rotate_right(1);
+            }
+            Some((*root_id, copies))
+        })
+        .collect()
 }
 
 /// The positions reachable from `positions` by matching one path
@@ -174,8 +268,10 @@ struct Walker<'a> {
     root: &'a RootConfig,
     root_index: usize,
     components: &'a [Component],
-    /// The pattern has no wildcards, so it names one root, existing or not.
+    /// The pattern has no wildcards, so it names one root.
     exact: bool,
+    /// The root of an exact pattern, when its lookup found nothing there.
+    missing: Option<Vec<u8>>,
     locations: &'a mut Vec<Location>,
     /// Directories listed under `**`, for cycle detection.
     visited: HashMap<Identity, Vec<u8>>,
@@ -245,27 +341,31 @@ impl Walker<'_> {
         let path = node.child_path(name);
         // A wildcard pattern selects the names it matches, and an excluded
         // name is not selected, neither as a root nor as a directory to
-        // enter. An exact pattern names its root as written; only that
+        // enter. An exact pattern selects nothing but its root, so only its
         // root can be excluded.
         if (matched || !self.exact) && self.excluded(name, &path) {
             return;
         }
         if matched {
-            // A listed name exists, and an exact pattern names its root
-            // whether it exists or not. Only the final literal of a
-            // wildcard pattern is looked up: the lookup decides whether
-            // the pattern matches here, as a listing decides for a
+            // A listed name exists. Any other match is looked up, since a
+            // pattern matches only entries that exist: the lookup decides
+            // whether the pattern matches here, as a listing decides for a
             // wildcard, or `/srv/**/data` would name a root under every
-            // directory. It decides nothing about the entry itself; the
-            // scan task opens the root and classifies it from its own
-            // descriptor.
-            let exists = if listed || self.exact {
+            // directory, and a completed group, which no scan opens, would
+            // stay while the configuration names its missing copies
+            // (DESIGN.md §4.2). It decides nothing about the entry itself;
+            // the scan task opens the root and classifies it from its own
+            // descriptor. A failed lookup is reported and is no match, like
+            // a directory on the way that cannot be opened: no scan or
+            // candidate read could reach the entry.
+            let exists = if listed {
                 Ok(true)
             } else {
                 fsops::entry_exists(node.fd.as_fd(), name)
             };
             match exists {
                 Ok(true) => self.emit(node, name, &path),
+                Ok(false) if self.exact => self.missing = Some(path.clone()),
                 Ok(false) => {}
                 Err(e) => self.error(&path, "stat", e),
             }
@@ -325,13 +425,25 @@ impl Walker<'_> {
         self.root.exclude.excludes(name, || path.to_vec())
     }
 
-    /// Record the match `name` of `parent`.
+    /// Record the match `name` of `parent`, with its identifier when the
+    /// root is immutable. A match that cannot have one is a configuration
+    /// error.
     fn emit(&mut self, parent: &Node, name: &[u8], path: &[u8]) {
+        let identifier = self.root.identifier.as_ref().map(|form| {
+            form.of(path).unwrap_or_else(|e| {
+                die(format!(
+                    "root {} of pattern {} {e}",
+                    quoted(path),
+                    quoted_pattern(&self.root.pattern)
+                ))
+            })
+        });
         self.locations.push(Location {
             root: self.root_index,
             path: path.to_vec(),
             dir: Arc::clone(&parent.fd),
             name: name.to_vec(),
+            identifier,
         });
     }
 }
