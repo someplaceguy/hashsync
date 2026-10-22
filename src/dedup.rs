@@ -797,12 +797,12 @@ impl Receiving {
     }
 
     /// Start the receiver's role on a thread of its own: prepare the index
-    /// of `config` for the run, with the `--no-update` and sender caching of
-    /// `settings`, and with the other host when both streams are
-    /// `deduplicated`, since it then updates an index of its own at the same
-    /// time (DESIGN.md §4.4). Then start the lookups, which take over the
-    /// index and answer the queries as soon as they arrive, and run the
-    /// receiver's side of the list exchange (DESIGN.md §5.6), unless the
+    /// of `config` for the run, with the `--no-update`, `--scan-immutable`,
+    /// and sender caching of `settings`, and with the other host when both
+    /// streams are `deduplicated`, since it then updates an index of its own
+    /// at the same time (DESIGN.md §4.4). Then start the lookups, which take
+    /// over the index and answer the queries as soon as they arrive, and run
+    /// the receiver's side of the list exchange (DESIGN.md §5.6), unless the
     /// stream has ended or stopped by then.
     pub fn start(
         self,
@@ -811,10 +811,10 @@ impl Receiving {
         deduplicated: Deduplicated,
     ) -> ReceivingThread {
         let preparation = Preparation::of(settings.no_update, deduplicated);
-        let sender_cache = settings.sender_cache;
+        let (scan_immutable, sender_cache) = (settings.scan_immutable, settings.sender_cache);
         let thread = std::thread::Builder::new()
             .name("receiver".into())
-            .spawn(move || self.run(&config, preparation, sender_cache))
+            .spawn(move || self.run(&config, preparation, scan_immutable, sender_cache))
             .expect("cannot start the receiver's list exchange");
         ReceivingThread(thread)
     }
@@ -828,6 +828,7 @@ impl Receiving {
         self,
         config: &Config,
         preparation: Preparation,
+        scan_immutable: bool,
         sender_cache: bool,
     ) -> (Lookups, ListBytes) {
         let Receiving {
@@ -838,7 +839,7 @@ impl Receiving {
         } = self;
         // The control reader keeps its own end of the link.
         drop(frames);
-        let (index, locations) = prepare(config, preparation, &link);
+        let (index, locations) = prepare(config, preparation, scan_immutable, &link);
         if pins.is_completing() {
             list_exchange::send_none(&link, config.hashlist_max_age);
             index.close();
@@ -874,10 +875,16 @@ impl ReceivingThread {
 
 /// Prepare the receiver's index for one run, as `preparation` says
 /// (DESIGN.md §4.4), with the other host through `link` when both hosts
-/// update their index. Returns the index, read-only with a shared lock,
-/// with the current root locations, from which the lookups read candidate
-/// blocks.
-fn prepare(config: &Config, preparation: Preparation, link: &Link) -> (Index, Vec<Location>) {
+/// update their index. An update scans the completed immutable groups
+/// again too with `scan_immutable`. Returns the index, read-only with a
+/// shared lock, with the current root locations, from which the lookups
+/// read candidate blocks.
+fn prepare(
+    config: &Config,
+    preparation: Preparation,
+    scan_immutable: bool,
+    link: &Link,
+) -> (Index, Vec<Location>) {
     match preparation {
         Preparation::Open => {
             fsops::raise_descriptor_limit();
@@ -886,7 +893,7 @@ fn prepare(config: &Config, preparation: Preparation, link: &Link) -> (Index, Ve
             (open_read_only(config), locations)
         }
         Preparation::UpdateAndKeep => {
-            let (index, locations) = update::perform(config, false, None);
+            let (index, locations) = update::perform(config, false, scan_immutable, None);
             (index.into_read_only(&config.index_path), locations)
         }
         // L1. The update, then the lock goes: the other host updates its own
@@ -899,7 +906,7 @@ fn prepare(config: &Config, preparation: Preparation, link: &Link) -> (Index, Ve
         // have changed the index in between, and a rebuild with other
         // settings ends the run, as with `--no-update`.
         Preparation::UpdateAndReopen => {
-            let (index, locations) = update::perform(config, false, None);
+            let (index, locations) = update::perform(config, false, scan_immutable, None);
             index.close();
             link.send(frame::UPDATED, Vec::new());
             link.expect_empty(frame::UPDATED, "UPDATED");

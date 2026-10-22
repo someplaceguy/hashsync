@@ -1161,6 +1161,47 @@ fn an_unfinished_group_is_read_from_every_copy() {
 }
 
 #[test]
+fn scan_immutable_scans_the_groups_of_the_receiver_again() {
+    // `--scan-immutable` reaches the update of the receiver, the client in
+    // a pull and the server in a push, which REQUEST tells (DESIGN.md §6.2
+    // and §8): its update scans the completed group again, which it
+    // otherwise reuses, and so indexes the file added to it later. A run
+    // with `--no-update` has no update, so with it, the option is a usage
+    // error.
+    for direction in DIRECTIONS {
+        let transfer = Transfer::new(&[]);
+        configure_copies(&transfer, direction, "", &tiled(2, 25));
+        transfer.update_receiver(direction, &[]);
+        transfer.env.write("copies/a/data/later", &tiled(2, 26));
+        let command = args(&["true"]);
+        let run = |flags: &[&str]| {
+            let mut invocation = transfer.invocation_in(direction, flags, &refs(&command));
+            invocation.output().unwrap()
+        };
+        let groups = |output: &Output| summary_line(output, "immutable roots: ");
+        let output = succeeded(run(&[]));
+        assert!(
+            groups(&output).ends_with("immutable roots: 1 reused, 0 completed, 0 incomplete"),
+            "{direction:?}: {}",
+            groups(&output)
+        );
+        let output = succeeded(run(&["--scan-immutable"]));
+        assert!(
+            groups(&output).ends_with("immutable roots: 0 reused, 1 completed, 0 incomplete"),
+            "{direction:?}: {}",
+            groups(&output)
+        );
+        assert!(
+            summary_line(&output, "files hashed").contains(" 1 files hashed"),
+            "{direction:?}"
+        );
+
+        let output = run(&["--scan-immutable", "--no-update"]);
+        assert_eq!(output.status.code(), Some(2), "{direction:?}");
+    }
+}
+
+#[test]
 fn copies_with_different_policies_end_a_run_without_an_update() {
     // The copies of a group must have the same exclusions, also in a run
     // with `--no-update`, which reads every copy (DESIGN.md §4.2). The

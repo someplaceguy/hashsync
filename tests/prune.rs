@@ -1,0 +1,414 @@
+//! `hashsync prune` through the binary (DESIGN.md §4.2 and §8): the roots
+//! and paths that it removes from the index without hashing, the roots
+//! that it looks into, and the compaction at its end.
+
+mod common;
+
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
+
+use common::*;
+
+/// Run `prune` with `options`, and require success. Returns stderr.
+fn prune(env: &Env, options: &[&str]) -> String {
+    let output = env.run(&[&["prune"], options].concat());
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(output.status.success(), "prune failed:\n{stderr}");
+    stderr
+}
+
+/// What the note of a prune says that it removed: roots, paths, and stale
+/// inodes.
+fn pruned(stderr: &str) -> [u64; 3] {
+    let line = stderr
+        .lines()
+        .find_map(|line| line.strip_prefix("hashsync: pruned index in "))
+        .unwrap_or_else(|| panic!("no note of the prune:\n{stderr}"));
+    let (_, counts) = line.split_once(": ").unwrap();
+    let counts: Vec<u64> = counts
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|number| !number.is_empty())
+        .map(|number| number.parse().unwrap())
+        .collect();
+    counts.try_into().unwrap()
+}
+
+/// The warning for a path whose lookup `prune` cannot make.
+fn denied(path: impl AsRef<Path>) -> String {
+    format!(
+        "hashsync: warning: {}: open: Permission denied (os error 13)",
+        quoted(path.as_ref())
+    )
+}
+
+/// Prune removes the paths of the files that a mutable root no longer
+/// holds, and the inodes and blocks that no other path keeps, but not those
+/// of a hard link that is left. A path that leads to a directory now, or
+/// only through a symlink, holds no file of the root either (DESIGN.md
+/// §4.5). Prune hashes no file: a changed file keeps its old row until the
+/// next update. A root without paths stays (DESIGN.md §4.2).
+#[test]
+fn prune_removes_the_files_that_are_gone_without_hashing() {
+    let env = Env::new();
+    env.write("tree/keep", &random(BLOCK, 1));
+    env.write("tree/gone", &random(BLOCK, 2));
+    env.write("tree/sub/gone", &random(BLOCK, 3));
+    env.write("tree/changed", &random(BLOCK, 4));
+    env.write("tree/linked", &random(BLOCK, 5));
+    env.write("tree/replaced", &random(BLOCK, 7));
+    std::fs::hard_link(env.path("tree/linked"), env.path("tree/link")).unwrap();
+    env.mkdir("empty");
+    env.configure(&format!(
+        "{}{}",
+        env.root("tree", ""),
+        env.root("empty", "")
+    ));
+    env.update();
+    let old = env.strong_prefixes("changed");
+
+    std::fs::remove_file(env.path("tree/gone")).unwrap();
+    std::fs::remove_dir_all(env.path("tree/sub")).unwrap();
+    env.write("outside/gone", &random(BLOCK, 3));
+    std::os::unix::fs::symlink(env.path("outside"), env.path("tree/sub")).unwrap();
+    std::fs::remove_file(env.path("tree/linked")).unwrap();
+    std::fs::remove_file(env.path("tree/replaced")).unwrap();
+    env.mkdir("tree/replaced");
+    env.write("tree/changed", &random(BLOCK, 6));
+    let stderr = prune(&env, &[]);
+    assert!(warnings(&stderr).is_empty(), "{stderr}");
+    assert_eq!(pruned(&stderr), [0, 4, 3], "{stderr}");
+    assert_eq!(env.tree_paths(), ["changed", "keep", "link"]);
+    assert_eq!(env.strong_prefixes("changed"), old);
+    assert_eq!(env.count("roots"), 2);
+    env.index().assert_consistent();
+
+    // The update hashes the changed file, and the one of `link`, whose
+    // ctime the removal of its other link changed.
+    let stderr = env.update();
+    assert!(stderr.contains(" 2 files hashed"), "{stderr}");
+    assert_ne!(env.strong_prefixes("changed"), old);
+}
+
+/// A root goes with its paths when the configuration no longer names it,
+/// and when none of its copies is there any more, and so do the inodes and
+/// blocks that only it kept. An immutable root that comes back is scanned
+/// again by the next update (DESIGN.md §4.2).
+#[test]
+fn roots_that_no_copy_holds_go() {
+    let env = Env::new();
+    env.write("tree/f", &random(BLOCK, 1));
+    env.write("old/f", &random(BLOCK, 2));
+    env.write("store/a/f", &random(BLOCK, 3));
+    env.write("store/b/f", &random(BLOCK, 4));
+    let store = env.root("store/*", "immutable = true\nidentifier = 'name'");
+    env.configure(&format!(
+        "{}{}{store}",
+        env.root("tree", ""),
+        env.root("old", "")
+    ));
+    env.update();
+
+    env.configure(&format!("{}{store}", env.root("tree", "")));
+    let b = env.path("store/b");
+    std::fs::rename(&b, env.path("b-away")).unwrap();
+    let stderr = prune(&env, &[]);
+    assert_eq!(pruned(&stderr), [2, 2, 2], "{stderr}");
+    assert_eq!(indexed(&env), [pair("store/a", "f"), pair("tree", "f")]);
+    assert_eq!(env.count("blocks"), 2);
+    env.index().assert_consistent();
+
+    std::fs::rename(env.path("b-away"), &b).unwrap();
+    let stderr = env.update();
+    assert_eq!(groups(&stderr), [1, 1, 0]);
+    assert_eq!(
+        indexed(&env),
+        [
+            pair("store/a", "f"),
+            pair("store/b", "f"),
+            pair("tree", "f")
+        ]
+    );
+}
+
+/// Prune looks into immutable roots only with `--scan-immutable`: without
+/// it, a file that is gone from a completed group keeps its path. With it,
+/// the path goes unless another copy of the group holds the file, and the
+/// group stays complete: a file that is gone is no failure (DESIGN.md
+/// §4.2).
+#[test]
+fn immutable_roots_are_looked_into_with_scan_immutable() {
+    let env = Env::new();
+    for copy in ["a", "b"] {
+        for (name, seed) in [("f", 1), ("g", 2), ("h", 3)] {
+            env.write(format!("copies/{copy}/data/{name}"), &random(BLOCK, seed));
+        }
+    }
+    let copy = "immutable = true\nidentifier = 'name'";
+    env.configure(&format!(
+        "{}{}",
+        env.root("copies/a/data", copy),
+        env.root("copies/b/data", copy)
+    ));
+    env.update();
+
+    // The scanned copy no longer has `g`, and neither copy has `h`.
+    std::fs::remove_file(env.path("copies/a/data/g")).unwrap();
+    for copy in ["a", "b"] {
+        std::fs::remove_file(env.path(format!("copies/{copy}/data/h"))).unwrap();
+    }
+    let stderr = prune(&env, &[]);
+    assert_eq!(pruned(&stderr), [0, 0, 0], "{stderr}");
+    assert_eq!(env.count("paths"), 3);
+
+    let stderr = prune(&env, &["--scan-immutable"]);
+    assert!(warnings(&stderr).is_empty(), "{stderr}");
+    assert!(!stderr.contains("immutable roots"), "{stderr}");
+    assert_eq!(pruned(&stderr), [0, 1, 1], "{stderr}");
+    let data = "copies/a/data";
+    assert_eq!(indexed(&env), [pair(data, "f"), pair(data, "g")]);
+    let stderr = env.update();
+    assert_eq!(groups(&stderr), [1, 0, 0]);
+}
+
+/// A path whose lookup fails goes too, as an update drops what it cannot
+/// reach: no candidate read could reach it either. A directory that cannot
+/// be searched gets one warning, as in an update, whatever the number of
+/// indexed paths below it, in subdirectories too. In a completed group,
+/// the failure leaves the group unfinished, so that the next update scans
+/// it again, and indexes the files once they can be reached (DESIGN.md §4.2
+/// and §4.5).
+#[test]
+fn a_path_that_cannot_be_looked_up_goes() {
+    if skip_as_root() {
+        return;
+    }
+    let env = Env::new();
+    for root in ["tree", "group"] {
+        env.write(format!("{root}/ok"), &random(BLOCK, 1));
+        env.write(format!("{root}/closed/f"), &random(BLOCK, 2));
+    }
+    env.write("tree/closed/g", &random(BLOCK, 3));
+    env.write("tree/closed/sub/h", &random(BLOCK, 4));
+    env.configure(&format!(
+        "{}{}",
+        env.root("tree", ""),
+        env.root("group", "immutable = true")
+    ));
+    env.update();
+
+    let closed = [("tree/closed", 0o755), ("group/closed", 0o755)];
+    let stderr = env.run_with_closed(&["prune", "--scan-immutable"], &closed);
+    let mut found = warnings(&stderr);
+    found.sort();
+    assert_eq!(found.len(), 2, "{stderr}");
+    assert_eq!(found[0], denied(env.path("group/closed/f")), "{stderr}");
+    // The warning names one of the paths below the closed directory.
+    let below = ["f", "g", "sub/h"].map(|rel| denied(env.path(format!("tree/closed/{rel}"))));
+    assert!(below.contains(&found[1].to_string()), "{stderr}");
+    assert_eq!(pruned(&stderr), [0, 4, 4], "{stderr}");
+    assert!(
+        stderr.contains(
+            "hashsync: immutable roots: 1 incomplete, which the next update scans again\n"
+        ),
+        "{stderr}"
+    );
+    assert_eq!(indexed(&env), [pair("group", "ok"), pair("tree", "ok")]);
+    let stats = env.stats();
+    assert!(stats.contains("(0 complete immutable)"), "{stats}");
+
+    let stderr = env.update();
+    assert_eq!(groups(&stderr), [0, 1, 0]);
+    assert_eq!(
+        indexed(&env),
+        [
+            pair("group", "closed/f"),
+            pair("group", "ok"),
+            pair("tree", "closed/f"),
+            pair("tree", "closed/g"),
+            pair("tree", "closed/sub/h"),
+            pair("tree", "ok")
+        ]
+    );
+}
+
+/// A copy can vanish after root resolution. Prune then finds it missing
+/// when it looks into its root, and gives the warning that root resolution
+/// would have given, unless the copy may vanish, as the scan of an update
+/// does. A root none of whose copies is there goes (DESIGN.md §4.2).
+#[test]
+fn a_root_that_vanishes_after_resolution_goes() {
+    let env = Env::new();
+    env.write("a/f", &random(BLOCK, 1));
+    env.write("b/f", &random(BLOCK, 2));
+    env.configure(&format!(
+        "{}{}",
+        env.root("a", ""),
+        env.root("b", "may_vanish = true")
+    ));
+    env.update();
+
+    let stderr = env.run_after_resolution(&["prune"], || {
+        for root in ["a", "b"] {
+            std::fs::rename(env.path(root), env.path(format!("{root}-away"))).unwrap();
+        }
+    });
+    assert_eq!(warnings(&stderr), [missing(env.path("a"))], "{stderr}");
+    assert_eq!(pruned(&stderr), [2, 2, 2], "{stderr}");
+    assert_eq!(env.count("roots"), 0);
+}
+
+/// A completed group that a failed lookup leaves unfinished keeps a row
+/// with the path of the first copy that prune opened, by which a run with
+/// `--no-update` finds the copies of an unfinished group, and so does the
+/// next prune, which keeps the group. Here the copy that the row named
+/// vanishes after root resolution, which still found it (DESIGN.md §4.2).
+#[test]
+fn an_unfinished_group_keeps_the_path_of_a_current_copy() {
+    if skip_as_root() {
+        return;
+    }
+    let env = Env::new();
+    for copy in ["a", "b"] {
+        env.write(format!("copies/{copy}/data/ok"), &random(BLOCK, 1));
+        env.write(format!("copies/{copy}/data/closed/f"), &random(BLOCK, 2));
+    }
+    let copy = "immutable = true\nidentifier = 'name'";
+    env.configure(&format!(
+        "{}{}",
+        env.root("copies/a/data", copy),
+        env.root("copies/b/data", copy)
+    ));
+    env.update();
+
+    let closed = env.close(&[("copies/b/data/closed", 0o755)]);
+    let a = env.path("copies/a/data");
+    let args = ["prune", "--scan-immutable"];
+    let stderr = env.run_after_resolution(&args, || std::fs::remove_dir_all(&a).unwrap());
+    drop(closed);
+    let expected = [missing(&a), denied(env.path("copies/b/data/closed/f"))];
+    assert_eq!(warnings(&stderr), expected, "{stderr}");
+    assert_eq!(pruned(&stderr), [0, 1, 1], "{stderr}");
+    let rows = env.index().roots();
+    let b = env.path("copies/b/data").as_os_str().as_bytes().to_vec();
+    assert_eq!(rows.len(), 1);
+    assert_eq!((rows[0].identifier.as_deref(), &rows[0].path), (None, &b));
+
+    let stderr = prune(&env, &[]);
+    assert_eq!(pruned(&stderr), [0, 0, 0], "{stderr}");
+    assert_eq!(indexed(&env), [pair("copies/b/data", "ok")]);
+}
+
+/// A root none of whose copies opens as a directory or a regular file goes
+/// with its paths, with the warning of a scan task: here the root is a
+/// symlink now, which root expansion still finds (DESIGN.md §4.2 and §4.5).
+#[test]
+fn a_root_that_does_not_open_goes() {
+    let env = Env::new();
+    env.write("tree/f", &random(BLOCK, 1));
+    env.write("other/f", &random(BLOCK, 2));
+    env.configure(&env.root("tree", ""));
+    env.update();
+
+    std::fs::rename(env.tree(), env.path("tree-away")).unwrap();
+    std::os::unix::fs::symlink(env.path("other"), env.tree()).unwrap();
+    let stderr = prune(&env, &[]);
+    let expected = format!(
+        "hashsync: warning: {}: root is not a directory or a regular file",
+        quoted(env.tree())
+    );
+    assert_eq!(warnings(&stderr), [expected], "{stderr}");
+    assert_eq!(pruned(&stderr), [1, 1, 1], "{stderr}");
+    assert_eq!(env.count("roots"), 0);
+    assert_eq!(env.count("blocks"), 0);
+}
+
+/// Prune ends with a compaction of the whole database: the entries that it
+/// and the updates before it removed leave the database files, where an
+/// update leaves them until RocksDB compacts the files on its own
+/// (DESIGN.md §4.4).
+#[test]
+fn prune_compacts_the_index() {
+    let env = Env::new();
+    for i in 0..4 {
+        env.write(format!("tree/{i}"), &random(BLOCK * 2, i));
+    }
+    env.configure(&env.root("tree", ""));
+    env.update();
+    std::fs::remove_file(env.path("tree/0")).unwrap();
+    let stderr = env.update();
+    assert!(stderr.contains(" 1 stale inodes removed"), "{stderr}");
+    assert!(env.index().file_deletions() > 0, "no removal in the files");
+
+    std::fs::remove_file(env.path("tree/1")).unwrap();
+    let stderr = prune(&env, &[]);
+    assert_eq!(pruned(&stderr), [0, 1, 1], "{stderr}");
+    assert!(stderr.contains("hashsync: compacted index in "), "{stderr}");
+    let index = env.index();
+    assert_eq!(index.file_deletions(), 0);
+    assert_eq!(index.count("paths"), 2);
+    index.assert_consistent();
+}
+
+/// The compaction also removes a deletion that RocksDB moved to the last
+/// level of the database without rewriting it, beside the entry that it
+/// deletes: one that deletes the first entry of an older file. Here the
+/// only indexed file goes, so that each of its deletions is such a one
+/// (DESIGN.md §4.4).
+#[test]
+fn prune_compacts_deletions_that_reach_the_last_level() {
+    let env = Env::new();
+    env.write("tree/f", &random(BLOCK, 1));
+    env.configure(&env.root("tree", ""));
+    env.update();
+    std::fs::remove_file(env.path("tree/f")).unwrap();
+    let stderr = prune(&env, &[]);
+    assert_eq!(pruned(&stderr), [0, 1, 1], "{stderr}");
+    assert_eq!(env.index().file_deletions(), 0);
+}
+
+/// Prune needs an index that matches the configuration, which only an
+/// update makes, and says which update to run. It creates no database, so
+/// that the other commands find no index either. A configuration error
+/// changes nothing (DESIGN.md §4.2 and §4.4).
+#[test]
+fn prune_needs_a_current_index() {
+    let env = Env::new();
+    env.write("tree/f", &random(BLOCK, 1));
+    env.configure(&env.root("tree", ""));
+    let update = format!(
+        "run `hashsync --config={} update`",
+        env.config_path().display()
+    );
+    let expected = format!(
+        "hashsync: no index at {}; {update}\n",
+        quoted(env.index_path())
+    );
+    for command in ["prune", "stats"] {
+        let output = env.run(&[command]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{command}: {stderr}");
+        assert!(stderr.ends_with(&expected), "{command}: {stderr}");
+    }
+
+    env.update();
+    env.configure_with(&format!("block_size = 8192\n{}", env.root("tree", "")));
+    let output = env.run(&["prune"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    let expected = format!(
+        "hashsync: index {} does not match the configuration; {update}\n",
+        quoted(env.index_path())
+    );
+    assert!(stderr.ends_with(&expected), "{stderr}");
+
+    env.configure(&format!(
+        "{}{}",
+        env.root("tree", ""),
+        env.root("tree/f", "")
+    ));
+    let output = env.run(&["prune"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("is inside root"), "{stderr}");
+    assert_eq!(env.count("paths"), 1);
+}

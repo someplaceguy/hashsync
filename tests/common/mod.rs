@@ -8,7 +8,7 @@ use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output};
+use std::process::{Child, Command, Output, Stdio};
 use std::time::Duration;
 
 use rocksdb::{ColumnFamily, DB, IteratorMode, Options, WriteBatch};
@@ -161,6 +161,60 @@ impl Env {
         String::from_utf8(output.stdout).unwrap()
     }
 
+    /// Make the entries `closed` impossible to read or search, each with the
+    /// mode that it gets back when the returned value drops.
+    pub fn close<'a>(&'a self, closed: &[(&'a str, u32)]) -> Closed<'a> {
+        for &(rel, _) in closed {
+            self.chmod(rel, 0o000);
+        }
+        Closed {
+            env: self,
+            entries: closed.to_vec(),
+        }
+    }
+
+    /// Run `hashsync ARGS...` while the entries `closed` cannot be read or
+    /// searched (`close`). Requires success. Returns stderr.
+    pub fn run_with_closed(&self, args: &[&str], closed: &[(&str, u32)]) -> String {
+        let closed = self.close(closed);
+        let output = self.run(args);
+        drop(closed);
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(output.status.success(), "{args:?} failed:\n{stderr}");
+        stderr
+    }
+
+    /// Run `hashsync ARGS...`, a command that resolves the roots before it
+    /// opens the index (DESIGN.md §4.2), such as `update` or `prune`, and
+    /// call `change` after the resolution and before the command uses the
+    /// index: the command waits while this process holds a lock of the
+    /// index, and `change` runs during that wait. Requires success. Returns
+    /// stderr.
+    pub fn run_after_resolution(&self, args: &[&str], change: impl FnOnce()) -> String {
+        // The first update creates the index and its lock file; this process
+        // creates them first, to lock that file.
+        std::fs::create_dir_all(self.index_path()).unwrap();
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.index_path().join("hashsync.lock"))
+            .unwrap();
+        let lock = shared_lock(&self.index_path());
+        let child = self.command(args).stderr(Stdio::piped()).spawn().unwrap();
+        let mut child = KillOnDrop(child);
+        wait_for_lock_wait(child.0.id());
+        change();
+        drop(lock);
+        let mut stderr = String::new();
+        let mut pipe = child.0.stderr.take().unwrap();
+        pipe.read_to_string(&mut stderr).unwrap();
+        assert!(
+            child.0.wait().unwrap().success(),
+            "{args:?} failed:\n{stderr}"
+        );
+        stderr
+    }
+
     /// The index, open read-only.
     pub fn index(&self) -> IndexView {
         IndexView::open(&self.index_path(), false)
@@ -260,6 +314,86 @@ impl Env {
     pub fn chmod(&self, rel: &str, mode: u32) {
         std::fs::set_permissions(self.path(rel), std::fs::Permissions::from_mode(mode)).unwrap();
     }
+}
+
+/// Entries of an environment that cannot be read or searched while this
+/// value lives (`Env::close`). Its drop gives them their modes back, also
+/// when an assertion fails, so that the cleanup of the test can remove the
+/// tree.
+pub struct Closed<'a> {
+    env: &'a Env,
+    entries: Vec<(&'a str, u32)>,
+}
+
+impl Drop for Closed<'_> {
+    fn drop(&mut self) {
+        for &(rel, mode) in &self.entries {
+            // A panic here, while a failed assertion unwinds, would abort
+            // the test binary.
+            let permissions = std::fs::Permissions::from_mode(mode);
+            let _ = std::fs::set_permissions(self.env.path(rel), permissions);
+        }
+    }
+}
+
+/// The indexed paths, as `(root, relative path)` strings, relative to the
+/// environment.
+pub fn indexed(env: &Env) -> Vec<(String, String)> {
+    let base = env.dir.path().as_os_str().as_bytes().to_vec();
+    env.paths()
+        .into_iter()
+        .map(|(root, rel)| {
+            let root = root
+                .strip_prefix(&base[..])
+                .expect("a root outside the test");
+            let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
+            (text(&root[1..]), text(&rel))
+        })
+        .collect()
+}
+
+pub fn pair(root: &str, rel: &str) -> (String, String) {
+    (root.to_string(), rel.to_string())
+}
+
+/// What the note of an update says about the immutable groups: how many it
+/// reused, completed, and left incomplete.
+pub fn groups(stderr: &str) -> [u64; 3] {
+    let line = stderr
+        .lines()
+        .find_map(|line| line.strip_prefix("hashsync: immutable roots: "))
+        .unwrap_or_else(|| panic!("no note about immutable roots:\n{stderr}"));
+    let counts: Vec<u64> = line
+        .split(", ")
+        .map(|part| part.split(' ').next().unwrap().parse().unwrap())
+        .collect();
+    counts.try_into().unwrap()
+}
+
+/// The warnings in `stderr`, one for each line.
+pub fn warnings(stderr: &str) -> Vec<&str> {
+    stderr
+        .lines()
+        .filter(|line| line.starts_with("hashsync: warning: "))
+        .collect()
+}
+
+/// The warning for the missing root at `path`.
+pub fn missing(path: impl AsRef<Path>) -> String {
+    format!(
+        "hashsync: warning: {}: root does not exist",
+        quoted(path.as_ref())
+    )
+}
+
+/// True when the test runs as root, whom permissions do not stop: the tests
+/// of entries that cannot be read or searched skip themselves then.
+pub fn skip_as_root() -> bool {
+    let root = rustix::process::geteuid().is_root();
+    if root {
+        eprintln!("skipped: root ignores permissions");
+    }
+    root
 }
 
 /// The column families of the index (DESIGN.md §4.4).
@@ -467,6 +601,14 @@ impl IndexView {
 
     pub fn write(&self, batch: WriteBatch) {
         self.db.write(batch).unwrap();
+    }
+
+    /// The deletions that the files of the database hold, in all column
+    /// families: removals that no compaction to the last level has applied
+    /// to the files yet.
+    pub fn file_deletions(&self) -> u64 {
+        let files = self.db.live_files().unwrap();
+        files.iter().map(|file| file.num_deletions).sum()
     }
 
     /// Assert the pairs of DESIGN.md §4.4: each inode row has its

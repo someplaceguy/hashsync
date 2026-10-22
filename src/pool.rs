@@ -1,7 +1,7 @@
 //! Rayon pools that join their threads when they drop (DESIGN.md §3): the
-//! pools of the reconciliation (§4.2), of the scan (§4.6), and of the
-//! export (§5.4), and the sender's probe threads (§6.3). The owner of a pool
-//! drops it after the work of the pool, explicitly where a later step
+//! pools of the reconciliation and of prune (§4.2), of the scan (§4.6), and
+//! of the export (§5.4), and the sender's probe threads (§6.3). The owner of
+//! a pool drops it after the work of the pool, explicitly where a later step
 //! must come after the join.
 //!
 //! Dropping a rayon pool only tells its threads to end: it does not wait

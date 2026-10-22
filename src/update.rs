@@ -1,4 +1,4 @@
-//! `hashsync update [--rebuild]` (DESIGN.md §4 and §8).
+//! `hashsync update [--rebuild] [--scan-immutable]` (DESIGN.md §4 and §8).
 
 use std::sync::atomic::Ordering::Relaxed;
 use std::time::Instant;
@@ -13,19 +13,26 @@ use crate::roots::{self, Location};
 use crate::scan;
 use crate::units::Bytes;
 
-pub fn run(config: &Config, rebuild: bool, jobs: Option<u32>) {
-    let (index, _) = perform(config, rebuild, jobs);
+pub fn run(config: &Config, rebuild: bool, scan_immutable: bool, jobs: Option<u32>) {
+    let (index, _) = perform(config, rebuild, scan_immutable, jobs);
     index.close();
 }
 
 /// Update the index and return it still open, with the current root
-/// locations that the update resolved. The receiver of a run turns it into
-/// a read-only index on the same lock (`Index::into_read_only`), so no
-/// modifying process comes between the update and its use, or, in a run
-/// with both streams deduplicated, closes it until the other host's update
-/// is done too (DESIGN.md §4.4). Its lookups read candidate blocks through
-/// these locations.
-pub fn perform(config: &Config, rebuild: bool, jobs: Option<u32>) -> (index::Index, Vec<Location>) {
+/// locations that the update resolved. With `scan_immutable`, the update
+/// scans the completed immutable groups again too, which it otherwise
+/// reuses without a scan (DESIGN.md §4.2). The receiver of a run turns the
+/// index into a read-only index on the same lock (`Index::into_read_only`),
+/// so no modifying process comes between the update and its use, or, in a
+/// run with both streams deduplicated, closes it until the other host's
+/// update is done too (DESIGN.md §4.4). Its lookups read candidate blocks
+/// through these locations.
+pub fn perform(
+    config: &Config,
+    rebuild: bool,
+    scan_immutable: bool,
+    jobs: Option<u32>,
+) -> (index::Index, Vec<Location>) {
     fsops::raise_descriptor_limit();
 
     // Resolve and validate the roots before the index is opened: a rejected
@@ -83,12 +90,12 @@ pub fn perform(config: &Config, rebuild: bool, jobs: Option<u32>) -> (index::Ind
             identifier: location.identifier.as_deref(),
         })
         .collect();
-    let reconciliation = index.reconcile_roots(&current);
+    let reconciliation = index.reconcile_roots(&current, scan_immutable);
 
     let (counters, summary) =
         scan::run(config, &locations, &reconciliation, &fs_cache, &index, jobs);
 
-    index.finish_update();
+    index.finish_writes();
 
     report::note(format_args!(
         "{} in {:.1}s: {} directories, {} files hashed ({}), \

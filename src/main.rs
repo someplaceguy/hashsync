@@ -4,9 +4,9 @@
 //! the client's stdin, replacing blocks that the server holds. See
 //! `DESIGN.md`.
 //!
-//! This build implements PLAN.md steps 1–7: `update` and `stats` for
-//! mutable roots and for immutable ones, whose copies share a group that an
-//! update scans once and then reuses, and `ssh`, which deduplicates stdout
+//! This build implements PLAN.md steps 1–8: `update`, `prune`, and `stats`
+//! for mutable roots and for immutable ones, whose copies share a group that
+//! an update scans once and then reuses, and `ssh`, which deduplicates stdout
 //! by default, stdin with `--dedup-stdin`, and both with `--dedup-stdin
 //! --dedup-stdout`. The command starts at once, and its streams with it;
 //! the hash lists that deduplicate them follow while they run, unless
@@ -38,6 +38,7 @@ mod names;
 mod pins;
 mod pool;
 mod protocol;
+mod prune;
 mod rendezvous;
 mod report;
 mod roots;
@@ -176,12 +177,25 @@ enum Command {
         #[arg(long)]
         rebuild: bool,
 
+        /// Scan the completed immutable roots again too, which an update
+        /// otherwise reuses without a scan
+        #[arg(long)]
+        scan_immutable: bool,
+
         /// Override the configured thread count; 0 selects the default
         #[arg(short = 'j', value_name = "N")]
         jobs: Option<u32>,
     },
     /// Report index statistics
     Stats,
+    /// Remove from the index the roots and paths that no current copy holds
+    /// any more, without hashing, then compact it
+    Prune {
+        /// Look up the paths of immutable roots too, which prune otherwise
+        /// leaves as they are while a copy of them is there
+        #[arg(long)]
+        scan_immutable: bool,
+    },
     /// Run a remote command through SSH, as ssh does, deduplicating its
     /// stdout against the local index, or with --dedup-stdin, stdin against
     /// the remote one, or both
@@ -318,8 +332,13 @@ fn main() {
     }
     let load_config = || config::load(&source, true);
     match &cli.command {
-        Command::Update { rebuild, jobs } => update::run(&load_config(), *rebuild, *jobs),
+        Command::Update {
+            rebuild,
+            scan_immutable,
+            jobs,
+        } => update::run(&load_config(), *rebuild, *scan_immutable, *jobs),
         Command::Stats => stats::run(&load_config()),
+        Command::Prune { scan_immutable } => prune::run(&load_config(), *scan_immutable),
         // The client receives the backward stream: it needs its
         // configuration file when that stream is deduplicated, for its index
         // (DESIGN.md §7).

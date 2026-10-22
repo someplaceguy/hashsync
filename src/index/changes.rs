@@ -23,12 +23,11 @@
 //! file that the group shares, before the file's paths go.
 
 use std::collections::{HashMap, HashSet};
-use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Mutex, MutexGuard};
 
 use rayon::ThreadPool;
-use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
 use super::layout::{self, Cf, ID_LEN, InodeRow, RootRow, id_key, u64_at};
 use super::{Group, Index, Reconciliation, Transaction};
@@ -80,7 +79,7 @@ pub struct Changes<'a> {
     failed: Mutex<HashSet<u64>>,
     /// The paths of the copies that the scan traverses for unfinished
     /// groups, by root ID, where these are not the first copies, which the
-    /// rows name.
+    /// rows name until the scan ends.
     copies: Mutex<HashMap<u64, Vec<u8>>>,
 }
 
@@ -122,8 +121,9 @@ impl<'a> Changes<'a> {
 
     /// Remember that the scan of the root `root_id` traverses the copy at
     /// `path`, and not the first copy of its group, which was not there and
-    /// may vanish (DESIGN.md §4.2). The row of the group names the copy
-    /// whose paths it has once the group is complete.
+    /// may vanish (DESIGN.md §4.2). After the scan, the row of the group
+    /// names the copy whose paths it has, whether the group is complete or
+    /// not.
     pub fn scan_copy(&self, root_id: u64, path: &[u8]) {
         self.copies.lock().unwrap().insert(root_id, path.to_vec());
     }
@@ -139,7 +139,7 @@ impl<'a> Changes<'a> {
             && let Some(existing) = self.existing(&self.identity_key(&identity))
         {
             let mut writer = self.writer();
-            delete_inode(&mut writer.txn, existing.inode_id, existing.row);
+            writer.txn.delete_inode(existing.inode_id, existing.row);
             writer.txn.checkpoint();
         }
     }
@@ -201,7 +201,9 @@ impl<'a> Changes<'a> {
     /// the threads of the pool. Only then do the unfinished groups that the
     /// scan traversed without a failure get their completion markers, so
     /// that a directory conflict that a late task finds ends the update
-    /// before any group is complete (DESIGN.md §4.2). Then remove the
+    /// before any group is complete (DESIGN.md §4.2). The row of each group
+    /// that the scan traversed names the copy that it traversed, whether
+    /// the group is complete now or stays unfinished. Then remove the
     /// inodes without paths, and their blocks, in bounded transactions,
     /// also on the threads of the pool.
     pub fn finish(self) -> Summary {
@@ -225,6 +227,18 @@ impl<'a> Changes<'a> {
         for (&root_id, group) in self.groups {
             if failed.contains(&root_id) {
                 summary.groups_incomplete += 1;
+                // A run with `--no-update` finds the copies of an
+                // unfinished group by the path of its row. The row names the
+                // first copy, which was not there when the scan took
+                // another, so it takes the path of that other copy.
+                if let Some(path) = copies.get(&root_id) {
+                    let row = RootRow {
+                        identifier: None,
+                        path: path.clone(),
+                    };
+                    txn.put(Cf::Roots, &id_key(root_id), &row.encode());
+                    txn.checkpoint();
+                }
             } else if group.complete {
                 summary.groups_reused += 1;
             } else {
@@ -239,7 +253,7 @@ impl<'a> Changes<'a> {
             }
         }
         txn.commit();
-        summary.orphans = remove_orphans(self.index, self.pool);
+        summary.orphans = self.index.remove_orphans(self.pool);
         summary
     }
 
@@ -469,7 +483,7 @@ impl Hashing<'_, '_> {
         self.writer.txn.commit();
         let changes = self.writer.changes;
         changes.invalidate_groups(&mut self.writer.txn, self.inode_id);
-        delete_inode(&mut self.writer.txn, self.inode_id, self.row);
+        self.writer.txn.delete_inode(self.inode_id, self.row);
         self.writer.txn.checkpoint();
         changes.drop_failed(&self.identity, &self.path);
     }
@@ -620,85 +634,6 @@ impl Files {
     }
 }
 
-/// Remove inodes without paths, and their blocks, once every result has
-/// committed (DESIGN.md §4.6). This also removes orphans left by earlier
-/// interrupted cleanup. Returns their number.
-///
-/// The threads of `pool` share the inode IDs by ranges, about four for
-/// each thread. A thread reads only entries whose keys start with an
-/// inode ID in its ranges, and changes only the entries of those inodes,
-/// so no thread reads the entries that another thread changes.
-fn remove_orphans(index: &Index, pool: &ThreadPool) -> u64 {
-    // The inode IDs start at 1 and are less than `end`.
-    let end = index.next_inode_id();
-    let parts = 4 * pool.current_num_threads() as u64;
-    let size = (end - 1).div_ceil(parts).max(1);
-    let mut ranges = Vec::new();
-    let mut start = 1;
-    while start < end {
-        let next = start.saturating_add(size).min(end);
-        ranges.push(start..next);
-        start = next;
-    }
-    pool.install(|| {
-        ranges
-            .into_par_iter()
-            .map(|ids| remove_orphans_in(index, ids))
-            .sum()
-    })
-}
-
-/// Remove the inodes with IDs in `ids` that have no paths, and their
-/// blocks, in bounded transactions. Returns their number.
-fn remove_orphans_in(index: &Index, ids: Range<u64>) -> u64 {
-    let mut txn = index.transaction();
-    let mut orphans = 0;
-    let (start, end) = (id_key(ids.start), id_key(ids.end));
-    // Both scans read the snapshot of their start, which the removals do
-    // not change.
-    let mut inodes = index
-        .shared
-        .scan_range(Cf::Inodes, &start, Some(end.to_vec()), false);
-    let mut paths = index
-        .shared
-        .scan_range(Cf::InodePaths, &start, Some(end.to_vec()), false);
-    while let Some((key, value)) = inodes.entry() {
-        let inode_id = u64_at(key, 0);
-        while let Some((path, _)) = paths.entry()
-            && u64_at(path, 0) < inode_id
-        {
-            paths.next();
-        }
-        if paths
-            .entry()
-            .is_none_or(|(path, _)| u64_at(path, 0) != inode_id)
-        {
-            delete_inode(&mut txn, inode_id, InodeRow::decode(value));
-            orphans += 1;
-            txn.checkpoint();
-        }
-        inodes.next();
-    }
-    txn.commit();
-    orphans
-}
-
-/// Remove an inode with its paths and blocks. The inode is marked
-/// incomplete first, in the same transaction as the removal of its paths
-/// and first blocks: block removal can commit between batches, and an
-/// interrupted removal must not leave a complete inode with missing
-/// blocks — a later scan would reuse it as unchanged. Recovery removes
-/// incomplete inodes instead (DESIGN.md §4.2). The removal reads committed
-/// entries.
-fn delete_inode(txn: &mut Transaction<'_>, inode_id: u64, mut row: InodeRow) {
-    row.size = None;
-    txn.put(Cf::Inodes, &id_key(inode_id), &row.encode());
-    txn.remove_inode_paths(inode_id);
-    txn.remove_blocks(inode_id);
-    txn.delete(Cf::Inodes, &id_key(inode_id));
-    txn.delete(Cf::Identities, &row.identity);
-}
-
 #[cfg(test)]
 mod tests {
     use std::os::unix::ffi::OsStrExt;
@@ -831,7 +766,7 @@ mod tests {
 
         index_tests::interrupt_after_commits(Some(1));
         let result = catch_unwind(AssertUnwindSafe(|| {
-            remove_orphans_in(&index, 1..index.next_inode_id())
+            index.remove_orphans_in(1..index.next_inode_id())
         }));
         index_tests::interrupt_after_commits(None);
         assert!(result.is_err(), "the injected failure must abort cleanup");
@@ -848,7 +783,7 @@ mod tests {
         assert_eq!(index_tests::count(&index, Cf::Strong) as u64, blocks);
 
         // The next update's reconciliation removes the incomplete remains.
-        index.reconcile_roots(&[]);
+        index.reconcile_roots(&[], false);
         for cf in [Cf::Inodes, Cf::Identities, Cf::Blocks, Cf::Strong] {
             assert_eq!(index_tests::count(&index, cf), 0, "{cf:?}");
         }
@@ -887,7 +822,7 @@ mod tests {
             &paths,
             &blocks,
         );
-        assert_eq!(remove_orphans(&fixture.index, &fixture.pool), 5);
+        assert_eq!(fixture.index.remove_orphans(&fixture.pool), 5);
         let mut left = Vec::new();
         fixture.index.shared.each(Cf::Inodes, b"", |key, _| {
             left.push(u64_at(key, 0));
@@ -1129,7 +1064,7 @@ mod tests {
         );
         index_tests::give_identifiers(&fixture.index, &[(1, b"g")]);
         let roots = [current(b"/g", Some(b"g")), current(b"/m", None)];
-        fixture.reconciliation = fixture.index.reconcile_roots(&roots);
+        fixture.reconciliation = fixture.index.reconcile_roots(&roots, false);
         assert_eq!(index_tests::scans(&fixture.reconciliation), [(2, vec![1])]);
         let changes = fixture.changes();
         fixture.pool.install(|| {
@@ -1162,8 +1097,10 @@ mod tests {
     /// After the scan, an unfinished group gets its marker only if no entry
     /// under its root failed and every file of it got its path: a link
     /// that waited for an owner that failed, a link that came later, and a
-    /// failed entry of the traversal leave their groups unfinished
-    /// (DESIGN.md §4.2 and §4.6).
+    /// failed entry of the traversal leave their groups unfinished. The row
+    /// of a group whose scan took another copy than the first names that
+    /// copy, also when the group stays unfinished (DESIGN.md §4.2 and
+    /// §4.6).
     #[test]
     fn groups_complete_only_without_failures() {
         let mut fixture = Fixture::new();
@@ -1174,7 +1111,7 @@ mod tests {
             current(b"/four", Some(b"four")),
             current(b"/m", None),
         ];
-        fixture.reconciliation = fixture.index.reconcile_roots(&roots);
+        fixture.reconciliation = fixture.index.reconcile_roots(&roots, false);
         let changes = fixture.changes();
         let path = |root_id, name: &str| RelPath {
             root_id,
@@ -1196,6 +1133,7 @@ mod tests {
             };
             owner.begin().end();
         });
+        changes.scan_copy(4, b"/four-b");
         changes.fail_root(4);
         let summary = changes.finish();
         assert_eq!(
@@ -1212,6 +1150,8 @@ mod tests {
                 (5, None)
             ]
         );
+        let (_, four) = &fixture.index.roots()[3];
+        assert_eq!(four.path, b"/four-b");
     }
 
     /// An owner that ends without a result is a bug, which `finish`

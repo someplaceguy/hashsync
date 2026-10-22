@@ -5,27 +5,11 @@
 
 mod common;
 
-use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-use std::process::Stdio;
 
 use common::*;
 use rocksdb::WriteBatch;
-
-/// What the note of an update says about the immutable groups: how many it
-/// reused, completed, and left incomplete.
-fn groups(stderr: &str) -> [u64; 3] {
-    let line = stderr
-        .lines()
-        .find_map(|line| line.strip_prefix("hashsync: immutable roots: "))
-        .unwrap_or_else(|| panic!("no note about immutable roots:\n{stderr}"));
-    let counts: Vec<u64> = line
-        .split(", ")
-        .map(|part| part.split(' ').next().unwrap().parse().unwrap())
-        .collect();
-    counts.try_into().unwrap()
-}
 
 fn bytes(path: &Path) -> Vec<u8> {
     path.as_os_str().as_bytes().to_vec()
@@ -35,101 +19,6 @@ fn bytes(path: &Path) -> Vec<u8> {
 fn root_rows(env: &Env) -> Vec<(Option<Vec<u8>>, Vec<u8>)> {
     let rows = env.index().roots().into_iter();
     rows.map(|root| (root.identifier, root.path)).collect()
-}
-
-/// The indexed paths, as `(root, relative path)` strings, relative to the
-/// environment.
-fn indexed(env: &Env) -> Vec<(String, String)> {
-    let base = bytes(env.dir.path());
-    env.paths()
-        .into_iter()
-        .map(|(root, rel)| {
-            let root = root
-                .strip_prefix(&base[..])
-                .expect("a root outside the test");
-            let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
-            (text(&root[1..]), text(&rel))
-        })
-        .collect()
-}
-
-fn pair(root: &str, rel: &str) -> (String, String) {
-    (root.to_string(), rel.to_string())
-}
-
-/// Run `update` while the entries `closed` cannot be read or searched,
-/// and give them their modes back before checking anything, so that a
-/// failed test leaves a tree that its cleanup can remove. Returns stderr.
-fn update_with_closed(env: &Env, closed: &[(&str, u32)]) -> String {
-    for &(rel, _) in closed {
-        env.chmod(rel, 0o000);
-    }
-    let output = env.run(&["update"]);
-    for &(rel, mode) in closed {
-        env.chmod(rel, mode);
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    assert!(output.status.success(), "update failed:\n{stderr}");
-    stderr
-}
-
-/// Run `update`, and call `change` after its root expansion and before its
-/// scan. The update expands and checks the roots before it opens the index
-/// (DESIGN.md §4.2), so it waits while this process holds a lock of the
-/// index, and `change` runs during that wait. Returns stderr.
-fn update_after_expansion(env: &Env, change: impl FnOnce()) -> String {
-    // The first update creates the index and its lock file; this process
-    // creates them first, to lock that file.
-    std::fs::create_dir_all(env.index_path()).unwrap();
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(env.index_path().join("hashsync.lock"))
-        .unwrap();
-    let lock = shared_lock(&env.index_path());
-    let child = env
-        .command(&["update"])
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut child = KillOnDrop(child);
-    wait_for_lock_wait(child.0.id());
-    change();
-    drop(lock);
-    let mut stderr = String::new();
-    let mut pipe = child.0.stderr.take().unwrap();
-    pipe.read_to_string(&mut stderr).unwrap();
-    assert!(
-        child.0.wait().unwrap().success(),
-        "update failed:\n{stderr}"
-    );
-    stderr
-}
-
-/// The warnings in `stderr`, one for each line.
-fn warnings(stderr: &str) -> Vec<&str> {
-    stderr
-        .lines()
-        .filter(|line| line.starts_with("hashsync: warning: "))
-        .collect()
-}
-
-/// The warning for the missing root at `path`.
-fn missing(path: impl AsRef<Path>) -> String {
-    format!(
-        "hashsync: warning: {}: root does not exist",
-        quoted(path.as_ref())
-    )
-}
-
-/// True when the test runs as root, whom permissions do not stop: the tests
-/// of entries that cannot be read skip themselves then.
-fn skip_as_root() -> bool {
-    let root = rustix::process::geteuid().is_root();
-    if root {
-        eprintln!("skipped: root ignores permissions");
-    }
-    root
 }
 
 /// An immutable root is scanned once, completely, and then its group is
@@ -311,7 +200,7 @@ fn a_failed_scan_leaves_its_group_unfinished() {
     env.write("tree/closed/f", &random(BLOCK, 3));
     env.configure(&env.root("tree", "immutable = true"));
     let (secret, closed) = (("tree/secret", 0o644), ("tree/closed", 0o755));
-    let stderr = update_with_closed(&env, &[secret, closed]);
+    let stderr = env.run_with_closed(&["update"], &[secret, closed]);
     assert!(
         stderr.contains("secret': reopen: Permission denied"),
         "{stderr}"
@@ -326,14 +215,14 @@ fn a_failed_scan_leaves_its_group_unfinished() {
     let stats = env.stats();
     assert!(stats.contains("(0 complete immutable)"), "{stats}");
 
-    let stderr = update_with_closed(&env, &[secret, closed]);
+    let stderr = env.run_with_closed(&["update"], &[secret, closed]);
     assert!(
         stderr.contains(": 1 directories, 0 files hashed (0 B), 1 unchanged"),
         "{stderr}"
     );
     assert_eq!(groups(&stderr), [0, 0, 1]);
 
-    let stderr = update_with_closed(&env, &[closed]);
+    let stderr = env.run_with_closed(&["update"], &[closed]);
     assert_eq!(groups(&stderr), [0, 0, 1]);
     let stderr = env.update();
     assert!(stderr.contains(": 2 directories"), "{stderr}");
@@ -428,14 +317,14 @@ fn a_copy_that_cannot_be_looked_up_is_no_copy() {
             ),
         ]
     };
-    let stderr = update_with_closed(&env, &[("copies/a", 0o755)]);
+    let stderr = env.run_with_closed(&["update"], &[("copies/a", 0o755)]);
     assert_eq!(warnings(&stderr), unreachable(&a), "{stderr}");
     assert_eq!(groups(&stderr), [0, 1, 0]);
     assert_eq!(root_rows(&env), [(Some(b"data".to_vec()), bytes(&b))]);
     assert_eq!(indexed(&env), [pair("copies/b/data", "f")]);
 
     let closed = [("copies/a", 0o755), ("copies/b", 0o755)];
-    let stderr = update_with_closed(&env, &closed);
+    let stderr = env.run_with_closed(&["update"], &closed);
     let all = [unreachable(&a), unreachable(&b)].concat();
     assert_eq!(warnings(&stderr), all, "{stderr}");
     assert!(!stderr.contains("immutable roots"), "{stderr}");
@@ -468,7 +357,7 @@ fn a_copy_that_may_vanish_gives_way_to_the_next() {
         env.root("copies/c/data", copy)
     ));
     let a = env.path("copies/a/data");
-    let stderr = update_after_expansion(&env, || std::fs::remove_dir_all(&a).unwrap());
+    let stderr = env.run_after_resolution(&["update"], || std::fs::remove_dir_all(&a).unwrap());
     assert!(warnings(&stderr).is_empty(), "{stderr}");
     assert_eq!(groups(&stderr), [0, 1, 0]);
     let scanned = bytes(&env.path("copies/b/data"));
@@ -481,6 +370,46 @@ fn a_copy_that_may_vanish_gives_way_to_the_next() {
     let stderr = env.update();
     assert_eq!(groups(&stderr), [1, 0, 0]);
     assert_eq!(root_rows(&env), [(Some(b"data".to_vec()), scanned)]);
+}
+
+/// The row of a group that stays unfinished names the copy that the scan
+/// traversed too, by which a run with `--no-update` finds the copies of an
+/// unfinished group, and so does a prune, which keeps the group. Here the
+/// first copy may vanish and vanishes after root expansion, and the scan of
+/// the next copy fails (DESIGN.md §4.2).
+#[test]
+fn an_unfinished_group_names_the_copy_that_its_scan_traversed() {
+    if skip_as_root() {
+        return;
+    }
+    let env = Env::new();
+    for copy in ["a", "b"] {
+        env.write(format!("copies/{copy}/data/f"), &random(BLOCK, 1));
+        env.write(format!("copies/{copy}/data/closed/g"), &random(BLOCK, 2));
+    }
+    let copy = "immutable = true\nidentifier = 'name'";
+    env.configure(&format!(
+        "{}{}",
+        env.root("copies/a/data", &format!("{copy}\nmay_vanish = true")),
+        env.root("copies/b/data", copy)
+    ));
+    let closed = env.close(&[("copies/b/data/closed", 0o755)]);
+    let a = env.path("copies/a/data");
+    let stderr = env.run_after_resolution(&["update"], || std::fs::remove_dir_all(&a).unwrap());
+    drop(closed);
+    assert_eq!(groups(&stderr), [0, 0, 1]);
+    let scanned = bytes(&env.path("copies/b/data"));
+    assert_eq!(root_rows(&env), [(None, scanned)]);
+    assert_eq!(indexed(&env), [pair("copies/b/data", "f")]);
+
+    let output = env.run(&["prune"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains(": 0 roots, 0 paths, and 0 stale inodes removed"),
+        "{stderr}"
+    );
+    assert_eq!(indexed(&env), [pair("copies/b/data", "f")]);
 }
 
 /// Only a copy that may vanish gives way: one that may not vanish and
@@ -511,7 +440,7 @@ fn only_copies_that_may_vanish_give_way() {
         env.root("copies/b/data", copy),
         env.root("copies/c/data", copy)
     ));
-    let stderr = update_after_expansion(&env, || remove(&["a", "b"]));
+    let stderr = env.run_after_resolution(&["update"], || remove(&["a", "b"]));
     assert_eq!(warnings(&stderr), [missing(data("b"))], "{stderr}");
     assert_eq!(groups(&stderr), [0, 0, 1]);
     assert_eq!(env.count("paths"), 0);
@@ -522,7 +451,7 @@ fn only_copies_that_may_vanish_give_way() {
         env.root("copies/a/data", &vanishing),
         env.root("copies/b/data", &vanishing)
     ));
-    let stderr = update_after_expansion(&env, || remove(&["a", "b"]));
+    let stderr = env.run_after_resolution(&["update"], || remove(&["a", "b"]));
     assert!(warnings(&stderr).is_empty(), "{stderr}");
     assert_eq!(groups(&stderr), [0, 0, 1]);
 }
@@ -621,7 +550,7 @@ fn a_shared_file_that_fails_leaves_its_group_unfinished() {
         env.root("tree/m", ""),
         env.root("tree/g", "immutable = true")
     ));
-    let stderr = update_with_closed(&env, &[("tree/m/f", 0o644)]);
+    let stderr = env.run_with_closed(&["update"], &[("tree/m/f", 0o644)]);
     assert!(stderr.contains("reopen: Permission denied"), "{stderr}");
     assert_eq!(groups(&stderr), [0, 0, 1]);
     assert_eq!(indexed(&env), [pair("tree/g", "ok")]);
@@ -694,6 +623,40 @@ fn an_interrupted_rehash_of_a_shared_file_reopens_its_group() {
         ]
     );
     env.index().assert_consistent();
+}
+
+/// `update --scan-immutable` scans the completed groups again, as an
+/// update scans an unfinished one: a file added later is indexed, one that
+/// is gone loses its path, unchanged files are reused without hashing, and
+/// a changed policy applies. The group is then complete again (DESIGN.md
+/// §4.2).
+#[test]
+fn scan_immutable_scans_completed_groups_again() {
+    let env = Env::new();
+    env.write("tree/a", &random(BLOCK, 1));
+    env.write("tree/b", &random(BLOCK, 2));
+    env.write("tree/c.tmp", &random(BLOCK, 3));
+    env.configure(&env.root("tree", "immutable = true"));
+    env.update();
+    env.write("tree/later", &random(BLOCK, 4));
+    std::fs::remove_file(env.path("tree/b")).unwrap();
+    env.configure(&env.root("tree", "immutable = true\nexclude = ['*.tmp']"));
+    let stderr = env.update();
+    assert_eq!(groups(&stderr), [1, 0, 0]);
+    assert_eq!(env.tree_paths(), ["a", "b", "c.tmp"]);
+
+    let output = env.run(&["update", "--scan-immutable"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains(": 1 directories, 1 files hashed (4.00 KiB), 1 unchanged"),
+        "{stderr}"
+    );
+    assert!(stderr.contains(" 2 stale inodes removed"), "{stderr}");
+    assert_eq!(groups(&stderr), [0, 1, 0]);
+    assert_eq!(env.tree_paths(), ["a", "later"]);
+    let stderr = env.update();
+    assert_eq!(groups(&stderr), [1, 0, 0]);
 }
 
 /// A changed policy does not reach a completed group until `update
@@ -898,11 +861,11 @@ fn unused_copies_and_completed_groups_are_never_scanned() {
         env.root("copies/a/data", copy),
         env.root("copies/b/data", copy)
     ));
-    let stderr = update_with_closed(&env, &[("copies/b/data", 0o755)]);
+    let stderr = env.run_with_closed(&["update"], &[("copies/b/data", 0o755)]);
     assert!(!stderr.contains("warning"), "{stderr}");
     assert_eq!(groups(&stderr), [0, 1, 0]);
 
-    let stderr = update_with_closed(&env, &[("copies/a/data", 0o755)]);
+    let stderr = env.run_with_closed(&["update"], &[("copies/a/data", 0o755)]);
     assert!(!stderr.contains("warning"), "{stderr}");
     assert_eq!(groups(&stderr), [1, 0, 0]);
     let scanned = bytes(&env.path("copies/a/data"));

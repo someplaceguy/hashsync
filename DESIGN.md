@@ -269,9 +269,10 @@ traversed roots, including paths of unchanged files.
 Immutable roots are grouped by identifier, with one root row and one set of
 relative paths from one scanned copy. A root row with an identifier means
 the group was completely indexed. Reuse it without traversal while the
-configuration still names that identifier. A root row without an identifier
-is a mutable root or an unfinished traversal; configuration supplies the
-intended kind and identifier.
+configuration still names that identifier, unless `--scan-immutable` asks
+the update to scan every group again (section 8). A root row without an
+identifier is a mutable root or an unfinished traversal; configuration
+supplies the intended kind and identifier.
 
 Copies sharing an identifier promise equivalent content. Directory copies
 must be distinct directories. A change to a copy's root-directory filesystem
@@ -311,7 +312,8 @@ select corresponding content in every copy.
 
 Policy changes do not invalidate completed immutable groups automatically.
 After changing exclusions or `one_filesystem`, the user must run
-`hashsync update --rebuild` to apply the new policy to those groups.
+`hashsync update --scan-immutable`, or `--rebuild`, to apply the new policy
+to those groups.
 
 Before scanning, reconcile roots. Paths and blocks to remove can be many,
 so their removal commits in bounded transactions; an interruption leaves
@@ -319,7 +321,8 @@ work that the next reconciliation finishes. The root and inode rows then
 change in one transaction:
 
 1. In one transaction, invalidate every completed immutable root that is
-   no longer configured or that references an incomplete inode: remove its
+   no longer configured or that references an incomplete inode, and with
+   `--scan-immutable` every completed immutable root: remove its
    identifier.
 2. In bounded transactions, on one thread per core, remove the paths and
    blocks of incomplete inodes. If a root keeps its identifier, also
@@ -347,9 +350,11 @@ one is there or a copy that may not vanish is missing. A group without a
 copy left stays unfinished without a warning. After all scan tasks
 finish, publish immutable identifiers only for groups whose traversals
 and dependent inode and path results succeeded and committed (section
-4.6), with the path of the copy that the scan traversed. A failed chosen
-copy leaves the traversal unfinished; a missing copy that may not vanish
-is such a failure. Other copies remain available for candidate reads.
+4.6), with the path of the copy that the scan traversed. A group that
+stays unfinished gets that path too, by which a run with `--no-update`
+finds its copies. A failed chosen copy leaves the traversal unfinished; a
+missing copy that may not vanish is such a failure. Other copies remain
+available for candidate reads.
 After processing all results, remove every orphaned inode and its blocks.
 
 The same reconciliation recovers interrupted updates. Renames and identifier
@@ -361,13 +366,26 @@ roots before deleting dependent paths.
 The user is responsible for immutability: a completed root can omit files
 added later. Copies may have different inode identities; unequal content
 fails verification. `prune` takes exclusive index access, hashes no files,
-and removes a path only when it is absent from every current copy.
-Inaccessibility does not prove absence. When a root is no longer configured
-or is confirmed absent from every copy, remove its immutable completion
-marker, then its paths, then its root row, and then the orphaned inodes and
-their blocks. The marker must not survive the removal of any path, so a
-root that later returns is scanned again. An existing root with no indexed
-paths is still valid.
+and removes what no current copy holds. A root goes when it has no current
+location. Prune looks into the other mutable roots, and with
+`--scan-immutable` into the immutable ones too: such a root goes when none
+of its copies opens as a directory or a regular file, and otherwise prune
+looks up each of its paths in its copies, as a candidate read does
+(section 6.4), and removes the path unless a copy holds a regular file
+there. A path whose lookup fails goes too, as an update drops what it
+cannot reach (section 4.5): no candidate read could reach it. Such a
+failure also makes a completed group unfinished, so that the next update
+scans it again, and its row takes the path of the first copy that prune
+opened, by which a run with `--no-update` finds its copies: the copy that
+the row named can have vanished after root resolution. Prune warns once
+for each directory in which lookups fail: the deepest directory above a
+failed path that still opens. So a directory that cannot be searched gets
+one warning, as in an update, and not one for each indexed path below it.
+The completion markers of the roots that go and of the groups that become
+unfinished go first, then the paths, then the root rows, and then the
+orphaned inodes and their blocks. So the marker of a root that goes never
+survives the removal of one of its paths, and a root that later returns
+is scanned again. An existing root with no indexed paths is still valid.
 
 ### 4.3 Identity of filesystems and inodes
 
@@ -429,8 +447,9 @@ transaction that changes a row changes that entry too.
   filesystem ID, and the inode handle (section 4.3).
 - Metadata names are `schema_version`, `block_size`, `weak_hash_id`,
   `strong_hash_id`, and `index_id`. An index whose metadata does not match
-  requires an in-place rebuild. Read-only runs report that an update is
-  required for a missing or incompatible index.
+  requires an in-place rebuild. Read-only runs and prune report that an
+  update is required for a missing or incompatible index, and prune
+  creates no database.
 - `index_id` is a random 128-bit value created with the schema and renewed
   on rebuild. It partitions caches, not list content; there is no index
   generation counter.
@@ -463,11 +482,13 @@ after the other, so that the last write also removes the old log.
 Parallel writes end sooner, but can leave that log on disk until the next
 modifying process opens the index. Then it waits for the compactions that
 RocksDB has scheduled: closing the database would cancel them
-(section 10). RocksDB keeps all files of the database open, so a process
-raises its soft descriptor limit to the hard limit before it opens the
-index. Its children, such as the command of a run whose forward stream is
-deduplicated, start with the limit from before the raise, as they would
-under SSH alone.
+(section 10). A prune ends the same way, after it has compacted every
+column family into its last level, so that the entries that it and the
+updates before it removed leave the database files. RocksDB keeps all
+files of the database open, so a process raises its soft descriptor limit
+to the hard limit before it opens the index. Its children, such as the
+command of a run whose forward stream is deduplicated, start with the
+limit from before the raise, as they would under SSH alone.
 
 **Process access.** A lock on the file `hashsync.lock` in the index
 directory excludes other processes:
@@ -1200,21 +1221,22 @@ Payloads:
   as a set of bits: 1 for the forward stream and 2 for the backward
   stream, so 1 in a push, 2 in a pull, and 3 with both; at least one is
   set. Then the settings of the run (section 8): `no_update u8`,
-  `sender_cache u8`, `compression_level i32`, `compression_long u8`,
-  `compression_threads u32`, `probe_threads u32`, `lookahead u64` (bytes;
-  0 for the default), `negative_cache u64` (bytes), `spool_limit u64`
-  (bytes; `2^64 − 1` for `unlimited`), `stdin_delivery u8` and
-  `stdout_delivery u8` (0 for eager, 1 for batch), and `wait u8`, 1 with
-  `--wait`. Each host applies the settings that concern its roles. Then
-  `quiet u8` and `human_readable u8`: the client's `-q`, and the opposite
-  of its `--no-human-readable`, which the server applies to its own notes.
-  Last, the server's configuration file (section 7): `config_kind u8`, 0
-  for its profile `default`, 1 for the profile of `--server-profile`, and
-  2 for the file of `--server-config`, and for 1 and 2, `config`, a byte
-  string, the profile name or the path. A profile name is one that the
-  client's options accept. The words of the command and `config` come
-  from the client's command line, whose arguments hold no NUL byte, so
-  REQUEST is invalid when one of them holds one.
+  `scan_immutable u8`, `sender_cache u8`, `compression_level i32`,
+  `compression_long u8`, `compression_threads u32`, `probe_threads u32`,
+  `lookahead u64` (bytes; 0 for the default), `negative_cache u64`
+  (bytes), `spool_limit u64` (bytes; `2^64 − 1` for `unlimited`),
+  `stdin_delivery u8` and `stdout_delivery u8` (0 for eager, 1 for batch),
+  and `wait u8`, 1 with `--wait`. Each host applies the settings that
+  concern its roles. Then `quiet u8` and `human_readable u8`: the client's
+  `-q`, and the opposite of its `--no-human-readable`, which the server
+  applies to its own notes. Last, the server's configuration file
+  (section 7): `config_kind u8`, 0 for its profile `default`, 1 for the
+  profile of `--server-profile`, and 2 for the file of `--server-config`,
+  and for 1 and 2, `config`, a byte string, the profile name or the path.
+  A profile name is one that the client's options accept. The words of the
+  command and `config` come from the client's command line, whose
+  arguments hold no NUL byte, so REQUEST is invalid when one of them holds
+  one.
 - HELLO, from the receiver of a deduplicated stream, on the data session:
   `block_size u32`, `weak_hash_id string`, and `strong_hash_id string`,
   from its configuration, so it needs no index: the client sends it right
@@ -2551,8 +2573,10 @@ exclude = ['*.tmp', 'literal\x2Aname', 'back\\slash']
 
 ## 8. Command line
 
-- `hashsync update [--rebuild] [-j N]`: update or rebuild the index;
-  `-j` overrides the configured thread count.
+- `hashsync update [--rebuild] [--scan-immutable] [-j N]`: update or
+  rebuild the index; `--scan-immutable` scans the completed immutable
+  groups again too (section 4.2), and `-j` overrides the configured thread
+  count.
 - `hashsync ssh [OPTIONS] [-l USER] [USER@]HOST [--] COMMAND [ARGS...]`:
   run the remote command as ssh does, reproduce its stdout, and return its
   status. It takes the arguments that rsync gives its remote shell
@@ -2606,7 +2630,9 @@ exclude = ['*.tmp', 'literal\x2Aname', 'back\\slash']
     then takes.
   - `--no-update` skips the update of each receiver's index, takes
     read-only index access (section 4.4), and still resolves current roots
-    (section 4.2).
+    (section 4.2). `--scan-immutable` makes the update of each receiver scan
+    its completed immutable groups again, as `hashsync update
+    --scan-immutable` does; with `--no-update`, it is a usage error.
   - `--ssh CMD` (default `ssh`) and `--hashsync-path PATH` (default
     `hashsync`) say how the client starts the server (section 6.1).
   - `--server-profile NAME` and `--server-config PATH` select the server's
@@ -2688,8 +2714,10 @@ exclude = ['*.tmp', 'literal\x2Aname', 'back\\slash']
   server entry points. `serve` reads the configuration file that REQUEST
   names, so `--profile` and `--config` are a usage error there.
 - `hashsync stats`: report index statistics.
-- `hashsync prune`: remove the paths and roots that no configured copy
-  holds any more (section 4.2).
+- `hashsync prune [--scan-immutable]`: remove the roots and paths that no
+  current copy holds any more, without hashing, then compact the index; it
+  looks up the paths of immutable roots only with `--scan-immutable`
+  (section 4.2).
 
 Every command also accepts these options, besides `--profile NAME` and
 `--config PATH`, which select its configuration file (section 7):
@@ -2886,6 +2914,14 @@ decision history, including fuller measurements, is in version control.
   `inodes` and `inode_paths`, also when completed immutable roots skip
   the scan. After an update without changes, it took 0.27–0.40 s on one
   thread, and takes 0.022–0.030 s on the threads of the scan pool.
+- **Prune with the scan of an update, without hashing:** prune would drop
+  a changed, shrunk, or newly excluded file at once, as an update does,
+  and keep the row of a renamed one. But a scan lists every directory and
+  examines every entry, also the small files that have no rows, where
+  prune looks up only the indexed paths. With all of `/nix/store` as
+  immutable roots (88,067 groups, 487,423 paths, and 2.28M small files),
+  `prune --scan-immutable` took 0.9–1.0 s, and a scan of every group,
+  which `update --scan-immutable` makes without hashing a file, 9.8–9.9 s.
 - **Other locks:** RocksDB's own `LOCK` file keeps only read/write opens
   apart, and a second open fails at once. A `flock` on the index directory
   fails on NFS, where Linux emulates it with byte-range locks, and an
@@ -3322,11 +3358,22 @@ decision history, including fuller measurements, is in version control.
     of a pattern without wildcards, and one that cannot be looked up,
     which are no copies of their groups, and a completed group whose
     copies are all missing, which goes; a copy that vanishes after root
-    expansion and may vanish, which gives its place to the next copy, and
+    expansion and may vanish, which gives its place to the next copy,
+    whose path the row of the group takes also when its scan fails, and
     one that may not vanish, which leaves its group unfinished; no tasks
     or scans solely for overlap checks; completion withheld after a late
     directory conflict; conflicting copy policies; a pruned immutable root
-    that returns;
+    that returns; `update --scan-immutable`, and `ssh --scan-immutable` in
+    both directions, which scan completed groups again;
+  - prune: roots that no copy holds, paths that no copy holds, in mutable
+    roots, and in immutable ones only with `--scan-immutable`, a path that
+    another copy holds, which stays, a path that prune cannot look up,
+    whose completed group the next update scans again, one warning for a
+    directory that cannot be searched, a root that no longer opens as a
+    directory or a regular file, a copy that vanishes after root
+    resolution, also the one that the row of a group that becomes
+    unfinished named, a missing index, which prune does not create, the
+    compaction, and the exclusive lock;
   - configuration byte escapes, TOML quoting, literal glob metacharacters,
     and non-UTF-8 values; a `~` that starts a path, also as `\x7E`;
     messages that show paths, names, patterns, and values of the

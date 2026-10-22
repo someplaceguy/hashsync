@@ -137,6 +137,7 @@ fn request_payload(command: &[&str], deduplicated: u8, settings: Settings) -> Ve
     }
     request.push(deduplicated);
     request.push(0); // no_update
+    request.push(0); // scan_immutable
     request.push(1); // sender_cache
     request.extend_from_slice(&settings.level.to_le_bytes()); // compression level
     request.push(1); // compression_long

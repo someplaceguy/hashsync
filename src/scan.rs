@@ -90,7 +90,8 @@ pub fn run(
 
 /// The scan pool size: `-j`, else the `threads` option, else the default
 /// `4 × cores` clamped to 16–64 (DESIGN.md §4.6). Zero selects the default.
-fn thread_count(configured: u32, jobs: Option<u32>) -> usize {
+/// The lookups of a prune use it too.
+pub fn thread_count(configured: u32, jobs: Option<u32>) -> usize {
     match jobs.unwrap_or(configured) {
         0 => {
             let cores = std::thread::available_parallelism().map_or(4, |n| n.get());

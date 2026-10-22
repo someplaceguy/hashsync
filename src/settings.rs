@@ -106,6 +106,11 @@ pub struct RunSettings {
     #[arg(long)]
     pub no_update: bool,
 
+    /// Scan the completed immutable roots of each index that a stream is
+    /// deduplicated against again too, in its update
+    #[arg(long, conflicts_with = "no_update")]
+    pub scan_immutable: bool,
+
     /// Send stdin to the command in batch delivery: only from full buffers
     /// and at its end, not each time stdin waits, which compresses better,
     /// and keeps more references when stdin is deduplicated
@@ -254,6 +259,7 @@ pub mod tests {
             settings,
             RunSettings {
                 no_update: false,
+                scan_immutable: false,
                 batch_stdin: false,
                 batch_stdout: false,
                 wait: false,
@@ -305,6 +311,15 @@ pub mod tests {
         assert_eq!(settings.compression_threads, 2);
         assert_eq!(settings.spool_limit, u64::MAX);
         assert!(!settings.sender_cache);
+    }
+
+    /// `--scan-immutable` changes the update of a receiver, which
+    /// `--no-update` skips, so together they are a usage error.
+    #[test]
+    fn scan_immutable_needs_an_update() {
+        assert!(settings(&["--scan-immutable"]).scan_immutable);
+        let both = ["hashsync", "--scan-immutable", "--no-update"];
+        assert!(Options::try_parse_from(both).is_err());
     }
 
     #[test]
