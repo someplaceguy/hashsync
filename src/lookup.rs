@@ -159,7 +159,7 @@ fn read_candidate(
     let file = if rel_path.is_empty() {
         root
     } else {
-        fsops::open_beneath(root.as_fd(), rel_path)?
+        fsops::open_beneath(root.as_fd(), rel_path, false)?
     };
     if fsops::stat(file.as_fd())?.kind != FileType::RegularFile {
         return Err(std::io::ErrorKind::InvalidInput.into());

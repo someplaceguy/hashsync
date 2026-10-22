@@ -25,7 +25,8 @@ changes.
 `stats` maintain the index for mutable and immutable roots, reuse
 unchanged files by identity, size, and ctime, and recover interrupted
 work. `prune` removes, without hashing, the roots that no current copy
-holds and the paths that none holds, in immutable roots only with
+holds and the paths that none holds or that exclusions or
+`one_filesystem` now leave out, in immutable roots only with
 `--scan-immutable`, and then compacts the index (DESIGN.md §4.2).
 The copies of an immutable group share one root row: an
 update scans the first copy of an unfinished group that is there, the
@@ -286,8 +287,9 @@ Deliver `hashsync prune [--scan-immutable]`, and `--scan-immutable` for
 `update` and `ssh`.
 
 - Resolve current roots and remove the paths that no current copy holds,
-  without hashing file contents: those of mutable roots, and with
-  `--scan-immutable`, those of immutable roots too.
+  or that exclusions or `one_filesystem` now leave out, without hashing
+  file contents: those of mutable roots, and with `--scan-immutable`,
+  those of immutable roots too.
 - Remove the entries of locations that cannot be reached too, with a
   warning, as an update does. A completed group that loses a path this way
   is scanned again by the next update.

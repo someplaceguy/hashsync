@@ -313,7 +313,8 @@ select corresponding content in every copy.
 Policy changes do not invalidate completed immutable groups automatically.
 After changing exclusions or `one_filesystem`, the user must run
 `hashsync update --scan-immutable`, or `--rebuild`, to apply the new policy
-to those groups.
+to those groups. `prune --scan-immutable` only removes what the new policy
+leaves out.
 
 Before scanning, reconcile roots. Paths and blocks to remove can be many,
 so their removal commits in bounded transactions; an interruption leaves
@@ -372,7 +373,11 @@ location. Prune looks into the other mutable roots, and with
 of its copies opens as a directory or a regular file, and otherwise prune
 looks up each of its paths in its copies, as a candidate read does
 (section 6.4), and removes the path unless a copy holds a regular file
-there. A path whose lookup fails goes too, as an update drops what it
+there that a scan of the copy would reach. So a path also goes when an
+`exclude` pattern of the copy matches it or a directory above it, or with
+`one_filesystem`, when its lookup crosses a mount point (`RESOLVE_NO_XDEV`):
+prune removes what a narrower policy leaves out, but only a scan adds what
+a wider one takes in. A path whose lookup fails goes too, as an update drops what it
 cannot reach (section 4.5): no candidate read could reach it. Such a
 failure also makes a completed group unfinished, so that the next update
 scans it again, and its row takes the path of the first copy that prune
@@ -2715,8 +2720,9 @@ exclude = ['*.tmp', 'literal\x2Aname', 'back\\slash']
   names, so `--profile` and `--config` are a usage error there.
 - `hashsync stats`: report index statistics.
 - `hashsync prune [--scan-immutable]`: remove the roots and paths that no
-  current copy holds any more, without hashing, then compact the index; it
-  looks up the paths of immutable roots only with `--scan-immutable`
+  current copy holds any more, and the paths that exclusions or
+  `one_filesystem` now leave out, without hashing, then compact the index;
+  it looks up the paths of immutable roots only with `--scan-immutable`
   (section 4.2).
 
 Every command also accepts these options, besides `--profile NAME` and
@@ -2915,10 +2921,10 @@ decision history, including fuller measurements, is in version control.
   the scan. After an update without changes, it took 0.27–0.40 s on one
   thread, and takes 0.022–0.030 s on the threads of the scan pool.
 - **Prune with the scan of an update, without hashing:** prune would drop
-  a changed, shrunk, or newly excluded file at once, as an update does,
-  and keep the row of a renamed one. But a scan lists every directory and
-  examines every entry, also the small files that have no rows, where
-  prune looks up only the indexed paths. With all of `/nix/store` as
+  a changed or shrunk file at once, as an update does, and keep the row of
+  a renamed one. But a scan lists every directory and examines every
+  entry, also the small files that have no rows, where prune looks up
+  only the indexed paths. With all of `/nix/store` as
   immutable roots (88,067 groups, 487,423 paths, and 2.28M small files),
   `prune --scan-immutable` took 0.9–1.0 s, and a scan of every group,
   which `update --scan-immutable` makes without hashing a file, 9.8–9.9 s.
@@ -3367,13 +3373,14 @@ decision history, including fuller measurements, is in version control.
     both directions, which scan completed groups again;
   - prune: roots that no copy holds, paths that no copy holds, in mutable
     roots, and in immutable ones only with `--scan-immutable`, a path that
-    another copy holds, which stays, a path that prune cannot look up,
-    whose completed group the next update scans again, one warning for a
-    directory that cannot be searched, a root that no longer opens as a
-    directory or a regular file, a copy that vanishes after root
-    resolution, also the one that the row of a group that becomes
-    unfinished named, a missing index, which prune does not create, the
-    compaction, and the exclusive lock;
+    another copy holds, which stays, paths that exclusions by name and by
+    absolute path, also of a directory above them, or `one_filesystem` now
+    leave out, a path that prune cannot look up, whose completed group the
+    next update scans again, one warning for a directory that cannot be
+    searched, a root that no longer opens as a directory or a regular file,
+    a copy that vanishes after root resolution, also the one that the row
+    of a group that becomes unfinished named, a missing index, which prune
+    does not create, the compaction, and the exclusive lock;
   - configuration byte escapes, TOML quoting, literal glob metacharacters,
     and non-UTF-8 values; a `~` that starts a path, also as `\x7E`;
     messages that show paths, names, patterns, and values of the

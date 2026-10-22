@@ -11,9 +11,9 @@ use common::*;
 
 const SAME_DIRECTORY: &str = "are the same directory (cycle or mount alias)";
 
-/// Run `hashsync update` after bind-mounting `binds` (source, target pairs)
-/// in a fresh mount namespace.
-fn update_with_binds(env: &Env, binds: &[(&str, &str)]) -> Output {
+/// Run `hashsync ARGS...` with the configuration file of `env` after
+/// bind-mounting `binds` (source, target pairs) in a fresh mount namespace.
+fn run_with_binds(env: &Env, binds: &[(&str, &str)], args: &[&str]) -> Output {
     let mut script = String::new();
     for (source, target) in binds {
         script.push_str(&format!(
@@ -22,13 +22,20 @@ fn update_with_binds(env: &Env, binds: &[(&str, &str)]) -> Output {
             env.path(target).display()
         ));
     }
-    script.push_str("exec \"$0\" --config \"$1\" update\n");
+    script.push_str("exec \"$0\" --config \"$@\"\n");
     Command::new("unshare")
         .args(["-Urm", "sh", "-c", &script])
         .arg(env!("CARGO_BIN_EXE_hashsync"))
         .arg(env.config_path())
+        .args(args)
         .output()
         .unwrap()
+}
+
+/// Run `hashsync update` after bind-mounting `binds` in a fresh mount
+/// namespace.
+fn update_with_binds(env: &Env, binds: &[(&str, &str)]) -> Output {
+    run_with_binds(env, binds, &["update"])
 }
 
 #[test]
@@ -140,6 +147,44 @@ fn one_filesystem_skips_bind_mounted_files() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stderr}");
     assert_eq!(env.tree_paths(), vec!["f", "g"]);
+}
+
+/// With `one_filesystem`, prune removes a path whose lookup crosses a mount
+/// point, also at a bind-mounted file, since the scan of an update skips
+/// such an entry: the next update finds nothing else to remove. Without
+/// it, the file on the other mount holds the path (DESIGN.md §4.2).
+#[test]
+fn prune_with_one_filesystem_does_not_cross_mount_points() {
+    if !namespaces_available() {
+        eprintln!("skipped: no unprivileged user namespaces");
+        return;
+    }
+    let env = Env::new();
+    env.write("tree/keep", &random(BLOCK, 1));
+    env.write("tree/f", &random(BLOCK, 2));
+    env.write("tree/sub/g", &random(BLOCK, 3));
+    env.write("other/f", &random(BLOCK, 4));
+    env.write("other/sub/g", &random(BLOCK, 5));
+    env.configure(&env.root("tree", ""));
+    env.update();
+
+    let binds = [("other/f", "tree/f"), ("other/sub", "tree/sub")];
+    let output = run_with_binds(&env, &binds, &["prune"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(env.tree_paths(), ["f", "keep", "sub/g"]);
+
+    env.configure(&env.root("tree", "one_filesystem = true"));
+    let output = run_with_binds(&env, &binds, &["prune"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(warnings(&stderr).is_empty(), "{stderr}");
+    assert_eq!(env.tree_paths(), ["keep"]);
+    let output = update_with_binds(&env, &binds);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains(" 0 stale inodes removed"), "{stderr}");
+    assert_eq!(env.tree_paths(), ["keep"]);
 }
 
 #[test]

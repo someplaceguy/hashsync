@@ -8,14 +8,17 @@
 //! mutable roots, and with `--scan-immutable` into the immutable ones too:
 //! it opens the copies of each such root, and looks up each path of the root
 //! in them, as a candidate read reaches a file (DESIGN.md §6.4), until one
-//! of them holds a regular file there. A path that no copy holds goes. So
-//! does a path whose lookup fails, as an update drops what it cannot reach:
-//! no candidate read could reach it either. Such a failure leaves a
-//! completed group unfinished, as a failure in the scan of a group does
-//! (DESIGN.md §4.5), so that the next update scans it again. A directory
-//! below which lookups fail gets one warning, as a directory that an update
-//! cannot read does, and not one for each indexed path below it. A root
-//! none of whose copies opens as a directory or a regular file goes too.
+//! of them holds a regular file there that a scan of the copy would reach.
+//! So no copy holds a path that the root's `exclude` patterns or
+//! `one_filesystem` now leave out: a scan would skip it. A path that no
+//! copy holds goes. So does a path whose lookup fails, as an update drops
+//! what it cannot reach: no candidate read could reach it either. Such a
+//! failure leaves a completed group unfinished, as a failure in the scan of
+//! a group does (DESIGN.md §4.5), so that the next update scans it again. A
+//! directory below which lookups fail gets one warning, as a directory that
+//! an update cannot read does, and not one for each indexed path below it.
+//! A root none of whose copies opens as a directory or a regular file goes
+//! too.
 
 use std::collections::{HashMap, HashSet};
 use std::os::fd::{AsFd, OwnedFd};
@@ -28,7 +31,7 @@ use rayon::slice::ParallelSlice;
 use rustix::fs::FileType;
 use rustix::io::Errno;
 
-use crate::config::Config;
+use crate::config::{Config, RootConfig};
 use crate::die::die;
 use crate::escapes::quoted;
 use crate::fsid::FsCache;
@@ -164,13 +167,13 @@ enum Found<'a> {
 /// copies, which `config` configures, on the threads of the current pool.
 fn look_into<'a>(
     index: &Index,
-    config: &Config,
+    config: &'a Config,
     root_id: u64,
     locations: &'a [Location],
 ) -> Found<'a> {
     let copies: Vec<CurrentCopy<'a>> = locations
         .iter()
-        .map(|location| CurrentCopy::new(location, config.roots[location.root].may_vanish))
+        .map(|location| CurrentCopy::new(location, &config.roots[location.root]))
         .collect();
     // The copies open in their order until one opens.
     let Some(opened) = copies.iter().find(|copy| copy.opens()) else {
@@ -201,7 +204,7 @@ fn look_into<'a>(
 
 /// What the lookup of a path finds in the copies of its root.
 enum Lookup {
-    /// A copy holds a regular file at the path.
+    /// A copy holds the path (`CurrentCopy::holds`).
     Held,
     /// No copy holds one.
     Absent,
@@ -210,9 +213,9 @@ enum Lookup {
     Failed,
 }
 
-/// Look `rel_path` up in `copies`, in their order, until one holds a
-/// regular file there. Only a path that goes reports the failures of its
-/// lookups: where a later copy holds the path, they change nothing.
+/// Look `rel_path` up in `copies`, in their order, until one holds it
+/// (`CurrentCopy::holds`). Only a path that goes reports the failures of
+/// its lookups: where a later copy holds the path, they change nothing.
 fn lookup(copies: &[CurrentCopy<'_>], rel_path: &[u8]) -> Lookup {
     let mut failures = Vec::new();
     for copy in copies {
@@ -235,8 +238,9 @@ fn lookup(copies: &[CurrentCopy<'_>], rel_path: &[u8]) -> Lookup {
 /// it, once for all the lookups of the root.
 struct CurrentCopy<'a> {
     location: &'a Location,
-    /// The copy need not be there (`may_vanish`).
-    may_vanish: bool,
+    /// The configuration of the copy's root: its indexing policy, and
+    /// whether the copy need not be there (`may_vanish`).
+    config: &'a RootConfig,
     root: OnceLock<CopyRoot>,
 }
 
@@ -258,12 +262,23 @@ enum CopyRoot {
 struct CopyDir {
     /// Its `O_PATH` descriptor, where the lookups start.
     fd: OwnedFd,
+    /// The root has `one_filesystem`, so the lookups do not cross mount
+    /// points.
+    one_filesystem: bool,
     /// The directories, relative to the root, below which a lookup failed
     /// and a warning said so. The root itself is the empty path.
     failed: Mutex<HashSet<Vec<u8>>>,
 }
 
 impl CopyDir {
+    /// Open `rel_path` below the root the way a scan of the copy reaches
+    /// it: without a symlink, and with `one_filesystem`, without crossing a
+    /// mount point. The scan skips an entry on another mount, where this
+    /// open fails with `EXDEV` (DESIGN.md §4.2).
+    fn open(&self, rel_path: &[u8]) -> Result<OwnedFd, Errno> {
+        fsops::open_beneath(self.fd.as_fd(), rel_path, self.one_filesystem)
+    }
+
     /// The deepest directory above `rel_path` that opens, relative to the
     /// root: the directory in which the lookup of `rel_path` failed. The
     /// root itself is the empty path.
@@ -271,7 +286,7 @@ impl CopyDir {
         let mut dir = rel_path;
         while let Some(slash) = dir.iter().rposition(|&b| b == b'/') {
             dir = &dir[..slash];
-            if fsops::open_beneath(self.fd.as_fd(), dir).is_ok() {
+            if self.open(dir).is_ok() {
                 return dir;
             }
         }
@@ -302,10 +317,10 @@ impl Failure<'_> {
 }
 
 impl<'a> CurrentCopy<'a> {
-    fn new(location: &'a Location, may_vanish: bool) -> Self {
+    fn new(location: &'a Location, config: &'a RootConfig) -> Self {
         CurrentCopy {
             location,
-            may_vanish,
+            config,
             root: OnceLock::new(),
         }
     }
@@ -313,7 +328,7 @@ impl<'a> CurrentCopy<'a> {
     /// The root of the copy, which the first call opens.
     fn root(&self) -> &CopyRoot {
         self.root
-            .get_or_init(|| open_root(self.location, self.may_vanish))
+            .get_or_init(|| open_root(self.location, self.config))
     }
 
     /// True when the root of the copy opens as a directory or a regular
@@ -322,12 +337,19 @@ impl<'a> CurrentCopy<'a> {
         matches!(self.root(), CopyRoot::Dir(_) | CopyRoot::File)
     }
 
-    /// Whether the copy holds a regular file at `rel_path`, which the path
-    /// reaches without symlinks, as a candidate read reaches it (DESIGN.md
-    /// §6.4). A failed lookup is an error, with the failure to report if
-    /// the path goes; a failed copy is one too, with nothing to report,
-    /// since it has had its own warning.
+    /// Whether the copy holds a regular file at `rel_path` that a scan of
+    /// the copy would reach (DESIGN.md §4.2): the copy's exclusions leave
+    /// out neither the file nor a directory above it (`excludes`), and the
+    /// path reaches the file without a symlink, as a candidate read does
+    /// (DESIGN.md §6.4), and with `one_filesystem`, without crossing a
+    /// mount point (`CopyDir::open`). A failed lookup is an error, with the
+    /// failure to report if the path goes; a failed copy is one too, with
+    /// nothing to report, since it has had its own warning.
     fn holds(&self, rel_path: &[u8]) -> Result<bool, Option<Failure<'_>>> {
+        // An excluded path needs no lookup, nor even an open copy.
+        if self.excludes(rel_path) {
+            return Ok(false);
+        }
         let dir = match self.root() {
             CopyRoot::Dir(dir) => dir,
             // The one path of a single-file root is empty.
@@ -344,11 +366,12 @@ impl<'a> CurrentCopy<'a> {
             let message = format!("{}: {what}: {e}", quoted(&path));
             Err(Some(Failure { dir, message }))
         };
-        let file = match fsops::open_beneath(dir.fd.as_fd(), rel_path) {
+        let file = match dir.open(rel_path) {
             Ok(file) => file,
-            // Nothing there, or nothing that the path reaches without a
-            // symlink: in neither case the file that a scan indexed there.
-            Err(Errno::NOENT | Errno::NOTDIR | Errno::LOOP) => return Ok(false),
+            // Nothing there, or nothing that a scan of the copy would
+            // reach: the path goes through a symlink, or with
+            // `one_filesystem`, across a mount point.
+            Err(Errno::NOENT | Errno::NOTDIR | Errno::LOOP | Errno::XDEV) => return Ok(false),
             Err(e) => return failure("open", e),
         };
         match fsops::stat(file.as_fd()) {
@@ -356,13 +379,37 @@ impl<'a> CurrentCopy<'a> {
             Err(e) => failure("statx", e),
         }
     }
+
+    /// True when an `exclude` pattern of the copy's root matches the entry
+    /// at `rel_path` or a directory above it, below the root. A scan
+    /// matches the patterns against each entry that it lists, and does not
+    /// enter an excluded directory, so it would not reach such an entry
+    /// (DESIGN.md §4.2). Absolute patterns match the path of the entry in
+    /// this copy. The root itself is not matched here: root expansion has
+    /// matched it already.
+    fn excludes(&self, rel_path: &[u8]) -> bool {
+        // The one path of a single-file root is empty, and names the root.
+        if rel_path.is_empty() {
+            return false;
+        }
+        let mut end = 0;
+        for name in rel_path.split(|&b| b == b'/') {
+            end += name.len();
+            let path = || roots::join(&self.location.path, &rel_path[..end]);
+            if self.config.exclude.excludes(name, path) {
+                return true;
+            }
+            end += 1;
+        }
+        false
+    }
 }
 
 /// Open the root of a copy in the directory that root expansion left open,
 /// as a scan task opens it (DESIGN.md §4.5), and say in a warning when it
 /// fails, or when it is missing and may not vanish (`may_vanish`): once for
-/// all the lookups of the root.
-fn open_root(location: &Location, may_vanish: bool) -> CopyRoot {
+/// all the lookups of the root. `config` configures the copy's root.
+fn open_root(location: &Location, config: &RootConfig) -> CopyRoot {
     let shown = || quoted(&location.path);
     let root = match fsops::open_path(location.dir.as_fd(), &location.name) {
         Ok(root) => root,
@@ -370,7 +417,7 @@ fn open_root(location: &Location, may_vanish: bool) -> CopyRoot {
         // root expansion gives a copy that was gone before it, as in the
         // scan of an update (DESIGN.md §4.2).
         Err(Errno::NOENT) => {
-            if !may_vanish {
+            if !config.may_vanish {
                 warn(format!("{}: root does not exist", shown()));
             }
             return CopyRoot::Missing;
@@ -383,6 +430,7 @@ fn open_root(location: &Location, may_vanish: bool) -> CopyRoot {
     match fsops::stat(root.as_fd()) {
         Ok(meta) if meta.kind == FileType::Directory => CopyRoot::Dir(CopyDir {
             fd: root,
+            one_filesystem: config.one_filesystem,
             failed: Mutex::default(),
         }),
         Ok(meta) if meta.kind == FileType::RegularFile => CopyRoot::File,

@@ -55,9 +55,14 @@ pub fn open_path(dir: BorrowedFd<'_>, name: &[u8]) -> Result<OwnedFd, Errno> {
 /// Open the relative path `rel` beneath the directory `dir` for
 /// classification only, without following a symlink in any component and
 /// without leaving `dir` (DESIGN.md §6.4). A final symlink yields a
-/// descriptor of the link itself.
-pub fn open_beneath(dir: BorrowedFd<'_>, rel: &[u8]) -> Result<OwnedFd, Errno> {
-    let resolve = ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS;
+/// descriptor of the link itself. With `same_mount`, the path must not
+/// cross a mount point either, including at a bind-mounted file, and the
+/// open fails with `EXDEV` where it would.
+pub fn open_beneath(dir: BorrowedFd<'_>, rel: &[u8], same_mount: bool) -> Result<OwnedFd, Errno> {
+    let mut resolve = ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS;
+    if same_mount {
+        resolve |= ResolveFlags::NO_XDEV;
+    }
     retry_on_intr(|| rustix::fs::openat2(dir, rel, PATH_FLAGS, Mode::empty(), resolve))
 }
 
@@ -402,7 +407,8 @@ mod tests {
         )
         .unwrap();
 
-        let kind = |rel: &[u8]| stat(open_beneath(root.as_fd(), rel)?.as_fd()).map(|m| m.kind);
+        let kind =
+            |rel: &[u8]| stat(open_beneath(root.as_fd(), rel, false)?.as_fd()).map(|m| m.kind);
         assert_eq!(kind(b"sub/file"), Ok(FileType::RegularFile));
         // A symlink in the middle cannot be traversed; a final one is not
         // followed.

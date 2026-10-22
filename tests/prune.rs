@@ -170,6 +170,56 @@ fn immutable_roots_are_looked_into_with_scan_immutable() {
     assert_eq!(groups(&stderr), [1, 0, 0]);
 }
 
+/// Prune removes the paths that the exclusions of their root now leave
+/// out, by name and by absolute path, also below an excluded directory,
+/// since a scan of the root would skip them: the next update finds nothing
+/// else to remove. In a completed group, prune does so only with
+/// `--scan-immutable`, and the group stays complete (DESIGN.md §4.2).
+#[test]
+fn paths_that_exclusions_leave_out_go() {
+    let env = Env::new();
+    env.write("tree/keep", &random(BLOCK, 1));
+    env.write("tree/x.tmp", &random(BLOCK, 2));
+    env.write("tree/sub/y.tmp", &random(BLOCK, 3));
+    env.write("tree/.cache/sub/f", &random(BLOCK, 4));
+    env.write("tree/absolute/f", &random(BLOCK, 5));
+    env.write("tree/other/absolute/f", &random(BLOCK, 6));
+    env.write("group/f", &random(BLOCK, 7));
+    env.write("group/g.tmp", &random(BLOCK, 8));
+    let configure = |tree: &str, group: &str| {
+        env.configure(&format!(
+            "{}{}",
+            env.root("tree", tree),
+            env.root("group", &format!("immutable = true\n{group}"))
+        ));
+    };
+    configure("", "");
+    env.update();
+
+    let absolute = format!("{}/absolute", env.tree().display());
+    configure(
+        &format!("exclude = ['*.tmp', '.cache', '{absolute}']"),
+        "exclude = ['*.tmp']",
+    );
+    let stderr = prune(&env, &[]);
+    assert!(warnings(&stderr).is_empty(), "{stderr}");
+    assert_eq!(pruned(&stderr), [0, 4, 4], "{stderr}");
+    let tree = [pair("tree", "keep"), pair("tree", "other/absolute/f")];
+    let group = [pair("group", "f"), pair("group", "g.tmp")];
+    assert_eq!(indexed(&env), [&group[..], &tree].concat());
+    let stderr = env.update();
+    assert!(stderr.contains(" 0 files hashed"), "{stderr}");
+    assert!(stderr.contains(" 0 stale inodes removed"), "{stderr}");
+    assert_eq!(groups(&stderr), [1, 0, 0]);
+
+    let stderr = prune(&env, &["--scan-immutable"]);
+    assert!(!stderr.contains("immutable roots"), "{stderr}");
+    assert_eq!(pruned(&stderr), [0, 1, 1], "{stderr}");
+    assert_eq!(indexed(&env), [&group[..1], &tree].concat());
+    let stderr = env.update();
+    assert_eq!(groups(&stderr), [1, 0, 0]);
+}
+
 /// A path whose lookup fails goes too, as an update drops what it cannot
 /// reach: no candidate read could reach it either. A directory that cannot
 /// be searched gets one warning, as in an update, whatever the number of
