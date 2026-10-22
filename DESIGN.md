@@ -290,7 +290,7 @@ Per-root options:
 
 | Option | Meaning |
 |---|---|
-| `exclude` | Globs using the same match options as roots. Patterns beginning with `/` match absolute paths, including root matches; others match basenames. Excluded entries and descendants are skipped. |
+| `exclude` | Globs using the same match options as roots. Patterns beginning with `/` match absolute paths, including root matches; others match basenames. Normalization drops empty components and a trailing `/` from each pattern; a `.` or `..` component, or a `/` that remains in a basename pattern, is a configuration error, since matched paths have no such components and basenames have no `/`. Excluded entries and descendants are skipped. |
 | `one_filesystem` | Skip an entry and descendants when its mount ID differs from its parent's. |
 | `may_vanish` | The root need not exist: neither a pattern without matches nor a missing root gets a warning, and a copy that vanishes before its scan task opens it gives its place to the next one (below). Copies of a group can differ in it. |
 | `identifier = "path"` | Default for immutable roots: the absolute matched path. |
@@ -304,11 +304,11 @@ forms. They are allowed only on immutable roots.
 All configured copies sharing an identifier must have the same indexing
 policy: identical `exclude` pattern sets, ignoring order and duplicates,
 and equal `one_filesystem` values after applying defaults. Compare the
-patterns after byte-escape decoding and glob quoting, without attempting
-to prove glob equivalence. Conflicting policies are a configuration error,
-including for completed groups and `--no-update` runs; reject them before
-changing the index. The user is responsible for making absolute exclusions
-select corresponding content in every copy.
+patterns after byte-escape decoding, glob quoting, and normalization,
+without attempting to prove glob equivalence. Conflicting policies are a
+configuration error, including for completed groups and `--no-update`
+runs; reject them before changing the index. The user is responsible for
+making absolute exclusions select corresponding content in every copy.
 
 Policy changes do not invalidate completed immutable groups automatically.
 After changing exclusions or `one_filesystem`, the user must run

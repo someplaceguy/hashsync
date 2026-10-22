@@ -17,7 +17,7 @@ use std::path::Path;
 use serde::Deserialize;
 
 use crate::die::die;
-use crate::escapes::{self, Syntax, quoted};
+use crate::escapes::{self, Syntax, quoted, quoted_pattern};
 use crate::fsops;
 use crate::glob;
 use crate::hash::StrongHash;
@@ -83,8 +83,9 @@ impl RootConfig {
     /// `one_filesystem` values. This function exists because copies of an
     /// immutable group must index the same content, whichever copy an
     /// update scans (DESIGN.md §4.2). The patterns compare as bytes after
-    /// byte-escape decoding, with their glob quoting: two globs that match
-    /// the same names but differ in their bytes still differ.
+    /// byte-escape decoding and normalization (`parse_exclusions`), with
+    /// their glob quoting: two globs that match the same names but differ
+    /// in their bytes still differ.
     pub fn policy_difference(&self, other: &RootConfig) -> Option<&'static str> {
         if self.exclude != other.exclude {
             Some("exclusions")
@@ -150,10 +151,10 @@ impl Identifier {
     }
 }
 
-/// The exclusion patterns of one root. Patterns beginning with `/` match
-/// absolute paths; others match basenames. Each kind is sorted and without
-/// duplicates, so that equal sets of patterns compare equal
-/// (`RootConfig::policy_difference`).
+/// The exclusion patterns of one root, normalized (`parse_exclusions`).
+/// Patterns beginning with `/` match absolute paths; others match
+/// basenames. Each kind is sorted and without duplicates, so that equal
+/// sets of patterns compare equal (`RootConfig::policy_difference`).
 #[derive(Default, Debug, PartialEq, Eq)]
 pub struct Exclusions {
     names: Vec<Vec<u8>>,
@@ -518,23 +519,7 @@ fn parse_root(raw: RawRoot) -> Result<RootConfig, String> {
     let pattern = escapes::decode(&raw.path, Syntax::Glob).map_err(|e| format!("path: {e}"))?;
     check_no_nul(&pattern).map_err(|e| format!("path: {e}"))?;
     let normalized = normalize(&pattern).map_err(|e| format!("path: {e}"))?;
-    let mut exclude = Exclusions::default();
-    for text in &raw.exclude {
-        let pattern = escapes::decode(text, Syntax::Glob).map_err(|e| format!("exclude: {e}"))?;
-        check_no_nul(&pattern).map_err(|e| format!("exclude: {e}"))?;
-        if pattern.is_empty() {
-            return Err("exclude: empty pattern".into());
-        }
-        if pattern[0] == b'/' {
-            exclude.paths.push(pattern);
-        } else {
-            exclude.names.push(pattern);
-        }
-    }
-    for patterns in [&mut exclude.names, &mut exclude.paths] {
-        patterns.sort_unstable();
-        patterns.dedup();
-    }
+    let exclude = parse_exclusions(&raw.exclude).map_err(|e| format!("exclude: {e}"))?;
     Ok(RootConfig {
         pattern: normalized,
         exclude,
@@ -544,10 +529,54 @@ fn parse_root(raw: RawRoot) -> Result<RootConfig, String> {
     })
 }
 
-/// `path`, an absolute path or root pattern, without empty components and
-/// without a trailing `/`, and `/` alone for the root directory. `.` and
-/// `..` components are not allowed: the root checks compare paths as
-/// bytes (DESIGN.md §4.2).
+/// The `exclude` patterns of a root (DESIGN.md §4.2), normalized to the
+/// form of what they are matched against. A pattern that begins with `/`
+/// matches absolute paths, which have no empty, `.` or `..` components and
+/// no trailing `/`, so it is normalized as a root pattern is. Any other
+/// pattern matches basenames, which have no `/`, so it must be one
+/// component, and a trailing `/` is dropped. A pattern written as a path
+/// below the root, such as `*/.links`, is then an error instead of an
+/// exclusion that matches nothing.
+fn parse_exclusions(texts: &[String]) -> Result<Exclusions, String> {
+    let mut exclude = Exclusions::default();
+    for text in texts {
+        let pattern = escapes::decode(text, Syntax::Glob)?;
+        check_no_nul(&pattern)?;
+        if pattern.is_empty() {
+            return Err("empty pattern".into());
+        }
+        let quoted = quoted_pattern(&pattern);
+        if pattern[0] == b'/' {
+            let path = normalize(&pattern).map_err(|e| format!("{quoted}: {e}"))?;
+            exclude.paths.push(path);
+            continue;
+        }
+        let components: Vec<&[u8]> = glob::components(&pattern).collect();
+        match components[..] {
+            [b"." | b".."] => {
+                return Err(format!("{quoted}: `.` and `..` components are not allowed"));
+            }
+            [name] => exclude.names.push(name.to_vec()),
+            _ => {
+                return Err(format!(
+                    "{quoted}: basenames have no `/`; \
+                     start the pattern with `/` to match absolute paths"
+                ));
+            }
+        }
+    }
+    for patterns in [&mut exclude.names, &mut exclude.paths] {
+        patterns.sort_unstable();
+        patterns.dedup();
+    }
+    Ok(exclude)
+}
+
+/// `path`, an absolute path or a pattern of absolute paths, without empty
+/// components and without a trailing `/`, and `/` alone for the root
+/// directory. `.` and `..` components are not allowed: the root checks
+/// compare paths as bytes (DESIGN.md §4.2), and the paths that exclusion
+/// patterns match have none.
 fn normalize(path: &[u8]) -> Result<Vec<u8>, String> {
     if path.first() != Some(&b'/') {
         return Err("must be an absolute path".into());
@@ -739,6 +768,7 @@ exclude = ['*.tmp', 'literal\x2Aname', 'back\\slash', '/srv/archive-\xFF/skip']
 
 [[roots]]
 path = "/nix//store/*/"
+exclude = ['//nix/store//.links/', '.cache/']
 one_filesystem = true
 "#,
         )
@@ -764,8 +794,13 @@ one_filesystem = true
         assert!(exclude.excludes(b"back\\slash", never));
         assert!(exclude.excludes(b"skip", || b"/srv/archive-\xff/skip".to_vec()));
         assert!(!exclude.excludes(b"skip", || b"/srv/archive-\xff/sub/skip".to_vec()));
-        assert!(config.roots[1].exclude.names.is_empty());
-        assert!(config.roots[1].exclude.paths.is_empty());
+        // Exclusions lose empty components and trailing slashes, as root
+        // patterns do.
+        let exclude = &config.roots[1].exclude;
+        assert_eq!(exclude.names, [b".cache"]);
+        assert_eq!(exclude.paths, [b"/nix/store/.links"]);
+        assert!(exclude.excludes(b".cache", never));
+        assert!(exclude.excludes(b".links", || b"/nix/store/.links".to_vec()));
         assert_eq!(config.roots[1].pattern, b"/nix/store/*");
         assert!(config.roots[1].one_filesystem);
         assert!(!config.roots[0].one_filesystem);
@@ -838,15 +873,32 @@ one_filesystem = true
                 .contains("NUL")
         );
         assert!(
-            parse("[[roots]]\npath = '/a'\nexclude = ['']")
-                .unwrap_err()
-                .contains("empty")
-        );
-        assert!(
             parse("[[roots]]\npath = '/a\\'")
                 .unwrap_err()
                 .contains("trailing")
         );
+    }
+
+    /// An exclusion must have the form of what it is matched against, so a
+    /// pattern written as a path below the root, or with `.` or `..`
+    /// components, is an error instead of an exclusion that matches
+    /// nothing (DESIGN.md §4.2).
+    #[test]
+    fn rejected_exclusions() {
+        let dots = "`.` and `..` components are not allowed";
+        let slash = "basenames have no `/`; start the pattern with `/` to match absolute paths";
+        for (pattern, expected) in [
+            ("", "empty pattern".to_string()),
+            ("/a/../b", format!("'/a/../b': {dots}")),
+            ("..", format!("'..': {dots}")),
+            ("./", format!("'./': {dots}")),
+            ("*/.links", format!("'*/.links': {slash}")),
+            ("**/x", format!("'**/x': {slash}")),
+        ] {
+            let text = format!("[[roots]]\npath = '/a'\nexclude = ['{pattern}']");
+            let error = parse(&text).unwrap_err();
+            assert_eq!(error, format!("roots[0]: exclude: {expected}"));
+        }
     }
 
     /// A TOML error is one line, which says where the error is, so that it
@@ -1101,8 +1153,8 @@ one_filesystem = true
     }
 
     /// Copies must have the same exclusions, as sets of patterns after
-    /// byte-escape decoding, and the same `one_filesystem` (DESIGN.md
-    /// §4.2).
+    /// byte-escape decoding and normalization, and the same
+    /// `one_filesystem` (DESIGN.md §4.2).
     #[test]
     fn indexing_policies_compare_as_sets() {
         let root = |extra: &str| {
@@ -1113,6 +1165,7 @@ one_filesystem = true
         for same in [
             r"exclude = ['/a/x', 'literal\x2A', '*.tmp', '*.tmp']",
             r"exclude = ['literal\*', '/a/x', '*.tmp']",
+            r"exclude = ['//a/x/', 'literal\*/', '*.tmp']",
         ] {
             assert_eq!(base.policy_difference(&root(same)), None, "{same}");
         }
