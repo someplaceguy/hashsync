@@ -7,13 +7,13 @@ use std::time::Instant;
 
 use crate::config::Config;
 use crate::fsops;
-use crate::index::{self, Index};
+use crate::index::{self, Access, Index};
 use crate::report::note;
 
 pub fn run(config: &Config) {
     // RocksDB keeps every file of the index open (DESIGN.md §4.4).
     fsops::raise_descriptor_limit();
-    let index = index::open_existing(config);
+    let index = index::open_current(config, Access::Modifying);
     perform(&index);
     index.close();
 }

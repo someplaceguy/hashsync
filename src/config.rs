@@ -17,7 +17,7 @@ use std::path::Path;
 use serde::Deserialize;
 
 use crate::die::die;
-use crate::escapes::{self, Syntax, quoted, quoted_pattern};
+use crate::escapes::{self, Syntax, quoted, quoted_from_home, quoted_pattern};
 use crate::fsops;
 use crate::glob;
 use crate::hash::StrongHash;
@@ -46,7 +46,10 @@ pub struct Config {
     index_named_after_file: bool,
     pub block_size: u32,
     pub strong_hash: StrongHash,
-    /// Path bytes of the index database.
+    /// Path bytes of the index database. Messages show it with `~` for the
+    /// home directory (`escapes::quoted_from_home`), as the note of `load`
+    /// that names the index does, so that the same index does not appear
+    /// as two different paths.
     pub index_path: Vec<u8>,
     /// Scan threads; 0 selects the default count (DESIGN.md §4.6).
     pub threads: u32,
@@ -315,12 +318,14 @@ pub fn load(source: &Source, uses_index: bool) -> Config {
     // The files of profiles share one directory, so their names are
     // distinct, and so are the names of their indexes. A file anywhere can
     // have the name of another one, such as the file of a profile, and then
-    // shares its index.
+    // shares its index. The warning names the file and the index as the
+    // note before it does.
     if uses_index && config.index_named_after_file && matches!(source, Source::File(_)) {
         warn(format!(
-            "{shown} sets no index_path, so its index is {}, as for any other \
+            "{} sets no index_path, so its index is {}, as for any other \
              configuration file of the same name; set index_path to avoid sharing it by accident",
-            quoted(&config.index_path)
+            quoted_from_home(&path),
+            quoted_from_home(&config.index_path)
         ));
     }
     config
@@ -334,16 +339,17 @@ pub fn load(source: &Source, uses_index: bool) -> Config {
 /// does without. Paths in the home directory start with `~`, which keeps
 /// the line short.
 fn note_files(source: &Source, path: &[u8], found: bool, index: Option<&[u8]>) {
-    let home = std::env::var_os("HOME").unwrap_or_default();
-    let shown = |path| escapes::quoted_from_home(path, home.as_bytes());
-    let path = shown(path);
+    let path = quoted_from_home(path);
     let file = match source.profile() {
         None => format!("config {path}"),
         Some(name) if found => format!("profile {} [{path}]", quoted(name)),
         Some(name) => format!("profile {} [{path} not found]", quoted(name)),
     };
     match index {
-        Some(index) => note(format_args!("using {file} and index {}", shown(index))),
+        Some(index) => note(format_args!(
+            "using {file} and index {}",
+            quoted_from_home(index)
+        )),
         None => note(format_args!("using {file}")),
     }
 }

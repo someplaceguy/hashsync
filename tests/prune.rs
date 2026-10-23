@@ -8,6 +8,7 @@ mod common;
 use std::os::unix::ffi::OsStrExt;
 
 use common::*;
+use rocksdb::WriteBatch;
 
 /// Run `hashsync WORDS...`, and require success. Returns stderr.
 fn succeed(env: &Env, words: &[&str]) -> String {
@@ -492,10 +493,12 @@ fn update_compact_compacts_the_index() {
 }
 
 /// Prune and compact need an index that matches the configuration, which
-/// only an update makes, and say which update to run. They create no
-/// database, so that the other commands find no index either. An error in
-/// the roots of the configuration, which prune resolves, changes nothing
-/// (DESIGN.md §4.2 and §4.4).
+/// only an update makes, and say which update to run. Without an index,
+/// they create no directory, lock file, or database, so that a wrong index
+/// path leaves no files behind. A database without metadata, which the
+/// first update leaves when it ends before it writes them, is no index for
+/// them or for `stats` either. An error in the roots of the configuration,
+/// which prune resolves, changes nothing (DESIGN.md §4.2 and §4.4).
 #[test]
 fn prune_and_compact_need_a_current_index() {
     let env = Env::new();
@@ -509,12 +512,26 @@ fn prune_and_compact_need_a_current_index() {
         "hashsync: no index at {}; {update}\n",
         quoted(env.index_path())
     );
-    for command in ["prune", "compact", "stats"] {
-        let output = env.run(&[command]);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert_eq!(output.status.code(), Some(1), "{command}: {stderr}");
-        assert!(stderr.ends_with(&expected), "{command}: {stderr}");
+    let need_an_index = || {
+        for command in ["prune", "compact", "stats"] {
+            let output = env.run(&[command]);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.code(), Some(1), "{command}: {stderr}");
+            assert!(stderr.ends_with(&expected), "{command}: {stderr}");
+        }
+    };
+    need_an_index();
+    assert!(!env.index_path().exists());
+
+    env.update();
+    let index = env.index_rw();
+    let mut batch = WriteBatch::default();
+    for (name, _) in index.entries("default") {
+        batch.delete_cf(index.cf("default"), name);
     }
+    index.write(batch);
+    drop(index);
+    need_an_index();
 
     env.update();
     env.configure_with(&format!("block_size = 8192\n{}", env.root("tree", "")));

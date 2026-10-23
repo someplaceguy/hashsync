@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use crate::compact;
 use crate::config::Config;
-use crate::escapes::quoted;
+use crate::escapes::quoted_from_home;
 use crate::fsid::FsCache;
 use crate::fsops;
 use crate::index::{self, CurrentRoot, Settings};
@@ -63,7 +63,7 @@ pub fn perform(config: &Config, options: Options) -> (index::Index, Vec<Location
             None => {
                 report::note(format_args!(
                     "creating index {}",
-                    quoted(&config.index_path)
+                    quoted_from_home(&config.index_path)
                 ));
                 true
             }

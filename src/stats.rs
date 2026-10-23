@@ -7,23 +7,18 @@ use std::path::Path;
 
 use crate::config::Config;
 use crate::die::die;
-use crate::escapes::quoted;
+use crate::escapes::{quoted, quoted_from_home};
 use crate::fsops;
-use crate::index::{self, Settings};
+use crate::index::{self, Access, Settings};
 use crate::report::warn;
 use crate::units::Bytes;
 
 pub fn run(config: &Config) {
     // RocksDB keeps every file of the index open (DESIGN.md §4.4).
     fsops::raise_descriptor_limit();
-    let path = quoted(&config.index_path);
-    let update = config.update_command();
-    let Some(index) = index::open_read_only(&config.index_path) else {
-        die(format!("no index at {path}; run `{update}`"));
-    };
-    let Some(meta) = index.read_meta() else {
-        die(format!("index {path} has no schema; run `{update}`"));
-    };
+    // Also an index that no longer matches the configuration: the report
+    // shows its settings, and a warning follows it.
+    let (index, meta) = index::open_existing(config, Access::ReadOnly);
     let stats = index.stats();
     // The lock keeps modifying processes away while the files are listed.
     let (database, wal) = file_sizes(&config.index_path);
@@ -47,6 +42,9 @@ pub fn run(config: &Config) {
          distinct weak:    {distinct_weak}\n\
          indexed size:     {indexed_size}\n\
          database size:    {database} (+{wal} write-ahead log)\n",
+        // The report is output that a program may read, so it shows the
+        // path as it is, without the `~` of the messages.
+        path = quoted(&config.index_path),
         schema_version = meta.schema_version,
         block_size = meta.settings.block_size,
         strong_hash = meta.settings.strong_hash_id,
@@ -68,6 +66,7 @@ pub fn run(config: &Config) {
     }
 
     if !meta.compatible(&Settings::from_config(config)) {
+        let update = config.update_command();
         warn(format!(
             "the index settings differ from the configuration; run `{update}` to rebuild it"
         ));
@@ -79,7 +78,9 @@ pub fn run(config: &Config) {
 /// failure.
 fn file_sizes(path: &[u8]) -> (u64, u64) {
     let dir = Path::new(OsStr::from_bytes(path));
-    let fail = |e: std::io::Error| -> ! { die(format!("cannot list index {}: {e}", quoted(path))) };
+    let fail = |e: std::io::Error| -> ! {
+        die(format!("cannot list index {}: {e}", quoted_from_home(path)))
+    };
     let (mut database, mut wal) = (0, 0);
     for entry in fsops::retry_interrupted(|| std::fs::read_dir(dir)).unwrap_or_else(|e| fail(e)) {
         let entry = entry.unwrap_or_else(|e| fail(e));

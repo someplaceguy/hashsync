@@ -34,7 +34,7 @@ use rustix::io::Errno;
 
 use crate::config::Config;
 use crate::die::die;
-use crate::escapes::quoted;
+use crate::escapes::quoted_from_home;
 use crate::fsops;
 use crate::hash::{PREFIX_LEN, weak};
 use crate::pool::Pool;
@@ -112,6 +112,15 @@ fn os_path(path: &[u8]) -> &Path {
     Path::new(OsStr::from_bytes(path))
 }
 
+/// End the process after `action`, such as "open" or "lock", failed on the
+/// index at `path`.
+fn fatal(action: &str, path: &[u8], error: impl std::fmt::Display) -> ! {
+    die(format!(
+        "cannot {action} index {}: {error}",
+        quoted_from_home(path)
+    ))
+}
+
 /// The database handle of a process, with the lock that gives the process
 /// its access.
 struct Shared {
@@ -135,15 +144,17 @@ pub struct Reader {
     shared: Arc<Shared>,
 }
 
-/// Open the lock file of the index at `path` and lock it, waiting forever
-/// on contention (DESIGN.md §4.4): exclusive and read/write for a
-/// modifying process, which creates the file, shared and read-only for the
-/// others. A lock that another process holds makes this process say, in a
-/// note, that it waits, and for which index: a wait can be long, and
-/// without the note it looks like a hang. A second note says when the wait
-/// is over. Without it, the wait note would stay the last line on stderr
-/// while the process goes on with its work, such as an update, which can
-/// take long too, and the process would seem to be still waiting.
+/// Open the lock file of the index at `path` and lock it for `access`,
+/// waiting forever on contention (DESIGN.md §4.4): exclusive and
+/// read/write for a modifying process, shared and read-only for the
+/// others. With `create`, which only an update passes, it creates the file
+/// when there is none. A lock that another process holds makes this
+/// process say, in a note, that it waits, and for which index: a wait can
+/// be long, and without the note it looks like a hang. A second note says
+/// when the wait is over. Without it, the wait note would stay the last
+/// line on stderr while the process goes on with its work, such as an
+/// update, which can take long too, and the process would seem to be
+/// still waiting.
 ///
 /// The lock belongs to the open file description (`F_OFD_SETLKW`), not to
 /// the process as a classic POSIX lock does. Closing another descriptor of
@@ -153,16 +164,18 @@ pub struct Reader {
 /// only after that, when it releases the open file description: a process
 /// that gets this lock never finds `LOCK` held. Close-on-exec keeps
 /// children from inheriting the descriptor, and so the lock.
-fn lock(path: &[u8], exclusive: bool) -> Result<OwnedFd, Errno> {
+fn lock(path: &[u8], access: Access, create: bool) -> Result<OwnedFd, Errno> {
     // An exclusive lock needs the file open for writing. Read/write and not
     // write-only: `into_read_only` turns that lock into a shared one on the
     // same descriptor, and a shared lock needs it open for reading, else
     // the change fails with `EBADF`.
-    let flags = if exclusive {
-        OFlags::RDWR | OFlags::CREATE
-    } else {
-        OFlags::RDONLY
+    let (mut flags, exclusive) = match access {
+        Access::Modifying => (OFlags::RDWR, true),
+        Access::ReadOnly => (OFlags::RDONLY, false),
     };
+    if create {
+        flags |= OFlags::CREATE;
+    }
     let file = rustix::io::retry_on_intr(|| {
         rustix::fs::open(
             os_path(path).join(LOCK_FILE),
@@ -171,12 +184,10 @@ fn lock(path: &[u8], exclusive: bool) -> Result<OwnedFd, Errno> {
         )
     })?;
     if !sys::try_lock_file(file.as_fd(), exclusive)? {
-        report::note(format_args!(
-            "waiting for the lock of index {}",
-            quoted(path)
-        ));
+        let index = quoted_from_home(path);
+        report::note(format_args!("waiting for the lock of index {index}"));
         sys::lock_file(file.as_fd(), exclusive)?;
-        report::note(format_args!("acquired the lock of index {}", quoted(path)));
+        report::note(format_args!("acquired the lock of index {index}"));
     }
     Ok(file)
 }
@@ -239,55 +250,98 @@ fn column_families() -> Vec<ColumnFamilyDescriptor> {
         .collect()
 }
 
-/// Open the index of a modifying process, creating it when necessary.
-/// Waits for exclusive access.
+/// Open the index of an update, creating its directory, its lock file,
+/// and its database when necessary (DESIGN.md §4.4). Waits for exclusive
+/// access.
 pub fn open_modifying(path: &[u8]) -> Index {
-    open_read_write(path, lock_modifying(path))
-}
-
-/// Open the index of `config` for a modifying process that only works on
-/// an index that an update has made, and that matches the configuration:
-/// `prune` and `compact` (DESIGN.md §4.4). Unlike `open_modifying`, it
-/// creates no database when there is none, since later commands would then
-/// report an index without metadata in place of a missing one. It waits for
-/// exclusive access, and creates the directory and the lock file when
-/// necessary, as `open_modifying` does. A missing or incompatible index
-/// ends the process with a message that says which update to run.
-pub fn open_existing(config: &Config) -> Index {
-    let path = &config.index_path;
-    let (shown, update) = (quoted(path), config.update_command());
-    let no_index = || -> ! { die(format!("no index at {shown}; run `{update}`")) };
-    let lock = lock_modifying(path);
-    if !has_database(path) {
-        no_index();
-    }
-    let index = open_read_write(path, lock);
-    match index.read_meta() {
-        None => no_index(),
-        Some(meta) if !meta.compatible(&Settings::from_config(config)) => die(format!(
-            "index {shown} does not match the configuration; run `{update}`"
-        )),
-        Some(_) => index,
-    }
-}
-
-/// Create the directory of the index at `path` when necessary, and take
-/// the exclusive lock of a modifying process.
-fn lock_modifying(path: &[u8]) -> OwnedFd {
     if let Err(e) = fsops::create_dir_all(os_path(path), 0o777) {
         die(format!(
             "cannot create index directory {}: {e}",
-            quoted(path)
+            quoted_from_home(path)
         ));
     }
-    lock(path, true).unwrap_or_else(|e| die(format!("cannot lock index {}: {e}", quoted(path))))
+    let lock = lock(path, Access::Modifying, true).unwrap_or_else(|e| fatal("lock", path, e));
+    open_read_write(path, lock)
+}
+
+/// How a process uses the index (DESIGN.md §4.4): a modifying process
+/// takes the exclusive lock and opens the database read/write, and a
+/// read-only process takes a shared lock and opens it read-only.
+#[derive(Clone, Copy)]
+pub enum Access {
+    Modifying,
+    ReadOnly,
+}
+
+/// Open the index of `config` for `access`, for a process that needs an
+/// index that an update has made and that matches the configuration, such
+/// as prune, compact, and a run that does not update its index or opens it
+/// again after its update (DESIGN.md §4.4). Otherwise the process ends
+/// with a message that says which update to run.
+pub fn open_current(config: &Config, access: Access) -> Index {
+    let (index, meta) = open_existing(config, access);
+    if !meta.compatible(&Settings::from_config(config)) {
+        die(format!(
+            "index {} does not match the configuration; run `{}`",
+            quoted_from_home(&config.index_path),
+            config.update_command()
+        ));
+    }
+    index
+}
+
+/// Open the index of `config` for `access`, for a process that needs an
+/// index that an update has made, whatever its settings, such as `stats`,
+/// which reports them. Returns the index with its metadata. Without an
+/// index, the process ends with a message that says which update to run;
+/// a database without metadata, which the first update leaves when it
+/// ends before it writes them, is no index either. Unlike
+/// `open_modifying`, it creates no directory, lock file, or database, also
+/// for a modifying process (DESIGN.md §4.4), to avoid leaving leftover
+/// files, especially when the user configured the wrong index path.
+pub fn open_existing(config: &Config, access: Access) -> (Index, Meta) {
+    let path = &config.index_path;
+    let no_index = || -> ! {
+        die(format!(
+            "no index at {}; run `{}`",
+            quoted_from_home(path),
+            config.update_command()
+        ))
+    };
+    let Some(index) = open_database(path, access) else {
+        no_index();
+    };
+    let Some(meta) = index.read_meta() else {
+        no_index();
+    };
+    (index, meta)
+}
+
+/// Open the index at `path` for `access`, waiting for its lock, but create
+/// nothing: `None` when there is no database. That is no directory or no
+/// lock file, which an update creates before the database, or a directory
+/// that the first update left before it created the database with all its
+/// column families.
+fn open_database(path: &[u8], access: Access) -> Option<Index> {
+    let lock = match lock(path, access, false) {
+        Ok(lock) => lock,
+        Err(Errno::NOENT) => return None,
+        Err(e) => fatal("open", path, e),
+    };
+    if !has_database(path) {
+        return None;
+    }
+    Some(match access {
+        Access::Modifying => open_read_write(path, lock),
+        Access::ReadOnly => open_read_only(path, lock),
+    })
 }
 
 /// Open the database of the index at `path` read/write, creating it when
 /// necessary, for the process that holds `lock`, its exclusive lock.
 fn open_read_write(path: &[u8], lock: OwnedFd) -> Index {
     let db = DB::open_cf_descriptors(&db_options(), os_path(path), column_families())
-        .unwrap_or_else(|e| die(format!("cannot open index {}: {e}", quoted(path))));
+        .unwrap_or_else(|e| fatal("open", path, e));
     Index {
         shared: Arc::new(Shared { db, _lock: lock }),
     }
@@ -300,36 +354,26 @@ fn has_database(path: &[u8]) -> bool {
     match rustix::io::retry_on_intr(|| rustix::fs::stat(os_path(path).join("CURRENT"))) {
         Ok(_) => {}
         Err(Errno::NOENT) => return false,
-        Err(e) => die(format!("cannot open index {}: {e}", quoted(path))),
+        Err(e) => fatal("open", path, e),
     }
     // A database without every column family: the first update ended
     // before it created them all.
-    let names = DB::list_cf(&Options::default(), os_path(path))
-        .unwrap_or_else(|e| die(format!("cannot open index {}: {e}", quoted(path))));
+    let names =
+        DB::list_cf(&Options::default(), os_path(path)).unwrap_or_else(|e| fatal("open", path, e));
     Cf::ALL
         .iter()
         .all(|cf| names.iter().any(|name| name == cf.name()))
 }
 
-/// Open the index of a read-only process, waiting while a modifying
-/// process has it. `None` when there is no database: no directory or no
-/// lock file, or a directory that the first update left before it created
-/// the database with all its column families.
-pub fn open_read_only(path: &[u8]) -> Option<Index> {
-    let lock = match lock(path, false) {
-        Ok(lock) => lock,
-        Err(Errno::NOENT) => return None,
-        Err(e) => die(format!("cannot open index {}: {e}", quoted(path))),
-    };
-    if !has_database(path) {
-        return None;
-    }
+/// Open the database of the index at `path` read-only, for the process
+/// that holds `lock`, a shared lock of the index.
+fn open_read_only(path: &[u8], lock: OwnedFd) -> Index {
     let db =
         DB::open_cf_descriptors_read_only(&db_options(), os_path(path), column_families(), false)
-            .unwrap_or_else(|e| die(format!("cannot open index {}: {e}", quoted(path))));
-    Some(Index {
+            .unwrap_or_else(|e| fatal("open", path, e));
+    Index {
         shared: Arc::new(Shared { db, _lock: lock }),
-    })
+    }
 }
 
 /// The entries of one column family in a range of keys, in key order,
@@ -819,18 +863,8 @@ impl Index {
         let Shared { db, _lock: lock } =
             Arc::into_inner(self.shared).expect("a reader outlives the index");
         drop(db);
-        sys::lock_file(lock.as_fd(), false)
-            .unwrap_or_else(|e| die(format!("cannot lock index {}: {e}", quoted(path))));
-        let db = DB::open_cf_descriptors_read_only(
-            &db_options(),
-            os_path(path),
-            column_families(),
-            false,
-        )
-        .unwrap_or_else(|e| die(format!("cannot open index {}: {e}", quoted(path))));
-        Index {
-            shared: Arc::new(Shared { db, _lock: lock }),
-        }
+        sys::lock_file(lock.as_fd(), false).unwrap_or_else(|e| fatal("lock", path, e));
+        open_read_only(path, lock)
     }
 
     /// An empty transaction.
@@ -1642,7 +1676,7 @@ mod tests {
         drop(reader);
         probe(&path, "open");
 
-        let read_only = open_read_only(path.as_os_str().as_bytes()).unwrap();
+        let read_only = open_database(path.as_os_str().as_bytes(), Access::ReadOnly).unwrap();
         probe(&path, "open");
         assert!(read_only.read_meta().unwrap().compatible(&settings()));
     }
@@ -1661,25 +1695,44 @@ mod tests {
         probe(&path, "open");
     }
 
-    /// A read-only process finds no index where there is no directory, a
-    /// directory without the lock file, or without a database, or a
-    /// database without all its column families: the first update ended
-    /// early.
+    /// A process that needs an index that an update has made, modifying or
+    /// read-only, finds no index where there is no directory, a directory
+    /// without the lock file, or without a database, or a database without
+    /// all its column families: the first update ended early. It adds no
+    /// file to what it finds, so that a wrong index path leaves no files
+    /// behind (DESIGN.md §4.4).
     #[test]
     fn a_missing_database_is_no_index() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("index");
-        let no_index = || open_read_only(path.as_os_str().as_bytes()).is_none();
+        let no_index = || {
+            [Access::Modifying, Access::ReadOnly]
+                .into_iter()
+                .all(|access| open_database(path.as_os_str().as_bytes(), access).is_none())
+        };
+        let files = || {
+            let mut names: Vec<String> = std::fs::read_dir(&path)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect();
+            names.sort();
+            names
+        };
         assert!(no_index());
+        assert!(!path.exists());
         std::fs::create_dir(&path).unwrap();
         assert!(no_index());
+        assert_eq!(files(), Vec::<String>::new());
         std::fs::write(path.join(LOCK_FILE), b"").unwrap();
         assert!(no_index());
+        assert_eq!(files(), [LOCK_FILE]);
         let mut options = Options::default();
         options.create_if_missing(true);
         options.create_missing_column_families(true);
         drop(DB::open_cf(&options, &path, ["default", "roots"]).unwrap());
+        let database = files();
         assert!(no_index());
+        assert_eq!(files(), database);
     }
 
     /// The export sorts the weak hashes as unsigned values and

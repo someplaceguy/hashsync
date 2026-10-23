@@ -97,11 +97,20 @@ pub fn quoted_path(path: &Path) -> Quoted<'_> {
     quoted(path.as_os_str().as_bytes())
 }
 
-/// `path` as `quoted` shows it, but with `~` in place of `home`, the home
-/// directory, when the path is in it, which keeps a note short. With a home
-/// of `/`, paths stay as they are, or every absolute path would start with
-/// `~`.
-pub fn quoted_from_home<'a>(path: &'a [u8], home: &[u8]) -> Quoted<'a> {
+/// `path` as `quoted` shows it, but with `~` in place of the home
+/// directory, `$HOME`, when the path is in it, which keeps a message short.
+/// Without `$HOME`, paths stay as they are.
+pub fn quoted_from_home(path: &[u8]) -> Quoted<'_> {
+    let home = std::env::var_os("HOME").unwrap_or_default();
+    from_home(path, home.as_bytes())
+}
+
+/// `path` as `quoted_from_home` shows it when the home directory is
+/// `home`. This function exists so that the tests can choose the home
+/// directory without changing the environment of the test process. With a
+/// home of `/`, paths stay as they are, or every absolute path would start
+/// with `~`.
+fn from_home<'a>(path: &'a [u8], home: &[u8]) -> Quoted<'a> {
     let mut home = home;
     while let [rest @ .., b'/'] = home {
         home = rest;
@@ -419,13 +428,12 @@ mod tests {
         }
     }
 
-    /// A path in the home directory shows with `~`, as a note shows it, but
-    /// not a path in another directory whose name starts with the same
-    /// bytes.
+    /// A path in the home directory shows with `~`, but not a path in
+    /// another directory whose name starts with the same bytes.
     #[test]
-    fn notes_show_the_home_directory_as_a_tilde() {
+    fn messages_show_the_home_directory_as_a_tilde() {
         let home = b"/home/u";
-        let shown = |path: &[u8], home: &[u8]| quoted_from_home(path, home).to_string();
+        let shown = |path: &[u8], home: &[u8]| from_home(path, home).to_string();
         assert_eq!(
             shown(b"/home/u/.cache/hashsync/a.db", home),
             "'~/.cache/hashsync/a.db'"

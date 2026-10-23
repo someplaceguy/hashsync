@@ -40,12 +40,11 @@ use crossbeam_channel::{Receiver, Select, Sender, TryRecvError, TrySendError, bo
 
 use crate::config::{Config, thread_count};
 use crate::die::die;
-use crate::escapes::quoted;
 use crate::fsid::FsCache;
 use crate::fsops;
 use crate::hash::StrongHash;
 use crate::hashtable::HashTable;
-use crate::index::{self, Index, Settings};
+use crate::index::{self, Access, Index};
 use crate::list_exchange::{self, Link, ListBytes, ReceiverExchange, TableUpdate};
 use crate::lookup;
 use crate::pins::Pins;
@@ -891,7 +890,7 @@ fn prepare(config: &Config, preparation: Preparation, link: &Link) -> (Index, Ve
             fsops::raise_descriptor_limit();
             let fs_cache = FsCache::new();
             let locations = roots::resolve(config, &fs_cache);
-            (open_read_only(config), locations)
+            (index::open_current(config, Access::ReadOnly), locations)
         }
         Preparation::UpdateAndKeep(options) => {
             let (index, locations) = update::perform(config, options);
@@ -911,30 +910,9 @@ fn prepare(config: &Config, preparation: Preparation, link: &Link) -> (Index, Ve
             index.close();
             link.send(frame::UPDATED, Vec::new());
             link.expect_empty(frame::UPDATED, "UPDATED");
-            (open_read_only(config), locations)
+            (index::open_current(config, Access::ReadOnly), locations)
         }
     }
-}
-
-/// The index of `config`, opened read-only with a shared lock: with
-/// `--no-update`, or again after an update that released it. No update
-/// holds this lock, so the index must exist and still match the
-/// configuration, else the run ends with `die`.
-fn open_read_only(config: &Config) -> Index {
-    let path = quoted(&config.index_path);
-    let update = config.update_command();
-    let Some(index) = index::open_read_only(&config.index_path) else {
-        die(format!("no index at {path}; run `{update}`"));
-    };
-    let Some(meta) = index.read_meta() else {
-        die(format!("index {path} has no schema; run `{update}`"));
-    };
-    if !meta.compatible(&Settings::from_config(config)) {
-        die(format!(
-            "index {path} does not match the configuration; run `{update}`"
-        ));
-    }
-    index
 }
 
 /// The receiver's role once its list exchange is done (DESIGN.md §6.4):

@@ -79,7 +79,7 @@ impl Env {
 
     /// `hashsync --config CONFIG ARGS...` with the configuration file of this
     /// environment. Its home directory holds none of the files of the
-    /// environment, so the notes show their paths in full, whatever the
+    /// environment, so messages show their paths in full, whatever the
     /// home directory of the test (DESIGN.md §7).
     pub fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_hashsync"));

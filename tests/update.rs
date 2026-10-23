@@ -411,6 +411,44 @@ fn messages_show_paths_that_a_program_can_read_back() {
     assert!(stderr.starts_with(&note), "{stderr}");
 }
 
+/// Messages name an index in the home directory with `~`, as the note
+/// that names the configuration file and the index does (DESIGN.md §7), so
+/// that the same index does not appear as two different paths: here the
+/// errors of a missing index and of one that no longer matches the
+/// configuration, the note of a new index, and the warning for a file of
+/// `--config` without `index_path`, which names that file with `~` too.
+#[test]
+fn messages_show_an_index_in_the_home_directory_with_a_tilde() {
+    let env = Env::new();
+    env.write("tree/f", &random(BLOCK, 1));
+    env.configure(&env.root("tree", ""));
+    // The home directory of `command` and `bare_command` holds none of the
+    // files of the environment, so these children get the directory of the
+    // environment as their home.
+    let stderr_of = |command: &mut Command| {
+        let output = command.env("HOME", env.dir.path()).output().unwrap();
+        String::from_utf8(output.stderr).unwrap()
+    };
+    let has = |stderr: &str, line: &str| assert!(stderr.contains(line), "{line}\n{stderr}");
+    let index = "'~/default.db'";
+    let missing = format!("hashsync: no index at {index}; run ");
+    for command in ["compact", "stats"] {
+        has(&stderr_of(&mut env.command(&[command])), &missing);
+    }
+    let created = format!("hashsync: creating index {index}\n");
+    has(&stderr_of(&mut env.command(&["update"])), &created);
+    env.configure_with(&format!("block_size = 8192\n{}", env.root("tree", "")));
+    let mismatch = format!("hashsync: index {index} does not match the configuration; run ");
+    has(&stderr_of(&mut env.command(&["compact"])), &mismatch);
+
+    env.write("elsewhere/nas.conf", b"");
+    let file = env.path("elsewhere/nas.conf");
+    let stderr = stderr_of(&mut env.bare_command(&["--config", file.to_str().unwrap(), "stats"]));
+    let warning = "hashsync: warning: '~/elsewhere/nas.conf' sets no index_path, \
+                   so its index is '~/cache/hashsync/nas.db', ";
+    has(&stderr, warning);
+}
+
 #[test]
 fn root_pattern_expansion() {
     let env = Env::new();

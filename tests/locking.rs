@@ -178,11 +178,19 @@ fn prune_and_compact_wait_for_a_read_only_process() {
 
 #[test]
 fn stats_waits_for_a_modifying_process() {
+    // The notes of the wait show the index the way the note before them,
+    // which names the configuration file and the index (DESIGN.md §7),
+    // shows it: with `~` for the home directory, so that the same index
+    // does not appear as two different paths. The home directory that
+    // `command` gives holds none of the files of the environment, so this
+    // child gets the directory of the environment as its home. The tests
+    // of the other lock waits check the same notes with the paths in full.
     let env = indexed_env();
     let writer = lock(&env, FlockOperation::LockExclusive);
 
     let mut child = env
         .command(&["stats"])
+        .env("HOME", env.dir.path())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
@@ -191,9 +199,13 @@ fn stats_waits_for_a_modifying_process() {
     drop(writer);
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success());
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    let notes = files_note(&env) + &waiting_note(&env) + &acquired_note(&env);
-    assert_eq!(stderr, notes);
+    let index = "'~/default.db'";
+    let notes = format!(
+        "hashsync: using config '~/config.toml' and index {index}\n\
+         hashsync: waiting for the lock of index {index}\n\
+         hashsync: acquired the lock of index {index}\n"
+    );
+    assert_eq!(String::from_utf8(output.stderr).unwrap(), notes);
 }
 
 #[test]

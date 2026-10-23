@@ -39,7 +39,7 @@ use crate::config::{Config, RootConfig};
 use crate::escapes::quoted;
 use crate::fsid::FsCache;
 use crate::fsops;
-use crate::index::{self, Index, Pruning, RootRow};
+use crate::index::{self, Access, Index, Pruning, RootRow};
 use crate::pool::Pool;
 use crate::report::{note, warn};
 use crate::roots::{self, Location};
@@ -59,7 +59,7 @@ pub fn run(config: &Config, scan_immutable: bool) {
     let fs_cache = FsCache::new();
     let locations = roots::resolve(config, &fs_cache);
 
-    let index = index::open_existing(config);
+    let index = index::open_current(config, Access::Modifying);
     // As for an update, the time counts from the moment the index is
     // locked.
     let start = Instant::now();

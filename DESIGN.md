@@ -456,8 +456,7 @@ transaction that changes a row changes that entry too.
 - Metadata names are `schema_version`, `block_size`, `weak_hash_id`,
   `strong_hash_id`, and `index_id`. An index whose metadata does not match
   requires an in-place rebuild. Read-only runs, prune, and compact report
-  that an update is required for a missing or incompatible index, and
-  prune and compact create no database.
+  that an update is required for a missing or incompatible index.
 - `index_id` is a random 128-bit value created with the schema and renewed
   on rebuild. It partitions caches, not list content; there is no index
   generation counter.
@@ -505,14 +504,16 @@ under SSH alone.
 directory excludes other processes:
 
 - A modifying process (`update`, `prune`, `compact`, or the receiver of a
-  run without `--no-update`, for its update) creates the directory and the
-  lock file if necessary, opens the lock file read/write, and takes an
-  exclusive lock before it opens the database read/write.
+  run without `--no-update`, for its update) opens the lock file
+  read/write and takes an exclusive lock before it opens the database
+  read/write. An update first creates the directory and the lock file if
+  necessary, so without the lock file, there is no index. Prune and
+  compact create no directory, lock file, or database, so that a wrong
+  index path leaves no files behind.
 - A read-only process (the receiver of a run with `--no-update`, `stats`)
   opens the lock file read-only and takes a shared lock, then opens the
   database read-only. It sees the database as it was when it opened it.
-  Read-only processes can coexist but exclude a modifying process. Without
-  the lock file, there is no index.
+  Read-only processes can coexist but exclude a modifying process.
 - After its update, a run closes the read/write database, turns its
   exclusive lock into a shared one on the same open file description,
   which never leaves the index unlocked, and opens the database read-only.
