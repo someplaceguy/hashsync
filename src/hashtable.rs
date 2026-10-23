@@ -23,6 +23,7 @@ struct Bucket([u32; 16]);
 const SLOTS: u64 = 16;
 const _: () = assert!(std::mem::size_of::<Bucket>() == 64);
 
+#[derive(Clone)]
 pub struct HashTable {
     buckets: Vec<Bucket>,
     /// The high 32 bits of the value in each slot of `buckets`. Lookups do

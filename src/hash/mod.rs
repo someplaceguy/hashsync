@@ -22,6 +22,10 @@ pub enum StrongHash {
 impl StrongHash {
     pub const DEFAULT: StrongHash = StrongHash::Blake3;
 
+    /// Every supported strong hash, the default first. `from_id` looks names
+    /// up here, so a hash missing from this list cannot be selected.
+    pub const ALL: [StrongHash; 2] = [StrongHash::Blake3, StrongHash::Sha256];
+
     /// The algorithm name used in the index metadata and the protocol.
     pub fn id(self) -> &'static str {
         match self {
@@ -32,11 +36,7 @@ impl StrongHash {
 
     /// The algorithm with this name; `None` for unsupported names.
     pub fn from_id(id: &str) -> Option<StrongHash> {
-        match id {
-            "blake3" => Some(StrongHash::Blake3),
-            "sha256" => Some(StrongHash::Sha256),
-            _ => None,
-        }
+        Self::ALL.into_iter().find(|hash| hash.id() == id)
     }
 
     pub fn digest(self, data: &[u8]) -> Strong {

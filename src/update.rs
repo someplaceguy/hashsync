@@ -5,7 +5,7 @@ use std::sync::atomic::Ordering::Relaxed;
 use std::time::Instant;
 
 use crate::compact;
-use crate::config::Config;
+use crate::config::{Config, MIN_RECOMMENDED_BLOCK_SIZE};
 use crate::escapes::quoted_from_home;
 use crate::fsid::FsCache;
 use crate::fsops;
@@ -86,10 +86,11 @@ pub fn perform(config: &Config, options: Options) -> (index::Index, Vec<Location
         };
     if rebuild {
         // Warn only when the index gets its block size, not on each update.
-        if settings.block_size < 4096 {
+        if settings.block_size < MIN_RECOMMENDED_BLOCK_SIZE {
+            let kib = MIN_RECOMMENDED_BLOCK_SIZE / 1024;
             report::warn(format!(
-                "block_size ({} bytes) is less than 4 KiB, so performance is much \
-                 reduced; a block size of at least 4 KiB is strongly recommended",
+                "block_size ({} bytes) is less than {kib} KiB, so performance is much \
+                 reduced; a block size of at least {kib} KiB is strongly recommended",
                 settings.block_size
             ));
         }

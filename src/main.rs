@@ -15,8 +15,10 @@
 //! blocks with verified references, read from any current copy of their root,
 //! sends runs of one byte compactly, compresses both streams, and spools both
 //! ends of each. Stdout and stdin each use eager or batch delivery.
+//! `bench` measures how fast this host hashes blocks and scans output.
 
 mod attach;
+mod bench;
 mod blocks;
 mod cache;
 mod client;
@@ -94,7 +96,8 @@ struct Cli {
     #[arg(short, long, global = true)]
     quiet: bool,
 
-    /// Show amounts of bytes as whole bytes, without scale units such as KiB
+    /// Show amounts of bytes as whole bytes, without scale units such as KiB,
+    /// and the list sizes of bench as plain numbers
     #[arg(long, global = true)]
     no_human_readable: bool,
 
@@ -108,7 +111,9 @@ impl Cli {
     /// usage error. clap's `conflicts_with` misses a global option before
     /// the command with the other one after it, so this checks them
     /// wherever they are. `serve` reads the file that the client names in
-    /// REQUEST, so either option is a usage error there.
+    /// REQUEST, and `attach` and `bench` read none, so either option is a
+    /// usage error there. The match names every command, so that a new
+    /// one must decide whether it takes these options.
     fn source(&self) -> Result<Source, clap::Error> {
         let (option, source) = match (&self.profile, &self.config) {
             (Some(_), Some(_)) => {
@@ -121,16 +126,22 @@ impl Cli {
             (None, Some(path)) => ("--config <PATH>", Source::File(bytes(path))),
             (None, None) => return Ok(Source::Default),
         };
-        if let Command::Serve { .. } = self.command {
-            return Err(Cli::command().error(
-                ErrorKind::ArgumentConflict,
-                format!(
-                    "the argument '{option}' cannot be used with 'serve', \
-                     which reads the configuration file that the client names"
-                ),
-            ));
-        }
-        Ok(source)
+        let (command, reason) = match self.command {
+            Command::Update { .. }
+            | Command::Stats
+            | Command::Prune { .. }
+            | Command::Compact
+            | Command::Ssh(_) => return Ok(source),
+            Command::Serve { .. } => ("serve", "the configuration file that the client names"),
+            Command::Attach { .. } => ("attach", "no configuration file"),
+            Command::Bench { .. } => ("bench", "no configuration file"),
+        };
+        Err(Cli::command().error(
+            ErrorKind::ArgumentConflict,
+            format!(
+                "the argument '{option}' cannot be used with '{command}', which reads {reason}"
+            ),
+        ))
     }
 }
 
@@ -208,6 +219,20 @@ enum Command {
     /// stdout against the local index, or with --dedup-stdin, stdin against
     /// the remote one, or both
     Ssh(Box<SshArgs>),
+    /// Measure how fast this host computes the hashes that deduplication
+    /// uses at a few common block sizes, on one thread, and scans output
+    /// against hash lists of a few sizes, on one thread and on the probe
+    /// threads
+    Bench {
+        /// Measure only this block size, and scan with it; it takes the
+        /// values that block_size takes in a configuration file
+        #[arg(long, value_name = "SIZE", value_parser = config::parse_block_size)]
+        block_size: Option<u32>,
+        /// The probe threads of the second scan rate, as for ssh; 0 selects
+        /// half the cores, and 1 leaves that rate out
+        #[arg(long, value_name = "N", default_value_t = 0)]
+        probe_threads: u32,
+    },
     /// Internal server entry point: serve one transfer (DESIGN.md §6.1)
     #[command(hide = true)]
     Serve {
@@ -365,6 +390,10 @@ fn main() {
             let config = config::load(&source, request.deduplicated.stdout());
             client::run(config, &args.remote(), &request, args.no_stdin)
         }
+        Command::Bench {
+            block_size,
+            probe_threads,
+        } => bench::run(*block_size, *probe_threads),
         // The server reads the configuration file that REQUEST names, once
         // REQUEST has told it its roles.
         Command::Serve { token } => server::run(token),
@@ -490,17 +519,73 @@ mod tests {
     }
 
     /// `serve` reads the configuration file that the client names in
-    /// REQUEST, so an option of its own that selects one would have no
-    /// meaning (DESIGN.md §7). `attach` reads no file.
+    /// REQUEST, and `attach` and `bench` read none, so an option of their
+    /// own that selects one would have no meaning, before the command or
+    /// after it (DESIGN.md §8).
     #[test]
-    fn serve_takes_its_configuration_file_from_the_client() {
-        let serve = ["serve", "--token", "t"];
-        assert_eq!(parse(&serve).unwrap().source().unwrap(), Source::Default);
-        for option in [["--profile", "work"], ["--config", "/c"]] {
-            let words = [&option[..], &serve].concat();
-            let error = parse(&words).unwrap().source().err().map(|e| e.kind());
-            assert_eq!(error, Some(ErrorKind::ArgumentConflict), "{words:?}");
+    fn serve_attach_and_bench_reject_profile_and_config() {
+        for command in [
+            &["serve", "--token", "t"][..],
+            &["attach", "--token", "t"],
+            &["bench"],
+        ] {
+            let source = parse(command).unwrap().source().unwrap();
+            assert_eq!(source, Source::Default, "{command:?}");
+            for option in [["--profile", "work"], ["--config", "/c"]] {
+                for words in [
+                    [&option[..], command].concat(),
+                    [command, &option[..]].concat(),
+                ] {
+                    let error = parse(&words).unwrap().source().err().map(|e| e.kind());
+                    assert_eq!(error, Some(ErrorKind::ArgumentConflict), "{words:?}");
+                }
+            }
         }
+    }
+
+    /// The block size and the probe threads of `hashsync WORDS...`, which
+    /// must be `bench`.
+    fn bench(words: &[&str]) -> Result<(Option<u32>, u32), clap::Error> {
+        match parse(words)?.command {
+            Command::Bench {
+                block_size,
+                probe_threads,
+            } => Ok((block_size, probe_threads)),
+            _ => panic!("not bench"),
+        }
+    }
+
+    /// `--block-size` takes the values that `block_size` takes in a
+    /// configuration file (DESIGN.md §7 and §8).
+    #[test]
+    fn bench_takes_the_block_sizes_of_the_configuration() {
+        let block_size = |words: &[&str]| bench(words).map(|(size, _)| size);
+        assert_eq!(block_size(&["bench"]).unwrap(), None);
+        let size = block_size(&["bench", "--block-size", "64KiB"]).unwrap();
+        assert_eq!(size, Some(64 * 1024));
+        assert_eq!(
+            block_size(&["bench", "--block-size=512"]).unwrap(),
+            Some(512)
+        );
+        for (size, message) in [
+            ("511", "must be at least 512 bytes"),
+            ("4GiB", "must be at most 4294967295 bytes"),
+            ("16XiB", "unknown unit 'XiB'"),
+        ] {
+            let error = block_size(&["bench", "--block-size", size]).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::ValueValidation, "{size}");
+            assert!(error.to_string().contains(message), "{error}");
+        }
+    }
+
+    /// `--probe-threads` takes the counts that it takes for `ssh`, and
+    /// selects half the cores by default, with 0 (DESIGN.md §8).
+    #[test]
+    fn bench_takes_the_probe_threads_of_ssh() {
+        let threads = |words: &[&str]| bench(words).map(|(_, threads)| threads);
+        assert_eq!(threads(&["bench"]).unwrap(), 0);
+        assert_eq!(threads(&["bench", "--probe-threads", "3"]).unwrap(), 3);
+        assert!(threads(&["bench", "--probe-threads", "-1"]).is_err());
     }
 
     /// By default, the server uses its profile `default`, whatever file the

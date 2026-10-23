@@ -2478,9 +2478,10 @@ and will get a broken pipe on its next write to either closed output pipe.
 
 ## 7. Configuration
 
-Each command reads one configuration file. `--profile NAME` selects the
-file of the **profile** NAME, `$XDG_CONFIG_HOME/hashsync/NAME.toml`
-(fallback `~/.config/hashsync/NAME.toml`), and `--config PATH` a file
+Each command but `attach` and `bench` reads one configuration file.
+`--profile NAME` selects the file of the **profile** NAME,
+`$XDG_CONFIG_HOME/hashsync/NAME.toml` (fallback
+`~/.config/hashsync/NAME.toml`), and `--config PATH` a file
 anywhere. Without either, a command uses the profile `default`, and both
 together are a usage error. A profile name is a nonempty file name, so it
 contains no `/`; any other name is a usage error.
@@ -2746,7 +2747,8 @@ exclude = ['*.tmp', 'literal\x2Aname', 'back\\slash']
   stopped.
 - `hashsync serve --token T` and `hashsync attach --token T`: internal
   server entry points. `serve` reads the configuration file that REQUEST
-  names, so `--profile` and `--config` are a usage error there.
+  names, and `attach` reads none, so `--profile` and `--config` are a
+  usage error for both.
 - `hashsync stats`: report index statistics.
 - `hashsync prune [--scan-immutable]`: remove the roots and paths that no
   current copy holds any more, and the paths that exclusions or
@@ -2755,13 +2757,49 @@ exclude = ['*.tmp', 'literal\x2Aname', 'back\\slash']
   (section 4.2).
 - `hashsync compact`: compact the index as prune does at its end, and do
   nothing else (section 4.4).
+- `hashsync bench [--block-size SIZE] [--probe-threads N]`: measure how
+  fast this host computes the hashes that deduplication uses and scans
+  output, to help choose `strong_hash`, `block_size` and
+  `--probe-threads`. It prints two tables, with an empty line between
+  them. The first has one line per block size, 4 KiB, 16 KiB, 64 KiB and
+  1 MiB, or only SIZE, which accepts the same values as `block_size`
+  (section 7). Each line gives the block size, such as `16 KiB`, then
+  these rates:
+  - `weak`: the weak hash of a whole block (section 5.1), which an update
+    computes for each block that it indexes, and the sender whenever it
+    reinitializes the rolling hash (section 6.3).
+  - `rolling`: the weak hash of the next window, rolled from that of the
+    window before (section 5.1), which the sender computes for the other
+    windows.
+  - Each strong hash of a block (section 5.3).
 
-Every command also accepts these options, besides `--profile NAME` and
-`--config PATH`, which select its configuration file (section 7):
+  Each of these hashes runs on one thread for half a second over the
+  blocks of one read of an update (section 4.5), again and again, so that
+  they fit in the CPU caches exactly when the blocks of an update's read
+  do. The second table has one line per size of the receiver's list: 10
+  thousand values, whose hash table fits in the CPU caches, and 10
+  million, whose table does not. Each line gives the size, `10K` or
+  `10M`, then the rate at which the scanner (section 6.3) searches output
+  that matches none of the values, with the default lookahead and blocks
+  of SIZE or of the default size. The first rate is on one thread. The
+  second is on the probe threads, which search a long stretch of such
+  output at once; `--probe-threads N` sets their count as for `hashsync
+  ssh`, by default half the cores. With one probe thread, the scanner
+  probes on its own thread, so each line has only the first rate. The
+  header gives the thread count of each rate, such as `1 thread` and
+  `12 threads`. Each rate covers half a second of scanning, which leaves
+  out copying the output into the scanner's lookahead buffer. `bench`
+  reads no configuration file, so `--profile` and `--config` are a usage
+  error there.
+
+`--profile NAME` and `--config PATH` select the configuration file of every
+command but `serve`, `attach` and `bench` (section 7). Every command also
+accepts these options:
 
 - `-q` (`--quiet`): do not print progress messages and summaries to
   stderr. Warnings and errors stay.
-- `--no-human-readable`: show all amounts of bytes as whole bytes.
+- `--no-human-readable`: show all amounts of bytes as whole bytes, and the
+  list sizes of `bench` as plain numbers.
 
 `hashsync ssh` sends both to the server in REQUEST, and the server applies
 them to its own notes.
@@ -2809,7 +2847,11 @@ decimal digits, rounded half up, such as `1.50 KiB`, in the first of KiB,
 MiB, GiB, TiB, and PiB in which its rounded value is less than 1024, else
 in PiB. So 1048575 bytes, which round to 1024.00 KiB, show as `1.00 MiB`.
 Settings, limits, and messages that help to debug show exact byte counts,
-because rounding could make them unclear.
+because rounding could make them unclear. The tables of `bench` show a
+block size in the largest of KiB, MiB, GiB, TiB, and PiB of which it is a
+whole number, such as `16 KiB`, else in bytes, such as `4100 B`, and the
+size of a list likewise in the largest of K, M, G, T, and P, powers of
+1000, such as `10M`, so that neither rounds.
 
 ```sh
 hashsync ssh -n backup@nas tar -C /srv/data -cf - . | tar -C /srv/data -xf -

@@ -811,6 +811,13 @@ impl<'a> Scanner<'a> {
     pub fn emitted(&self) -> u64 {
         self.e
     }
+
+    /// `p`: the bytes of the stream that the scanner has scanned. Their
+    /// frames need not have left yet, and a rejection scans the bytes after
+    /// the rejected window again, so this can go back.
+    pub fn scanned(&self) -> u64 {
+        self.p
+    }
 }
 
 /// The length of the run of equal bytes at the end of `window`, which must

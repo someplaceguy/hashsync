@@ -153,6 +153,15 @@ impl BlockHasher {
     }
 }
 
+/// The longest read of a file's data: `MAX_BATCH` rounded down to whole
+/// blocks, and at least one block, even for blocks over 1 MiB (DESIGN.md
+/// §4.5). `hashsync bench` hashes this much data over and over, so that its
+/// data fits in the CPU caches exactly when the data of an update's read
+/// does.
+pub fn max_batch(block_size: u64) -> u64 {
+    block_size * (MAX_BATCH / block_size).max(1)
+}
+
 /// Sparse-file discovery and bounded read planning (DESIGN.md §4.5).
 /// The hasher only needs the resulting ranges, including gaps to count as
 /// holes; seek fallbacks and cached extent information stay here.
@@ -178,8 +187,7 @@ impl ReadPlanner {
     fn new(block_size: u64) -> Self {
         Self {
             block_size,
-            // Whole blocks, at least one, even for blocks over 1 MiB.
-            max_batch: block_size * (MAX_BATCH / block_size).max(1),
+            max_batch: max_batch(block_size),
             hole_window: block_size * (HOLE_WINDOW / block_size).max(1),
             mode: ReadMode::Sparse {
                 hole_start: 0,

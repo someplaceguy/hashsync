@@ -286,8 +286,10 @@ fn start_scan(scan: Scan, spool: Spool, stop: Stop) -> (DataItems, Scanning) {
 /// Start the threads that probe the scanner's long stretches of windows
 /// (DESIGN.md §6.3): `requested` threads, or half the cores for 0. One
 /// thread needs no pool: the scanner probes on its own thread. A thread
-/// that cannot start ends the run.
-fn start_probe_pool(requested: u32) -> Option<Pool> {
+/// that cannot start ends the run. `hashsync bench` starts its probe
+/// threads here too, so that it measures the scan of a sender with the
+/// same `--probe-threads`.
+pub fn start_probe_pool(requested: u32) -> Option<Pool> {
     let count = thread_count(requested) as usize;
     (count > 1).then(|| {
         Pool::try_start("probe", count).unwrap_or_else(|e| {

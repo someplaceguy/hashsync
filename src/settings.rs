@@ -189,24 +189,30 @@ impl RunSettings {
     }
 
     /// The lookahead of a scanner whose stream goes to a receiver with
-    /// blocks of `block_size` bytes: `--lookahead`, or by default the
-    /// larger of 256 MiB and three blocks, which leaves room for the probe
-    /// threads: a stretch of windows splits among them only when it has
-    /// two parts of `B` windows, after up to `B` literal bytes that wait for
-    /// a whole LIT frame (DESIGN.md §6.3). A scan step needs a whole window
-    /// of lookahead, so `--lookahead` below one block is a user error,
-    /// which the client reports. `index` names the receiver's index in the
-    /// message.
+    /// blocks of `block_size` bytes: `--lookahead`, or by default
+    /// `default_lookahead`. A scan step needs a whole window of lookahead,
+    /// so `--lookahead` below one block is a user error, which the client
+    /// reports. `index` names the receiver's index in the message.
     pub fn lookahead(&self, block_size: u32, index: &str) -> Result<u64, String> {
         let block = u64::from(block_size);
         match self.lookahead {
-            None => Ok(DEFAULT_LOOKAHEAD.max(3 * block)),
+            None => Ok(default_lookahead(block_size)),
             Some(lookahead) if lookahead < block => Err(format!(
                 "--lookahead must be at least the block size of {index} ({block} bytes)"
             )),
             Some(lookahead) => Ok(lookahead),
         }
     }
+}
+
+/// The lookahead without `--lookahead`, for a receiver with blocks of
+/// `block_size` bytes: the larger of 256 MiB and three blocks, which leaves
+/// room for the probe threads. A stretch of windows splits among them only
+/// when it has two parts of `B` windows, after up to `B` literal bytes that
+/// wait for a whole LIT frame (DESIGN.md §6.3). `hashsync bench` scans with
+/// this lookahead too, so that its scanner runs as a sender's does.
+pub fn default_lookahead(block_size: u32) -> u64 {
+    DEFAULT_LOOKAHEAD.max(3 * u64::from(block_size))
 }
 
 fn delivery(batch: bool) -> Delivery {

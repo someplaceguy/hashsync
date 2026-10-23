@@ -1,8 +1,10 @@
-//! Amounts of bytes in summaries and statistics (DESIGN.md §8).
+//! Amounts of bytes in summaries and statistics, and the block and list
+//! sizes in the tables of `bench` (DESIGN.md §8).
 //!
 //! Settings, limits, and messages that help to debug, such as panic
 //! messages, show exact byte counts without this module: rounding could
-//! make them unclear.
+//! make them unclear. The sizes in the tables of `bench` are settings too,
+//! so their units never round.
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
@@ -44,9 +46,61 @@ impl fmt::Display for Bytes {
     }
 }
 
+/// An exact amount of bytes, such as a block size in the tables of
+/// `bench`: in the largest of KiB, MiB, GiB, TiB, and PiB of which it is a
+/// whole number, `16 KiB`, else in bytes, `4100 B`. Unlike `Bytes`, it
+/// never rounds. Without human-readable output, it shows as whole bytes.
+pub struct ExactBytes(pub u64);
+
+impl fmt::Display for ExactBytes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match whole_units(self.0, 1024, &UNITS) {
+            Some((whole, unit)) => write!(f, "{whole} {unit}"),
+            None => write!(f, "{} B", self.0),
+        }
+    }
+}
+
+/// An exact count, such as the size of a list in the tables of `bench`: in
+/// the largest of thousands, millions, billions, trillions, and
+/// quadrillions of which it is a whole number, `10K`, else as it is. It
+/// never rounds. Without human-readable output, it shows as it is.
+pub struct ExactCount(pub u64);
+
+const COUNT_UNITS: [&str; 5] = ["K", "M", "G", "T", "P"];
+
+impl fmt::Display for ExactCount {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match whole_units(self.0, 1000, &COUNT_UNITS) {
+            Some((whole, unit)) => write!(f, "{whole}{unit}"),
+            None => write!(f, "{}", self.0),
+        }
+    }
+}
+
+/// `count` as a whole number of the largest of `units` of which it is one,
+/// where the first unit is `base` and each later one is `base` times the
+/// one before it. `None` when `count` is zero or no whole number of the
+/// first unit, and without human-readable output.
+fn whole_units(count: u64, base: u64, units: &[&'static str]) -> Option<(u64, &'static str)> {
+    if !HUMAN_READABLE.load(Relaxed) {
+        return None;
+    }
+    let mut whole = None;
+    let mut rest = count;
+    for &unit in units {
+        if rest == 0 || !rest.is_multiple_of(base) {
+            break;
+        }
+        rest /= base;
+        whole = Some((rest, unit));
+    }
+    whole
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Bytes;
+    use super::{Bytes, ExactBytes, ExactCount};
 
     #[test]
     fn amounts_show_in_scale_units() {
@@ -69,6 +123,38 @@ mod tests {
             (u64::MAX, "16384.00 PiB"),
         ] {
             assert_eq!(Bytes(count).to_string(), shown, "{count} bytes");
+        }
+    }
+
+    #[test]
+    fn exact_amounts_show_in_the_largest_unit_that_divides_them() {
+        for (count, shown) in [
+            (0, "0 B"),
+            (512, "512 B"),
+            (1024, "1 KiB"),
+            // 1.5 KiB is no whole number of KiB.
+            (1536, "1536 B"),
+            (4100, "4100 B"),
+            (16 << 10, "16 KiB"),
+            (1 << 20, "1 MiB"),
+            (3 << 30, "3 GiB"),
+            // No unit is larger than PiB.
+            (1 << 60, "1024 PiB"),
+            (u64::from(u32::MAX), "4294967295 B"),
+        ] {
+            assert_eq!(ExactBytes(count).to_string(), shown, "{count} bytes");
+        }
+        for (count, shown) in [
+            (0, "0"),
+            (999, "999"),
+            (1000, "1K"),
+            (1500, "1500"),
+            (10_000, "10K"),
+            (10_000_000, "10M"),
+            (1_000_000_001, "1000000001"),
+            (10u64.pow(18), "1000P"),
+        ] {
+            assert_eq!(ExactCount(count).to_string(), shown, "{count}");
         }
     }
 }

@@ -24,6 +24,9 @@ use crate::hash::StrongHash;
 use crate::report::{note, warn};
 
 pub const MIN_BLOCK_SIZE: u64 = 512;
+/// The smallest block size that an update does not warn about. Smaller
+/// blocks work, but they reduce performance a lot.
+pub const MIN_RECOMMENDED_BLOCK_SIZE: u32 = 4 * 1024;
 pub const DEFAULT_BLOCK_SIZE: u32 = 16 * 1024;
 
 /// 30 days (DESIGN.md §5.6), in seconds.
@@ -373,13 +376,7 @@ pub fn parse(text: &str, source: &Source) -> Result<Config, String> {
         None => DEFAULT_BLOCK_SIZE,
         Some(size) => {
             let bytes = size.bytes().map_err(|e| format!("block_size: {e}"))?;
-            if bytes < MIN_BLOCK_SIZE {
-                return Err(format!(
-                    "block_size must be at least {MIN_BLOCK_SIZE} bytes"
-                ));
-            }
-            u32::try_from(bytes)
-                .map_err(|_| format!("block_size must be at most {} bytes", u32::MAX))?
+            block_size(bytes).map_err(|e| format!("block_size {e}"))?
         }
     };
     // The name is parsed here and not by serde, so that the error shows it
@@ -387,9 +384,14 @@ pub fn parse(text: &str, source: &Source) -> Result<Config, String> {
     let strong_hash = match raw.strong_hash {
         None => StrongHash::DEFAULT,
         Some(name) => StrongHash::from_id(&name).ok_or_else(|| {
+            let names: Vec<String> = StrongHash::ALL
+                .iter()
+                .map(|hash| format!("`{}`", hash.id()))
+                .collect();
             format!(
-                "strong_hash: unknown hash {}, expected `blake3` or `sha256`",
-                quoted(name.as_bytes())
+                "strong_hash: unknown hash {}, expected {}",
+                quoted(name.as_bytes()),
+                names.join(" or ")
             )
         })?,
     };
@@ -654,6 +656,21 @@ fn check_no_nul(bytes: &[u8]) -> Result<(), String> {
         return Err("NUL byte is not allowed".into());
     }
     Ok(())
+}
+
+/// Parse a block size given on the command line, which takes the same
+/// values as `block_size` in a configuration file.
+pub fn parse_block_size(text: &str) -> Result<u32, String> {
+    block_size(parse_size(text)?)
+}
+
+/// `bytes` as a block size. The index and HELLO store a block size as a
+/// u32, so a larger one is an error too.
+fn block_size(bytes: u64) -> Result<u32, String> {
+    if bytes < MIN_BLOCK_SIZE {
+        return Err(format!("must be at least {MIN_BLOCK_SIZE} bytes"));
+    }
+    u32::try_from(bytes).map_err(|_| format!("must be at most {} bytes", u32::MAX))
 }
 
 /// Parse a size such as `32KiB`, `1MB`, or `4096`.

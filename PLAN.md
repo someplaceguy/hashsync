@@ -66,8 +66,10 @@ shows what each stream read, sent, dropped, and wrote (DESIGN.md §6.6
 and §8). The server marks its lines with `hashsync (server): `, and
 reads its own file of the profile `default`, unless `--server-profile` or
 `--server-config` selects another; every command names its file and
-index in a note, on both hosts of a run (DESIGN.md §7). Step 9 is the next
-milestone.
+index in a note, on both hosts of a run (DESIGN.md §7). `bench` measures
+how fast this host computes the weak and strong hashes at a few block
+sizes, and how fast the scanner searches output, on one thread and on the
+probe threads (DESIGN.md §8). Step 9 is the next milestone.
 
 ## 1. Build and inspect a local index
 
