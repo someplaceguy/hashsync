@@ -14,7 +14,12 @@
 //! any other such entry, but with a warning, since it is configuration.
 //! Every entry that cannot be indexed because of a failure makes its root
 //! unsuccessful, so that an immutable group that the root scans is scanned
-//! again by the next update.
+//! again by the next update. An entry below the root that its permissions
+//! keep from being opened, examined or listed is skipped with a warning
+//! but is no failure: a group's copy keeps its permissions as it keeps its
+//! content, so a scan of the group would be denied again on every update.
+//! A read that fails is a failure whatever its errno, and the root itself
+//! must be readable.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -132,11 +137,17 @@ struct DirCtx<'a> {
 }
 
 /// Why an entry is not indexed. Entries that vanish before they are
-/// opened, and symlinks and special files, are normal and silent; failures
-/// are reported.
+/// opened, and symlinks and special files, are normal and silent; the
+/// others are reported (`Scanner::skipped`).
 enum Skip {
     Vanished,
     OtherKind,
+    /// A permission error (`EACCES` or `EPERM`) of a call that opens,
+    /// examines or lists the entry. The copy's own permissions deny the
+    /// entry, and would deny it again in every scan of an immutable group,
+    /// so it does not make the root unsuccessful, unless they deny the root
+    /// itself (DESIGN.md §4.5).
+    Denied(String),
     Failed(String),
 }
 
@@ -145,6 +156,7 @@ type LocalResult<T> = Result<T, Skip>;
 fn io(what: &'static str) -> impl Fn(Errno) -> Skip {
     move |e| match e {
         Errno::NOENT => Skip::Vanished,
+        Errno::ACCESS | Errno::PERM => Skip::Denied(format!("{what}: {e}")),
         e => Skip::Failed(format!("{what}: {e}")),
     }
 }
@@ -175,6 +187,17 @@ impl<'a> Scanner<'a> {
     fn fail(&self, root: &Root<'_>, rel: &[u8], message: &str) {
         warn(format!("{}: {message}", quoted(&root.abs_path(rel))));
         self.changes.fail_root(root.root_id);
+    }
+
+    /// Report an entry below `root`, at `rel`, that is not indexed because
+    /// of `skip`, unless that is a normal skip, and make the root
+    /// unsuccessful when it is a failure (`Skip`).
+    fn skipped(&self, root: &Root<'_>, rel: &[u8], skip: Skip) {
+        match skip {
+            Skip::Vanished | Skip::OtherKind => {}
+            Skip::Denied(message) => warn(format!("{}: {message}", quoted(&root.abs_path(rel)))),
+            Skip::Failed(message) => self.fail(root, rel, &message),
+        }
     }
 
     /// Scan the root of the row `root_id` at the first of `copies` that is
@@ -214,7 +237,9 @@ impl<'a> Scanner<'a> {
                 Ok(()) => return,
                 Err(Skip::Vanished) => "root does not exist".to_string(),
                 Err(Skip::OtherKind) => "root is not a directory or a regular file".to_string(),
-                Err(Skip::Failed(message)) => message,
+                // A root that its permissions deny cannot be read at all, and
+                // its group must not complete without its files.
+                Err(Skip::Denied(message) | Skip::Failed(message)) => message,
             };
             return self.fail(&root, b"", &message);
         }
@@ -230,11 +255,17 @@ impl<'a> Scanner<'a> {
         } else {
             roots::join(&ctx.rel, &name)
         };
-        let result = fsops::open_path(ctx.fd.as_fd(), &name)
-            .map_err(io("open"))
-            .and_then(|fd| self.visit(scope, fd, &ctx.root, rel.clone(), Some(&ctx)));
-        if let Err(Skip::Failed(message)) = result {
-            self.fail(&ctx.root, &rel, &message);
+        let result = match fsops::open_path(ctx.fd.as_fd(), &name).map_err(io("open")) {
+            // Opening an entry needs the search permission of its directory.
+            // So a root that cannot be searched denies every entry in it, and
+            // cannot be read at all, as a root that cannot be listed.
+            Err(Skip::Denied(message)) if ctx.rel.is_empty() => Err(Skip::Failed(message)),
+            opened => {
+                opened.and_then(|fd| self.visit(scope, fd, &ctx.root, rel.clone(), Some(&ctx)))
+            }
+        };
+        if let Err(skip) = result {
+            self.skipped(&ctx.root, &rel, skip);
         }
     }
 
@@ -360,8 +391,13 @@ impl<'a> Scanner<'a> {
         let readable = match fsops::reopen_file(fd.as_fd()) {
             Ok(readable) => readable,
             Err(e) => {
-                owner.fail();
-                return Err(io("reopen")(e));
+                let skip = io("reopen")(e);
+                if let Skip::Denied(_) = skip {
+                    owner.deny();
+                } else {
+                    owner.fail();
+                }
+                return Err(skip);
             }
         };
         drop(fd);
@@ -385,6 +421,9 @@ impl<'a> Scanner<'a> {
                 self.count(|c| &c.blocks_in_holes, outcome.blocks_in_holes);
                 Ok(())
             }
+            // A read that fails is a failure, also for a permission error:
+            // the file opened, so its permissions are not the cause, and
+            // the cause may not last (DESIGN.md §4.5).
             Err(e) => {
                 hashing.abandon();
                 Err(Skip::Failed(e.to_string()))

@@ -292,7 +292,8 @@ Deliver `hashsync prune [--scan-immutable]`, and `--scan-immutable` for
   those of immutable roots too.
 - Remove the entries of locations that cannot be reached too, with a
   warning, as an update does. A completed group that loses a path this way
-  is scanned again by the next update.
+  is scanned again by the next update, unless permissions below the copy's
+  root deny the lookup (DESIGN.md §4.5).
 - Remove vanished or unconfigured roots and their unused indexed content.
   A vanished immutable root that later returns must be indexed again.
 - Apply the specified exclusive-access rules and retain existing roots that

@@ -31,11 +31,12 @@ use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use std::time::Duration;
 
 use common::{
-    ANSWER, BLOCK, CHUNK, END, Env, FEATURES, HASHDELTA, HASHLIST, HASHNONE, HELLO, KillOnDrop,
-    LIT, QUERY, REQUEST, STOP, STREAM_END, exclusive_lock, frame, hello_payload, ofd_lock,
-    proc_state, quoted, random, shared_lock, tiled, toml_literal, try_recv_frame,
+    ANSWER, BLOCK, CHUNK, END, Env, FEATURES, HASHDELTA, HASHLIST, HASHNONE, HELLO, IndexView,
+    KillOnDrop, LIT, QUERY, REQUEST, Root, STOP, STREAM_END, exclusive_lock, frame, hello_payload,
+    ofd_lock, proc_state, quoted, random, shared_lock, tiled, toml_literal, try_recv_frame,
     version_and_features, wait_for_lock_wait, wait_until_asleep,
 };
+use rocksdb::WriteBatch;
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::fs::{CWD, Mode, OFlags, inotify, mkfifoat};
 use rustix::io::{Errno, read, retry_on_intr};
@@ -1130,21 +1131,30 @@ fn candidates_are_read_from_every_current_copy() {
 
 #[test]
 fn an_unfinished_group_is_read_from_every_copy() {
-    // The scan of the first copy failed on a file that cannot be read, so
-    // the group is unfinished: its root row has no identifier. A run with
-    // `--no-update` finds the copies of the group through the stored path
-    // of the row and the configuration, and a changed block of the
-    // scanned copy is read from the other copy (DESIGN.md §4.2).
+    // The group is unfinished: its root row has no identifier, but it has
+    // the paths of the first copy, as an update leaves it when a read of a
+    // file of the copy fails, or when the update ends before it completes
+    // the group. The test makes that state by removing the identifier. A
+    // run with `--no-update` finds the copies of the group through the
+    // stored path of the row and the configuration, and a changed block of
+    // the scanned copy is read from the other copy (DESIGN.md §4.2).
     for direction in DIRECTIONS {
         let transfer = Transfer::new(&[]);
         let original = tiled(8, 22);
         configure_copies(&transfer, direction, "", &original);
-        transfer
-            .env
-            .write("copies/a/data/secret", &random(BLOCK, 23));
-        transfer.env.chmod("copies/a/data/secret", 0o000);
         transfer.update_receiver(direction, &[]);
-        transfer.env.chmod("copies/a/data/secret", 0o644);
+        let index = IndexView::open(&transfer.receiver_index(direction), true);
+        let mut batch = WriteBatch::default();
+        for root in index.roots() {
+            let unfinished = Root {
+                identifier: None,
+                ..root
+            };
+            let key = unfinished.id.to_be_bytes();
+            batch.put_cf(index.cf("roots"), key, unfinished.value());
+        }
+        index.write(batch);
+        drop(index);
         let payload = transfer.env.path("payload");
         std::fs::write(&payload, &original).unwrap();
         let script = format!("cat '{}'", payload.display());

@@ -5,7 +5,6 @@
 mod common;
 
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
 
 use common::*;
 
@@ -31,14 +30,6 @@ fn pruned(stderr: &str) -> [u64; 3] {
         .map(|number| number.parse().unwrap())
         .collect();
     counts.try_into().unwrap()
-}
-
-/// The warning for a path whose lookup `prune` cannot make.
-fn denied(path: impl AsRef<Path>) -> String {
-    format!(
-        "hashsync: warning: {}: open: Permission denied (os error 13)",
-        quoted(path.as_ref())
-    )
 }
 
 /// Prune removes the paths of the files that a mutable root no longer
@@ -223,10 +214,13 @@ fn paths_that_exclusions_leave_out_go() {
 /// A path whose lookup fails goes too, as an update drops what it cannot
 /// reach: no candidate read could reach it either. A directory that cannot
 /// be searched gets one warning, as in an update, whatever the number of
-/// indexed paths below it, in subdirectories too. In a completed group,
-/// the failure leaves the group unfinished, so that the next update scans
-/// it again, and indexes the files once they can be reached (DESIGN.md §4.2
-/// and §4.5).
+/// indexed paths below it, in subdirectories too. In a completed group, such
+/// a directory below the root leaves the group complete, as a scan of the
+/// copy would, which skips the directory without a failure: here `group`.
+/// But a copy whose root cannot be searched cannot be read at all, so its
+/// group becomes unfinished, and the next update scans it again, and
+/// indexes the files once they can be reached: here `sealed` (DESIGN.md
+/// §4.2 and §4.5).
 #[test]
 fn a_path_that_cannot_be_looked_up_goes() {
     if skip_as_root() {
@@ -239,23 +233,35 @@ fn a_path_that_cannot_be_looked_up_goes() {
     }
     env.write("tree/closed/g", &random(BLOCK, 3));
     env.write("tree/closed/sub/h", &random(BLOCK, 4));
+    env.write("sealed/f", &random(BLOCK, 5));
     env.configure(&format!(
-        "{}{}",
+        "{}{}{}",
         env.root("tree", ""),
-        env.root("group", "immutable = true")
+        env.root("group", "immutable = true"),
+        env.root("sealed", "immutable = true")
     ));
     env.update();
 
-    let closed = [("tree/closed", 0o755), ("group/closed", 0o755)];
+    let closed = [
+        ("tree/closed", 0o755),
+        ("group/closed", 0o755),
+        ("sealed", 0o755),
+    ];
     let stderr = env.run_with_closed(&["prune", "--scan-immutable"], &closed);
     let mut found = warnings(&stderr);
     found.sort();
-    assert_eq!(found.len(), 2, "{stderr}");
-    assert_eq!(found[0], denied(env.path("group/closed/f")), "{stderr}");
+    assert_eq!(found.len(), 3, "{stderr}");
+    assert_eq!(
+        found[0],
+        denied(env.path("group/closed/f"), "open"),
+        "{stderr}"
+    );
+    assert_eq!(found[1], denied(env.path("sealed/f"), "open"), "{stderr}");
     // The warning names one of the paths below the closed directory.
-    let below = ["f", "g", "sub/h"].map(|rel| denied(env.path(format!("tree/closed/{rel}"))));
-    assert!(below.contains(&found[1].to_string()), "{stderr}");
-    assert_eq!(pruned(&stderr), [0, 4, 4], "{stderr}");
+    let below =
+        ["f", "g", "sub/h"].map(|rel| denied(env.path(format!("tree/closed/{rel}")), "open"));
+    assert!(below.contains(&found[2].to_string()), "{stderr}");
+    assert_eq!(pruned(&stderr), [0, 5, 5], "{stderr}");
     assert!(
         stderr.contains(
             "hashsync: immutable roots: 1 incomplete, which the next update scans again\n"
@@ -264,15 +270,15 @@ fn a_path_that_cannot_be_looked_up_goes() {
     );
     assert_eq!(indexed(&env), [pair("group", "ok"), pair("tree", "ok")]);
     let stats = env.stats();
-    assert!(stats.contains("(0 complete immutable)"), "{stats}");
+    assert!(stats.contains("(1 complete immutable)"), "{stats}");
 
     let stderr = env.update();
-    assert_eq!(groups(&stderr), [0, 1, 0]);
+    assert_eq!(groups(&stderr), [1, 1, 0]);
     assert_eq!(
         indexed(&env),
         [
-            pair("group", "closed/f"),
             pair("group", "ok"),
+            pair("sealed", "f"),
             pair("tree", "closed/f"),
             pair("tree", "closed/g"),
             pair("tree", "closed/sub/h"),
@@ -310,41 +316,53 @@ fn a_root_that_vanishes_after_resolution_goes() {
 /// A completed group that a failed lookup leaves unfinished keeps a row
 /// with the path of the first copy that prune opened, by which a run with
 /// `--no-update` finds the copies of an unfinished group, and so does the
-/// next prune, which keeps the group. Here the copy that the row named
-/// vanishes after root resolution, which still found it (DESIGN.md §4.2).
+/// next prune, which keeps the group, and the next update, which scans it
+/// there. The paths that a copy holds stay. Here the copy that the row
+/// named vanishes after root resolution, which still found it, a file goes
+/// from every copy, and the root of the last copy cannot be searched, so
+/// prune cannot tell that this copy does not hold the file (DESIGN.md
+/// §4.2).
 #[test]
 fn an_unfinished_group_keeps_the_path_of_a_current_copy() {
     if skip_as_root() {
         return;
     }
     let env = Env::new();
-    for copy in ["a", "b"] {
+    let copies = ["a", "b", "c"];
+    for copy in copies {
         env.write(format!("copies/{copy}/data/ok"), &random(BLOCK, 1));
-        env.write(format!("copies/{copy}/data/closed/f"), &random(BLOCK, 2));
+        env.write(format!("copies/{copy}/data/gone"), &random(BLOCK, 2));
     }
     let copy = "immutable = true\nidentifier = 'name'";
     env.configure(&format!(
-        "{}{}",
+        "{}{}{}",
         env.root("copies/a/data", copy),
-        env.root("copies/b/data", copy)
+        env.root("copies/b/data", copy),
+        env.root("copies/c/data", copy)
     ));
     env.update();
+    for copy in copies {
+        std::fs::remove_file(env.path(format!("copies/{copy}/data/gone"))).unwrap();
+    }
 
-    let closed = env.close(&[("copies/b/data/closed", 0o755)]);
+    let closed = env.close(&[("copies/c/data", 0o755)]);
     let a = env.path("copies/a/data");
     let args = ["prune", "--scan-immutable"];
     let stderr = env.run_after_resolution(&args, || std::fs::remove_dir_all(&a).unwrap());
     drop(closed);
-    let expected = [missing(&a), denied(env.path("copies/b/data/closed/f"))];
+    let expected = [missing(&a), denied(env.path("copies/c/data/gone"), "open")];
     assert_eq!(warnings(&stderr), expected, "{stderr}");
     assert_eq!(pruned(&stderr), [0, 1, 1], "{stderr}");
     let rows = env.index().roots();
     let b = env.path("copies/b/data").as_os_str().as_bytes().to_vec();
     assert_eq!(rows.len(), 1);
     assert_eq!((rows[0].identifier.as_deref(), &rows[0].path), (None, &b));
+    assert_eq!(indexed(&env), [pair("copies/b/data", "ok")]);
 
     let stderr = prune(&env, &[]);
     assert_eq!(pruned(&stderr), [0, 0, 0], "{stderr}");
+    let stderr = env.update();
+    assert_eq!(groups(&stderr), [0, 1, 0]);
     assert_eq!(indexed(&env), [pair("copies/b/data", "ok")]);
 }
 

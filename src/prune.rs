@@ -14,9 +14,12 @@
 //! copy holds goes. So does a path whose lookup fails, as an update drops
 //! what it cannot reach: no candidate read could reach it either. Such a
 //! failure leaves a completed group unfinished, as a failure in the scan of
-//! a group does (DESIGN.md §4.5), so that the next update scans it again. A
-//! directory below which lookups fail gets one warning, as a directory that
-//! an update cannot read does, and not one for each indexed path below it.
+//! a group does (DESIGN.md §4.5), so that the next update scans it again,
+//! unless the permissions of a directory or a file below the root of the
+//! copy deny the lookup: the scan of a copy skips such an entry without a
+//! failure too. A directory below which lookups fail gets one warning, as a
+//! directory that an update cannot read does, and not one for each indexed
+//! path below it.
 //! A root none of whose copies opens as a directory or a regular file goes
 //! too.
 
@@ -206,7 +209,9 @@ fn look_into<'a>(
 enum Lookup {
     /// A copy holds the path (`CurrentCopy::holds`).
     Held,
-    /// No copy holds one.
+    /// No copy holds one. A copy where the permissions of an entry below its
+    /// root deny the lookup holds none either, since a scan of the copy
+    /// skips the entry without a failure (DESIGN.md §4.5).
     Absent,
     /// No copy holds one, but a lookup failed, so a copy may. The path goes
     /// all the same: no candidate read could reach it either.
@@ -225,13 +230,15 @@ fn lookup(copies: &[CurrentCopy<'_>], rel_path: &[u8]) -> Lookup {
             Err(failure) => failures.push(failure),
         }
     }
-    if failures.is_empty() {
-        return Lookup::Absent;
+    let mut lookup = Lookup::Absent;
+    for failure in failures {
+        // A failed copy has had its own warning.
+        let denied = failure.is_some_and(|failure| failure.report(rel_path));
+        if !denied {
+            lookup = Lookup::Failed;
+        }
     }
-    for failure in failures.into_iter().flatten() {
-        failure.report(rel_path);
-    }
-    Lookup::Failed
+    lookup
 }
 
 /// A current copy of a root, which prune opens when a lookup first needs
@@ -300,6 +307,19 @@ struct Failure<'c> {
     dir: &'c CopyDir,
     /// The warning that reports the failure.
     message: String,
+    /// What denied the lookup by its permissions (`EACCES` or `EPERM`), if
+    /// that is why it failed.
+    denied: Option<Denier>,
+}
+
+/// What denied a lookup by its permissions.
+enum Denier {
+    /// A directory on the way to the path, which cannot be searched: the
+    /// deepest one that still opens, which can be the root.
+    Directory,
+    /// The file at the path, which opened. Examining it needs no
+    /// permission, but a security module can still deny it.
+    File,
 }
 
 impl Failure<'_> {
@@ -307,11 +327,19 @@ impl Failure<'_> {
     /// already reported a failure in the same directory: the deepest one
     /// above the path that still opens. So a directory that cannot be
     /// searched gets one warning, as a directory that an update cannot
-    /// read does, and not one for each indexed path below it.
-    fn report(self, rel_path: &[u8]) {
+    /// read does, and not one for each indexed path below it. Returns true
+    /// when the permissions of an entry below the root denied the lookup,
+    /// which the scan of the copy skips without a failure: the root itself
+    /// must be readable (DESIGN.md §4.5).
+    fn report(self, rel_path: &[u8]) -> bool {
         let dir = self.dir.deepest_open(rel_path);
         if self.dir.failed.lock().unwrap().insert(dir.to_vec()) {
             warn(self.message);
+        }
+        match self.denied {
+            Some(Denier::Directory) => !dir.is_empty(),
+            Some(Denier::File) => true,
+            None => false,
         }
     }
 }
@@ -361,10 +389,15 @@ impl<'a> CurrentCopy<'a> {
         if rel_path.is_empty() {
             return Ok(false);
         }
-        let failure = |what: &str, e: Errno| {
+        let failure = |what: &str, e: Errno, denier: Denier| {
             let path = roots::join(&self.location.path, rel_path);
             let message = format!("{}: {what}: {e}", quoted(&path));
-            Err(Some(Failure { dir, message }))
+            let denied = matches!(e, Errno::ACCESS | Errno::PERM).then_some(denier);
+            Err(Some(Failure {
+                dir,
+                message,
+                denied,
+            }))
         };
         let file = match dir.open(rel_path) {
             Ok(file) => file,
@@ -372,11 +405,11 @@ impl<'a> CurrentCopy<'a> {
             // reach: the path goes through a symlink, or with
             // `one_filesystem`, across a mount point.
             Err(Errno::NOENT | Errno::NOTDIR | Errno::LOOP | Errno::XDEV) => return Ok(false),
-            Err(e) => return failure("open", e),
+            Err(e) => return failure("open", e, Denier::Directory),
         };
         match fsops::stat(file.as_fd()) {
             Ok(meta) => Ok(meta.kind == FileType::RegularFile),
-            Err(e) => failure("statx", e),
+            Err(e) => failure("statx", e, Denier::File),
         }
     }
 

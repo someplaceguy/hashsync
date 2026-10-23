@@ -15,12 +15,13 @@
 //!
 //! The changes also keep the completion markers of the immutable groups
 //! (DESIGN.md §4.2). A root whose scan fails, because an entry under it
-//! cannot be indexed, is remembered until the scan ends, and so is every
-//! root with a path of a file whose processing fails. Once every
-//! transaction has committed, the unfinished groups that the scan
-//! traversed without a failure get their markers. A completed group, which
-//! the update does not scan, loses its marker when an owner abandons a
-//! file that the group shares, before the file's paths go.
+//! fails, is remembered until the scan ends, and so is every root with a
+//! path of a file whose processing fails, and a single-file root that its
+//! permissions keep from being opened for reading. Once every transaction
+//! has committed, the unfinished groups that the scan traversed without a
+//! failure get their markers. A completed group, which the update does not
+//! scan, loses its marker when an owner abandons a file that the group
+//! shares, before the file's paths go.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -112,9 +113,9 @@ impl<'a> Changes<'a> {
     }
 
     /// Remember that the scan of the root `root_id` did not index all of
-    /// it: an entry under it could not be indexed, or no copy of its group
-    /// was there. An unfinished group of such a root stays unfinished, and
-    /// the next update scans it again (DESIGN.md §4.5).
+    /// it: an entry under it failed, or no copy of its group was there. An
+    /// unfinished group of such a root stays unfinished, and the next update
+    /// scans it again (DESIGN.md §4.5).
     pub fn fail_root(&self, root_id: u64) {
         self.failed.lock().unwrap().insert(root_id);
     }
@@ -163,8 +164,8 @@ impl<'a> Changes<'a> {
                 self.writer().insert_path(inode_id, &path);
                 return Claim::Linked;
             }
-            Found::Failed(path) => {
-                self.fail_root(path.root_id);
+            Found::Dropped(why, path) => {
+                self.drop_link(why, &path);
                 return Claim::Linked;
             }
             Found::Deferred => return Claim::Linked,
@@ -257,13 +258,32 @@ impl<'a> Changes<'a> {
         summary
     }
 
-    /// The processing of the file `identity`, which its owner found at
-    /// `path`, failed: no link adds a path, and the roots of all links,
-    /// those that waited and those that come later, are unsuccessful
-    /// (DESIGN.md §4.6).
-    fn drop_failed(&self, identity: &Identity, path: &RelPath) {
-        self.fail_root(path.root_id);
-        for path in self.files.discard(identity) {
+    /// The file `identity`, which its owner found at `path`, has no rows,
+    /// for the reason `why`: no link adds a path, and the roots of the
+    /// links, the owner's, those that waited, and those that come later,
+    /// are unsuccessful as `drop_link` says (DESIGN.md §4.6).
+    fn drop_file(&self, why: Dropped, identity: &Identity, path: &RelPath) {
+        self.drop_link(why, path);
+        for path in self.files.discard(identity, why) {
+            self.drop_link(why, &path);
+        }
+    }
+
+    /// A link at `path` of a file that has no rows, for the reason `why`,
+    /// adds no path. Its root is unsuccessful when the file's processing
+    /// failed. A file that its permissions keep from being opened for
+    /// reading is skipped below the root, as any entry is that the
+    /// permissions of the root's copy deny, which a scan would find again
+    /// on every update; but a single-file root that is the link cannot be
+    /// read at all, so that root is unsuccessful, and its group does not
+    /// complete without its file (DESIGN.md §4.5).
+    fn drop_link(&self, why: Dropped, path: &RelPath) {
+        let fails = match why {
+            Dropped::Small => false,
+            Dropped::Denied => path.rel_path.is_empty(),
+            Dropped::Failed => true,
+        };
+        if fails {
             self.fail_root(path.root_id);
         }
     }
@@ -348,9 +368,9 @@ pub enum Claim<'c, 'a> {
 }
 
 /// The owner of a file that its task must hash. The owner ends with
-/// `fail`, or with `begin` and then `end` or `abandon`, which publish the
-/// file's result to the other links. `Changes::finish` checks that every
-/// claimed file has a result.
+/// `fail` or `deny`, or with `begin` and then `end` or `abandon`, which
+/// publish the file's result to the other links. `Changes::finish` checks
+/// that every claimed file has a result.
 #[must_use]
 pub struct Owner<'c, 'a> {
     changes: &'c Changes<'a>,
@@ -404,13 +424,23 @@ impl<'c, 'a> Owner<'c, 'a> {
         }
     }
 
-    /// The file cannot be opened for reading: no link adds a path, and the
-    /// roots of the links are unsuccessful. The existing row of the file,
-    /// if any, gets no path either, so it goes with the orphans after the
-    /// scan, unless a completed group, which the update does not scan,
-    /// keeps a path of it.
+    /// The file cannot be opened for reading, and not because of its
+    /// permissions (`deny`): no link adds a path, and the roots of the links
+    /// are unsuccessful. The existing row of the file, if any, gets no path
+    /// either, so it goes with the orphans after the scan, unless a
+    /// completed group, which the update does not scan, keeps a path of it.
     pub fn fail(self) {
-        self.changes.drop_failed(&self.identity, &self.path);
+        self.changes
+            .drop_file(Dropped::Failed, &self.identity, &self.path);
+    }
+
+    /// The file cannot be opened for reading because its permissions deny
+    /// it: no link adds a path, nor does the existing row get one, as with
+    /// `fail`, but only a single-file root that is a link of the file is
+    /// unsuccessful (`Changes::drop_link`).
+    pub fn deny(self) {
+        self.changes
+            .drop_file(Dropped::Denied, &self.identity, &self.path);
     }
 }
 
@@ -485,7 +515,7 @@ impl Hashing<'_, '_> {
         changes.invalidate_groups(&mut self.writer.txn, self.inode_id);
         self.writer.txn.delete_inode(self.inode_id, self.row);
         self.writer.txn.checkpoint();
-        changes.drop_failed(&self.identity, &self.path);
+        changes.drop_file(Dropped::Failed, &self.identity, &self.path);
     }
 }
 
@@ -535,20 +565,27 @@ impl Existing {
 #[derive(Default)]
 struct Files(Mutex<HashMap<Identity, FileState>>);
 
-/// The state of a claimed file. `Small` and `Failed` are the Dropped state
-/// of DESIGN.md §4.6, which keeps them apart only for the roots of later
-/// links.
+/// The state of a claimed file (DESIGN.md §4.6).
 enum FileState {
     /// The owner has no result yet: the paths of other links wait here.
     Pending(Vec<RelPath>),
     /// The owner's inode row has committed: other links add their paths
     /// to it.
     Indexed(u64),
-    /// The file has no rows because it is too small to index: other links
-    /// add nothing.
+    /// The file has no rows, for the reason given: other links add
+    /// nothing.
+    Dropped(Dropped),
+}
+
+/// Why a claimed file has no rows, which decides whether the roots of its
+/// links are unsuccessful (`Changes::drop_link`).
+#[derive(Clone, Copy, PartialEq)]
+enum Dropped {
+    /// The file is too small to index.
     Small,
-    /// The file has no rows because its processing failed: other links add
-    /// nothing, and their roots are unsuccessful.
+    /// Its permissions deny opening it for reading.
+    Denied,
+    /// Its processing failed.
     Failed,
 }
 
@@ -559,11 +596,12 @@ enum Found {
     /// Another link of a file whose inode row has committed: the task adds
     /// this path to the row.
     Link(u64, RelPath),
-    /// Another link of a file whose processing failed: this path goes
-    /// nowhere, and its root is unsuccessful.
-    Failed(RelPath),
-    /// Another link of a file without a committed row: the path waits for
-    /// the owner's result, or goes nowhere if the file is too small.
+    /// Another link of a file that has no rows, for the reason given: this
+    /// path goes nowhere, and its root is unsuccessful as
+    /// `Changes::drop_link` says.
+    Dropped(Dropped, RelPath),
+    /// Another link of a file whose owner has no result yet: the path waits
+    /// for that result.
     Deferred,
 }
 
@@ -575,7 +613,7 @@ impl Files {
         if files.contains_key(identity) {
             return false;
         }
-        files.insert(identity.clone(), FileState::Small);
+        files.insert(identity.clone(), FileState::Dropped(Dropped::Small));
         true
     }
 
@@ -592,8 +630,7 @@ impl Files {
                 Found::Deferred
             }
             Some(FileState::Indexed(inode_id)) => Found::Link(*inode_id, path),
-            Some(FileState::Small) => Found::Deferred,
-            Some(FileState::Failed) => Found::Failed(path),
+            Some(FileState::Dropped(why)) => Found::Dropped(*why, path),
         }
     }
 
@@ -606,10 +643,10 @@ impl Files {
         }
     }
 
-    /// The owner's processing failed: drop the paths of later links.
-    /// Returns the paths that waited, which go nowhere either.
-    fn discard(&self, identity: &Identity) -> Vec<RelPath> {
-        match self.settle(identity, FileState::Failed) {
+    /// The owner's file gets no rows, for the reason `why`, which later
+    /// links find. Returns the paths that waited, which go nowhere either.
+    fn discard(&self, identity: &Identity, why: Dropped) -> Vec<RelPath> {
+        match self.settle(identity, FileState::Dropped(why)) {
             FileState::Pending(paths) => paths,
             _ => panic!("the result of a file was published twice"),
         }
@@ -860,25 +897,32 @@ mod tests {
         assert_eq!(waiting, [b"b".to_vec()]);
         assert!(matches!(files.claim(&one, path("c")), Found::Link(7, p) if p.rel_path == b"c"));
 
-        // A failed owner drops the waiting paths and the later ones, whose
-        // roots are then unsuccessful.
-        let two = identity(2);
-        assert!(matches!(files.claim(&two, path("a")), Found::Owner(_)));
-        assert!(matches!(files.claim(&two, path("b")), Found::Deferred));
-        let waited: Vec<_> = files
-            .discard(&two)
-            .into_iter()
-            .map(|p| p.rel_path)
-            .collect();
-        assert_eq!(waited, [b"b".to_vec()]);
-        assert!(matches!(files.claim(&two, path("c")), Found::Failed(p) if p.rel_path == b"c"));
+        // An owner whose file gets no rows drops the waiting paths and the
+        // later ones, which find why: its processing failed, or its
+        // permissions deny opening it for reading.
+        for (handle, why) in [(2, Dropped::Failed), (4, Dropped::Denied)] {
+            let file = identity(handle);
+            assert!(matches!(files.claim(&file, path("a")), Found::Owner(_)));
+            assert!(matches!(files.claim(&file, path("b")), Found::Deferred));
+            let waited: Vec<_> = files
+                .discard(&file, why)
+                .into_iter()
+                .map(|p| p.rel_path)
+                .collect();
+            assert_eq!(waited, [b"b".to_vec()]);
+            let later = files.claim(&file, path("c"));
+            assert!(
+                matches!(later, Found::Dropped(found, p) if found == why && p.rel_path == b"c")
+            );
+        }
 
         // Only the first claim of a small file owns it, and no link of it
         // adds a path, even one that finds the file large.
         let three = identity(3);
         assert!(files.claim_small(&three));
         assert!(!files.claim_small(&three));
-        assert!(matches!(files.claim(&three, path("d")), Found::Deferred));
+        let large = files.claim(&three, path("d"));
+        assert!(matches!(large, Found::Dropped(Dropped::Small, _)));
         assert!(!files.claim_small(&one));
         assert_eq!(files.pending(), 0, "every claimed file has a result");
     }
@@ -1099,8 +1143,9 @@ mod tests {
     /// that waited for an owner that failed, a link that came later, and a
     /// failed entry of the traversal leave their groups unfinished. The row
     /// of a group whose scan took another copy than the first names that
-    /// copy, also when the group stays unfinished (DESIGN.md §4.2 and
-    /// §4.6).
+    /// copy, also when the group stays unfinished, and the group keeps the
+    /// paths that the scan found there, which a run with `--no-update`
+    /// reads (DESIGN.md §4.2 and §4.6).
     #[test]
     fn groups_complete_only_without_failures() {
         let mut fixture = Fixture::new();
@@ -1126,12 +1171,16 @@ mod tests {
             assert!(matches!(claim(1), Claim::Linked));
             owner.fail();
             assert!(matches!(claim(2), Claim::Linked));
-            // Group three has a file of its own.
-            let Claim::Owner(owner) = changes.claim(fixture.identity(2), path(3, "b"), 4096, 1)
-            else {
-                panic!("the first claim owns the file");
-            };
-            owner.begin().end();
+            // Groups three and four have files of their own, and another
+            // entry of four fails.
+            for (handle, root_id, name) in [(2, 3, "b"), (3, 4, "c")] {
+                let Claim::Owner(owner) =
+                    changes.claim(fixture.identity(handle), path(root_id, name), 4096, 1)
+                else {
+                    panic!("the first claim owns the file");
+                };
+                owner.begin().end();
+            }
         });
         changes.scan_copy(4, b"/four-b");
         changes.fail_root(4);
@@ -1140,6 +1189,7 @@ mod tests {
             (summary.groups_completed, summary.groups_incomplete),
             (1, 3)
         );
+        assert_eq!(fixture.committed_paths(), [b"b".to_vec(), b"c".to_vec()]);
         assert_eq!(
             identifiers(&fixture.index),
             [
@@ -1152,6 +1202,68 @@ mod tests {
         );
         let (_, four) = &fixture.index.roots()[3];
         assert_eq!(four.path, b"/four-b");
+    }
+
+    /// A file that its permissions keep from being read leaves no group
+    /// unfinished through a link below the group's root: the scan of a
+    /// copy skips it as it skips any entry that the copy's permissions deny.
+    /// A single-file root that is a link of the file cannot be read at all,
+    /// so it stays unfinished, whether its link owns the file, waits for the
+    /// owner, or comes later (DESIGN.md §4.5 and §4.6).
+    #[test]
+    fn denied_files_leave_only_their_single_file_roots_unfinished() {
+        let mut fixture = Fixture::new();
+        let roots = [
+            current(b"/one", Some(b"one")),
+            current(b"/two", Some(b"two")),
+            current(b"/three", Some(b"three")),
+            current(b"/four", Some(b"four")),
+            current(b"/five", Some(b"five")),
+            current(b"/m", None),
+        ];
+        fixture.reconciliation = fixture.index.reconcile_roots(&roots, false);
+        let changes = fixture.changes();
+        let path = |root_id, name: &str| RelPath {
+            root_id,
+            rel_path: name.as_bytes().to_vec(),
+        };
+        let owner = |handle, path| match changes.claim(fixture.identity(handle), path, 4096, 1) {
+            Claim::Owner(owner) => owner,
+            _ => panic!("the first claim owns the file"),
+        };
+        fixture.pool.install(|| {
+            // The mutable root owns a file that groups one to four link:
+            // one and three below their roots, two and four as single-file
+            // roots. One and two wait for the owner; three and four come
+            // after it.
+            let claim =
+                |root_id, name| changes.claim(fixture.identity(1), path(root_id, name), 4096, 1);
+            let denied = owner(1, path(6, "f"));
+            assert!(matches!(claim(1, "f"), Claim::Linked));
+            assert!(matches!(claim(2, ""), Claim::Linked));
+            denied.deny();
+            assert!(matches!(claim(3, "f"), Claim::Linked));
+            assert!(matches!(claim(4, ""), Claim::Linked));
+            // Group five, a single-file root, owns its file.
+            owner(2, path(5, "")).deny();
+        });
+        let summary = changes.finish();
+        assert_eq!(summary.paths, 0);
+        assert_eq!(
+            (summary.groups_completed, summary.groups_incomplete),
+            (2, 3)
+        );
+        assert_eq!(
+            identifiers(&fixture.index),
+            [
+                (1, Some(b"one".to_vec())),
+                (2, None),
+                (3, Some(b"three".to_vec())),
+                (4, None),
+                (5, None),
+                (6, None)
+            ]
+        );
     }
 
     /// An owner that ends without a result is a bug, which `finish`

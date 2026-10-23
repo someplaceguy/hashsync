@@ -164,8 +164,19 @@ impl Env {
     /// Make the entries `closed` impossible to read or search, each with the
     /// mode that it gets back when the returned value drops.
     pub fn close<'a>(&'a self, closed: &[(&'a str, u32)]) -> Closed<'a> {
+        self.close_to(closed, 0o000)
+    }
+
+    /// Make the directories `closed` impossible to search, though they can
+    /// still be listed, so that no entry in them opens: `close` with mode
+    /// 0444.
+    pub fn close_search<'a>(&'a self, closed: &[(&'a str, u32)]) -> Closed<'a> {
+        self.close_to(closed, 0o444)
+    }
+
+    fn close_to<'a>(&'a self, closed: &[(&'a str, u32)], mode: u32) -> Closed<'a> {
         for &(rel, _) in closed {
-            self.chmod(rel, 0o000);
+            self.chmod(rel, mode);
         }
         Closed {
             env: self,
@@ -317,9 +328,9 @@ impl Env {
 }
 
 /// Entries of an environment that cannot be read or searched while this
-/// value lives (`Env::close`). Its drop gives them their modes back, also
-/// when an assertion fails, so that the cleanup of the test can remove the
-/// tree.
+/// value lives (`Env::close`, `Env::close_search`). Its drop gives them
+/// their modes back, also when an assertion fails, so that the cleanup of
+/// the test can remove the tree.
 pub struct Closed<'a> {
     env: &'a Env,
     entries: Vec<(&'a str, u32)>,
@@ -386,6 +397,15 @@ pub fn missing(path: impl AsRef<Path>) -> String {
     )
 }
 
+/// The warning for the entry at `path` when permissions deny the operation
+/// `what` on it, such as `open` or `reopen`.
+pub fn denied(path: impl AsRef<Path>, what: &str) -> String {
+    format!(
+        "hashsync: warning: {}: {what}: Permission denied (os error 13)",
+        quoted(path.as_ref())
+    )
+}
+
 /// True when the test runs as root, whom permissions do not stop: the tests
 /// of entries that cannot be read or searched skip themselves then.
 pub fn skip_as_root() -> bool {
@@ -421,6 +441,18 @@ pub struct Root {
     pub id: u64,
     pub identifier: Option<Vec<u8>>,
     pub path: Vec<u8>,
+}
+
+impl Root {
+    /// The `roots` value: the length of the identifier, which is zero
+    /// without one, the identifier, and the path.
+    pub fn value(&self) -> Vec<u8> {
+        let identifier = self.identifier.as_deref().unwrap_or_default();
+        let mut value = (identifier.len() as u32).to_be_bytes().to_vec();
+        value.extend_from_slice(identifier);
+        value.extend_from_slice(&self.path);
+        value
+    }
 }
 
 /// A row of `inodes`.

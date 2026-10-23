@@ -382,7 +382,10 @@ cannot reach (section 4.5): no candidate read could reach it. Such a
 failure also makes a completed group unfinished, so that the next update
 scans it again, and its row takes the path of the first copy that prune
 opened, by which a run with `--no-update` finds its copies: the copy that
-the row named can have vanished after root resolution. Prune warns once
+the row named can have vanished after root resolution. A permission error
+below the root of the copy does not make the group unfinished, since it does
+not fail a scan of the copy either (section 4.5); a lookup that the root
+itself denies, because the root cannot be searched, does. Prune warns once
 for each directory in which lookups fail: the deepest directory above a
 failed path that still opens. So a directory that cannot be searched gets
 one warning, as in an update, and not one for each indexed path below it.
@@ -657,6 +660,20 @@ them, abandon the entry, and continue. An entry that vanishes before it is
 opened is skipped silently. Entries that are not indexed are normal and do
 not change the exit status. A directory failure also skips unread
 descendants. Mark the root unsuccessful so an immutable traversal is retried.
+Opening, metadata, and directory-listing errors below the root that are
+permission errors (`EACCES` or `EPERM`) are the exception, such as a
+directory that cannot be searched or listed, or a file that cannot be
+opened for reading: the entry is logged and skipped, but the root stays
+successful. A copy keeps its permissions just as it keeps its content, so
+a retry would be denied again, and a group with one private file would
+otherwise be scanned on every update. Reading errors are no exception,
+whatever their errno: the permissions of a file are checked when it
+opens, so a read that is denied later has another cause, which may not
+last. A permission error on the root itself, including a root that cannot
+be searched, still marks the root unsuccessful, so a copy that cannot be
+read at all never completes empty. Access that the scanning user gains
+later, such as a new group membership, reaches a completed group only
+through `--scan-immutable`.
 If inode work has begun, its owner removes the partial result (section 4.6).
 Supported identity and hole-seeking fallbacks are not failures. Database
 failures and invariant violations are fatal. The traversal conflicts above
@@ -689,7 +706,7 @@ The file visited set holds the state of each claimed file, keyed by
 |---|---|
 | Pending | The owner has no result yet. The paths of other links wait in the entry. |
 | Indexed | The owner's inode row has committed. Other links add their paths to it. |
-| Dropped | The file has no rows: it is too small to index, or its processing failed. Other links add nothing. |
+| Dropped | The file has no rows: it is too small to index, its permissions deny opening it for reading, or its processing failed. Other links add nothing. |
 
 The first claim of a file makes its task the owner, with a Dropped entry
 for a file too small to index and a Pending entry otherwise. The owner
@@ -706,8 +723,11 @@ When the owner publishes Indexed, it adds the paths that waited; a later
 link adds its own path. A path therefore commits only after its inode row.
 A link that finds Pending waits even if an old complete row exists. Every
 claimed file ends Indexed or Dropped. A failure makes the roots of all
-waiting and later paths unsuccessful. Do not retry an abandoned inode
-through another hard link during the same update.
+waiting and later paths unsuccessful. A file that its permissions keep from
+being opened for reading makes only a single-file root that is a link of it
+unsuccessful: that root cannot be read at all, while for the other links
+the file is an entry below the root (section 4.5). Do not retry an
+abandoned inode through another hard link during the same update.
 
 Tasks mark failed roots, which stay remembered until the scan ends. Once
 all scan tasks finish and every thread's transaction has committed,
@@ -2928,6 +2948,13 @@ decision history, including fuller measurements, is in version control.
   immutable roots (88,067 groups, 487,423 paths, and 2.28M small files),
   `prune --scan-immutable` took 0.9–1.0 s, and a scan of every group,
   which `update --scan-immutable` makes without hashing a file, 9.8–9.9 s.
+- **Retrying permission errors below the root of an immutable group:** the
+  copy's own permissions deny every retry, so a group with one private file
+  would be scanned on every update, like a mutable root, and warn every
+  time. With all of `/nix/store` scanned that way, an update without
+  changes took 10–14 s instead of 0.3–0.5 s. Retrying only the denied
+  entries of a completed group would need rows for them and partial scans
+  of completed groups.
 - **Other locks:** RocksDB's own `LOCK` file keeps only read/write opens
   apart, and a second open fails at once. A `flock` on the index directory
   fails on NFS, where Linux emulates it with byte-range locks, and an
@@ -3366,17 +3393,22 @@ decision history, including fuller measurements, is in version control.
     copies are all missing, which goes; a copy that vanishes after root
     expansion and may vanish, which gives its place to the next copy,
     whose path the row of the group takes also when its scan fails, and
-    one that may not vanish, which leaves its group unfinished; no tasks
-    or scans solely for overlap checks; completion withheld after a late
-    directory conflict; conflicting copy policies; a pruned immutable root
-    that returns; `update --scan-immutable`, and `ssh --scan-immutable` in
-    both directions, which scan completed groups again;
+    one that may not vanish, which leaves its group unfinished; entries
+    below the root of a group that permissions deny, which leave the group
+    complete, and a root that cannot be read or searched, also a
+    single-file root that is a hard link of a file that cannot be read,
+    which leaves its group unfinished; no tasks or scans solely for
+    overlap checks; completion withheld after a late directory conflict;
+    conflicting copy policies; a pruned immutable root that returns;
+    `update --scan-immutable`, and `ssh --scan-immutable` in both
+    directions, which scan completed groups again;
   - prune: roots that no copy holds, paths that no copy holds, in mutable
     roots, and in immutable ones only with `--scan-immutable`, a path that
     another copy holds, which stays, paths that exclusions by name and by
     absolute path, also of a directory above them, or `one_filesystem` now
     leave out, a path that prune cannot look up, whose completed group the
-    next update scans again, one warning for a directory that cannot be
+    next update scans again, unless permissions below the root of the copy
+    deny the lookup, one warning for a directory that cannot be
     searched, a root that no longer opens as a directory or a regular file,
     a copy that vanishes after root resolution, also the one that the row
     of a group that becomes unfinished named, a missing index, which prune

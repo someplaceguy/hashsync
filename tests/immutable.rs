@@ -186,11 +186,15 @@ fn groups_that_the_configuration_no_longer_names_go() {
     env.index().assert_consistent();
 }
 
-/// An entry of an immutable root that cannot be indexed leaves its group
-/// unfinished, with the paths that the scan found: the next update scans
-/// the group again, until a scan has no failure (DESIGN.md §4.5).
+/// An entry below the root of an immutable group that its permissions deny
+/// is skipped with a warning, as in a mutable root, and the group completes
+/// with the other files: a copy keeps its permissions as it keeps its
+/// content, so a scan of the group would be denied again on every update.
+/// Here a file cannot be read, a directory cannot be listed, and another
+/// one cannot be searched. Access that comes later reaches the completed
+/// group only through `--scan-immutable` (DESIGN.md §4.5).
 #[test]
-fn a_failed_scan_leaves_its_group_unfinished() {
+fn entries_that_permissions_deny_leave_their_group_complete() {
     if skip_as_root() {
         return;
     }
@@ -198,38 +202,87 @@ fn a_failed_scan_leaves_its_group_unfinished() {
     env.write("tree/ok", &random(BLOCK, 1));
     env.write("tree/secret", &random(BLOCK, 2));
     env.write("tree/closed/f", &random(BLOCK, 3));
+    env.write("tree/unsearchable/g", &random(BLOCK, 4));
     env.configure(&env.root("tree", "immutable = true"));
-    let (secret, closed) = (("tree/secret", 0o644), ("tree/closed", 0o755));
-    let stderr = env.run_with_closed(&["update"], &[secret, closed]);
-    assert!(
-        stderr.contains("secret': reopen: Permission denied"),
-        "{stderr}"
-    );
-    assert!(
-        stderr.contains("closed': reopen: Permission denied"),
-        "{stderr}"
-    );
-    assert_eq!(groups(&stderr), [0, 0, 1]);
-    assert_eq!(root_rows(&env), [(None, bytes(&env.tree()))]);
-    assert_eq!(env.tree_paths(), ["ok"]);
-    let stats = env.stats();
-    assert!(stats.contains("(0 complete immutable)"), "{stats}");
-
-    let stderr = env.run_with_closed(&["update"], &[secret, closed]);
-    assert!(
-        stderr.contains(": 1 directories, 0 files hashed (0 B), 1 unchanged"),
-        "{stderr}"
-    );
-    assert_eq!(groups(&stderr), [0, 0, 1]);
-
-    let stderr = env.run_with_closed(&["update"], &[closed]);
-    assert_eq!(groups(&stderr), [0, 0, 1]);
-    let stderr = env.update();
-    assert!(stderr.contains(": 2 directories"), "{stderr}");
+    let unsearchable = env.close_search(&[("tree/unsearchable", 0o755)]);
+    let closed = [("tree/secret", 0o644), ("tree/closed", 0o755)];
+    let stderr = env.run_with_closed(&["update"], &closed);
+    drop(unsearchable);
+    let mut found = warnings(&stderr);
+    found.sort();
+    let expected = [
+        denied(env.path("tree/closed"), "reopen"),
+        denied(env.path("tree/secret"), "reopen"),
+        denied(env.path("tree/unsearchable/g"), "open"),
+    ];
+    assert_eq!(found, expected, "{stderr}");
     assert_eq!(groups(&stderr), [0, 1, 0]);
-    assert_eq!(env.tree_paths(), ["closed/f", "ok", "secret"]);
+    assert_eq!(
+        root_rows(&env),
+        [(Some(bytes(&env.tree())), bytes(&env.tree()))]
+    );
+    assert_eq!(env.tree_paths(), ["ok"]);
+
     let stderr = env.update();
+    assert!(warnings(&stderr).is_empty(), "{stderr}");
     assert_eq!(groups(&stderr), [1, 0, 0]);
+    assert_eq!(env.tree_paths(), ["ok"]);
+
+    let output = env.run(&["update", "--scan-immutable"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(groups(&stderr), [0, 1, 0]);
+    assert_eq!(
+        env.tree_paths(),
+        ["closed/f", "ok", "secret", "unsearchable/g"]
+    );
+}
+
+/// A copy whose root cannot be read leaves its group unfinished, so that a
+/// group never completes without the files of a copy that cannot be read
+/// at all: here a directory that cannot be listed, one that can be listed
+/// but not searched, and a single-file root that cannot be read. The next
+/// update scans the groups again, and completes them once their roots can
+/// be read (DESIGN.md §4.5).
+#[test]
+fn a_root_that_cannot_be_read_leaves_its_group_unfinished() {
+    if skip_as_root() {
+        return;
+    }
+    let env = Env::new();
+    env.write("tree/closed/f", &random(BLOCK, 1));
+    env.write("tree/unsearchable/f", &random(BLOCK, 2));
+    env.write("tree/one.iso", &random(BLOCK, 3));
+    env.configure(&env.root("tree/*", "immutable = true"));
+    let unsearchable = env.close_search(&[("tree/unsearchable", 0o755)]);
+    let closed = [("tree/closed", 0o755), ("tree/one.iso", 0o644)];
+    let stderr = env.run_with_closed(&["update"], &closed);
+    drop(unsearchable);
+    let mut found = warnings(&stderr);
+    found.sort();
+    assert_eq!(found.len(), 3, "{stderr}");
+    // The scan task that identifies the first object on the filesystem of
+    // the test reads it to find the filesystem's identity, so a closed root
+    // fails there or when it is read.
+    for (warning, root) in found.iter().zip(["closed", "one.iso"]) {
+        let ends =
+            ["identity", "reopen"].map(|what| denied(env.path(format!("tree/{root}")), what));
+        assert!(ends.contains(&warning.to_string()), "{stderr}");
+    }
+    assert_eq!(found[2], denied(env.path("tree/unsearchable/f"), "open"));
+    assert_eq!(groups(&stderr), [0, 0, 3]);
+    assert!(indexed(&env).is_empty());
+
+    let stderr = env.update();
+    assert_eq!(groups(&stderr), [0, 3, 0]);
+    assert_eq!(
+        indexed(&env),
+        [
+            pair("tree/closed", "f"),
+            pair("tree/one.iso", ""),
+            pair("tree/unsearchable", "f")
+        ]
+    );
 }
 
 /// A copy that is not there is no copy of its group, also for a pattern
@@ -376,7 +429,7 @@ fn a_copy_that_may_vanish_gives_way_to_the_next() {
 /// traversed too, by which a run with `--no-update` finds the copies of an
 /// unfinished group, and so does a prune, which keeps the group. Here the
 /// first copy may vanish and vanishes after root expansion, and the scan of
-/// the next copy fails (DESIGN.md §4.2).
+/// the next copy fails: its root cannot be read (DESIGN.md §4.2).
 #[test]
 fn an_unfinished_group_names_the_copy_that_its_scan_traversed() {
     if skip_as_root() {
@@ -385,7 +438,6 @@ fn an_unfinished_group_names_the_copy_that_its_scan_traversed() {
     let env = Env::new();
     for copy in ["a", "b"] {
         env.write(format!("copies/{copy}/data/f"), &random(BLOCK, 1));
-        env.write(format!("copies/{copy}/data/closed/g"), &random(BLOCK, 2));
     }
     let copy = "immutable = true\nidentifier = 'name'";
     env.configure(&format!(
@@ -393,14 +445,14 @@ fn an_unfinished_group_names_the_copy_that_its_scan_traversed() {
         env.root("copies/a/data", &format!("{copy}\nmay_vanish = true")),
         env.root("copies/b/data", copy)
     ));
-    let closed = env.close(&[("copies/b/data/closed", 0o755)]);
+    let closed = env.close(&[("copies/b/data", 0o755)]);
     let a = env.path("copies/a/data");
     let stderr = env.run_after_resolution(&["update"], || std::fs::remove_dir_all(&a).unwrap());
     drop(closed);
     assert_eq!(groups(&stderr), [0, 0, 1]);
     let scanned = bytes(&env.path("copies/b/data"));
     assert_eq!(root_rows(&env), [(None, scanned)]);
-    assert_eq!(indexed(&env), [pair("copies/b/data", "f")]);
+    assert!(indexed(&env).is_empty());
 
     let output = env.run(&["prune"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -409,6 +461,8 @@ fn an_unfinished_group_names_the_copy_that_its_scan_traversed() {
         stderr.contains(": 0 roots, 0 paths, and 0 stale inodes removed"),
         "{stderr}"
     );
+    let stderr = env.update();
+    assert_eq!(groups(&stderr), [0, 1, 0]);
     assert_eq!(indexed(&env), [pair("copies/b/data", "f")]);
 }
 
@@ -530,13 +584,16 @@ fn hard_links_join_groups_and_mutable_roots() {
     env.index().assert_consistent();
 }
 
-/// A file that a group shares with a mutable root and that cannot be read
-/// leaves the group unfinished, whichever of its links the scan finds
-/// first (DESIGN.md §4.6). The group's link is deep in its tree, so that
-/// usually the mutable root's link owns the file, and the group's waits
-/// for that owner or comes after it.
+/// A file that a group shares with a mutable root and that its permissions
+/// keep from being read gets no path through any of its links. A group
+/// with a link of it below its root completes all the same, as with any
+/// entry that the permissions of its copy deny, but a single-file root that
+/// is a link of it cannot be read at all, and stays unfinished, whichever
+/// of the links the scan finds first (DESIGN.md §4.5 and §4.6). The
+/// directory group's link is deep in its tree, so that usually another
+/// link owns the file, and that link waits for the owner or comes after it.
 #[test]
-fn a_shared_file_that_fails_leaves_its_group_unfinished() {
+fn a_shared_file_that_cannot_be_read_leaves_only_its_single_file_root_unfinished() {
     if skip_as_root() {
         return;
     }
@@ -544,25 +601,28 @@ fn a_shared_file_that_fails_leaves_its_group_unfinished() {
     env.write("tree/m/f", &random(BLOCK, 1));
     env.mkdir("tree/g/a/b/c");
     std::fs::hard_link(env.path("tree/m/f"), env.path("tree/g/a/b/c/f")).unwrap();
+    std::fs::hard_link(env.path("tree/m/f"), env.path("tree/one")).unwrap();
     env.write("tree/g/ok", &random(BLOCK, 2));
     env.configure(&format!(
-        "{}{}",
+        "{}{}{}",
         env.root("tree/m", ""),
-        env.root("tree/g", "immutable = true")
+        env.root("tree/g", "immutable = true"),
+        env.root("tree/one", "immutable = true")
     ));
     let stderr = env.run_with_closed(&["update"], &[("tree/m/f", 0o644)]);
-    assert!(stderr.contains("reopen: Permission denied"), "{stderr}");
-    assert_eq!(groups(&stderr), [0, 0, 1]);
+    assert!(stderr.contains("Permission denied"), "{stderr}");
+    assert_eq!(groups(&stderr), [0, 1, 1]);
     assert_eq!(indexed(&env), [pair("tree/g", "ok")]);
 
+    // The completed group gets the file's path only from a scan of it.
     let stderr = env.update();
-    assert_eq!(groups(&stderr), [0, 1, 0]);
+    assert_eq!(groups(&stderr), [1, 1, 0]);
     assert_eq!(
         indexed(&env),
         [
-            pair("tree/g", "a/b/c/f"),
             pair("tree/g", "ok"),
-            pair("tree/m", "f")
+            pair("tree/m", "f"),
+            pair("tree/one", "")
         ]
     );
 }
