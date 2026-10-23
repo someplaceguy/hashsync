@@ -550,10 +550,12 @@ fn line_counts(line: &str) -> Vec<usize> {
 /// amounts (DESIGN.md §8): `NAME -- B (L literal, R -> RF refs, N -> NF
 /// RLE, F false positives, M not found) + H hashlist + D hashlist delta
 /// --> W wire (deduplicated, compressed)`, where each list shows only when
-/// the exchange sent it.
+/// the exchange sent it. The line of a stopped stream also has stop
+/// details, which `StoppedLine` takes out first.
 #[derive(Debug)]
 struct DeduplicatedLine {
-    /// The bytes of the stream, then its literal, reference, and RLE bytes.
+    /// The bytes that the source reader read, then the literal, reference,
+    /// and RLE bytes that the destination took.
     bytes: [usize; 4],
     /// The bytes of the REF frames and of the RLE frames.
     frames: [usize; 2],
@@ -610,6 +612,10 @@ impl DeduplicatedLine {
         let Some((wire, how)) = wire.split_once(" B wire") else {
             unexpected()
         };
+        // The line of a stopped stream has its stop details here.
+        if !matches!(how, " (deduplicated, compressed)" | " (deduplicated)") {
+            unexpected();
+        }
         let [wire] = line_counts(wire)[..] else {
             unexpected()
         };
@@ -649,18 +655,77 @@ fn summary(output: &Output) -> [usize; 4] {
     deduplicated(output).bytes
 }
 
-/// The bytes and the wire bytes of the plain stream, `stdin` or `stdout`,
-/// from its summary line.
+/// The bytes and the wire bytes of the whole plain stream, `stdin` or
+/// `stdout`, from its summary line.
 fn plain_counts(output: &Output, stream: &str) -> [usize; 2] {
-    let line = summary_line(output, &format!("hashsync: {stream} "));
+    plain_line(&summary_line(output, &format!("hashsync: {stream} ")))
+}
+
+/// The bytes and the wire bytes of `line`, the summary line of a whole
+/// plain stream in a run with `EXACT` amounts.
+fn plain_line(line: &str) -> [usize; 2] {
     assert!(
         !line.contains(DEDUPLICATED),
-        "{stream} is deduplicated: {line}"
+        "a deduplicated stream: {line}"
     );
-    let [bytes, wire] = line_counts(&line)[..] else {
+    let [bytes, wire] = line_counts(line)[..] else {
         panic!("unexpected summary line: {line}");
     };
     [bytes, wire]
+}
+
+/// The summary line of a stopped stream in a run with `EXACT` amounts
+/// (DESIGN.md §8): the line of a whole stream with the same counts, with
+/// `, pipe closed, D B dropped, N B written` between its wire bytes and
+/// how the stream went over the wire.
+#[derive(Debug)]
+struct StoppedLine {
+    /// The line without the stop details, which reads as the line of a
+    /// whole stream.
+    whole: String,
+    /// The CHUNK bytes that the receiver dropped undecoded.
+    dropped: usize,
+    /// The bytes that the destination took.
+    written: usize,
+}
+
+impl StoppedLine {
+    fn parse(line: &str) -> Self {
+        let unexpected = || -> ! { panic!("unexpected summary line: {line}") };
+        let Some((start, details)) = line.split_once(", pipe closed, ") else {
+            unexpected()
+        };
+        let Some((dropped, details)) = details.split_once(" B dropped, ") else {
+            unexpected()
+        };
+        let Some((written, how)) = details.split_once(" B written") else {
+            unexpected()
+        };
+        StoppedLine {
+            whole: format!("{start}{how}"),
+            dropped: whole_bytes(dropped, line),
+            written: whole_bytes(written, line),
+        }
+    }
+
+    /// The parts of the line of a deduplicated stream.
+    fn deduplicated(&self) -> DeduplicatedLine {
+        DeduplicatedLine::parse(&self.whole)
+    }
+
+    /// The bytes that the source reader read, the bytes of the stream's
+    /// CHUNK payloads, which the wire bytes count with the lists of a
+    /// deduplicated stream, the CHUNK bytes that the receiver dropped, and
+    /// the bytes that the destination took.
+    fn counts(&self) -> [usize; 4] {
+        let [read, chunks] = if self.whole.contains(DEDUPLICATED) {
+            let line = self.deduplicated();
+            [line.bytes[0], line.chunks()]
+        } else {
+            plain_line(&self.whole)
+        };
+        [read, chunks, self.dropped, self.written]
+    }
 }
 
 /// The last summary line, which reports the traffic as rsync does.
@@ -2317,6 +2382,15 @@ fn rsync(
     output
 }
 
+/// The directory `dir` on the server, for `rsync`, as the user `tester`,
+/// whom rsync gives its remote shell with `-l`.
+fn remote_spec(dir: &std::path::Path) -> OsString {
+    let mut spec = format!("tester@{HOST}:").into_bytes();
+    spec.extend_from_slice(dir.as_os_str().as_bytes());
+    spec.push(b'/');
+    OsString::from_vec(spec)
+}
+
 #[test]
 fn rsync_runs_through_hashsync_ssh_in_both_directions() {
     // rsync talks both ways through its remote shell. In a pull, the
@@ -2356,12 +2430,6 @@ fn rsync_runs_through_hashsync_ssh_in_both_directions() {
             .env
             .write(transfer.indexed(direction, "a"), &files[0].1);
         transfer.update_receiver(direction, &[]);
-        let remote_spec = |dir: &std::path::Path| {
-            let mut spec = format!("tester@{HOST}:").into_bytes();
-            spec.extend_from_slice(dir.as_os_str().as_bytes());
-            spec.push(b'/');
-            OsString::from_vec(spec)
-        };
         for (i, (rsync_flags, shell_flags)) in
             [(&[][..], &[][..]), (&["-s"], &[]), (&["-s"], &["-s"])]
                 .into_iter()
@@ -2388,6 +2456,42 @@ fn rsync_runs_through_hashsync_ssh_in_both_directions() {
             }
         }
     }
+}
+
+#[test]
+fn the_stdin_line_of_an_rsync_push_shows_its_references() {
+    // rsync keeps the stdin of its remote shell open until the shell has
+    // exited, so the client of a push through `hashsync ssh` never reads
+    // the EOF of its stdin: the exit of the remote rsync stops the forward
+    // stream (DESIGN.md §6.6). The stdin line still shows what
+    // deduplication did (DESIGN.md §8). The server's index holds a copy of
+    // the file of whole blocks, so the line shows references, and its parts
+    // add up to the bytes that the remote rsync took. With `--wait`, the
+    // scanner scans only once it has the whole list, so the references do
+    // not depend on when the list arrives, and the line shows the list.
+    let data = tiled(16, 77);
+    let transfer = Transfer::new(&[]);
+    transfer.configure_server("");
+    transfer.env.write("server-tree/a", &data);
+    let local = transfer.env.path("local");
+    transfer.env.write(local.join("a"), &data);
+    let remote = transfer.env.path("remote");
+    std::fs::create_dir_all(&remote).unwrap();
+    let mut source = local.into_os_string();
+    source.push("/");
+    let flags = ["--dedup-stdin", "--wait", EXACT];
+    let output = rsync(&transfer, &[], &flags, &source, &remote_spec(&remote));
+    assert!(
+        std::fs::read(remote.join("a")).unwrap() == data,
+        "the copy differs"
+    );
+    let line = summary_line(&output, "hashsync: stdin -- ");
+    let stdin = StoppedLine::parse(&line);
+    let deduplicated = stdin.deduplicated();
+    let [_, literal, reference, run] = deduplicated.bytes;
+    assert!(reference > 0, "{line}");
+    assert_eq!(literal + reference + run, stdin.written, "{line}");
+    assert!(deduplicated.hashlist.is_some(), "{line}");
 }
 
 #[test]
@@ -4536,10 +4640,10 @@ exit "$(cat '{0}'.$session.status)""#,
 fn the_summary_of_a_stopped_forward_stream_counts_what_reached_the_command() {
     // The command ignores its stdin of 4 MiB, writes a word, and exits,
     // which stops the forward stream (DESIGN.md §6.6). The stdin line then
-    // gives the bytes that the client read, `pipe closed`, the CHUNK bytes
-    // that the server decoded and that it dropped, which together are every
-    // CHUNK byte that the client sent, and the bytes that the command's
-    // stdin took, which a pipe holds while no process reads it. The data
+    // gives the bytes that the client read, its wire bytes, which count
+    // every CHUNK byte that the client sent, `pipe closed`, the CHUNK bytes
+    // that the server dropped, and the bytes that the command's stdin
+    // took, which a pipe holds while no process reads it. The data
     // shrinkage factor and the saved bytes count only the bytes that
     // reached their destinations (DESIGN.md §8).
     // `tee` copies what the client sends on the data session; the wrapper
@@ -4564,16 +4668,13 @@ fn the_summary_of_a_stopped_forward_stream_counts_what_reached_the_command() {
         let output = succeeded(output);
         assert_eq!(output.stdout, b"done");
         let line = summary_line(&output, "hashsync: stdin -- ");
-        assert!(line.contains(" read, pipe closed, "), "{line}");
-        let [read, decoded, dropped, written] = line_counts(&line)[..] else {
-            panic!("unexpected summary line: {line}");
-        };
+        let [read, chunks, dropped, written] = StoppedLine::parse(&line).counts();
         assert!(
-            written <= read && read <= input.len(),
+            written <= read && read <= input.len() && dropped <= chunks,
             "{direction:?}: {line}"
         );
         let data = std::fs::read(format!("{}.data", captured.display())).unwrap();
-        assert_eq!(decoded + dropped, chunk_payload_bytes(&data), "{line}");
+        assert_eq!(chunks, chunk_payload_bytes(&data), "{line}");
         traffic(&output).check_delivered(output.stdout.len() + written, direction);
     }
 }
@@ -4598,7 +4699,7 @@ fn a_forward_stream_that_stops_before_the_eof_of_stdin_shows_as_stopped() {
     let output = succeeded(output_of(KillOnDrop(client)));
     assert_eq!(
         summary_line(&output, "hashsync: stdin"),
-        "hashsync: stdin -- 0 B read, pipe closed, 0 B wire, 0 B dropped, 0 B written"
+        "hashsync: stdin -- 0 B --> 0 B wire, pipe closed, 0 B dropped, 0 B written (compressed)"
     );
     drop(producer);
 }
@@ -4617,10 +4718,9 @@ fn a_stopped_forward_stream_shows_the_chunk_bytes_that_the_server_dropped() {
     // stream is plain, and without compression, each piece goes out as one
     // LIT frame, 5 bytes longer than the piece, in a CHUNK of its own, in
     // eager delivery. So the stdin line is exact: the client read both
-    // pieces, the server decoded the first frame and dropped the second,
-    // and the command's stdin took nothing. The CHUNK bytes that the client
-    // sent are both frames, and the dropped bytes are those that the server
-    // did not decode (DESIGN.md §8).
+    // pieces, its wire bytes are both frames, the server dropped the
+    // second, which it did not decode, and the command's stdin took nothing
+    // (DESIGN.md §8).
     let transfer = Transfer::new(&["--compression-level", "0"]);
     let (stops, sent, status) = (
         transfer.env.path("control-received"),
@@ -4686,9 +4786,9 @@ tee '{1}' | "$ssh" "$@""#,
     assert_eq!(
         summary_line(&output, "hashsync: stdin"),
         format!(
-            "hashsync: stdin -- {} B read, pipe closed, {} B wire, {} B dropped, 0 B written",
+            "hashsync: stdin -- {} B --> {} B wire, pipe closed, {} B dropped, 0 B written",
             first.len() + second.len(),
-            5 + first.len(),
+            5 + first.len() + 5 + second.len(),
             5 + second.len()
         )
     );
@@ -4892,10 +4992,11 @@ fn a_closed_stdout_stops_the_backward_stream_and_the_command_gets_sigpipe() {
     // and exits with 7. The run ends normally with that status (DESIGN.md
     // §6.9), and the descendant lives on, where the fatal end of a run kills
     // the command's process group. Without compression, the stdout line
-    // shows exact counts: the server read 15 bytes, the client decoded both
-    // CHUNK frames, of 15 and 10 bytes, and dropped none, and its stdout
-    // took 10 bytes (DESIGN.md §8). A run that did not stop the stream on
-    // the server would leave the command waiting for its last write to fail,
+    // shows exact counts: the server read 15 bytes and sent them in CHUNK
+    // frames of 15 and 10 bytes, the client dropped none, and its stdout
+    // took 10 bytes, which the line of a pull splits into literal bytes
+    // alone (DESIGN.md §8). A run that did not stop the stream on the
+    // server would leave the command waiting for its last write to fail,
     // and hang the test.
     for direction in DIRECTIONS {
         let transfer = Transfer::new(&["--compression-level", "0"]);
@@ -4926,11 +5027,12 @@ fn a_closed_stdout_stops_the_backward_stream_and_the_command_gets_sigpipe() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(output.status.code(), Some(7), "{direction:?}:\n{stderr}");
         assert_eq!(std::fs::read(&marker).unwrap(), b"sigpipe\n");
-        assert_eq!(
-            summary_line(&output, "hashsync: stdout"),
-            "hashsync: stdout -- 15 B read, pipe closed, 25 B wire, 0 B dropped, 10 B written",
-            "{direction:?}"
-        );
+        let line = summary_line(&output, "hashsync: stdout -- ");
+        let stopped = StoppedLine::parse(&line);
+        assert_eq!(stopped.counts(), [15, 25, 0, 10], "{direction:?}: {line}");
+        if direction == Direction::Pull {
+            assert_eq!(stopped.deduplicated().bytes, [15, 10, 0, 0], "{line}");
+        }
         // The stdout of the client took 10 bytes, and its stdin none.
         traffic(&output).check_delivered(10, direction);
         // The descendant has run on since the command started it, so no
@@ -4962,9 +5064,9 @@ fn a_stopped_backward_stream_shows_the_chunk_bytes_that_the_client_dropped() {
     // of the data session holds that CHUNK, the wrapper lets STOP go. The
     // client drops that CHUNK undecoded. Without compression, each write of
     // the command goes out as one LIT frame, 5 bytes longer than the write,
-    // so the stdout line is exact: the server read 20 bytes, the client
-    // decoded the frames of the first two writes and dropped the third, and
-    // its stdout took 10 bytes (DESIGN.md §8).
+    // so the stdout line is exact: the server read 20 bytes and sent the
+    // frames of all three writes, the client dropped the third, and its
+    // stdout took 10 bytes (DESIGN.md §8).
     for direction in DIRECTIONS {
         let transfer = Transfer::new(&["--compression-level", "0"]);
         transfer.configure_receiver(direction, "");
@@ -5016,11 +5118,9 @@ exit "$(cat '{3}')""#,
         });
         stop_gate.release();
         let output = succeeded(run.output());
-        assert_eq!(
-            summary_line(&output, "hashsync: stdout"),
-            "hashsync: stdout -- 20 B read, pipe closed, 25 B wire, 10 B dropped, 10 B written",
-            "{direction:?}"
-        );
+        let line = summary_line(&output, "hashsync: stdout -- ");
+        let counts = StoppedLine::parse(&line).counts();
+        assert_eq!(counts, [20, 35, 10, 10], "{direction:?}: {line}");
     }
 }
 
@@ -5069,13 +5169,7 @@ fn a_consumer_that_exits_early_ends_the_run_with_the_status_of_the_command() {
             "{direction:?}:\n{stderr}"
         );
         let line = summary_line(&output, "hashsync: stdout -- ");
-        assert!(
-            line.contains(" read, pipe closed, "),
-            "{direction:?}: {line}"
-        );
-        let [read, _, _, written] = line_counts(&line)[..] else {
-            panic!("unexpected summary line: {line}");
-        };
+        let [read, _, _, written] = StoppedLine::parse(&line).counts();
         assert!(
             (1 << 20) <= written && written <= read,
             "{direction:?}: {line}"
@@ -5089,13 +5183,13 @@ fn the_summary_of_a_stopped_backward_stream_counts_what_reached_stdout() {
     // the client's stdout reads 1 MiB of it, then exits. The client's next
     // write to stdout fails with EPIPE, which stops the backward stream
     // (DESIGN.md §6.6). The stdout line then gives the bytes that the
-    // server read, `pipe closed`, the CHUNK bytes that the client decoded
-    // and those that it dropped, which together are every CHUNK byte that
-    // the server sent, and the bytes that stdout took (DESIGN.md §8). With
-    // compression, the decoded bytes are those of the zstd frame that the
-    // decoder consumed. `tee` copies what the server sends on the data
-    // session. The command ends with SIGPIPE, or before the stop when its
-    // output fits in the buffers of the server.
+    // server read, its wire bytes, which count every CHUNK byte that the
+    // server sent, `pipe closed`, the CHUNK bytes that the client dropped,
+    // and the bytes that stdout took (DESIGN.md §8). With compression, the
+    // dropped bytes are those of the zstd frame that the decoder did not
+    // consume. `tee` copies what the server sends on the data session. The
+    // command ends with SIGPIPE, or before the stop when its output fits in
+    // the buffers of the server.
     let payload = random(16 << 20, 70);
     for direction in DIRECTIONS {
         let transfer = Transfer::new(&["--spool-limit", "1MiB"]);
@@ -5135,23 +5229,13 @@ exit "$(cat '{1}'.$session)""#,
             "{direction:?}:\n{stderr}"
         );
         let line = summary_line(&output, "hashsync: stdout -- ");
+        let [read, chunks, dropped, written] = StoppedLine::parse(&line).counts();
         assert!(
-            line.contains(" read, pipe closed, "),
-            "{direction:?}: {line}"
-        );
-        let [read, decoded, dropped, written] = line_counts(&line)[..] else {
-            panic!("unexpected summary line: {line}");
-        };
-        assert!(
-            (1 << 20) <= written && written <= read && read <= payload.len(),
+            (1 << 20) <= written && written <= read && read <= payload.len() && dropped <= chunks,
             "{direction:?}: {line}"
         );
         let data = std::fs::read(format!("{}.data", captured.display())).unwrap();
-        assert_eq!(
-            decoded + dropped,
-            chunk_payload_bytes(&data),
-            "{direction:?}: {line}"
-        );
+        assert_eq!(chunks, chunk_payload_bytes(&data), "{direction:?}: {line}");
     }
 }
 
@@ -5201,11 +5285,9 @@ fn the_clients_index_closes_at_the_stop_of_the_backward_stream() {
         );
         last.release();
         let output = succeeded(run.output());
-        assert_eq!(
-            summary_line(&output, "hashsync: stdout"),
-            "hashsync: stdout -- 15 B read, pipe closed, 25 B wire, 0 B dropped, 10 B written",
-            "{both}"
-        );
+        let line = summary_line(&output, "hashsync: stdout -- ");
+        let counts = StoppedLine::parse(&line).counts();
+        assert_eq!(counts, [15, 25, 0, 10], "{both}: {line}");
     }
 }
 
@@ -6377,7 +6459,9 @@ fn the_forward_stream_stops_while_the_deduplicated_backward_stream_goes_on() {
     // forward stream, and the client's stdin reader ends (DESIGN.md §6.6).
     // The backward stream goes on: the command then writes blocks of the
     // client's index, which reach the client as references, and the run
-    // ends with the command's status.
+    // ends with the command's status. The stdin line still shows what
+    // deduplication did: the command's stdin took the first 4 bytes, as
+    // literal bytes (DESIGN.md §8).
     let transfer = Transfer::new(&[]);
     transfer.configure_server("");
     let blocks = tiled(16, 63);
@@ -6416,8 +6500,10 @@ fn the_forward_stream_stops_while_the_deduplicated_backward_stream_goes_on() {
     assert!(output.stdout == blocks, "the output differs");
     let stdout = deduplicated_stream(&output, "stdout");
     assert_eq!(stdout.bytes, [blocks.len(), 0, blocks.len(), 0]);
-    let stdin = summary_line(&output, "hashsync: stdin -- ");
-    assert!(stdin.contains(" read, pipe closed, "), "{stdin}");
+    let line = summary_line(&output, "hashsync: stdin -- ");
+    let stdin = StoppedLine::parse(&line);
+    assert_eq!(stdin.written, 4, "{line}");
+    assert_eq!(stdin.deduplicated().bytes[1..], [4, 0, 0], "{line}");
 }
 
 #[test]
@@ -6717,12 +6803,6 @@ fn rsync_runs_through_hashsync_ssh_with_both_streams_deduplicated() {
     }
     let remote = transfer.env.path("remote");
     std::fs::create_dir_all(&remote).unwrap();
-    let remote_spec = |dir: &std::path::Path| {
-        let mut spec = format!("tester@{HOST}:").into_bytes();
-        spec.extend_from_slice(dir.as_os_str().as_bytes());
-        spec.push(b'/');
-        OsString::from_vec(spec)
-    };
     let both = ["--dedup-stdin", "--dedup-stdout"];
     let pushed = remote.join("pushed");
     let mut source = local.into_os_string();

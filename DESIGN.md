@@ -2681,42 +2681,43 @@ exclude = ['*.tmp', 'literal\x2Aname', 'back\\slash']
 
   After a successful transfer, also when the command fails, the client
   prints a summary to stderr:
-  1. One line for each stream, `stdin` first, then `stdout`. A stream is
-     whole when its source reader reached the EOF of its source and its
-     destination took every byte that the source reader read, whether or
-     not a stop came. The stdin reader also reaches the EOF when it finds
-     stdin at its EOF at the stop (section 6.6). A whole stream's line
-     shows its bytes, then `-->` and its wire bytes, and in parentheses
-     how it was sent: `deduplicated`, `compressed`, or both. A plain
-     stream without compression has no parentheses. A plain stream's wire
-     bytes are the bytes of its CHUNK payloads: `stdin -- 6.46 KiB -->
-     3.28 KiB wire (compressed)`.
+  1. One line for each stream, `stdin` first, then `stdout`. The line
+     shows the bytes that the stream's source reader read, then `-->` and
+     its wire bytes, and in parentheses how it was sent: `deduplicated`,
+     `compressed`, or both. A plain stream without compression has no
+     parentheses. A plain stream's wire bytes are the bytes of all its
+     CHUNK payloads: `stdin -- 6.46 KiB --> 3.28 KiB wire (compressed)`.
 
-     A deduplicated stream's line splits its bytes into literal,
-     reference, and RLE bytes, and shows how many bytes the REF and RLE
-     frames that carried the last two took, before compression. Then it
-     gives the queries that the receiver answered no after it looked their
-     blocks up in its index. False positives: the index has no candidate
-     for the strong hash (section 6.4), so the window had the weak hash of
-     an indexed block, but other bytes. Not found: the index has
-     candidates, but none of those that the lookup tried verified, for
-     example because their files changed since the update. Then it adds
-     the lists that the exchange sent: the full list or a delta, both
-     when the sender could not use a delta and asked for the full list,
-     and none after HASHKEEP. The wire bytes count these lists too:
-     `stdout -- 10.00 MiB (2.00 MiB literal, 8.00 MiB -> 2.50 KiB refs,
-     0 B -> 0 B RLE, 0 false positives, 0 not found) + 12.00 KiB
-     hashlist --> 1.11 MiB wire (deduplicated, compressed)`.
+     A deduplicated stream's line splits the bytes that its destination
+     took into literal, reference, and RLE bytes, and shows how many bytes
+     the REF and RLE frames that carried the last two took, before
+     compression. Then it gives the queries that the receiver answered no
+     after it looked their blocks up in its index. False positives: the
+     index has no candidate for the strong hash (section 6.4), so the
+     window had the weak hash of an indexed block, but other bytes. Not
+     found: the index has candidates, but none of those that the lookup
+     tried verified, for example because their files changed since the
+     update. Then it adds the lists that the exchange sent: the full list
+     or a delta, both when the sender could not use a delta and asked for
+     the full list, and none after HASHKEEP. The wire bytes count these
+     lists too: `stdout -- 10.00 MiB (2.00 MiB literal, 8.00 MiB ->
+     2.50 KiB refs, 0 B -> 0 B RLE, 0 false positives, 0 not found) +
+     12.00 KiB hashlist --> 1.11 MiB wire (deduplicated, compressed)`.
 
-     Any other stream stopped, and shows the bytes that its sender read
-     from its source, `pipe closed`, the CHUNK bytes that its receiver
-     decoded, and those that it dropped undecoded, which together are all
-     the CHUNK bytes of the stream, and the bytes that its destination
-     took: `stdin -- 2.09 MiB read, pipe closed, 1.01 MiB wire, 36.00 KiB
-     dropped, 1.05 MiB written`. The server counts what its decoder of the
-     forward stream decoded and wrote, what its lookups found, and what
-     its stdout reader read, which END carries (section 6.2); the client
-     counts the rest.
+     A stream is whole when its source reader reached the EOF of its
+     source and its destination took every byte that the source reader
+     read, whether or not a stop came. The stdin reader also reaches the
+     EOF when it finds stdin at its EOF at the stop (section 6.6). Any
+     other stream stopped, as the forward stream of `rsync -e` always
+     does: rsync keeps the stdin of its remote shell open until the shell
+     exits. The line of a stopped stream adds, after the wire bytes and
+     before the parentheses, `pipe closed`, the CHUNK bytes that the
+     receiver dropped undecoded, which the wire bytes count too, and the
+     bytes that the destination took: `stdin -- 2.09 MiB --> 1.08 MiB
+     wire, pipe closed, 36.00 KiB dropped, 1.05 MiB written (compressed)`.
+     The server counts what its decoder of the forward stream decoded and
+     wrote, what its lookups found, and what its stdout reader read, which
+     END carries (section 6.2); the client counts the rest.
   2. The total. As rsync does, the bytes that the client sent and
      received on both sessions, the elapsed time of the run, including its
      index update, and the rate of the sent and received bytes in that
@@ -3363,23 +3364,24 @@ decision history, including fuller measurements, is in version control.
     consumer of the client's stdout that exits, which stops the backward
     stream, also with both streams deduplicated; the summary line of a
     stopped stream, with bytes that its receiver dropped, in both
-    directions; the summary line of a deduplicated stream: the bytes of
-    its REF and RLE frames, a window with the weak hash of an indexed
-    block but other bytes, which counts as a false positive, stale and
-    unreadable candidates, and an intact copy beyond `candidate_attempts`,
-    which count as not found, and the lists that each kind of exchange
-    sent; STOP before the client starts its forward stream, which
-    leaves stdin unread, and STREAM_END after STOP, on either host; the
-    look at whether stdin is at its EOF, for a file, `/dev/null`, a pipe, a
-    socket, and a terminal; a stop inside one RLE frame,
-    and while a descendant holds the command's stdin without reading it;
-    the loss of the client while the server's data reader waits at its
-    limit; the ends of a stream: a zstd frame cut short, bytes after it, a
-    cut inside a stream frame, and a stop inside it; a lookahead whose
-    buffer the sender cannot reserve, which ends the run before the
-    command; a client whose stdout is slow after END; and a non-blocking
-    stdin, unless it is a terminal, with its flags restored at its EOF and
-    at a fatal end;
+    directions, and with the references of the forward stream of an
+    `rsync -e` push, which always stops; the summary line of a
+    deduplicated stream: the bytes of its REF and RLE frames, a window
+    with the weak hash of an indexed block but other bytes, which counts
+    as a false positive, stale and unreadable candidates, and an intact
+    copy beyond `candidate_attempts`, which count as not found, and the
+    lists that each kind of exchange sent; STOP before the client starts
+    its forward stream, which leaves stdin unread, and STREAM_END after
+    STOP, on either host; the look at whether stdin is at its EOF, for a
+    file, `/dev/null`, a pipe, a socket, and a terminal; a stop inside one
+    RLE frame, and while a descendant holds the command's stdin without
+    reading it; the loss of the client while the server's data reader
+    waits at its limit; the ends of a stream: a zstd frame cut short,
+    bytes after it, a cut inside a stream frame, and a stop inside it; a
+    lookahead whose buffer the sender cannot reserve, which ends the run
+    before the command; a client whose stdout is slow after END; and a
+    non-blocking stdin, unless it is a terminal, with its flags restored
+    at its EOF and at a fatal end;
   - one write call per frame, and non-blocking standard descriptors;
   - filesystem races and sparse files; reopening files and directories
     after rename or unlink; symlinks and special files, never opened for

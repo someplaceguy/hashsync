@@ -415,34 +415,38 @@ pub fn run(config: Config, remote: &ssh::Remote, request: &Request, no_stdin: bo
     die::finish(end_frame.status)
 }
 
-/// The summary line of one stream (DESIGN.md §8).
+/// The summary line of one stream (DESIGN.md §8). A stopped stream's line
+/// shows everything that a whole stream's line shows, so that a stream
+/// that always stops, such as the forward stream of `rsync -e`, still shows
+/// what deduplication did.
 #[derive(Debug, PartialEq, Eq)]
-enum Line<'a> {
-    /// A stream that its receiver wrote whole: its counts, and in a
-    /// deduplicated stream, the lists of its exchange.
-    Whole(Counts, Option<&'a ListBytes>),
-    /// A stream that stopped before its receiver wrote all of it: the bytes
-    /// that its sender read from its source, the bytes of the CHUNK payloads
-    /// that its receiver decoded and that it dropped undecoded, and the
-    /// bytes that its destination took.
-    Stopped {
-        read: u64,
-        decoded: u64,
-        dropped: u64,
-        written: u64,
-    },
+struct Line<'a> {
+    /// The bytes that the stream's source reader read.
+    read: u64,
+    /// What the stream's receiver counted: the bytes that its destination
+    /// took, and in a deduplicated stream, the queries that its lookups
+    /// answered no. The wire bytes are those of all the stream's CHUNK
+    /// payloads, also the ones that the receiver dropped undecoded.
+    counts: Counts,
+    /// In a deduplicated stream, the lists that its exchange sent.
+    lists: Option<&'a ListBytes>,
+    /// For a stream that stopped before its destination took all of it, the
+    /// CHUNK bytes that its receiver dropped undecoded. `None` when the
+    /// stream is whole.
+    dropped: Option<u64>,
 }
 
 impl<'a> Line<'a> {
-    /// The line of a stream, from what its sender read of its source, the
-    /// counts of its receiver's decoder, `chunks`, the bytes of all its
-    /// CHUNK payloads, and in a deduplicated stream, the lists of its
-    /// exchange. A stream is whole when its source reader reached the EOF
-    /// of its source (`SourceRead::eof`) and its destination took every
-    /// byte that the sender read, whether or not a stop came. Its wire
-    /// bytes are then all its CHUNK bytes, also those that a stop after its
-    /// last byte left undecoded. Else the stream stopped first, and its
-    /// receiver dropped the CHUNK bytes that it did not decode.
+    /// The line of a stream, from what its source reader read, the counts
+    /// of its receiver, `chunks`, the bytes of all its CHUNK payloads,
+    /// which become its wire bytes, and in a deduplicated stream, the lists
+    /// of its exchange. A stream is whole when its source reader reached
+    /// the EOF of its source (`SourceRead::eof`) and its destination took
+    /// every byte that the source reader read, whether or not a stop came:
+    /// the CHUNK bytes that a stop after its last byte left undecoded, such
+    /// as the end of its zstd frame, don't show as dropped. Otherwise the
+    /// stream stopped first, and its receiver dropped the CHUNK bytes that
+    /// it did not decode.
     ///
     /// One of the counts of each stream comes from the server's END, so a
     /// count that cannot be right is a protocol error: a destination that
@@ -466,27 +470,15 @@ impl<'a> Line<'a> {
                 decoded.wire
             )
         });
-        if source.eof && decoded.bytes == source.bytes {
-            let counts = Counts {
+        let whole = source.eof && decoded.bytes == source.bytes;
+        Line {
+            read: source.bytes,
+            counts: Counts {
                 wire: chunks,
                 ..decoded.clone()
-            };
-            Line::Whole(counts, lists)
-        } else {
-            Line::Stopped {
-                read: source.bytes,
-                decoded: decoded.wire,
-                dropped,
-                written: decoded.bytes,
-            }
-        }
-    }
-
-    /// The bytes of the stream that reached its destination.
-    fn written(&self) -> u64 {
-        match self {
-            Line::Whole(counts, _) => counts.bytes,
-            Line::Stopped { written, .. } => *written,
+            },
+            lists,
+            dropped: (!whole).then_some(dropped),
         }
     }
 }
@@ -540,66 +532,65 @@ fn read_data<R: Read>(
 }
 
 /// The summary on stderr (DESIGN.md §8). One line for each stream, which
-/// names it. A whole stream's line gives the bytes that it carried, its
-/// wire bytes, and how it went over the wire: deduplicated, compressed,
-/// both, or neither, which shows nothing. The wire bytes are those of its
-/// CHUNK payloads, and in a deduplicated stream also those of the lists
-/// that its exchange sent, which the line shows before them. The line of a
-/// deduplicated stream also gives its literal bytes, its reference and RLE
-/// bytes with the bytes of the frames that carried them, and the queries
-/// that its receiver answered no after a lookup in its index: those without
-/// a candidate, false positives of the weak hash, and those whose
-/// candidates did not verify, not found. A stopped stream's line gives the
-/// bytes that its sender read, the CHUNK bytes that its receiver decoded
-/// and that it dropped, and the bytes that its destination took. The last
-/// line gives, as rsync does, the bytes sent and received on both
-/// sessions, and the elapsed time of the run with the rate of that traffic;
-/// then the data shrinkage factor, the bytes that reached the destinations
-/// of both streams over the traffic, and the bytes saved, the difference.
-/// The threads that count have ended, so the counts are exact.
+/// names it. The line gives the bytes that the stream's source reader
+/// read, its wire bytes, and how it went over the wire: deduplicated,
+/// compressed, both, or neither, which shows nothing. The wire bytes are
+/// those of all its CHUNK payloads, and in a deduplicated stream also those
+/// of the lists that its exchange sent, which the line shows before them.
+/// The line of a deduplicated stream also splits the bytes that its
+/// destination took into literal, reference, and RLE bytes, the last two
+/// with the bytes of the frames that carried them, and gives the queries
+/// that its receiver answered no after a lookup in its index: those
+/// without a candidate, false positives of the weak hash, and those whose
+/// candidates did not verify, not found. The line of a stopped stream adds,
+/// before how the stream went over the wire, the CHUNK bytes that its
+/// receiver dropped and the bytes that its destination took. The last line
+/// gives, as rsync does, the bytes sent and received on both sessions, and
+/// the elapsed time of the run with the rate of that traffic; then the
+/// data shrinkage factor, the bytes that reached the destinations of both
+/// streams over the traffic, and the bytes saved, the difference. The
+/// threads that count have ended, so the counts are exact.
 fn print_summary(start: Instant, compressed: bool, streams: &[(&str, Line)]) {
     let elapsed = start.elapsed().as_secs_f64();
     for (name, line) in streams {
-        match *line {
-            Line::Whole(ref counts, Some(lists)) => report::note(format_args!(
-                "{name} -- {} ({} literal, {} -> {} refs, {} -> {} RLE, \
-                 {} false positives, {} not found){} --> {} wire{}",
-                Bytes(counts.bytes),
-                Bytes(counts.literal),
-                Bytes(counts.reference),
-                Bytes(counts.reference_frames),
-                Bytes(counts.run),
-                Bytes(counts.run_frames),
-                counts.misses.false_positives,
-                counts.misses.not_found,
-                sent_lists(lists),
-                Bytes(counts.wire + lists.full + lists.delta),
-                how_sent(true, compressed),
-            )),
-            Line::Whole(ref counts, None) => report::note(format_args!(
-                "{name} -- {} --> {} wire{}",
-                Bytes(counts.bytes),
-                Bytes(counts.wire),
-                how_sent(false, compressed),
-            )),
-            Line::Stopped {
-                read,
-                decoded,
-                dropped,
-                written,
-            } => report::note(format_args!(
-                "{name} -- {} read, pipe closed, {} wire, {} dropped, {} written",
-                Bytes(read),
-                Bytes(decoded),
+        let counts = &line.counts;
+        let (deduplication, list_bytes) = match line.lists {
+            Some(lists) => (
+                format!(
+                    " ({} literal, {} -> {} refs, {} -> {} RLE, \
+                     {} false positives, {} not found){}",
+                    Bytes(counts.literal),
+                    Bytes(counts.reference),
+                    Bytes(counts.reference_frames),
+                    Bytes(counts.run),
+                    Bytes(counts.run_frames),
+                    counts.misses.false_positives,
+                    counts.misses.not_found,
+                    sent_lists(lists),
+                ),
+                lists.full + lists.delta,
+            ),
+            None => (String::new(), 0),
+        };
+        let stop = match line.dropped {
+            Some(dropped) => format!(
+                ", pipe closed, {} dropped, {} written",
                 Bytes(dropped),
-                Bytes(written)
-            )),
-        }
+                Bytes(counts.bytes)
+            ),
+            None => String::new(),
+        };
+        report::note(format_args!(
+            "{name} -- {}{deduplication} --> {} wire{stop}{}",
+            Bytes(line.read),
+            Bytes(counts.wire + list_bytes),
+            how_sent(line.lists.is_some(), compressed),
+        ));
     }
     let sent = SENT.load(Relaxed);
     let received = RECEIVED.load(Relaxed);
     let traffic = sent + received;
-    let carried: u64 = streams.iter().map(|(_, line)| line.written()).sum();
+    let carried: u64 = streams.iter().map(|(_, line)| line.counts.bytes).sum();
     // A run that sends more than it delivers, such as a short one whose
     // hash list outweighs its streams, saves a negative amount.
     let saved = match carried.checked_sub(traffic) {
@@ -633,8 +624,7 @@ fn sent_lists(lists: &ListBytes) -> String {
     sent
 }
 
-/// How a whole stream went over the wire, after its wire bytes on its
-/// summary line.
+/// How a stream went over the wire, at the end of its summary line.
 fn how_sent(deduplicated: bool, compressed: bool) -> &'static str {
     match (deduplicated, compressed) {
         (true, true) => " (deduplicated, compressed)",
@@ -849,21 +839,37 @@ mod tests {
             ..Counts::default()
         };
         let line = Line::of(&read(10, true), &counts, 9, Some(&lists));
-        let whole = Counts { wire: 9, ..counts };
-        assert_eq!(line, Line::Whole(whole, Some(&lists)));
+        let whole = Line {
+            read: 10,
+            counts: Counts { wire: 9, ..counts },
+            lists: Some(&lists),
+            dropped: None,
+        };
+        assert_eq!(line, whole);
     }
 
-    /// The line of a stopped stream: the bytes that its sender read, the
-    /// CHUNK bytes that its receiver decoded and those that it dropped, and
-    /// the bytes that its destination took (DESIGN.md §8).
+    /// The line of a stopped stream keeps everything that the line of a
+    /// whole stream has, here the counts of a deduplicated stream, which
+    /// split what its destination took, and the lists of its exchange. Its
+    /// wire bytes are all its CHUNK bytes, and it adds the CHUNK bytes that
+    /// its receiver dropped (DESIGN.md §8).
     #[test]
     fn a_stopped_stream_shows_the_chunk_bytes_that_its_receiver_dropped() {
-        let line = Line::of(&read(100, false), &decoded(40, 20), 50, None);
-        let stopped = Line::Stopped {
+        let lists = ListBytes { full: 0, delta: 3 };
+        let counts = Counts {
+            bytes: 40,
+            literal: 8,
+            reference: 32,
+            reference_frames: 10,
+            wire: 20,
+            ..Counts::default()
+        };
+        let line = Line::of(&read(100, false), &counts, 50, Some(&lists));
+        let stopped = Line {
             read: 100,
-            decoded: 20,
-            dropped: 30,
-            written: 40,
+            counts: Counts { wire: 50, ..counts },
+            lists: Some(&lists),
+            dropped: Some(30),
         };
         assert_eq!(line, stopped);
     }
@@ -873,11 +879,14 @@ mod tests {
     #[test]
     fn a_stream_stopped_after_the_eof_of_its_source_is_not_whole() {
         let line = Line::of(&read(100, true), &decoded(60, 30), 45, None);
-        let stopped = Line::Stopped {
+        let stopped = Line {
             read: 100,
-            decoded: 30,
-            dropped: 15,
-            written: 60,
+            counts: Counts {
+                wire: 45,
+                ..decoded(60, 30)
+            },
+            lists: None,
+            dropped: Some(15),
         };
         assert_eq!(line, stopped);
     }

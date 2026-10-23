@@ -60,7 +60,7 @@ reaches its destination at each idle point of its source, once the link
 can carry it, unless `--batch-stdout` or `--batch-stdin` asks for batch
 delivery (DESIGN.md §6.2). Either stream stops once no process reads its
 destination, and the run then ends with the command's status; the summary
-shows what each stream read, decoded, dropped, and wrote (DESIGN.md §6.6
+shows what each stream read, sent, dropped, and wrote (DESIGN.md §6.6
 and §8). The server marks its lines with `hashsync (server): `, and
 reads its own file of the profile `default`, unless `--server-profile` or
 `--server-config` selects another; every command names its file and
