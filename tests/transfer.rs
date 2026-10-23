@@ -1277,6 +1277,75 @@ fn scan_immutable_scans_the_groups_of_the_receiver_again() {
 }
 
 #[test]
+fn compact_compacts_the_index_of_each_receiver() {
+    // `--compact` reaches the update of each receiver, which REQUEST tells
+    // (DESIGN.md §6.2 and §8): the client in a pull, the server in a push,
+    // and both hosts with both streams deduplicated. Each update removes the
+    // rows of a file that is gone, and leaves the deletions of the rows in
+    // the database files, unless the option makes it end with a compaction,
+    // as `update --compact` does. A run with `--no-update` has no update, so
+    // with it, the option is a usage error.
+    let runs: [(&[&str], &[Direction]); 3] = [
+        (&[], &[Direction::Pull]),
+        (&["--dedup-stdin"], &[Direction::Push]),
+        (&["--dedup-stdin", "--dedup-stdout"], &DIRECTIONS),
+    ];
+    for (streams, receivers) in runs {
+        let transfer = Transfer::new(&[]);
+        transfer.configure("");
+        transfer.configure_server("");
+        let file = |direction: Direction, i: u64| transfer.indexed(direction, &i.to_string());
+        for direction in DIRECTIONS {
+            for i in 0..2 {
+                transfer
+                    .env
+                    .write(file(direction, i), &random(2 * BLOCK, i));
+            }
+            transfer.update_receiver(direction, &[]);
+        }
+        let command = args(&["true"]);
+        let invocation =
+            |flags: &[&str]| transfer.invocation(&[streams, flags].concat(), &refs(&command));
+        // A run after the removal of file `i` from both trees.
+        let run = |i: u64, flags: &[&str]| {
+            for direction in DIRECTIONS {
+                std::fs::remove_file(transfer.env.path(file(direction, i))).unwrap();
+            }
+            let output = succeeded(invocation(flags).output().unwrap());
+            String::from_utf8_lossy(&output.stderr).into_owned()
+        };
+        let deletions = |direction: Direction| {
+            IndexView::open(&transfer.receiver_index(direction), false).file_deletions()
+        };
+        let note = |direction: Direction| match direction {
+            Direction::Pull => "hashsync: compacted index in ",
+            Direction::Push => "hashsync (server): compacted index in ",
+        };
+
+        let stderr = run(0, &[]);
+        assert!(
+            !stderr.contains("compacted index"),
+            "{streams:?}:\n{stderr}"
+        );
+        for &direction in receivers {
+            let removals = deletions(direction);
+            assert!(
+                removals > 0,
+                "{streams:?}, {direction:?}: no removal in the files"
+            );
+        }
+        let stderr = run(1, &["--compact"]);
+        for &direction in receivers {
+            assert!(stderr.contains(note(direction)), "{streams:?}:\n{stderr}");
+            assert_eq!(deletions(direction), 0, "{streams:?}, {direction:?}");
+        }
+
+        let output = invocation(&["--compact", "--no-update"]).output().unwrap();
+        assert_eq!(output.status.code(), Some(2), "{streams:?}");
+    }
+}
+
+#[test]
 fn copies_with_different_policies_end_a_run_without_an_update() {
     // The copies of a group must have the same exclusions, also in a run
     // with `--no-update`, which reads every copy (DESIGN.md §4.2). The

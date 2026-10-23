@@ -122,8 +122,8 @@ struct Shared {
 }
 
 /// The index of a process: read/write in a modifying process (`update`,
-/// `prune`, and the receiver of a run for its update), read-only in the
-/// others, and in that receiver after its update (`into_read_only`).
+/// `prune`, `compact`, and the receiver of a run for its update), read-only
+/// in the others, and in that receiver after its update (`into_read_only`).
 pub struct Index {
     shared: Arc<Shared>,
 }
@@ -245,15 +245,30 @@ pub fn open_modifying(path: &[u8]) -> Index {
     open_read_write(path, lock_modifying(path))
 }
 
-/// Open the index of a modifying process that only works on an index that
-/// an update has made: `prune`. Unlike `open_modifying`, it creates no
-/// database when there is none, since later commands would then report an
-/// index without metadata in place of a missing one. It waits for
+/// Open the index of `config` for a modifying process that only works on
+/// an index that an update has made, and that matches the configuration:
+/// `prune` and `compact` (DESIGN.md §4.4). Unlike `open_modifying`, it
+/// creates no database when there is none, since later commands would then
+/// report an index without metadata in place of a missing one. It waits for
 /// exclusive access, and creates the directory and the lock file when
-/// necessary, as `open_modifying` does. `None` when there is no database.
-pub fn open_existing(path: &[u8]) -> Option<Index> {
+/// necessary, as `open_modifying` does. A missing or incompatible index
+/// ends the process with a message that says which update to run.
+pub fn open_existing(config: &Config) -> Index {
+    let path = &config.index_path;
+    let (shown, update) = (quoted(path), config.update_command());
+    let no_index = || -> ! { die(format!("no index at {shown}; run `{update}`")) };
     let lock = lock_modifying(path);
-    has_database(path).then(|| open_read_write(path, lock))
+    if !has_database(path) {
+        no_index();
+    }
+    let index = open_read_write(path, lock);
+    match index.read_meta() {
+        None => no_index(),
+        Some(meta) if !meta.compatible(&Settings::from_config(config)) => die(format!(
+            "index {shown} does not match the configuration; run `{update}`"
+        )),
+        Some(_) => index,
+    }
 }
 
 /// Create the directory of the index at `path` when necessary, and take
@@ -943,12 +958,12 @@ impl Index {
         txn.commit();
     }
 
-    /// End the writes of a modifying process, an update or a prune
-    /// (DESIGN.md §4.4): write the memtables to the database files, so that
-    /// a later read-only process has no write-ahead log to replay, then
-    /// wait for the compactions that RocksDB has scheduled. Closing the
-    /// database would cancel them, and short updates would leave ever more
-    /// of them to later ones.
+    /// End the writes of a modifying process, at the end of an update and
+    /// of a compaction (DESIGN.md §4.4): write the memtables to the
+    /// database files, so that a later read-only process has no write-ahead
+    /// log to replay, then wait for the compactions that RocksDB has
+    /// scheduled. Closing the database would cancel them, and short updates
+    /// would leave ever more of them to later ones.
     pub fn finish_writes(&self) {
         // `set_flush` flushes the column families one after the other, and
         // the last flush removes the old write-ahead log. Parallel flushes
@@ -962,12 +977,12 @@ impl Index {
     }
 
     /// Compact every column family completely, then end the writes as
-    /// `finish_writes` does. A prune ends with it, so that the entries that
-    /// it and the updates before it removed leave the database files
-    /// (DESIGN.md §4.4). The compaction of a column family writes its
-    /// memtable to the files first, then moves every entry to the last
-    /// level, where the removed entries go with the deletions that removed
-    /// them.
+    /// `finish_writes` does. A prune ends with it, and so do an update with
+    /// `--compact` and `hashsync compact`, so that the entries that updates
+    /// and prunes removed leave the database files (DESIGN.md §4.4). The
+    /// compaction of a column family writes its memtable to the files
+    /// first, then moves every entry to the last level, where the removed
+    /// entries go with the deletions that removed them.
     pub fn compact(&self) {
         let shared = &self.shared;
         for cf in Cf::ALL {

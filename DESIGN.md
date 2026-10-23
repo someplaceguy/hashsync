@@ -455,9 +455,9 @@ transaction that changes a row changes that entry too.
   filesystem ID, and the inode handle (section 4.3).
 - Metadata names are `schema_version`, `block_size`, `weak_hash_id`,
   `strong_hash_id`, and `index_id`. An index whose metadata does not match
-  requires an in-place rebuild. Read-only runs and prune report that an
-  update is required for a missing or incompatible index, and prune
-  creates no database.
+  requires an in-place rebuild. Read-only runs, prune, and compact report
+  that an update is required for a missing or incompatible index, and
+  prune and compact create no database.
 - `index_id` is a random 128-bit value created with the schema and renewed
   on rebuild. It partitions caches, not list content; there is no index
   generation counter.
@@ -492,17 +492,20 @@ modifying process opens the index. Then it waits for the compactions that
 RocksDB has scheduled: closing the database would cancel them
 (section 10). A prune ends the same way, after it has compacted every
 column family into its last level, so that the entries that it and the
-updates before it removed leave the database files. RocksDB keeps all
-files of the database open, so a process raises its soft descriptor limit
-to the hard limit before it opens the index. Its children, such as the
-command of a run whose forward stream is deduplicated, start with the
-limit from before the raise, as they would under SSH alone.
+updates before it removed leave the database files. An update with
+`--compact` ends with the same compaction, also in a run with
+`ssh --compact`, and `hashsync compact` does nothing else (section 8).
+RocksDB keeps all files of the database open, so a process raises its
+soft descriptor limit to the hard limit before it opens the index. Its
+children, such as the command of a run whose forward stream is
+deduplicated, start with the limit from before the raise, as they would
+under SSH alone.
 
 **Process access.** A lock on the file `hashsync.lock` in the index
 directory excludes other processes:
 
-- A modifying process (`update`, `prune`, or the receiver of a run
-  without `--no-update`, for its update) creates the directory and the
+- A modifying process (`update`, `prune`, `compact`, or the receiver of a
+  run without `--no-update`, for its update) creates the directory and the
   lock file if necessary, opens the lock file read/write, and takes an
   exclusive lock before it opens the database read/write.
 - A read-only process (the receiver of a run with `--no-update`, `stats`)
@@ -1246,10 +1249,11 @@ Payloads:
   as a set of bits: 1 for the forward stream and 2 for the backward
   stream, so 1 in a push, 2 in a pull, and 3 with both; at least one is
   set. Then the settings of the run (section 8): `no_update u8`,
-  `scan_immutable u8`, `sender_cache u8`, `compression_level i32`,
-  `compression_long u8`, `compression_threads u32`, `probe_threads u32`,
-  `lookahead u64` (bytes; 0 for the default), `negative_cache u64`
-  (bytes), `spool_limit u64` (bytes; `2^64 − 1` for `unlimited`),
+  `scan_immutable u8`, `compact u8`, `sender_cache u8`,
+  `compression_level i32`, `compression_long u8`,
+  `compression_threads u32`, `probe_threads u32`, `lookahead u64`
+  (bytes; 0 for the default), `negative_cache u64` (bytes),
+  `spool_limit u64` (bytes; `2^64 − 1` for `unlimited`),
   `stdin_delivery u8` and `stdout_delivery u8` (0 for eager, 1 for batch),
   and `wait u8`, 1 with `--wait`. Each host applies the settings that
   concern its roles. Then `quiet u8` and `human_readable u8`: the client's
@@ -2598,10 +2602,11 @@ exclude = ['*.tmp', 'literal\x2Aname', 'back\\slash']
 
 ## 8. Command line
 
-- `hashsync update [--rebuild] [--scan-immutable] [-j N]`: update or
-  rebuild the index; `--scan-immutable` scans the completed immutable
-  groups again too (section 4.2), and `-j` overrides the configured thread
-  count.
+- `hashsync update [--rebuild] [--scan-immutable] [--compact] [-j N]`:
+  update or rebuild the index; `--scan-immutable` scans the completed
+  immutable groups again too (section 4.2), `--compact` compacts the index
+  at the end, as prune does (section 4.4), and `-j` overrides the
+  configured thread count.
 - `hashsync ssh [OPTIONS] [-l USER] [USER@]HOST [--] COMMAND [ARGS...]`:
   run the remote command as ssh does, reproduce its stdout, and return its
   status. It takes the arguments that rsync gives its remote shell
@@ -2657,7 +2662,9 @@ exclude = ['*.tmp', 'literal\x2Aname', 'back\\slash']
     read-only index access (section 4.4), and still resolves current roots
     (section 4.2). `--scan-immutable` makes the update of each receiver scan
     its completed immutable groups again, as `hashsync update
-    --scan-immutable` does; with `--no-update`, it is a usage error.
+    --scan-immutable` does, and `--compact` makes it end with a compaction
+    of the index, as `hashsync update --compact` does; with `--no-update`,
+    either is a usage error.
   - `--ssh CMD` (default `ssh`) and `--hashsync-path PATH` (default
     `hashsync`) say how the client starts the server (section 6.1).
   - `--server-profile NAME` and `--server-config PATH` select the server's
@@ -2745,6 +2752,8 @@ exclude = ['*.tmp', 'literal\x2Aname', 'back\\slash']
   `one_filesystem` now leave out, without hashing, then compact the index;
   it looks up the paths of immutable roots only with `--scan-immutable`
   (section 4.2).
+- `hashsync compact`: compact the index as prune does at its end, and do
+  nothing else (section 4.4).
 
 Every command also accepts these options, besides `--profile NAME` and
 `--config PATH`, which select its configuration file (section 7):
@@ -3415,6 +3424,11 @@ decision history, including fuller measurements, is in version control.
     a copy that vanishes after root resolution, also the one that the row
     of a group that becomes unfinished named, a missing index, which prune
     does not create, the compaction, and the exclusive lock;
+  - compaction: by `hashsync compact`, which changes no entry, needs an
+    index that matches the configuration, creates none, and takes the
+    exclusive lock; by `update --compact`; by the updates of a run with
+    `ssh --compact`, in a pull, in a push, and with both streams
+    deduplicated; and `ssh --compact --no-update`, a usage error;
   - configuration byte escapes, TOML quoting, literal glob metacharacters,
     and non-UTF-8 values; a `~` that starts a path, also as `\x7E`;
     messages that show paths, names, patterns, and values of the

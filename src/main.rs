@@ -4,22 +4,23 @@
 //! the client's stdin, replacing blocks that the server holds. See
 //! `DESIGN.md`.
 //!
-//! This build implements PLAN.md steps 1–8: `update`, `prune`, and `stats`
-//! for mutable roots and for immutable ones, whose copies share a group that
-//! an update scans once and then reuses, and `ssh`, which deduplicates stdout
-//! by default, stdin with `--dedup-stdin`, and both with `--dedup-stdin
-//! --dedup-stdout`. The command starts at once, and its streams with it;
-//! the hash lists that deduplicate them follow while they run, unless
-//! `--wait` holds each deduplicated stream until its list is in. A transfer
-//! reuses the hash lists of earlier transfers, replaces indexed blocks with
-//! verified references, read from any current copy of their root, sends
-//! runs of one byte compactly, compresses both streams, and spools both
+//! This build implements PLAN.md steps 1–8: `update`, `prune`, `compact`, and
+//! `stats` for mutable roots and for immutable ones, whose copies share a
+//! group that an update scans once and then reuses, and `ssh`, which
+//! deduplicates stdout by default, stdin with `--dedup-stdin`, and both with
+//! `--dedup-stdin --dedup-stdout`. The command starts at once, and its
+//! streams with it; the hash lists that deduplicate them follow while they
+//! run, unless `--wait` holds each deduplicated stream until its list is in.
+//! A transfer reuses the hash lists of earlier transfers, replaces indexed
+//! blocks with verified references, read from any current copy of their root,
+//! sends runs of one byte compactly, compresses both streams, and spools both
 //! ends of each. Stdout and stdin each use eager or batch delivery.
 
 mod attach;
 mod blocks;
 mod cache;
 mod client;
+mod compact;
 mod config;
 mod control;
 mod dedup;
@@ -182,6 +183,10 @@ enum Command {
         #[arg(long)]
         scan_immutable: bool,
 
+        /// Compact the index at the end, as the compact command does
+        #[arg(long)]
+        compact: bool,
+
         /// Override the configured thread count; 0 selects the default
         #[arg(short = 'j', value_name = "N")]
         jobs: Option<u32>,
@@ -196,6 +201,9 @@ enum Command {
         #[arg(long)]
         scan_immutable: bool,
     },
+    /// Compact the index: rewrite its files without the entries that
+    /// updates and prunes removed
+    Compact,
     /// Run a remote command through SSH, as ssh does, deduplicating its
     /// stdout against the local index, or with --dedup-stdin, stdin against
     /// the remote one, or both
@@ -335,10 +343,20 @@ fn main() {
         Command::Update {
             rebuild,
             scan_immutable,
+            compact,
             jobs,
-        } => update::run(&load_config(), *rebuild, *scan_immutable, *jobs),
+        } => {
+            let options = update::Options {
+                rebuild: *rebuild,
+                scan_immutable: *scan_immutable,
+                compact: *compact,
+                jobs: *jobs,
+            };
+            update::run(&load_config(), options)
+        }
         Command::Stats => stats::run(&load_config()),
         Command::Prune { scan_immutable } => prune::run(&load_config(), *scan_immutable),
+        Command::Compact => compact::run(&load_config()),
         // The client receives the backward stream: it needs its
         // configuration file when that stream is deduplicated, for its index
         // (DESIGN.md §7).

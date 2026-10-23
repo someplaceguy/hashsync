@@ -1,6 +1,7 @@
 //! `hashsync prune` through the binary (DESIGN.md §4.2 and §8): the roots
 //! and paths that it removes from the index without hashing, the roots
-//! that it looks into, and the compaction at its end.
+//! that it looks into, and the compaction at its end, which `hashsync
+//! compact` and `update --compact` do too.
 
 mod common;
 
@@ -8,12 +9,17 @@ use std::os::unix::ffi::OsStrExt;
 
 use common::*;
 
+/// Run `hashsync WORDS...`, and require success. Returns stderr.
+fn succeed(env: &Env, words: &[&str]) -> String {
+    let output = env.run(words);
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(output.status.success(), "{words:?} failed:\n{stderr}");
+    stderr
+}
+
 /// Run `prune` with `options`, and require success. Returns stderr.
 fn prune(env: &Env, options: &[&str]) -> String {
-    let output = env.run(&[&["prune"], options].concat());
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    assert!(output.status.success(), "prune failed:\n{stderr}");
-    stderr
+    succeed(env, &[&["prune"], options].concat())
 }
 
 /// What the note of a prune says that it removed: roots, paths, and stale
@@ -390,12 +396,11 @@ fn a_root_that_does_not_open_goes() {
     assert_eq!(env.count("blocks"), 0);
 }
 
-/// Prune ends with a compaction of the whole database: the entries that it
-/// and the updates before it removed leave the database files, where an
-/// update leaves them until RocksDB compacts the files on its own
-/// (DESIGN.md §4.4).
-#[test]
-fn prune_compacts_the_index() {
+/// An index of four files, of which the last update removed one. An update
+/// without `--compact` leaves the deletions of the file's entries in the
+/// database files, until RocksDB compacts the files on its own (DESIGN.md
+/// §4.4).
+fn index_with_deletions() -> Env {
     let env = Env::new();
     for i in 0..4 {
         env.write(format!("tree/{i}"), &random(BLOCK * 2, i));
@@ -405,8 +410,17 @@ fn prune_compacts_the_index() {
     std::fs::remove_file(env.path("tree/0")).unwrap();
     let stderr = env.update();
     assert!(stderr.contains(" 1 stale inodes removed"), "{stderr}");
+    assert!(!stderr.contains("compacted"), "{stderr}");
     assert!(env.index().file_deletions() > 0, "no removal in the files");
+    env
+}
 
+/// Prune ends with a compaction of the whole database: the entries that it
+/// and the updates before it removed leave the database files (DESIGN.md
+/// §4.4).
+#[test]
+fn prune_compacts_the_index() {
+    let env = index_with_deletions();
     std::fs::remove_file(env.path("tree/1")).unwrap();
     let stderr = prune(&env, &[]);
     assert_eq!(pruned(&stderr), [0, 1, 1], "{stderr}");
@@ -434,12 +448,56 @@ fn prune_compacts_deletions_that_reach_the_last_level() {
     assert_eq!(env.index().file_deletions(), 0);
 }
 
-/// Prune needs an index that matches the configuration, which only an
-/// update makes, and says which update to run. It creates no database, so
-/// that the other commands find no index either. A configuration error
-/// changes nothing (DESIGN.md §4.2 and §4.4).
+/// `hashsync compact` compacts the index as a prune does at its end, and
+/// changes no entry of it (DESIGN.md §4.4).
 #[test]
-fn prune_needs_a_current_index() {
+fn compact_compacts_the_index() {
+    let env = index_with_deletions();
+    let entries = || {
+        let index = env.index();
+        let families = env.column_families();
+        families
+            .iter()
+            .map(|cf| index.entries(cf))
+            .collect::<Vec<_>>()
+    };
+    let before = entries();
+    let stderr = succeed(&env, &["compact"]);
+    assert!(stderr.contains("hashsync: compacted index in "), "{stderr}");
+    assert_eq!(env.index().file_deletions(), 0);
+    assert!(entries() == before, "the compaction changed the index");
+}
+
+/// `update --compact` ends with the same compaction, after the note of the
+/// update, so that the entries that the update itself removed leave the
+/// database files too (DESIGN.md §4.4).
+#[test]
+fn update_compact_compacts_the_index() {
+    let env = index_with_deletions();
+    std::fs::remove_file(env.path("tree/1")).unwrap();
+    let stderr = succeed(&env, &["update", "--compact"]);
+    let position = |note: &str| {
+        let found = stderr.find(note);
+        found.unwrap_or_else(|| panic!("no {note:?} in:\n{stderr}"))
+    };
+    let updated = position(" 1 stale inodes removed");
+    assert!(
+        updated < position("hashsync: compacted index in "),
+        "{stderr}"
+    );
+    let index = env.index();
+    assert_eq!(index.file_deletions(), 0);
+    assert_eq!(index.count("paths"), 2);
+    index.assert_consistent();
+}
+
+/// Prune and compact need an index that matches the configuration, which
+/// only an update makes, and say which update to run. They create no
+/// database, so that the other commands find no index either. An error in
+/// the roots of the configuration, which prune resolves, changes nothing
+/// (DESIGN.md §4.2 and §4.4).
+#[test]
+fn prune_and_compact_need_a_current_index() {
     let env = Env::new();
     env.write("tree/f", &random(BLOCK, 1));
     env.configure(&env.root("tree", ""));
@@ -451,7 +509,7 @@ fn prune_needs_a_current_index() {
         "hashsync: no index at {}; {update}\n",
         quoted(env.index_path())
     );
-    for command in ["prune", "stats"] {
+    for command in ["prune", "compact", "stats"] {
         let output = env.run(&[command]);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(output.status.code(), Some(1), "{command}: {stderr}");
@@ -460,14 +518,16 @@ fn prune_needs_a_current_index() {
 
     env.update();
     env.configure_with(&format!("block_size = 8192\n{}", env.root("tree", "")));
-    let output = env.run(&["prune"]);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(output.status.code(), Some(1), "{stderr}");
     let expected = format!(
         "hashsync: index {} does not match the configuration; {update}\n",
         quoted(env.index_path())
     );
-    assert!(stderr.ends_with(&expected), "{stderr}");
+    for command in ["prune", "compact"] {
+        let output = env.run(&[command]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{command}: {stderr}");
+        assert!(stderr.ends_with(&expected), "{command}: {stderr}");
+    }
 
     env.configure(&format!(
         "{}{}",

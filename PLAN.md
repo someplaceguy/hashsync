@@ -21,13 +21,15 @@ process-isolation tests, and protocol fuzzing from DESIGN.md §11. Run
 changes.
 
 **Status:** Steps 1 to 8 are implemented: `update` (with `--rebuild`,
-`--scan-immutable`, and `-j`), `prune` (with `--scan-immutable`), and
-`stats` maintain the index for mutable and immutable roots, reuse
-unchanged files by identity, size, and ctime, and recover interrupted
-work. `prune` removes, without hashing, the roots that no current copy
-holds and the paths that none holds or that exclusions or
-`one_filesystem` now leave out, in immutable roots only with
+`--scan-immutable`, `--compact`, and `-j`), `prune` (with
+`--scan-immutable`), `compact`, and `stats` maintain the index for
+mutable and immutable roots, reuse unchanged files by identity, size, and
+ctime, and recover interrupted work. `prune` removes, without hashing, the
+roots that no current copy holds and the paths that none holds or that
+exclusions or `one_filesystem` now leave out, in immutable roots only with
 `--scan-immutable`, and then compacts the index (DESIGN.md §4.2).
+`compact` compacts it in the same way, and so do `update --compact` and
+the updates of a run with `ssh --compact` at their end (DESIGN.md §4.4).
 The copies of an immutable group share one root row: an
 update scans the first copy of an unfinished group that is there, the
 next one when a copy that may vanish disappears before its scan, marks
@@ -283,8 +285,8 @@ Design coverage: §§4.2–4.6, 6.4, 7–8.
 
 ## 8. Prune content that is no longer available
 
-Deliver `hashsync prune [--scan-immutable]`, and `--scan-immutable` for
-`update` and `ssh`.
+Deliver `hashsync prune [--scan-immutable]` and `hashsync compact`, and
+`--scan-immutable` and `--compact` for `update` and `ssh`.
 
 - Resolve current roots and remove the paths that no current copy holds,
   or that exclusions or `one_filesystem` now leave out, without hashing
@@ -300,9 +302,11 @@ Deliver `hashsync prune [--scan-immutable]`, and `--scan-immutable` for
   happen to have no indexed paths. Compact the database at the end.
 - Let `update --scan-immutable`, and the updates of a run with
   `ssh --scan-immutable`, scan the completed immutable groups again.
+- Let `hashsync compact`, `update --compact`, and the updates of a run
+  with `ssh --compact` compact the database as prune does.
 
-Result: users can remove stale index entries without a content scan, and
-scan immutable trees again when they did change.
+Result: users can remove stale index entries without a content scan,
+compact the index, and scan immutable trees again when they did change.
 
 Design coverage: §§4.2, 4.4, 6.2, 8.
 

@@ -1,6 +1,6 @@
 //! `hashsync prune [--scan-immutable]` (DESIGN.md §4.2 and §8): remove from
 //! the index what no current copy of a root holds any more, without hashing
-//! a file, then compact the database.
+//! a file, then compact the database, as `hashsync compact` does.
 //!
 //! Prune resolves the roots as an update does, so a root that the
 //! configuration no longer names, or whose copies are all missing, has no
@@ -34,12 +34,12 @@ use rayon::slice::ParallelSlice;
 use rustix::fs::FileType;
 use rustix::io::Errno;
 
+use crate::compact;
 use crate::config::{Config, RootConfig};
-use crate::die::die;
 use crate::escapes::quoted;
 use crate::fsid::FsCache;
 use crate::fsops;
-use crate::index::{self, Index, Pruning, RootRow, Settings};
+use crate::index::{self, Index, Pruning, RootRow};
 use crate::pool::Pool;
 use crate::report::{note, warn};
 use crate::roots::{self, Location};
@@ -59,22 +59,10 @@ pub fn run(config: &Config, scan_immutable: bool) {
     let fs_cache = FsCache::new();
     let locations = roots::resolve(config, &fs_cache);
 
-    let (path, update) = (quoted(&config.index_path), config.update_command());
-    let no_index = || -> ! { die(format!("no index at {path}; run `{update}`")) };
-    let Some(index) = index::open_existing(&config.index_path) else {
-        no_index()
-    };
+    let index = index::open_existing(config);
     // As for an update, the time counts from the moment the index is
     // locked.
     let start = Instant::now();
-    match index.read_meta() {
-        None => no_index(),
-        Some(meta) if !meta.compatible(&Settings::from_config(config)) => die(format!(
-            "index {path} does not match the configuration; run `{update}`"
-        )),
-        Some(_) => {}
-    }
-
     let pool = Pool::start("prune", scan::thread_count(config.threads, None));
     let rows = index.roots();
     let current = roots::current_locations(&locations, &rows);
@@ -94,13 +82,7 @@ pub fn run(config: &Config, scan_immutable: bool) {
             pruning.unfinished.len()
         ));
     }
-
-    let start = Instant::now();
-    index.compact();
-    note(format_args!(
-        "compacted index in {:.1}s",
-        start.elapsed().as_secs_f64()
-    ));
+    compact::perform(&index);
     index.close();
 }
 

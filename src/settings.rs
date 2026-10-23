@@ -111,6 +111,11 @@ pub struct RunSettings {
     #[arg(long, conflicts_with = "no_update")]
     pub scan_immutable: bool,
 
+    /// Compact each index that a stream is deduplicated against at the end
+    /// of its update, as update --compact does
+    #[arg(long, conflicts_with = "no_update")]
+    pub compact: bool,
+
     /// Send stdin to the command in batch delivery: only from full buffers
     /// and at its end, not each time stdin waits, which compresses better,
     /// and keeps more references when stdin is deduplicated
@@ -260,6 +265,7 @@ pub mod tests {
             RunSettings {
                 no_update: false,
                 scan_immutable: false,
+                compact: false,
                 batch_stdin: false,
                 batch_stdout: false,
                 wait: false,
@@ -313,13 +319,16 @@ pub mod tests {
         assert!(!settings.sender_cache);
     }
 
-    /// `--scan-immutable` changes the update of a receiver, which
-    /// `--no-update` skips, so together they are a usage error.
+    /// `--scan-immutable` and `--compact` change the update of a receiver,
+    /// which `--no-update` skips, so with it, either is a usage error.
     #[test]
-    fn scan_immutable_needs_an_update() {
+    fn the_options_of_the_update_need_an_update() {
         assert!(settings(&["--scan-immutable"]).scan_immutable);
-        let both = ["hashsync", "--scan-immutable", "--no-update"];
-        assert!(Options::try_parse_from(both).is_err());
+        assert!(settings(&["--compact"]).compact);
+        for option in ["--scan-immutable", "--compact"] {
+            let both = ["hashsync", option, "--no-update"];
+            assert!(Options::try_parse_from(both).is_err(), "{option}");
+        }
     }
 
     #[test]

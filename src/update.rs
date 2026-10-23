@@ -1,8 +1,10 @@
-//! `hashsync update [--rebuild] [--scan-immutable]` (DESIGN.md §4 and §8).
+//! `hashsync update [--rebuild] [--scan-immutable] [--compact]` (DESIGN.md
+//! §4 and §8).
 
 use std::sync::atomic::Ordering::Relaxed;
 use std::time::Instant;
 
+use crate::compact;
 use crate::config::Config;
 use crate::escapes::quoted;
 use crate::fsid::FsCache;
@@ -13,26 +15,37 @@ use crate::roots::{self, Location};
 use crate::scan;
 use crate::units::Bytes;
 
-pub fn run(config: &Config, rebuild: bool, scan_immutable: bool, jobs: Option<u32>) {
-    let (index, _) = perform(config, rebuild, scan_immutable, jobs);
+/// The options of an update: those of `hashsync update`, of which the
+/// update of a run's receiver takes `scan_immutable` and `compact` from the
+/// options of `hashsync ssh` (DESIGN.md §8).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Options {
+    /// Remove every entry of the index and build it again.
+    pub rebuild: bool,
+    /// Scan the completed immutable groups again too, which an update
+    /// otherwise reuses without a scan (DESIGN.md §4.2).
+    pub scan_immutable: bool,
+    /// End with a compaction of the index, as a prune does (DESIGN.md
+    /// §4.4).
+    pub compact: bool,
+    /// The thread count of the scan, in place of the configured one; 0
+    /// selects the default.
+    pub jobs: Option<u32>,
+}
+
+pub fn run(config: &Config, options: Options) {
+    let (index, _) = perform(config, options);
     index.close();
 }
 
-/// Update the index and return it still open, with the current root
-/// locations that the update resolved. With `scan_immutable`, the update
-/// scans the completed immutable groups again too, which it otherwise
-/// reuses without a scan (DESIGN.md §4.2). The receiver of a run turns the
-/// index into a read-only index on the same lock (`Index::into_read_only`),
-/// so no modifying process comes between the update and its use, or, in a
-/// run with both streams deduplicated, closes it until the other host's
-/// update is done too (DESIGN.md §4.4). Its lookups read candidate blocks
-/// through these locations.
-pub fn perform(
-    config: &Config,
-    rebuild: bool,
-    scan_immutable: bool,
-    jobs: Option<u32>,
-) -> (index::Index, Vec<Location>) {
+/// Update the index as `options` say, and return it still open, with the
+/// current root locations that the update resolved. The receiver of a run
+/// turns the index into a read-only index on the same lock
+/// (`Index::into_read_only`), so no modifying process comes between the
+/// update and its use, or, in a run with both streams deduplicated, closes
+/// it until the other host's update is done too (DESIGN.md §4.4). Its
+/// lookups read candidate blocks through these locations.
+pub fn perform(config: &Config, options: Options) -> (index::Index, Vec<Location>) {
     fsops::raise_descriptor_limit();
 
     // Resolve and validate the roots before the index is opened: a rejected
@@ -45,7 +58,7 @@ pub fn perform(
     // locked: a wait for the lock of another process is no update work.
     let start = Instant::now();
     let settings = Settings::from_config(config);
-    let rebuild = rebuild
+    let rebuild = options.rebuild
         || match index.read_meta() {
             None => {
                 report::note(format_args!(
@@ -90,10 +103,16 @@ pub fn perform(
             identifier: location.identifier.as_deref(),
         })
         .collect();
-    let reconciliation = index.reconcile_roots(&current, scan_immutable);
+    let reconciliation = index.reconcile_roots(&current, options.scan_immutable);
 
-    let (counters, summary) =
-        scan::run(config, &locations, &reconciliation, &fs_cache, &index, jobs);
+    let (counters, summary) = scan::run(
+        config,
+        &locations,
+        &reconciliation,
+        &fs_cache,
+        &index,
+        options.jobs,
+    );
 
     index.finish_writes();
 
@@ -128,6 +147,9 @@ pub fn perform(
             "immutable roots: {} reused, {} completed, {} incomplete",
             summary.groups_reused, summary.groups_completed, summary.groups_incomplete
         ));
+    }
+    if options.compact {
+        compact::perform(&index);
     }
     (index, locations)
 }

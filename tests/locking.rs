@@ -151,26 +151,29 @@ fn update_waits_for_a_read_only_process() {
 }
 
 #[test]
-fn prune_waits_for_a_read_only_process() {
-    // Prune changes the index, so it takes the exclusive lock, and waits
-    // until no read-only process has the index (DESIGN.md §4.4).
-    let env = indexed_env();
-    let reader = lock(&env, FlockOperation::LockShared);
+fn prune_and_compact_wait_for_a_read_only_process() {
+    // Prune and compact change the index, so they take the exclusive lock,
+    // and wait until no read-only process has the index (DESIGN.md §4.4).
+    for (command, note) in [("prune", "pruned"), ("compact", "compacted")] {
+        let env = indexed_env();
+        let reader = lock(&env, FlockOperation::LockShared);
 
-    let mut child = env
-        .command(&["prune"])
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    wait_for_waiter(&mut child, &reader);
+        let mut child = env
+            .command(&[command])
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        wait_for_waiter(&mut child, &reader);
 
-    drop(reader);
-    let output = child.wait_with_output().unwrap();
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(output.status.success(), "{stderr}");
-    let notes = files_note(&env) + &waiting_note(&env) + &acquired_note(&env);
-    assert!(stderr.starts_with(&notes), "{stderr}");
-    assert!(stderr.contains("hashsync: pruned index in "), "{stderr}");
+        drop(reader);
+        let output = child.wait_with_output().unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(output.status.success(), "{stderr}");
+        let notes = files_note(&env) + &waiting_note(&env) + &acquired_note(&env);
+        assert!(stderr.starts_with(&notes), "{stderr}");
+        let note = format!("hashsync: {note} index in ");
+        assert!(stderr.contains(&note), "{stderr}");
+    }
 }
 
 #[test]

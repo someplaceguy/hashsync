@@ -714,26 +714,34 @@ impl SendingThreads {
 enum Preparation {
     /// With `--no-update`: open the index read-only, as it is.
     Open,
-    /// The only update of the run: update the index, and keep it read-only
-    /// on the same lock, so that no modifying process comes between the
-    /// update and the use of the index.
-    UpdateAndKeep,
-    /// Both hosts update their index, at the same time: update it, and
-    /// release it, because the other host can still be waiting for the
-    /// exclusive lock of its own update then. Open it again, read-only, once
-    /// that update is done too (steps L1 and L2).
-    UpdateAndReopen,
+    /// The only update of the run, with its options: update the index, and
+    /// keep it read-only on the same lock, so that no modifying process
+    /// comes between the update and the use of the index.
+    UpdateAndKeep(update::Options),
+    /// Both hosts update their index, at the same time: update it with the
+    /// options, and release it, because the other host can still be waiting
+    /// for the exclusive lock of its own update then. Open it again,
+    /// read-only, once that update is done too (steps L1 and L2).
+    UpdateAndReopen(update::Options),
 }
 
 impl Preparation {
-    /// The preparation for a run with `--no-update` (`no_update`) or
-    /// without it, whose `deduplicated` streams tell whether the other host
-    /// updates an index of its own too.
-    fn of(no_update: bool, deduplicated: Deduplicated) -> Self {
-        match (no_update, deduplicated) {
+    /// The preparation for a run with `settings`, whose `deduplicated`
+    /// streams tell whether the other host updates an index of its own too.
+    /// The update takes `--scan-immutable` and `--compact` from the
+    /// settings, which `--no-update` excludes.
+    fn of(settings: &RunSettings, deduplicated: Deduplicated) -> Self {
+        let options = update::Options {
+            scan_immutable: settings.scan_immutable,
+            compact: settings.compact,
+            ..update::Options::default()
+        };
+        match (settings.no_update, deduplicated) {
             (true, _) => Preparation::Open,
-            (false, Deduplicated::Both) => Preparation::UpdateAndReopen,
-            (false, Deduplicated::Stdin | Deduplicated::Stdout) => Preparation::UpdateAndKeep,
+            (false, Deduplicated::Both) => Preparation::UpdateAndReopen(options),
+            (false, Deduplicated::Stdin | Deduplicated::Stdout) => {
+                Preparation::UpdateAndKeep(options)
+            }
         }
     }
 }
@@ -798,23 +806,23 @@ impl Receiving {
 
     /// Start the receiver's role on a thread of its own: prepare the index
     /// of `config` for the run, with the `--no-update`, `--scan-immutable`,
-    /// and sender caching of `settings`, and with the other host when both
-    /// streams are `deduplicated`, since it then updates an index of its own
-    /// at the same time (DESIGN.md §4.4). Then start the lookups, which take
-    /// over the index and answer the queries as soon as they arrive, and run
-    /// the receiver's side of the list exchange (DESIGN.md §5.6), unless the
-    /// stream has ended or stopped by then.
+    /// `--compact`, and sender caching of `settings`, and with the other
+    /// host when both streams are `deduplicated`, since it then updates an
+    /// index of its own at the same time (DESIGN.md §4.4). Then start the
+    /// lookups, which take over the index and answer the queries as soon as
+    /// they arrive, and run the receiver's side of the list exchange
+    /// (DESIGN.md §5.6), unless the stream has ended or stopped by then.
     pub fn start(
         self,
         config: Arc<Config>,
         settings: &RunSettings,
         deduplicated: Deduplicated,
     ) -> ReceivingThread {
-        let preparation = Preparation::of(settings.no_update, deduplicated);
-        let (scan_immutable, sender_cache) = (settings.scan_immutable, settings.sender_cache);
+        let preparation = Preparation::of(settings, deduplicated);
+        let sender_cache = settings.sender_cache;
         let thread = std::thread::Builder::new()
             .name("receiver".into())
-            .spawn(move || self.run(&config, preparation, scan_immutable, sender_cache))
+            .spawn(move || self.run(&config, preparation, sender_cache))
             .expect("cannot start the receiver's list exchange");
         ReceivingThread(thread)
     }
@@ -828,7 +836,6 @@ impl Receiving {
         self,
         config: &Config,
         preparation: Preparation,
-        scan_immutable: bool,
         sender_cache: bool,
     ) -> (Lookups, ListBytes) {
         let Receiving {
@@ -839,7 +846,7 @@ impl Receiving {
         } = self;
         // The control reader keeps its own end of the link.
         drop(frames);
-        let (index, locations) = prepare(config, preparation, scan_immutable, &link);
+        let (index, locations) = prepare(config, preparation, &link);
         if pins.is_completing() {
             list_exchange::send_none(&link, config.hashlist_max_age);
             index.close();
@@ -875,16 +882,10 @@ impl ReceivingThread {
 
 /// Prepare the receiver's index for one run, as `preparation` says
 /// (DESIGN.md §4.4), with the other host through `link` when both hosts
-/// update their index. An update scans the completed immutable groups
-/// again too with `scan_immutable`. Returns the index, read-only with a
-/// shared lock, with the current root locations, from which the lookups
-/// read candidate blocks.
-fn prepare(
-    config: &Config,
-    preparation: Preparation,
-    scan_immutable: bool,
-    link: &Link,
-) -> (Index, Vec<Location>) {
+/// update their index. Returns the index, read-only with a shared lock,
+/// with the current root locations, from which the lookups read candidate
+/// blocks.
+fn prepare(config: &Config, preparation: Preparation, link: &Link) -> (Index, Vec<Location>) {
     match preparation {
         Preparation::Open => {
             fsops::raise_descriptor_limit();
@@ -892,8 +893,8 @@ fn prepare(
             let locations = roots::resolve(config, &fs_cache);
             (open_read_only(config), locations)
         }
-        Preparation::UpdateAndKeep => {
-            let (index, locations) = update::perform(config, false, scan_immutable, None);
+        Preparation::UpdateAndKeep(options) => {
+            let (index, locations) = update::perform(config, options);
             (index.into_read_only(&config.index_path), locations)
         }
         // L1. The update, then the lock goes: the other host updates its own
@@ -905,8 +906,8 @@ fn prepare(
         // read-only, which needs a shared lock alone. Another process can
         // have changed the index in between, and a rebuild with other
         // settings ends the run, as with `--no-update`.
-        Preparation::UpdateAndReopen => {
-            let (index, locations) = update::perform(config, false, scan_immutable, None);
+        Preparation::UpdateAndReopen(options) => {
+            let (index, locations) = update::perform(config, options);
             index.close();
             link.send(frame::UPDATED, Vec::new());
             link.expect_empty(frame::UPDATED, "UPDATED");

@@ -152,6 +152,7 @@ impl Request {
         let settings = &self.settings;
         enc.u8(settings.no_update.into());
         enc.u8(settings.scan_immutable.into());
+        enc.u8(settings.compact.into());
         enc.u8(settings.sender_cache.into());
         enc.i32(settings.compression_level);
         enc.u8(settings.compression_long.into());
@@ -212,6 +213,7 @@ impl Request {
         let settings = RunSettings {
             no_update: dec.flag(),
             scan_immutable: dec.flag(),
+            compact: dec.flag(),
             sender_cache: dec.flag(),
             compression_level: dec.i32(),
             compression_long: dec.flag(),
@@ -2634,7 +2636,7 @@ mod tests {
             Just(Deduplicated::Both),
         ];
         let settings = (
-            any::<[bool; 7]>(),
+            any::<[bool; 8]>(),
             any::<i32>(),
             any::<[u32; 2]>(),
             any::<[u64; 3]>(),
@@ -2643,6 +2645,7 @@ mod tests {
                 let [
                     no_update,
                     scan_immutable,
+                    compact,
                     sender_cache,
                     compression_long,
                     batch_stdin,
@@ -2653,6 +2656,7 @@ mod tests {
                 RunSettings {
                     no_update,
                     scan_immutable,
+                    compact,
                     sender_cache,
                     compression_level,
                     compression_long,
