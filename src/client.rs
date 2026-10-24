@@ -106,8 +106,11 @@ pub fn run(config: Config, remote: &ssh::Remote, request: &Request, no_stdin: bo
 
     // The tmp_data directory holds the segments of the pins and of the
     // spools of both streams (DESIGN.md §6.5). An unusable directory ends
-    // the run when it opens, before the sessions start.
+    // the run when it opens, before the sessions start. The segment files
+    // that failed runs left there go once they are older than
+    // `hashlist_max_age`.
     let tmp_data = Arc::new(Directory::open(&config.tmp_data_dir));
+    tmp_data.expire_temporaries(config.hashlist_max_age);
     // This side's roles in the deduplicated streams: the receiver of a
     // deduplicated backward stream, and the sender of a deduplicated forward
     // stream. With the stop of the backward stream, they are the producers

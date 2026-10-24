@@ -20,7 +20,7 @@ process-isolation tests, and protocol fuzzing from DESIGN.md §11. Run
 `cargo fmt`, `cargo clippy --all-targets`, and `cargo test` for implementation
 changes.
 
-**Status:** Steps 1 to 8 are implemented: `update` (with `--rebuild`,
+**Status:** All steps are implemented: `update` (with `--rebuild`,
 `--scan-immutable`, `--compact`, and `-j`), `prune` (with
 `--scan-immutable`), `compact`, and `stats` maintain the index for
 mutable and immutable roots, reuse unchanged files by identity, size, and
@@ -69,7 +69,12 @@ reads its own file of the profile `default`, unless `--server-profile` or
 index in a note, on both hosts of a run (DESIGN.md §7). `bench` measures
 how fast this host computes the weak and strong hashes at a few block
 sizes, and how fast the scanner searches output, on one thread and on the
-probe threads (DESIGN.md §8). Step 9 is the next milestone.
+probe threads (DESIGN.md §8). `default.nix` builds the package from the
+committed lockfile, also cross-compiled and statically linked with musl,
+installs the man page `docs/hashsync.1`, and checks the installed binary
+(`install-check.sh`): that it bundles RocksDB, LZ4, libzstd, and mimalloc,
+that every command works, and that a run finds its server through PATH and
+through `--hashsync-path` (DESIGN.md §9 and §11).
 
 ## 1. Build and inspect a local index
 

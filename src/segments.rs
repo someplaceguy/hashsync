@@ -26,6 +26,7 @@ use std::sync::{Arc, Weak};
 use rustix::fs::{AtFlags, Mode, OFlags};
 use rustix::io::{Errno, retry_on_intr};
 
+use crate::cache;
 use crate::die::die;
 use crate::escapes::quoted;
 use crate::fsops;
@@ -39,7 +40,7 @@ pub const SEGMENT_MINIMUM: u64 = 16 << 20;
 /// unlinked file in it (DESIGN.md §6.5).
 pub struct Directory {
     fd: OwnedFd,
-    /// Its path, for messages.
+    /// Its path, for messages and for `expire_temporaries`.
     path: Vec<u8>,
 }
 
@@ -66,6 +67,18 @@ impl Directory {
         };
         drop(directory.create_segment());
         directory
+    }
+
+    /// Remove the segment files that failed runs left in the directory,
+    /// once they are older than `max_age` seconds, the `hashlist_max_age`
+    /// of this host (`cache::expire_temporaries`). A segment that a run
+    /// creates without `O_TMPFILE` has a `.hashsync-` name until the run
+    /// unlinks it (`open_unlinked`), so a run that fails in between leaves
+    /// the file. Failures only print warnings, unlike those of the other
+    /// operations on the directory: a file that stays does no harm
+    /// (DESIGN.md §6.5).
+    pub fn expire_temporaries(&self, max_age: u64) {
+        cache::expire_temporaries(Path::new(OsStr::from_bytes(&self.path)), max_age);
     }
 
     /// The file of a new segment. A failure ends the run.
@@ -110,9 +123,14 @@ fn open_unlinked(dir: BorrowedFd<'_>) -> Result<OwnedFd, Errno> {
     loop {
         let name = names::temporary_name();
         match retry_on_intr(|| rustix::fs::openat(dir, name.as_str(), named, mode)) {
+            // Expiry in another run can remove the name first, with a very
+            // small age bound (`Directory::expire_temporaries`), which
+            // leaves the file unlinked, as this unlink would.
             Ok(fd) => {
-                retry_on_intr(|| rustix::fs::unlinkat(dir, name.as_str(), AtFlags::empty()))?;
-                return Ok(fd);
+                match retry_on_intr(|| rustix::fs::unlinkat(dir, name.as_str(), AtFlags::empty())) {
+                    Ok(()) | Err(Errno::NOENT) => return Ok(fd),
+                    Err(e) => return Err(e),
+                }
             }
             Err(Errno::EXIST) => {}
             Err(e) => return Err(e),

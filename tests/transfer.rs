@@ -33,8 +33,8 @@ use std::time::Duration;
 use common::{
     ANSWER, BLOCK, CHUNK, END, Env, FEATURES, HASHDELTA, HASHLIST, HASHNONE, HELLO, IndexView,
     KillOnDrop, LIT, QUERY, REQUEST, Root, STOP, STREAM_END, exclusive_lock, frame, hello_payload,
-    ofd_lock, proc_state, quoted, random, shared_lock, tiled, toml_literal, try_recv_frame,
-    version_and_features, wait_for_lock_wait, wait_until_asleep,
+    ofd_lock, proc_state, quoted, random, shared_lock, skip_as_root, tiled, toml_literal,
+    try_recv_frame, version_and_features, wait_for_lock_wait, wait_until_asleep,
 };
 use rocksdb::WriteBatch;
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
@@ -873,6 +873,22 @@ fn succeeded(output: Output) -> Output {
 /// The permission bits of `path`.
 fn mode(path: &std::path::Path) -> u32 {
     std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+/// Wait, with no deadline, until expiry counts a file whose ctime is
+/// `ctime` as older than `max_age` seconds: expiry compares whole seconds
+/// of the clock with the ctime (DESIGN.md §5.6). The clock here is the
+/// ctime of a probe file on the same filesystem, which this rewrites until
+/// it is far enough ahead.
+fn wait_until_expired(env: &Env, ctime: i64, max_age: i64) {
+    let probe = env.path("probe");
+    loop {
+        std::fs::write(&probe, b"").unwrap();
+        if std::fs::metadata(&probe).unwrap().ctime() > ctime + max_age {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
 fn refs(words: &[OsString]) -> Vec<&OsStr> {
@@ -1982,6 +1998,40 @@ fn an_error_in_the_servers_configuration_file_is_one_line() {
 }
 
 #[test]
+fn a_hashlist_max_age_of_0_ends_the_run_on_either_host() {
+    // An age of 0 in the file of either host is an error, whose message
+    // points to the option that does what such an age would do: send the
+    // whole list every time (DESIGN.md §7). The client reads its file
+    // before it starts SSH, and the server reads its own at REQUEST, so
+    // either error ends the run before the command starts.
+    let transfer = Transfer::new(&[]);
+    let marker = transfer.env.path("command-ran");
+    let command = args(&[&format!(": >'{}'", marker.display())]);
+    let fails_with = |error: String| {
+        let output = transfer.run(&[], &refs(&command));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{stderr}");
+        assert!(
+            stderr.lines().any(|line| line == error),
+            "missing {error:?}:\n{stderr}"
+        );
+        assert!(!marker.exists(), "the command ran");
+    };
+    let zero = "hashlist_max_age = 0\n";
+    let message = "hashlist_max_age must be at least 1 second; to send the whole hash list \
+                   every time, use `hashsync ssh --no-sender-cache`";
+    transfer.configure(zero);
+    fails_with(format!(
+        "hashsync: {}: {message}",
+        quoted(transfer.env.config_path())
+    ));
+    transfer.configure("");
+    let server = transfer.server_config();
+    transfer.env.write(&server, zero.as_bytes());
+    fails_with(format!("hashsync (server): {}: {message}", quoted(&server)));
+}
+
+#[test]
 fn command_killed_by_a_signal_reports_128_plus_signal() {
     let transfer = Transfer::new(&[]);
     let command = args(&["kill -KILL $$"]);
@@ -2128,20 +2178,10 @@ fn the_server_reads_the_configuration_file_that_the_client_names() {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, b"stale").unwrap();
     }
-    // Expiry compares whole seconds of the ctime with the clock, so a list
-    // is older than a `hashlist_max_age` of 0 once the second of its ctime
-    // has passed. Wait for that, with no deadline, on a probe file of the
-    // same filesystem.
+    // Wait until both lists are older than the `hashlist_max_age` of 1
+    // second that the server gets below.
     let ctime = |path: &std::path::Path| std::fs::metadata(path).unwrap().ctime();
-    let newest = ctime(&stale[0]).max(ctime(&stale[1]));
-    let probe = transfer.env.path("probe");
-    loop {
-        std::fs::write(&probe, b"").unwrap();
-        if ctime(&probe) > newest {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    wait_until_expired(&transfer.env, ctime(&stale[0]).max(ctime(&stale[1])), 1);
 
     let default_dir = transfer.env.path("server/home/.cache/hashsync/tmp-data");
     let configured = transfer.env.path("server-tmp-data");
@@ -2151,7 +2191,7 @@ fn the_server_reads_the_configuration_file_that_the_client_names() {
             toml_literal(path.as_os_str().as_bytes())
         )
     };
-    let server_config = format!("{}hashlist_max_age = \"0\"\n", tmp_data_dir(&configured));
+    let server_config = format!("{}hashlist_max_age = \"1\"\n", tmp_data_dir(&configured));
     transfer.env.write(
         "server/home/.config/hashsync/default.toml",
         server_config.as_bytes(),
@@ -4215,6 +4255,119 @@ fn an_empty_cache_directory_that_cannot_be_removed_only_warns() {
     transfer.run_ok(&refs(&command));
     for tree in trees {
         assert!(!transfer.env.path(format!("{tree}/stale")).exists());
+    }
+}
+
+#[test]
+fn each_host_removes_the_temporaries_that_failed_runs_left() {
+    // A failed run can leave a temporary next to the account ID, from its
+    // initialization, and one in the tmp_data directory, from a segment
+    // that it created without `O_TMPFILE` and had not unlinked yet. Each
+    // host removes those that are older than its `hashlist_max_age`: in its
+    // tmp_data directory when it opens it, and next to its account ID when
+    // it expires its list cache (DESIGN.md §5.6 and §6.5). The run waits
+    // for its list and has a byte of output, as in
+    // `an_empty_cache_directory_that_cannot_be_removed_only_warns`, so that
+    // its exchange ends with its list. Both hosts warn about an age below
+    // an hour (DESIGN.md §7).
+    let transfer = Transfer::new(&["--wait"]);
+    let max_age = "hashlist_max_age = \"1\"\n";
+    transfer.configure(max_age);
+    transfer.env.write(
+        "server/home/.config/hashsync/default.toml",
+        max_age.as_bytes(),
+    );
+    let leftovers = [
+        "client/cache/hashsync",
+        "client/cache/hashsync/tmp-data",
+        "server/home/.cache/hashsync",
+        "server/home/.cache/hashsync/tmp-data",
+    ]
+    .map(|dir| transfer.env.path(dir).join(".hashsync-0123456789abcdef"));
+    for path in &leftovers {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"").unwrap();
+    }
+    let ctimes = leftovers
+        .iter()
+        .map(|path| std::fs::metadata(path).unwrap().ctime());
+    wait_until_expired(&transfer.env, ctimes.max().unwrap(), 1);
+
+    let output = transfer.run_ok(&refs(&args(&["printf", "x"])));
+    for path in &leftovers {
+        assert!(!path.exists(), "{} stayed", path.display());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let client = quoted(transfer.env.config_path());
+    for (prefix, file) in [
+        ("hashsync", &client[..]),
+        ("hashsync (server)", "'~/.config/hashsync/default.toml'"),
+    ] {
+        let warning = format!("{prefix}: warning: {file} sets hashlist_max_age below an hour");
+        assert!(stderr.contains(&warning), "missing {warning:?}:\n{stderr}");
+    }
+}
+
+#[test]
+fn temporaries_that_cannot_be_expired_only_warn() {
+    // The expiry of the temporaries that failed runs left never ends a
+    // run: when it cannot list a directory, or remove an old temporary, it
+    // prints a warning, and the files stay (DESIGN.md §5.6 and §6.5). Once
+    // a first run has made the account ID and the list cache of each host,
+    // a read-only cache directory still lets a run use them, but not
+    // remove an old temporary next to the account ID, and a tmp_data
+    // directory without read permission still takes segments, but cannot
+    // be listed. The runs wait for their lists and have a byte of output,
+    // as in `an_empty_cache_directory_that_cannot_be_removed_only_warns`,
+    // so that their exchanges end with their lists.
+    if skip_as_root() {
+        return;
+    }
+    let transfer = Transfer::new(&["--wait"]);
+    let max_age = "hashlist_max_age = \"1\"\n";
+    transfer.configure(max_age);
+    transfer.env.write(
+        "server/home/.config/hashsync/default.toml",
+        max_age.as_bytes(),
+    );
+    let command = args(&["printf", "x"]);
+    transfer.run_ok(&refs(&command));
+    let hosts = [
+        ("hashsync", "client/cache/hashsync"),
+        ("hashsync (server)", "server/home/.cache/hashsync"),
+    ];
+    let leftover = |cache: &str| transfer.env.path(cache).join(".hashsync-0123456789abcdef");
+    let tmp_data = |cache: &str| format!("{cache}/tmp-data");
+    for (_, cache) in hosts {
+        std::fs::write(leftover(cache), b"").unwrap();
+    }
+    let ctimes = hosts.map(|(_, cache)| std::fs::metadata(leftover(cache)).unwrap().ctime());
+    wait_until_expired(&transfer.env, ctimes.into_iter().max().unwrap(), 1);
+
+    for (_, cache) in hosts {
+        transfer.env.chmod(cache, 0o555);
+        transfer.env.chmod(&tmp_data(cache), 0o300);
+    }
+    let output = transfer.run(&[], &refs(&command));
+    for (_, cache) in hosts {
+        transfer.env.chmod(cache, 0o755);
+        transfer.env.chmod(&tmp_data(cache), 0o700);
+    }
+    let output = succeeded(output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for (prefix, cache) in hosts {
+        let removal = format!(
+            "{prefix}: warning: cannot remove {}: ",
+            quoted(leftover(cache))
+        );
+        let listing = format!(
+            "{prefix}: warning: cannot list {}: ",
+            quoted(transfer.env.path(tmp_data(cache)))
+        );
+        for warning in [removal, listing] {
+            assert!(stderr.contains(&warning), "missing {warning:?}:\n{stderr}");
+        }
+        assert!(leftover(cache).exists(), "{cache}");
     }
 }
 

@@ -1,0 +1,839 @@
+.\" Manual page for hashsync, in mdoc(7) format. docs/DESIGN.md specifies the
+.\" behavior described here, so update both when a command, an option, or the
+.\" configuration file changes. Tests in src/main.rs and src/config.rs check
+.\" that this page documents every command, option, and configuration key,
+.\" and no others, and the Nix build lints it with mandoc -T lint.
+.Dd October 24, 2026
+.Dt HASHSYNC 1
+.Os
+.Sh NAME
+.Nm hashsync
+.Nd run a command over SSH, deduplicating its output or input against indexed files
+.Sh SYNOPSIS
+.Nm
+.Op Fl -profile Ar name | Fl -config Ar path
+.Op Fl q
+.Op Fl -no-human-readable
+.Ar subcommand
+.Op Ar argument ...
+.Pp
+.Nm
+.Cm update
+.Op Fl -compact
+.Op Fl -rebuild
+.Op Fl -scan-immutable
+.Op Fl j Ar threads
+.Nm
+.Cm stats
+.Nm
+.Cm prune
+.Op Fl -scan-immutable
+.Nm
+.Cm compact
+.Nm
+.Cm ssh
+.Op Ar options
+.Op Fl l Ar user
+.Oo Ar user Ns @ Oc Ns Ar host
+.Op Fl -
+.Ar command
+.Op Ar argument ...
+.Nm
+.Cm bench
+.Op Fl -block-size Ar size
+.Op Fl -probe-threads Ar threads
+.Sh DESCRIPTION
+.Nm Cm ssh
+runs a command on a remote host, much like
+.Xr ssh 1 ,
+and deduplicates its standard output, its standard input, or both: data that
+the receiving host already has in its files is sent as a reference to a block
+of one of those files.
+By default, the command's standard output is deduplicated against files on the
+local host
+.Pq a Em pull ;
+with
+.Fl -dedup-stdin ,
+standard input is deduplicated against files on the remote host instead
+.Pq a Em push .
+Blocks are deduplicated at any offset, so this saves bandwidth whenever a stream
+repeats data that the receiving host already has, as with
+.Xr tar 1
+archives,
+.Xr rsync 1
+transfers, or package trees.
+.Pp
+The local host is the
+.Em client
+and the remote host the
+.Em server .
+The host that receives a deduplicated stream is its
+.Em receiver ,
+and the other host its
+.Em sender .
+The receiver keeps an
+.Em index
+of the blocks in the regular files under the
+.Em roots
+listed in its configuration file
+.Pq see Sx CONFIGURATION .
+.Nm Cm update
+creates the index or brings it up to date, and so does
+.Nm Cm ssh
+when it starts, unless
+.Fl -no-update
+is given.
+The receiver sends the sender its
+.Em hash list ,
+short hashes of all its blocks, which the sender looks for at every offset of
+the stream.
+Every match is verified against the receiver's files, so a file that changed
+since the last update only reduces deduplication; the output always matches the
+original stream exactly.
+Both hosts cache hash lists, so later transfers only send the changes.
+.Pp
+The client starts
+.Nm
+on the server over two SSH sessions, which run the internal commands
+.Nm Cm serve
+and
+.Nm Cm attach .
+The server's shell looks
+.Nm
+up in its
+.Ev PATH ,
+unless
+.Fl -hashsync-path
+gives its location.
+.Pp
+The following options apply to all commands, and can be given before or after
+the command name:
+.Bl -tag -width Ds
+.It Fl -config Ar path
+Use the configuration file at
+.Ar path
+instead of a profile.
+Unless the file sets
+.Cm index_path ,
+the index is named after the file, as for a profile, so files with the same
+name share an index.
+.It Fl -no-human-readable
+Print byte counts in bytes instead of with units such as KiB, and the hash list
+sizes of
+.Cm bench
+as plain numbers.
+.It Fl -profile Ar name
+Use the profile
+.Ar name :
+the configuration file
+.Pa ~/.config/hashsync/ Ns Ar name Ns Pa .toml ,
+with the index
+.Pa ~/.cache/hashsync/ Ns Ar name Ns Pa .db
+unless the file sets
+.Cm index_path .
+The name must not be empty or contain a slash.
+Without
+.Fl -profile
+or
+.Fl -config ,
+the profile
+.Ql default
+is used.
+The two options cannot be combined, and
+.Cm bench
+accepts neither.
+.It Fl q , -quiet
+Print only warnings and errors.
+.El
+.Pp
+.Fl h
+or
+.Fl -help
+prints a short help text, for a specific command if given after its name, and
+.Fl V
+or
+.Fl -version
+prints the version.
+.Sh COMMANDS
+.Bl -tag -width Ds
+.It Xo
+.Cm update
+.Op Fl -compact
+.Op Fl -rebuild
+.Op Fl -scan-immutable
+.Op Fl j Ar threads
+.Xc
+Create the index, or bring it up to date: hash new and changed files, and
+remove from the index the files and roots that no longer exist or cannot be
+reached, or that the configuration no longer includes.
+Files whose identity, size and change time are unchanged are not read again,
+and fully indexed immutable roots are not scanned at all.
+If
+.Cm block_size
+or
+.Cm strong_hash
+changed, the index is rebuilt.
+Files and directories that cannot be read are skipped with a warning.
+.Bl -tag -width Ds
+.It Fl -compact
+Compact the index at the end, like
+.Cm compact .
+.It Fl -rebuild
+Rebuild the index from scratch.
+.It Fl -scan-immutable
+Also rescan fully indexed immutable roots, for example after their contents,
+.Cm exclude
+patterns or
+.Cm one_filesystem
+setting changed.
+.It Fl j Ar threads
+Number of threads that scan and hash, overriding the
+.Cm threads
+setting; 0 selects the default.
+.El
+.It Cm stats
+Print statistics about the index, and warn if its settings differ from the
+configuration.
+The index must already exist.
+.It Xo
+.Cm prune
+.Op Fl -scan-immutable
+.Xc
+Remove from the index the files and roots that no longer exist or cannot be
+reached, or that the configuration no longer includes, without hashing
+anything, then compact the index.
+An immutable root stays as long as any of its copies exists
+.Pq see Cm identifier .
+The index must already exist and match the configuration.
+.Bl -tag -width Ds
+.It Fl -scan-immutable
+Also check the individual paths of immutable roots.
+.El
+.It Cm compact
+Compact the index by rewriting its database files without the data that
+updates and prunes have removed.
+The index must already exist and match the configuration.
+.It Xo
+.Cm ssh
+.Op Ar options
+.Op Fl l Ar user
+.Oo Ar user Ns @ Oc Ns Ar host
+.Op Fl -
+.Ar command
+.Op Ar argument ...
+.Xc
+Run
+.Ar command
+on
+.Ar host
+over SSH, deduplicating its standard output, its standard input, or both.
+.Nm Cm ssh
+passes its standard input to the command, copies the command's standard output
+and standard error back, and exits with the command's exit status.
+It accepts the arguments that
+.Xr rsync 1
+passes to its remote shell, so
+.Ql rsync -e 'hashsync ssh'
+pulls with deduplication, and
+.Ql rsync -e 'hashsync ssh --dedup-stdin'
+pushes with it.
+As with
+.Xr ssh 1 ,
+options may also follow
+.Ar host ,
+and the command and its arguments are joined into a single line, which the
+server runs with the user's shell
+.Po Ev SHELL ,
+or
+.Pa /bin/sh
+if it is unset
+.Pc .
+A command that starts with
+.Ql -
+must follow
+.Fl - .
+.Pp
+Both streams start immediately, while each receiver updates its index and sends
+its hash list, so deduplication improves as the list arrives.
+Each stream is buffered on both hosts in temporary files, so a slow reader does
+not hold up the command or the transfer until the buffers are full.
+.Bl -tag -width Ds
+.It Fl -batch-stdin
+Send standard input in full buffers rather than as soon as data is available.
+This compresses better and deduplicates more blocks, but a program that waits
+for replies, such as
+.Xr rsync 1 ,
+would wait forever.
+.It Fl -batch-stdout
+Send the command's standard output in full buffers, like
+.Fl -batch-stdin .
+.It Fl -compact
+Compact each index after updating it, like
+.Nm Cm update Fl -compact .
+.It Fl -compression-level Ar level
+The zstd compression level, from 1 to 19, or 0 to disable compression.
+The default is 9.
+.It Fl -compression-threads Ar threads
+Number of zstd worker threads for each stream.
+The default, 0, uses half the cores of the compressing host.
+.It Fl -dedup-stdin
+Deduplicate standard input against the server's index.
+Without
+.Fl -dedup-stdout ,
+the command's standard output is only compressed.
+.It Fl -dedup-stdout
+Deduplicate the command's standard output against the client's index.
+This is the default without
+.Fl -dedup-stdin .
+.It Fl -hashsync-path Ar path
+The
+.Nm
+executable on the server, such as a statically linked binary on a host where
+.Nm
+is not installed: a name to look up in
+.Ev PATH ,
+or a path, absolute or relative to the remote home directory.
+It is a single word, not a shell command; use a wrapper script to set its
+environment.
+The default is
+.Ql hashsync .
+.It Fl l Ar user
+Log in as
+.Ar user
+on the server.
+.It Fl -lookahead Ar size
+How far ahead of the data already sent the sender looks for the receiver's
+blocks.
+It must be at least the receiver's block size, and the sender uses about twice
+this much memory.
+The default is 256\~MiB or three blocks, whichever is larger.
+.It Fl -negative-cache Ar size
+Size of the sender's cache of hashes that the receiver did not have, which
+saves the sender from asking again about repeated data.
+0 disables the cache.
+The default is 128\~MiB.
+.It Fl -no-compression-long
+Disable zstd's long-distance matching, which finds repeated data up to 128\~MiB
+apart.
+.It Fl -no-sender-cache
+Do not cache hash lists on the sender, and remove those cached for this
+receiver and index, so that the complete list is sent every time.
+.It Fl s , -no-shell
+Run the command and its arguments as separate words, without a shell.
+With
+.Xr rsync 1 ,
+use this only together with rsync's own
+.Fl s
+option; otherwise the server would take rsync's shell escapes literally.
+.It Fl n , -no-stdin
+Give the command an empty standard input, like
+.Ql ssh -n ,
+and do not read standard input.
+This is needed in the background of an interactive shell, or under
+.Xr nohup 1 .
+Cannot be combined with
+.Fl -dedup-stdin
+or
+.Fl -batch-stdin .
+.It Fl -no-update
+Do not update the indexes, and open them read-only, so that other readers can
+use them at the same time.
+Each index must exist and match its configuration.
+Cannot be combined with
+.Fl -compact
+or
+.Fl -scan-immutable .
+.It Fl -probe-threads Ar threads
+Number of threads with which the sender looks for the receiver's blocks in the
+stream.
+The default, 0, uses half the cores of the sender.
+.It Fl -scan-immutable
+Also rescan fully indexed immutable roots when updating each index, like
+.Nm Cm update Fl -scan-immutable .
+.It Fl -server-config Ar path
+Use the configuration file at
+.Ar path
+on the server, absolute or relative to the remote home directory, instead of
+its default profile.
+.It Fl -server-profile Ar name
+Use the profile
+.Ar name
+on the server instead of its default profile.
+Cannot be combined with
+.Fl -server-config .
+.It Fl -spool-limit Ar size | Cm unlimited
+Maximum amount of data buffered for each stream on each host.
+The default is 2\~GiB.
+.It Fl -ssh Ar ssh-command
+The SSH command, split into words like a shell would, but without expansion.
+The default is
+.Ql ssh .
+.Nm
+adds options of its own, such as
+.Ql -T
+and
+.Ql -o Compression=no ;
+per-host settings belong in
+.Xr ssh_config 5 .
+.It Fl -wait
+Make each deduplicated stream wait for the complete hash list, so that it sends
+as few bytes as possible, however long the receiver's update takes.
+.El
+.Pp
+Unless it fails itself,
+.Nm Cm ssh
+prints a summary to standard error at the end: for each stream, the bytes read
+and sent and how they were deduplicated, including the matches that the
+receiver rejected, either as hash collisions
+.Pq Em false positives
+or because the block failed verification, for example because its file changed
+.Pq Em not found ;
+then the total traffic and time.
+.It Xo
+.Cm bench
+.Op Fl -block-size Ar size
+.Op Fl -probe-threads Ar threads
+.Xc
+Measure how fast this host computes the hashes used for deduplication and
+looks for indexed blocks in a stream, on one thread and on several, to help
+choose
+.Cm strong_hash ,
+.Cm block_size
+and
+.Fl -probe-threads .
+.Bl -tag -width Ds
+.It Fl -block-size Ar size
+Measure only blocks of
+.Ar size ,
+instead of a few common sizes, and look for blocks of that size instead of the
+default
+.Cm block_size .
+.It Fl -probe-threads Ar threads
+Number of threads that look for blocks, as for
+.Nm Cm ssh .
+.El
+.El
+.Sh CONFIGURATION
+All commands except
+.Cm bench
+read a configuration file in TOML format, by default
+.Pa ~/.config/hashsync/default.toml ,
+the file of the profile
+.Ql default .
+.Fl -profile
+and
+.Fl -config
+select another file; for
+.Nm Cm ssh ,
+they select the client's file, and
+.Fl -server-profile
+and
+.Fl -server-config
+select the server's.
+A configuration file only describes its own host.
+.Nm Cm ssh
+needs one only on a host that receives a deduplicated stream, but a file named
+by an option must exist.
+Unknown keys are errors.
+.Pp
+The following keys are recognized, all optional:
+.Bl -tag -width Ds
+.It Cm block_size
+Size of the indexed blocks, at least 512\~bytes; at least 4\~KiB is recommended.
+Larger blocks make the index and the hash list smaller, but deduplicate less
+data.
+Changing it rebuilds the index.
+The default is
+.Ql 16KiB .
+.It Cm candidate_attempts
+How many indexed blocks with a matching hash the receiver tries before
+rejecting a match, at least 1.
+All copies of an immutable root count as one.
+The default is 128.
+.It Cm hashlist_max_age
+How long this host keeps unused cached hash lists, and the temporary files
+that
+.Nm
+leaves when it fails: a number of seconds, or a number followed by
+.Ql s ,
+.Ql m ,
+.Ql h
+or
+.Ql d ,
+at least 1 second.
+A value below an hour gets a warning, since expiry could then remove the
+temporary files of a
+.Nm Cm ssh
+that is still running.
+The default is
+.Ql 30d .
+.It Cm index_path
+Directory of the index, a RocksDB database.
+The default is
+.Pa ~/.cache/hashsync/ Ns Ar name Ns Pa .db
+for the file
+.Ar name Ns Pa .toml .
+.It Cm roots
+The roots to index, as an array of tables written
+.Ql [[roots]] ,
+with the keys described below.
+.It Cm strong_hash
+Hash used to verify blocks:
+.Ql blake3 ,
+the default, or
+.Ql sha256 .
+Changing it rebuilds the index.
+.It Cm threads
+Number of threads that scan and hash files in an update, or look up paths in a
+prune.
+The default, 0, uses four per core, but at least 16 and at most 64.
+.It Cm tmp_data_dir
+Directory for the temporary files of
+.Nm Cm ssh ,
+which disappear when it exits.
+Put it on a local disk; on tmpfs, the data would take up memory.
+The default is
+.Pa ~/.cache/hashsync/tmp-data .
+.El
+.Pp
+Each root accepts the following keys:
+.Bl -tag -width Ds
+.It Cm path
+An absolute path, or a glob pattern of absolute paths; each match, a directory
+or a regular file, is a root.
+.Ql * ,
+.Ql \&?
+and bracket expressions such as
+.Ql [a-z]
+match within a path component, and
+.Ql **
+across components.
+Matching compares bytes, is case-sensitive, and includes names that start with
+a dot.
+Symbolic links are not followed, and files and directories that cannot be
+reached do not match; they get a warning, like patterns without matches.
+Two roots with the same path, or one inside the other, are an error.
+An update also fails if a mount makes it reach the same directory twice, as
+with a bind mount of a directory that a root contains, or of a parent
+directory; exclude the mount point, or set
+.Cm one_filesystem
+for a mount below a root.
+This key is required.
+.It Cm exclude
+Patterns of files and directories to leave out, together with everything below
+them.
+A pattern that starts with
+.Ql /
+matches absolute paths; any other pattern matches names, and cannot contain a
+slash.
+.It Cm identifier
+How an immutable root names its
+.Em group :
+matches with the same identifier are
+.Em copies
+of the same content, which the index stores once.
+.Ql \(dqpath\(dq ,
+the default, uses the absolute path of the match;
+.Ql \(dqname\(dq
+its last component;
+.Ql { strip_prefix = \(dq/mnt/disk\(dq }
+the path without that prefix; and
+.Ql { literal = \(dqphotos-2019\(dq }
+that fixed name.
+.It Cm immutable
+If true, the contents of the root never change, which is up to the user to
+ensure.
+An update indexes a group once, from its first copy that exists, and then
+reuses it without reading it, until
+.Fl -scan-immutable
+or
+.Fl -rebuild ,
+or until an update finds none of its copies, which removes the group.
+The receiver reads blocks from any copy.
+All copies of a group must have the same
+.Cm exclude
+patterns and
+.Cm one_filesystem
+setting.
+The default is false.
+.It Cm may_vanish
+If true, the root need not exist: it gets no warning when it does not, and if a
+copy of a group disappears before the update scans it, the next copy is scanned
+instead.
+A group whose copies are all on an unmounted disk is still removed, and indexed
+again when the disk is back.
+The default is false.
+.It Cm one_filesystem
+If true, leave out files and directories on a different mount than their
+parent directory.
+Unlike
+.Ql rsync -x ,
+this compares mounts rather than devices.
+The default is false.
+.El
+.Pp
+Sizes, in the configuration file and in options, are a number of bytes, or a
+number followed by
+.Ql KiB ,
+.Ql MiB ,
+.Ql GiB
+or
+.Ql TiB ,
+or by
+.Ql KB ,
+.Ql MB ,
+.Ql GB
+or
+.Ql TB
+for powers of 1000, in any case.
+In the configuration file, sizes and durations can also be integers.
+.Pp
+Paths, patterns and identifiers are byte strings: after TOML parsing,
+.Ql \exHH
+stands for a byte and
+.Ql \e\e
+for a backslash, and any other backslash is an error, except in patterns, where
+.Ql \e* ,
+.Ql \e? ,
+.Ql \e[ ,
+.Ql \e] ,
+.Ql \e- ,
+.Ql \e!
+and
+.Ql \e^
+match those characters literally, as does a byte given as
+.Ql \exHH .
+Single-quoted TOML strings avoid doubling the backslashes.
+In
+.Cm index_path
+and
+.Cm tmp_data_dir ,
+.Ql ~
+and a leading
+.Ql ~/
+stand for the home directory, and other relative paths are relative to the
+working directory, which on the server is the home directory.
+.Sh ENVIRONMENT
+.Bl -tag -width Ds
+.It Ev HOME
+The home directory, under which the configuration, indexes and caches are kept
+by default.
+.It Ev PATH
+On the server, where the remote shell finds
+.Nm
+and, with
+.Fl s ,
+where
+.Nm
+finds the command.
+.It Ev SHELL
+On the server, the shell that runs the command, or
+.Pa /bin/sh
+if unset.
+.It Ev XDG_CACHE_HOME
+Used instead of
+.Pa ~/.cache .
+.It Ev XDG_CONFIG_HOME
+Used instead of
+.Pa ~/.config .
+.It Ev XDG_RUNTIME_DIR
+On the server, the directory of the socket that connects the two SSH sessions;
+.Pa /tmp/hashsync- Ns Ar uid
+if unset.
+.El
+.Pp
+The XDG variables are only used if they hold an absolute path.
+.Sh FILES
+.Bl -tag -width Ds
+.It Pa ~/.config/hashsync/ Ns Ar profile Ns Pa .toml
+Configuration file of a profile.
+.It Pa ~/.cache/hashsync/ Ns Ar profile Ns Pa .db/
+Index of a profile, with its lock file
+.Pa hashsync.lock .
+.It Pa ~/.cache/hashsync/account-id
+Random identifier of the user's account, which the hash list caches use to tell
+accounts apart.
+.It Pa ~/.cache/hashsync/local-hashlists/
+Cached hash lists of this host's indexes, as sent to other accounts.
+.It Pa ~/.cache/hashsync/remote-hashlists/
+Cached hash lists received from other accounts.
+.It Pa ~/.cache/hashsync/tmp-data/
+Default
+.Cm tmp_data_dir .
+.El
+.Pp
+If
+.Nm
+fails, it can leave temporary files whose names start with
+.Ql .hashsync-
+in the caches and in
+.Cm tmp_data_dir ;
+.Nm Cm ssh
+removes them once they are older than
+.Cm hashlist_max_age .
+.Sh EXIT STATUS
+.Nm Cm ssh
+exits with the exit status of
+.Ar command ,
+128 plus the number of the signal that terminated it, or 127 if it could not be
+started, even if the program reading its output exited early.
+If
+.Nm Cm ssh
+itself fails, for example because SSH cannot reach the host, it exits with 1,
+or with 128 plus the signal number after SIGINT or SIGTERM.
+.Pp
+The other commands exit with 0 on success, even if they skipped files or
+directories that cannot be read, and 1 on failure.
+Usage errors exit with 2.
+A bug, or an error in the index database such as corruption, aborts
+.Nm
+with SIGABRT, which shells report as status 134.
+.Sh EXAMPLES
+Copy a directory from the host
+.Ql nas
+over an older local copy of it, which the local index covers:
+.Bd -literal -offset indent
+hashsync ssh -n backup@nas tar -C /srv/data -cf - . |
+    tar -C /srv/data -xf -
+.Ed
+.Pp
+The same in the other direction, deduplicated against the index on
+.Ql nas :
+.Bd -literal -offset indent
+tar -C /srv/data -cf - . |
+    hashsync ssh --dedup-stdin backup@nas tar -C /srv/data -xf -
+.Ed
+.Pp
+Use
+.Nm
+as the remote shell of
+.Xr rsync 1 ,
+to pull and to push.
+With
+.Fl -delete-delay ,
+rsync deletes files only after the transfer, so files that are about to be
+deleted, such as the old names of renamed files, can still be used for
+deduplication:
+.Bd -literal -offset indent
+rsync -a --delete-delay -e 'hashsync ssh' nas:/srv/data/ /srv/data/
+rsync -a --delete-delay -e 'hashsync ssh --dedup-stdin' \e
+    /srv/data/ nas:/srv/data/
+.Ed
+.Pp
+Run the server from a statically linked binary in the remote home directory:
+.Bd -literal -offset indent
+hashsync ssh -n --hashsync-path bin/hashsync nas cat big.iso > big.iso
+.Ed
+.Pp
+A configuration file that indexes a Nix store, a copy of it on another disk,
+and a data directory:
+.Bd -literal -offset indent
+block_size = "16KiB"
+
+[[roots]]
+path = "/nix/store/*"
+immutable = true
+identifier = "name"
+exclude = [".links"]
+
+[[roots]]
+path = "/mnt/disk/nix/store/*"
+immutable = true
+identifier = "name"
+exclude = [".links"]
+may_vanish = true
+
+[[roots]]
+path = "/srv/data"
+exclude = ["*.tmp", ".cache"]
+one_filesystem = true
+.Ed
+.Pp
+A root whose name contains the byte FF, which is not valid UTF-8, and
+exclusions of the literal names
+.Ql literal*name
+and
+.Ql back\eslash :
+.Bd -literal -offset indent
+[[roots]]
+path = '/srv/archive-\exFF'
+immutable = true
+identifier = { literal = 'archive-\exFF' }
+exclude = ['*.tmp', 'literal\ex2Aname', 'back\e\eslash']
+.Ed
+.Sh DIAGNOSTICS
+Messages go to standard error.
+Notes report progress and summaries, and
+.Fl q
+suppresses them; messages from the server are marked as such.
+Paths and other values from outside the program are shown in the byte-string
+syntax of the configuration file.
+.Sh SEE ALSO
+.Xr rsync 1 ,
+.Xr ssh 1 ,
+.Xr tar 1 ,
+.Xr zstd 1 ,
+.Xr ssh_config 5
+.Sh CAVEATS
+.Nm Cm ssh
+holds a lock on each index it deduplicates against until the stream has ended,
+and
+.Nm
+commands that need exclusive access to the index wait for it.
+These include
+.Nm Cm update
+and the index update at the start of another
+.Nm Cm ssh .
+While that second
+.Nm Cm ssh
+waits, its stream is sent without deduplication, or held back if
+.Fl -wait
+is given.
+With
+.Fl -no-update ,
+several instances of
+.Nm Cm ssh
+can share the index.
+.Pp
+The lock can cause a deadlock if the
+.Ar command
+that
+.Nm Cm ssh
+runs on the server itself runs a
+.Nm
+command that needs exclusive access to an index, such as
+.Nm Cm update .
+For example,
+.Ql "hashsync ssh --dedup-stdin nas 'hashsync update; tar -xf -'"
+never finishes: the update waits for the lock, which is only released once
+.Xr tar 1
+has read all of its standard input.
+Two
+.Nm Cm ssh
+commands in opposite directions between the same two hosts can also deadlock if
+each one's
+.Ar command
+runs
+.Nm Cm update
+on its server, since each update then waits for the other
+.Nm Cm ssh .
+.Pp
+.Xr rsync 1
+sends file data in pieces of at most 32\~KiB, which makes deduplication
+ineffective.
+To deduplicate rsync transfers effectively, the rsync that sends the files
+needs a patch that raises this limit to 8\~MiB; the patch is backwards
+compatible, so the other rsync can be unpatched.
+.Pp
+If SSH multiplexes sessions over one connection, for example with
+.Cm ControlMaster ,
+.Nm Cm ssh
+still works, but the sender's questions about matching blocks wait behind the
+data of the streams.
+.Sh SECURITY CONSIDERATIONS
+The sender learns a hash of every block in the receiver's index, and can test
+whether the receiver has a block with given contents, so only use
+.Nm
+between hosts that trust each other.
+.Fl -no-sender-cache
+keeps the sender from storing the receiver's hash lists.

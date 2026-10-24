@@ -11,19 +11,22 @@
 //! start, the exchange lists the side's directory for the peer and index.
 //! It then reads the cached list it needs, may publish the side's target,
 //! and at the end removes every listed file except that target, expires old
-//! files in all directories and removes the directories left empty. None of
-//! this needs locks: publication recreates its directory if expiry removed
-//! it, a file is only removed while its name still points to the file this
-//! process opened, and each list is read once, through one open file, by a
-//! reader that keeps the bytes.
+//! files in all directories and next to the account ID, and removes the
+//! directories left empty. None of this needs locks: publication recreates
+//! its directory if expiry removed it, a file is only removed while its
+//! name still points to the file this process opened, and each list is
+//! read once, through one open file, by a reader that keeps the bytes. The
+//! expiry of the temporaries next to the account ID also serves the
+//! tmp_data directory (`expire_temporaries`).
 //!
 //! Cache directory and file operation failures end the run with `die`.
 //! The exceptions are absence — a missing list is a miss, and missing
 //! directories or already-removed files during lookup and cleanup are
 //! normal — invalid file contents, which are removed and treated as a
-//! miss, and an empty directory that cannot be removed, which only warns
-//! (DESIGN.md §5.6). On NFS, a list file that another host removed while
-//! this process had it open counts as absent too (see `ListFile`).
+//! miss, and an empty directory that cannot be removed or a failed expiry
+//! of the temporaries next to the account ID, which only warn (DESIGN.md
+//! §5.6). On NFS, a list file that another host removed while this
+//! process had it open counts as absent too (see `ListFile`).
 
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
@@ -95,8 +98,9 @@ fn cache_root() -> PathBuf {
 /// of its peers, so it lives in the cache too: a new ID just starts new
 /// directories, and the old ones expire. The first use initializes it with
 /// atomic no-replace publication; concurrent initializers use the winner's
-/// ID. Every use makes it durable first. Failures die: HELLO cannot be
-/// built without an identity.
+/// ID. Every use makes it durable first. An initialization that fails
+/// leaves its temporary, which expiry removes (`expire_temporaries`).
+/// Failures die: HELLO cannot be built without an identity.
 pub fn account_id() -> [u8; 16] {
     let base = cache_base();
     let dir = base.join("hashsync");
@@ -108,17 +112,21 @@ pub fn account_id() -> [u8; 16] {
             Err(e) => fatal("open", &path, e),
         }
         // Publish a fresh ID without replacing a concurrent initializer's;
-        // the next iteration uses whichever ID won.
+        // the next iteration uses whichever ID won. Expiry in another
+        // process removes the temporary once it is older than that
+        // process's `hashlist_max_age`, which can be as short as a second
+        // (`expire_temporaries`). The rename then fails with ENOENT, or on
+        // NFS the write or the fsync fails with ESTALE, and the loop tries
+        // again.
         create_dirs(&base, &dir, 0o777);
         let temp = dir.join(temporary_name());
         let written = write_file(&temp, 0o600, |file| {
             file.write_all(format!("{}\n", hex(&random_bytes::<16>())).as_bytes())
         });
-        if let Err(e) = written {
-            // Nothing expires this directory's temporaries, so try to
-            // remove this one before the fatal exit.
-            let _ = retry_interrupted(|| std::fs::remove_file(&temp));
-            fatal("initialize", &path, e);
+        match written {
+            Ok(_) => {}
+            Err(e) if stale(&e) => continue,
+            Err(e) => fatal("initialize", &path, e),
         }
         match retry_on_intr(|| {
             rustix::fs::renameat_with(
@@ -129,7 +137,7 @@ pub fn account_id() -> [u8; 16] {
                 RenameFlags::NOREPLACE,
             )
         }) {
-            Ok(()) => {}
+            Ok(()) | Err(Errno::NOENT) => {}
             Err(Errno::EXIST) => remove("remove", &temp),
             Err(e) => fatal("publish", &path, e),
         }
@@ -1011,17 +1019,36 @@ fn for_each_entry(dir: &Path, mut each: impl FnMut(std::fs::DirEntry)) -> std::i
 
 /// Expire the files older than `max_age` seconds in every peer/index
 /// directory of both cache trees, lists and abandoned hidden temporaries,
-/// then remove the directories that are left empty. Run at the end of each
-/// exchange, also one that HASHNONE ends. Absence is normal; other failures
-/// are fatal, except a failed removal of an empty directory, which only
-/// warns (DESIGN.md §5.6).
+/// then remove the directories that are left empty, and expire the
+/// temporaries next to the account ID (`expire_temporaries`). Run at the
+/// end of each exchange, also one that HASHNONE ends. Absence is normal;
+/// other failures are fatal, except a failed removal of an empty directory
+/// and any failure of `expire_temporaries`, which only warn (DESIGN.md
+/// §5.6).
 pub fn expire(max_age: u64) {
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs().min(i64::MAX as u64) as i64);
+    let now = expiry_now();
     for tree in ["local-hashlists", "remote-hashlists"] {
         expire_tree(&cache_root().join(tree), now, max_age);
     }
+    expire_temporaries_at(&cache_root(), now, max_age);
+}
+
+/// The time at which expiry counts the age of files, from the system
+/// clock, in whole seconds since the epoch (`expired`).
+fn expiry_now() -> i64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs().min(i64::MAX as u64) as i64)
+}
+
+/// True if a file whose ctime is `ctime`, in seconds since the epoch, has
+/// expired at `now`: it is more than `max_age` seconds old. Expiry applies
+/// this rule, with the `hashlist_max_age` of this host, to the files of the
+/// list caches, and to the temporaries that failed runs leave elsewhere.
+/// So a temporary that a run still writes is spared, unless the age is
+/// very small (DESIGN.md §5.6).
+fn expired(ctime: i64, now: i64, max_age: u64) -> bool {
+    now.saturating_sub(ctime) > i64::try_from(max_age).unwrap_or(i64::MAX)
 }
 
 fn expire_tree(tree: &Path, now: i64, max_age: u64) {
@@ -1043,8 +1070,7 @@ fn expire_tree(tree: &Path, now: i64, max_age: u64) {
                 Err(e) if absent(&e) => return,
                 Err(e) => fatal("stat", &file.path(), e),
             };
-            let age = now.saturating_sub(meta.ctime());
-            if meta.is_file() && age > i64::try_from(max_age).unwrap_or(i64::MAX) {
+            if meta.is_file() && expired(meta.ctime(), now, max_age) {
                 remove("expire", &file.path());
             } else {
                 kept = true;
@@ -1064,6 +1090,57 @@ fn expire_tree(tree: &Path, now: i64, max_age: u64) {
         Ok(()) => {}
         Err(e) if absent(&e) => {}
         Err(e) => fatal("list", tree, e),
+    }
+}
+
+/// Remove the temporaries that failed runs left in `dir`: the regular
+/// files whose names start with `.hashsync-` (`is_temporary`) and that are
+/// more than `max_age` seconds old, the `hashlist_max_age` of this host.
+/// This is for the two directories outside the cache trees that can hold
+/// them: the directory of the account ID (`account_id`) and the tmp_data
+/// directory (`segments::Directory::expire_temporaries`). Everything else
+/// in `dir` stays, also directories, such as the index of a profile whose
+/// name starts with `.hashsync-`.
+///
+/// A leftover temporary is harmless, so expiry must not end the run: when
+/// it cannot list `dir`, or stat or remove a temporary in it, for example
+/// one that another user owns in a shared directory, it only prints a
+/// warning, and the files stay. Absence is normal (DESIGN.md §5.6 and
+/// §6.5).
+pub fn expire_temporaries(dir: &Path, max_age: u64) {
+    expire_temporaries_at(dir, expiry_now(), max_age);
+}
+
+/// `expire_temporaries` with the clock at `now`, in seconds since the
+/// epoch (`expired`).
+fn expire_temporaries_at(dir: &Path, now: i64, max_age: u64) {
+    let listed = for_each_entry(dir, |entry| {
+        if !is_temporary(entry.file_name().as_bytes()) {
+            return;
+        }
+        let path = entry.path();
+        // `DirEntry::metadata` does not follow symlinks.
+        let meta = match retry_interrupted(|| entry.metadata()) {
+            Ok(meta) => meta,
+            Err(e) if absent(&e) => return,
+            Err(e) => {
+                warn(format!("cannot stat {}: {e}", quoted_path(&path)));
+                return;
+            }
+        };
+        if !meta.is_file() || !expired(meta.ctime(), now, max_age) {
+            return;
+        }
+        match retry_interrupted(|| std::fs::remove_file(&path)) {
+            Ok(()) => {}
+            Err(e) if absent(&e) => {}
+            Err(e) => warn(format!("cannot remove {}: {e}", quoted_path(&path))),
+        }
+    });
+    match listed {
+        Ok(()) => {}
+        Err(e) if absent(&e) => {}
+        Err(e) => warn(format!("cannot list {}: {e}", quoted_path(dir))),
     }
 }
 
@@ -1120,6 +1197,80 @@ pub(crate) mod tests {
                 .collect();
             assert_eq!(names, vec![std::ffi::OsString::from("account-id")]);
         });
+    }
+
+    /// Failed runs leave temporaries next to the account ID and in the
+    /// tmp_data directory. Expiry removes the regular files there whose
+    /// names start with `.hashsync-`, once they are older than its age
+    /// bound, and nothing else: no other name, however old, and no
+    /// directory, such as the index of a profile whose name starts with
+    /// `.hashsync-` (DESIGN.md §5.6 and §6.5).
+    #[test]
+    fn expiry_removes_old_temporaries_and_nothing_else() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
+        std::fs::create_dir(dir.join(".hashsync-x.db")).unwrap();
+        let temporary = temporary_name();
+        for name in [
+            temporary.as_str(),
+            ".hashsync-",
+            "account-id",
+            ".other",
+            "hashsync-0123456789abcdef",
+        ] {
+            std::fs::write(dir.join(name), b"").unwrap();
+        }
+        // `ctime` cannot be faked, so the clocks come from the ctimes of the
+        // files, as in `expiry_removes_old_files_and_keeps_fresh_ones`.
+        let ctimes: Vec<i64> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().metadata().unwrap().ctime())
+            .collect();
+        let first = *ctimes.iter().min().unwrap();
+        let last = *ctimes.iter().max().unwrap();
+        let all = names(dir);
+        assert_eq!(all.len(), 6);
+        // When the first file was made, no file was older than an hour.
+        expire_temporaries_at(dir, first, 3600);
+        assert_eq!(names(dir), all);
+        // An hour after the last one, all are older than half an hour.
+        expire_temporaries_at(dir, last + 3600, 1800);
+        let kept = [
+            ".hashsync-x.db",
+            ".other",
+            "account-id",
+            "hashsync-0123456789abcdef",
+        ];
+        assert_eq!(names(dir), kept);
+        // A missing directory is normal absence.
+        expire_temporaries_at(&dir.join("no-such-dir"), first, 0);
+    }
+
+    /// The expiry of temporaries never ends the run: when it cannot stat a
+    /// temporary, it only prints a warning, and the file stays (DESIGN.md
+    /// §5.6 and §6.5). A directory with read permission but no search
+    /// permission lets expiry list the temporary but not stat it. No run
+    /// gets that far with such a directory, since its account ID and its
+    /// segments need search permission, so only this test covers the
+    /// failed stat; `temporaries_that_cannot_be_expired_only_warn` in
+    /// tests/transfer.rs covers a failed listing and a failed removal, and
+    /// checks the warnings.
+    #[test]
+    fn expiry_only_warns_when_it_cannot_stat_a_temporary() {
+        if rustix::process::geteuid().is_root() {
+            eprintln!("skipped: root ignores permissions");
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
+        let temporary = dir.join(temporary_name());
+        std::fs::write(&temporary, b"").unwrap();
+        let ctime = std::fs::metadata(&temporary).unwrap().ctime();
+        let chmod = |mode| std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode));
+        chmod(0o600).unwrap();
+        expire_temporaries_at(dir, ctime + 3600, 1800);
+        chmod(0o700).unwrap();
+        assert!(temporary.exists());
     }
 
     #[test]

@@ -2,9 +2,9 @@
 //! deduplicates one or both of its streams: the command's stdout, replacing
 //! blocks that the client already holds with verified local content, and
 //! the client's stdin, replacing blocks that the server holds. See
-//! `DESIGN.md`.
+//! `docs/DESIGN.md`.
 //!
-//! This build implements PLAN.md steps 1–8: `update`, `prune`, `compact`, and
+//! This build implements PLAN.md steps 1–9: `update`, `prune`, `compact`, and
 //! `stats` for mutable roots and for immutable ones, whose copies share a
 //! group that an update scans once and then reuses, and `ssh`, which
 //! deduplicates stdout by default, stdin with `--dedup-stdin`, and both with
@@ -66,7 +66,6 @@ use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser, Subcommand};
 
 use crate::config::Source;
-use crate::die::die;
 use crate::protocol::Request;
 use crate::settings::{Deduplicated, RemoteCommand, RunSettings};
 
@@ -84,7 +83,7 @@ struct Cli {
     /// The profile: the configuration file $XDG_CONFIG_HOME/hashsync/NAME.toml,
     /// whose index is $XDG_CACHE_HOME/hashsync/NAME.db unless it sets
     /// index_path [default: default]
-    #[arg(long, global = true, value_name = "NAME", value_parser = ProfileName)]
+    #[arg(long, global = true, value_name = "NAME", value_parser = ByteValue(profile_name))]
     profile: Option<OsString>,
 
     /// A configuration file anywhere, in place of a profile; unless it sets
@@ -145,34 +144,47 @@ impl Cli {
     }
 }
 
-/// The value parser of the options that name a profile, `--profile` and
-/// `--server-profile`: a profile name becomes part of the path of the
-/// profile's file, so a bad one is a usage error (DESIGN.md §7). Its own
-/// message shows the name as every message shows one (DESIGN.md §8), which
-/// clap's message for a rejected value does not: it replaces the bytes that
-/// are not UTF-8.
+/// The value parser of the options whose values are byte strings that a
+/// function checks, and may take apart, so that a bad value is a usage
+/// error. Its own message shows the value as every message shows one
+/// (DESIGN.md §8), which clap's message for a rejected value does not: it
+/// replaces the bytes that are not UTF-8.
 #[derive(Clone)]
-struct ProfileName;
+struct ByteValue<T>(fn(&[u8]) -> Result<T, String>);
 
-impl TypedValueParser for ProfileName {
-    type Value = OsString;
+impl<T: Clone + Send + Sync + 'static> TypedValueParser for ByteValue<T> {
+    type Value = T;
 
     fn parse_ref(
         &self,
         cmd: &clap::Command,
         arg: Option<&clap::Arg>,
         value: &OsStr,
-    ) -> Result<OsString, clap::Error> {
-        match config::check_profile_name(value.as_bytes()) {
-            Ok(()) => Ok(value.to_owned()),
-            Err(e) => {
-                let arg = arg.map_or_else(|| "...".to_owned(), ToString::to_string);
-                let value = escapes::quoted(value.as_bytes());
-                let message = format!("invalid value {value} for '{arg}': {e}");
-                Err(cmd.clone().error(ErrorKind::ValueValidation, message))
-            }
-        }
+    ) -> Result<T, clap::Error> {
+        (self.0)(value.as_bytes()).map_err(|e| {
+            let arg = arg.map_or_else(|| "...".to_owned(), ToString::to_string);
+            let value = escapes::quoted(value.as_bytes());
+            let message = format!("invalid value {value} for '{arg}': {e}");
+            cmd.clone().error(ErrorKind::ValueValidation, message)
+        })
     }
+}
+
+/// The value of an option that names a profile, `--profile` or
+/// `--server-profile`: a profile name becomes part of the path of the
+/// profile's file, so it must be a file name (DESIGN.md §7).
+fn profile_name(name: &[u8]) -> Result<OsString, String> {
+    config::check_profile_name(name)?;
+    Ok(OsStr::from_bytes(name).to_owned())
+}
+
+/// The value of `--hashsync-path`, an executable name or path, which an
+/// empty word cannot be.
+fn hashsync_path(path: &[u8]) -> Result<OsString, String> {
+    if path.is_empty() {
+        return Err("empty path".into());
+    }
+    Ok(OsStr::from_bytes(path).to_owned())
 }
 
 /// The bytes of a command-line argument, as the configuration and the
@@ -283,18 +295,32 @@ struct SshArgs {
     dedup_stdout: bool,
 
     /// The SSH command, shell-split; the first word is the executable
-    /// [default: ssh]
-    #[arg(long, value_name = "CMD")]
-    ssh: Option<OsString>,
+    #[arg(
+        long,
+        value_name = "CMD",
+        default_value = "ssh",
+        value_parser = ByteValue(ssh::Program::parse)
+    )]
+    ssh: ssh::Program,
 
     /// The hashsync executable on the remote host, a name or a path; a
-    /// wrapper script there can set its environment [default: hashsync]
-    #[arg(long, value_name = "PATH")]
-    hashsync_path: Option<OsString>,
+    /// wrapper script there can set its environment
+    #[arg(
+        long,
+        value_name = "PATH",
+        default_value = "hashsync",
+        value_parser = ByteValue(hashsync_path)
+    )]
+    hashsync_path: OsString,
 
     /// The profile of the remote host, whose file there is
     /// $XDG_CONFIG_HOME/hashsync/NAME.toml [default: default]
-    #[arg(long, value_name = "NAME", value_parser = ProfileName, conflicts_with = "server_config")]
+    #[arg(
+        long,
+        value_name = "NAME",
+        value_parser = ByteValue(profile_name),
+        conflicts_with = "server_config"
+    )]
     server_profile: Option<OsString>,
 
     /// A configuration file on the remote host, in place of a profile; a
@@ -339,13 +365,12 @@ impl SshArgs {
     }
 
     fn remote(&self) -> ssh::Remote {
-        ssh::Remote::new(
-            self.ssh.as_deref().map(OsStrExt::as_bytes),
-            self.login.as_deref().map(OsStrExt::as_bytes),
-            self.host.as_bytes(),
-            self.hashsync_path.as_deref().map(OsStrExt::as_bytes),
-        )
-        .unwrap_or_else(|e| die(e))
+        ssh::Remote {
+            ssh: self.ssh.clone(),
+            login: self.login.as_ref().map(bytes),
+            host: bytes(&self.host),
+            hashsync_path: bytes(&self.hashsync_path),
+        }
     }
 }
 
@@ -403,6 +428,8 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{HashMap, HashSet};
+
     use super::*;
 
     /// The parsed arguments of `hashsync WORDS...`, or the usage error.
@@ -692,6 +719,128 @@ mod tests {
         assert!(ssh(&["-n", "--dedup-stdout", "nas", "true"]).no_stdin);
     }
 
+    /// The man page, `docs/hashsync.1`, documents the commands and options
+    /// of the program and no others, so that a new one cannot go
+    /// undocumented and a removed one cannot stay. Each option has an entry
+    /// of its own: an item of an option list whose head names it with an
+    /// mdoc `Fl` macro. The entries of the options of all commands are in
+    /// the sections before COMMANDS, and each command but the internal ones
+    /// has an item in COMMANDS, with the entries of its options. A mention
+    /// in the text of another entry does not count, so the test fails when
+    /// an entry is deleted, even if other entries still name its option.
+    #[test]
+    fn the_man_page_documents_every_command_and_option() {
+        let page = include_str!("../docs/hashsync.1");
+        let cli = Cli::command();
+        // What the entries `items` get wrong about the options of
+        // `command`, as the user writes them.
+        let wrong_options = |command: &clap::Command, items: &HashSet<&str>| {
+            let mut options = HashSet::new();
+            for arg in command.get_arguments() {
+                options.extend(arg.get_long().map(|long| format!("-{long}")));
+                options.extend(arg.get_short().map(String::from));
+            }
+            let name = command.get_name();
+            let undocumented = options
+                .iter()
+                .filter(|option| !items.contains(option.as_str()))
+                .map(|option| format!("undocumented option {name} -{option}"));
+            let unknown = items
+                .iter()
+                .filter(|item| !options.contains(**item))
+                .map(|item| format!("unknown option {name} -{item}"));
+            undocumented.chain(unknown).collect::<Vec<_>>()
+        };
+        let before_commands = page.lines().take_while(|line| *line != ".Sh COMMANDS");
+        let mut wrong = wrong_options(&cli, &item_flags(before_commands));
+        let commands = man_page_commands(page);
+        let visible = |command: &&clap::Command| !command.is_hide_set();
+        for command in cli.get_subcommands().filter(visible) {
+            match commands.get(command.get_name()) {
+                Some(items) => wrong.extend(wrong_options(command, items)),
+                None => wrong.push(format!("undocumented command {}", command.get_name())),
+            }
+        }
+        for name in commands.keys() {
+            if cli.find_subcommand(name).filter(visible).is_none() {
+                wrong.push(format!("unknown command {name}"));
+            }
+        }
+        assert!(wrong.is_empty(), "hashsync.1: {wrong:?}");
+    }
+
+    /// The options that have entries in each item of the COMMANDS section
+    /// of the man page (`item_flags`), by the name of its command: the
+    /// first word after a `Cm` macro in it.
+    fn man_page_commands(page: &str) -> HashMap<&str, HashSet<&str>> {
+        let mut items = Vec::new();
+        let mut item = Vec::new();
+        let mut depth = 0;
+        let section = page
+            .lines()
+            .skip_while(|line| *line != ".Sh COMMANDS")
+            .skip(1)
+            .take_while(|line| !line.starts_with(".Sh "));
+        for line in section {
+            // The items of the outermost list are the commands; the lists
+            // in them hold their options.
+            if depth == 1 && line.starts_with(".It") {
+                items.push(std::mem::take(&mut item));
+            }
+            if line.starts_with(".Bl") {
+                depth += 1;
+            } else if line.starts_with(".El") {
+                depth -= 1;
+            }
+            item.push(line);
+        }
+        items.push(item);
+        items
+            .into_iter()
+            .filter_map(|item| {
+                let mut words = item.iter().copied().flat_map(str::split_whitespace);
+                words.find(|word| matches!(*word, "Cm" | ".Cm"))?;
+                let name = words.next()?;
+                Some((name, item_flags(item.iter().copied())))
+            })
+            .collect()
+    }
+
+    /// The options that have entries in a part of the man page: those that
+    /// follow an `Fl` macro on the `.It` lines that head its items, up to
+    /// the next macro, as mdoc writes them, without their first `-`.
+    /// `.It Fl q , -quiet` gives `q` for `-q` and `-quiet` for `--quiet`.
+    fn item_flags<'a>(lines: impl Iterator<Item = &'a str>) -> HashSet<&'a str> {
+        let is_macro = |word: &str| {
+            let mut letters = word.trim_start_matches('.').chars();
+            word.len() >= 2
+                && letters.next().is_some_and(|c| c.is_ascii_uppercase())
+                && letters.all(|c| c.is_ascii_lowercase())
+        };
+        // A short option is a letter or a digit, and a long one a `-` and a
+        // name. Other words, such as the `,` between the two forms of an
+        // option, or `-` for `--`, are no options.
+        let is_option = |word: &str| match word.as_bytes() {
+            [short] => short.is_ascii_alphanumeric(),
+            [b'-', _, ..] => true,
+            _ => false,
+        };
+        let mut flags = HashSet::new();
+        for line in lines.filter(|line| line.starts_with(".It ")) {
+            let mut after_fl = false;
+            for word in line.split_whitespace() {
+                if is_macro(word) {
+                    after_fl = word.trim_start_matches('.') == "Fl";
+                } else if after_fl && is_option(word) {
+                    flags.insert(word);
+                }
+            }
+        }
+        flags
+    }
+
+    /// `--ssh` and `--hashsync-path` say how the client starts the server,
+    /// with `ssh` and `hashsync` by default (DESIGN.md §8).
     #[test]
     fn the_remote_takes_the_ssh_options() {
         let args = ssh(&[
@@ -707,11 +856,54 @@ mod tests {
         assert_eq!(
             args.remote(),
             ssh::Remote {
-                ssh: vec![b"ssh".to_vec(), b"-p".to_vec(), b"2222".to_vec()],
+                ssh: ssh::Program {
+                    executable: b"ssh".to_vec(),
+                    options: vec![b"-p".to_vec(), b"2222".to_vec()],
+                },
                 login: Some(b"u".to_vec()),
                 host: b"nas".to_vec(),
                 hashsync_path: b"/opt/hashsync".to_vec(),
             }
         );
+        let remote = ssh(&["nas", "true"]).remote();
+        assert_eq!(remote.ssh, ssh::Program::parse(b"ssh").unwrap());
+        assert_eq!(remote.hashsync_path, b"hashsync");
+    }
+
+    /// An `--ssh` that has no words or that does not split as a shell
+    /// splits it, and an empty `--hashsync-path`, are usage errors, whose
+    /// message shows the value as messages show values (DESIGN.md §8).
+    #[test]
+    fn bad_ssh_commands_and_hashsync_paths_are_usage_errors() {
+        for (option, value, message) in [
+            (
+                "--ssh",
+                "",
+                "invalid value '' for '--ssh <CMD>': empty command",
+            ),
+            (
+                "--ssh",
+                " ",
+                "invalid value ' ' for '--ssh <CMD>': empty command",
+            ),
+            (
+                "--ssh",
+                "ssh 'x",
+                r"invalid value 'ssh \x27x' for '--ssh <CMD>': unterminated single quote",
+            ),
+            (
+                "--hashsync-path",
+                "",
+                "invalid value '' for '--hashsync-path <PATH>': empty path",
+            ),
+        ] {
+            let error = parse(&["ssh", option, value, "nas", "true"]).err().unwrap();
+            assert_eq!(
+                error.kind(),
+                ErrorKind::ValueValidation,
+                "{option} {value:?}"
+            );
+            assert!(error.to_string().contains(message), "{error}");
+        }
     }
 }

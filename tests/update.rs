@@ -449,6 +449,27 @@ fn messages_show_an_index_in_the_home_directory_with_a_tilde() {
     has(&stderr, warning);
 }
 
+/// A file whose `hashlist_max_age` is less than an hour gets a warning from
+/// every command that reads it: expiry cannot tell a temporary that a
+/// failed run left from one that a running `hashsync ssh` is still writing,
+/// and a short age can remove the latter (DESIGN.md §7).
+#[test]
+fn a_hashlist_max_age_below_an_hour_gets_a_warning() {
+    let env = Env::new();
+    let warnings_with = |max_age: &str| {
+        env.configure(&format!("hashlist_max_age = \"{max_age}\"\n"));
+        let stderr = env.update();
+        warnings(&stderr).join("\n")
+    };
+    let warning = format!(
+        "hashsync: warning: {} sets hashlist_max_age below an hour, so expiry can remove \
+         the temporary files of a `hashsync ssh` that is still running",
+        quoted(env.config_path())
+    );
+    assert_eq!(warnings_with("59m"), warning);
+    assert_eq!(warnings_with("1h"), "");
+}
+
 #[test]
 fn root_pattern_expansion() {
     let env = Env::new();

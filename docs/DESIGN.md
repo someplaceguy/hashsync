@@ -895,7 +895,7 @@ bytes, excluding the wrapper and peer identities.
 
 For both roles, a failed cache directory or file operation ends the run
 with `die`. This covers every operation, including publication, renewal,
-the removal of listed and invalid files, and expiry, with three
+the removal of listed and invalid files, and expiry, with four
 exceptions:
 
 - Absence is normal. An absent cached list is a cache miss. Missing cache
@@ -910,6 +910,9 @@ exceptions:
 - A failure to remove an empty peer/index directory only prints a
   warning, and the directory stays. A directory that is no longer empty,
   or that is already gone, is normal and gets no warning.
+- A failure to list the directory of the account ID for expiry, or to
+  stat or remove a temporary there, only prints a warning, and the
+  temporaries stay.
 
 Validation failures in lists received over the protocol follow the
 exchange rules below.
@@ -1062,8 +1065,11 @@ made before it no longer matches the file. To expire the cache, at the
 end of each exchange, a side removes every file in every peer/index
 directory of both cache trees whose `ctime` is older than the
 `hashlist_max_age` of its host (default 30 days, section 7): lists and
-abandoned hidden temporaries. Then it removes every peer/index directory
-that is empty.
+abandoned hidden temporaries. It also removes the files next to the
+account ID whose names start with `.hashsync-`, temporaries of
+initializations that failed, once they are that old. An initializer that
+finds its temporary gone tries again. Then it removes every peer/index
+directory that is empty.
 
 A lost acknowledgement or a failed run can leave extra files until the
 next exchange of that peer and index, or until expiry. Database restore or
@@ -1791,15 +1797,20 @@ Data structures:
   it, it creates a segment and closes it at once, to make sure that
   segments can be created: the client before the SSH sessions start, and
   the server once it has read REQUEST and its configuration. So an
-  unusable directory ends the run before command startup. A disk-backed
-  directory moves the data out of RAM, where tmpfs would keep it in
-  memory or swap. Avoid NFS: its client writes the data of a file to the
-  server before it closes the file (section 10).
+  unusable directory ends the run before command startup. The host then
+  removes the files there whose names start with `.hashsync-` and whose
+  ctime is older than its `hashlist_max_age`: segments that failed runs
+  left before their unlink (section 11). A failure to list the directory,
+  or to stat or remove one of these files, only prints a warning, and the
+  files stay. A disk-backed directory moves the data out of RAM, where
+  tmpfs would keep it in memory or swap. Avoid NFS: its client writes the
+  data of a file to the server before it closes the file (section 10).
 - **Segment**: one open, unlinked file in the tmp_data directory, with its
   size and its count of extents in use. The size is the bytes of the
   extents appended to the segment. The file is read/write (0600) and
   close-on-exec. Prefer `O_TMPFILE`; otherwise create a unique file
-  securely and unlink it before writing any data.
+  securely and unlink it before writing any data. A name that is already
+  gone at that unlink is normal.
 - **Open segments**: each user keeps its open segments in creation order.
   At most one of them, the newest, is the **current segment**: it
   receives the new extents. The others are **sealed**: they receive no
@@ -2338,7 +2349,9 @@ rather than exiting ahead of it:
 - Process exit closes the unlinked segments of both hosts, which frees all
   their storage.
 - Abandoned cache temporaries remain until the next exchange of that peer
-  and index, or until expiry (section 5.6).
+  and index, or until expiry (section 5.6); those of the account ID and of
+  segments until they are older than `hashlist_max_age` (sections 5.6 and
+  6.5).
 
 Build with `panic = "abort"`; install a panic hook that performs the same
 cleanup before aborting. External failures use `die`; bugs and database
@@ -2514,13 +2527,21 @@ file that an option names. A host without a file of `default` says
 `['~/.config/hashsync/default.toml' not found]`.
 
 The receiver needs a file, for its roots and its index. A sender uses only
-`tmp_data_dir`, where its spools go, and `hashlist_max_age`, how long its
-list cache keeps lists. A file that an option names must exist, so that a
-mistyped name fails instead of quietly giving the defaults. But a sender
-uses the defaults of these two keys when it has no file of the profile
-`default`, which it uses without such an option. So the server of a pull
-and the client of a push need no file, and with both streams
+`tmp_data_dir`, where its spools go, and `hashlist_max_age`, the age at
+which expiry removes its unused lists and the temporaries that failed runs
+left (sections 5.6 and 6.5). A file that an option names must exist, so
+that a mistyped name fails instead of quietly giving the defaults. But a
+sender uses the defaults of these two keys when it has no file of the
+profile `default`, which it uses without such an option. So the server of
+a pull and the client of a push need no file, and with both streams
 deduplicated, both hosts need one.
+
+A `hashlist_max_age` of 0 is an error, whose message points to
+`--no-sender-cache` (section 8), which sends the whole list every time.
+Expiry cannot tell a temporary that a failed run left from one that a run
+in progress is still writing, so a command that reads a file whose
+`hashlist_max_age` is less than an hour warns that expiry can remove the
+latter.
 
 Everything about a run is an option of `hashsync ssh` (section 8), which
 the client sends to the server in REQUEST, so it is never ambiguous which
@@ -2530,7 +2551,7 @@ settings apply.
 block_size     = "16KiB"   # at least 512 bytes; changes rebuild the index
 strong_hash    = "blake3"  # blake3 or sha256
 candidate_attempts = 128  # candidates tried per query, at least 1
-hashlist_max_age = "30d"   # how long this host's list cache keeps a list
+hashlist_max_age = "30d"   # at least 1s; expiry of unused lists and leftover temporaries
 index_path     = "~/.cache/hashsync/default.db"  # a directory, named after this file by default
 threads        = 0         # 0 = 4 × cores, clamped to 16–64
 tmp_data_dir   = "~/.cache/hashsync/tmp-data"  # segments of pins and spools; any filesystem
@@ -3350,8 +3371,8 @@ decision history, including fuller measurements, is in version control.
 - The name of every temporary file of this program is `.hashsync-` and
   16 random hexadecimal digits: the cache temporaries, the temporary of
   the account ID, and the segment files without `O_TMPFILE`. Then a file
-  that a failed run leaves shows its owner, and the cache can tell its
-  temporaries apart from other hidden names (section 5.6).
+  that a failed run leaves shows its owner, and the program can tell its
+  temporaries apart from other hidden names (sections 5.6 and 6.5).
 - Run `cargo fmt`, `cargo clippy --all-targets`, and `cargo test` for
   implementation changes.
 - Test every rule of this document. Use separate processes for locking
@@ -3488,8 +3509,10 @@ decision history, including fuller measurements, is in version control.
     profiles and of `--config`, their indexes named after them, the note
     that names the file and the index of `update`, `stats`, and both hosts
     of a run, also without a file of `default`, the warning for a file of
-    `--config` without `index_path`, a named file that does not exist, an
-    invalid profile name, and both options together;
+    `--config` without `index_path`, the error for a `hashlist_max_age` of
+    0 and the warning for one below an hour, on both hosts of a run, a
+    named file that does not exist, an invalid profile name, and both
+    options together;
   - the command line of `hashsync ssh`: options after HOST, a command
     without `--`, `-l`, a command line for the user's shell and the words
     of `-s`, and `rsync -e 'hashsync ssh'` with a path with spaces, also
@@ -3503,9 +3526,12 @@ decision history, including fuller measurements, is in version control.
     its update, and the index closed at Completing while the run goes on;
     cache races, also a publication whose directory is gone and a listed
     name that a later run published again; fatal cache I/O failures, and a
-    warning for an empty directory that stays; the advertisement and
-    removal of listed files, hidden names that are not temporaries, and the
-    removal of empty directories; and invalid cached lists;
+    warning for an empty directory or a temporary that stays, or for a
+    tmp_data directory that cannot be listed; the advertisement and
+    removal of listed files, hidden names that are not temporaries, and
+    the removal of empty directories, and on both hosts of the
+    temporaries that failed runs left next to the account ID and in the
+    tmp_data directory; and invalid cached lists;
   - completion without truncation or premature exit; complete stderr
     forwarding with backpressure and late stderr EOF from descendants;
     compressed control traffic that the closure ends; late lookups; relay
@@ -3520,7 +3546,13 @@ decision history, including fuller measurements, is in version control.
   the end of that wait must be the success of the test: a slow machine
   can make such a test miss a fault, but never fail a correct build.
 - Package with Nix `rustPlatform.buildRustPackage`, including support for
-  cross and static builds.
+  cross and static builds. The package installs the man page
+  `docs/hashsync.1`, which documents every command, option, and
+  configuration key. Wherever the build can run the installed binary,
+  `install-check.sh` checks it: the binary links only the C and C++ runtime
+  libraries, since it bundles the others (section 9), it allocates with
+  mimalloc exactly when the `mimalloc` feature is on, every command works,
+  and a run finds its server through PATH and through `--hashsync-path`.
 
 ## 12. Deferred work
 

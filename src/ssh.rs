@@ -91,63 +91,54 @@ pub fn remote_command(argv: &[&[u8]]) -> Vec<u8> {
     out
 }
 
-/// How the client reaches the server (DESIGN.md §6.1 and §8).
+/// The SSH program of `--ssh`: the executable and its options (DESIGN.md
+/// §6.1).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Remote {
-    /// The shell-split `--ssh` command; the first word is the executable.
-    pub ssh: Vec<Vec<u8>>,
-    /// `-l USER`, which goes to SSH as it is.
-    pub login: Option<Vec<u8>>,
-    /// The SSH destination, `[USER@]HOST`, which goes to SSH unchanged.
-    pub host: Vec<u8>,
-    /// `--hashsync-path`: one executable name or path, not a shell
-    /// fragment, which the bootstrap quotes as one word.
-    pub hashsync_path: Vec<u8>,
+pub struct Program {
+    pub executable: Vec<u8>,
+    pub options: Vec<Vec<u8>>,
 }
 
-impl Remote {
-    /// The remote of `hashsync ssh` from its options: `ssh_command`
-    /// (`--ssh`, shell-split without byte escapes, as no CLI argument has
-    /// them; `ssh` by default), `login`, `host` and `hashsync_path`
-    /// (`hashsync` by default).
-    pub fn new(
-        ssh_command: Option<&[u8]>,
-        login: Option<&[u8]>,
-        host: &[u8],
-        hashsync_path: Option<&[u8]>,
-    ) -> Result<Remote, String> {
-        let ssh = match ssh_command {
-            None => vec![b"ssh".to_vec()],
-            Some(text) => match shell_split(text) {
-                Ok(words) if words.is_empty() => return Err("--ssh: empty command".into()),
-                Ok(words) => words,
-                Err(e) => return Err(format!("--ssh: {e}")),
-            },
+impl Program {
+    /// The program of the `--ssh` command `text`, which is shell-split
+    /// without byte escapes, as no CLI argument has them. The first word is
+    /// the executable, so a command without words is an error.
+    pub fn parse(text: &[u8]) -> Result<Program, String> {
+        let mut words = shell_split(text)?.into_iter();
+        let Some(executable) = words.next() else {
+            return Err("empty command".into());
         };
-        let hashsync_path = match hashsync_path {
-            None => b"hashsync".to_vec(),
-            Some([]) => return Err("--hashsync-path: empty path".into()),
-            Some(path) => path.to_vec(),
-        };
-        Ok(Remote {
-            ssh,
-            login: login.map(<[u8]>::to_vec),
-            host: host.to_vec(),
-            hashsync_path,
+        Ok(Program {
+            executable,
+            options: words.collect(),
         })
     }
 }
 
-/// One session's local argv: the split `ssh` command with the options,
+/// How the client reaches the server (DESIGN.md §6.1 and §8).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Remote {
+    /// `--ssh`, `ssh` by default.
+    pub ssh: Program,
+    /// `-l USER`, which goes to SSH as it is.
+    pub login: Option<Vec<u8>>,
+    /// The SSH destination, `[USER@]HOST`, which goes to SSH unchanged.
+    pub host: Vec<u8>,
+    /// `--hashsync-path`, `hashsync` by default: one executable name or
+    /// path, not a shell fragment, which the bootstrap quotes as one word.
+    pub hashsync_path: Vec<u8>,
+}
+
+/// One session's local argv: the `--ssh` program with the options,
 /// `-l USER`, HOST, and remote command that DESIGN.md §6.1 specifies.
 pub fn session_argv(remote: &Remote, command: &[u8]) -> Vec<OsString> {
     let ssh = &remote.ssh;
-    let mut argv: Vec<Vec<u8>> = Vec::with_capacity(ssh.len() + 12);
-    argv.push(ssh[0].clone());
+    let mut argv: Vec<Vec<u8>> = Vec::with_capacity(ssh.options.len() + 13);
+    argv.push(ssh.executable.clone());
     for option in ["-o", "ClearAllForwardings=yes", "-o", "RemoteCommand=none"] {
         argv.push(option.into());
     }
-    argv.extend(ssh[1..].iter().cloned());
+    argv.extend(ssh.options.iter().cloned());
     for option in ["-T", "-x", "-o", "Compression=no"] {
         argv.push(option.into());
     }
@@ -255,7 +246,12 @@ mod tests {
 
     #[test]
     fn session_argv_places_the_specified_options() {
-        let mut remote = Remote::new(Some(b"ssh -C -p 22"), None, b"user@host", None).unwrap();
+        let mut remote = Remote {
+            ssh: Program::parse(b"ssh -C -p 22").unwrap(),
+            login: None,
+            host: b"user@host".to_vec(),
+            hashsync_path: b"hashsync".to_vec(),
+        };
         let words = |remote: &Remote| -> Vec<Vec<u8>> {
             let argv = session_argv(remote, b"exec 'hashsync'");
             argv.iter().map(|w| w.as_encoded_bytes().to_vec()).collect()
@@ -284,23 +280,26 @@ mod tests {
         assert_eq!(words(&remote), with_login);
     }
 
+    /// The first word of `--ssh` is the executable and the rest are its
+    /// options, so a command needs a word. `--ssh` gets no byte escapes: a
+    /// CLI argument has none.
     #[test]
-    fn the_remote_has_defaults_and_rejects_bad_commands() {
-        let remote = Remote::new(None, None, b"host", None).unwrap();
-        assert_eq!(remote.ssh, [b"ssh"]);
-        assert_eq!(remote.hashsync_path, b"hashsync");
-        // `--ssh` gets no byte escapes: a CLI argument has none.
-        let remote =
-            Remote::new(Some(br"ssh -o 'X\x41'"), None, b"host", Some(b"/opt/h s")).unwrap();
-        assert_eq!(remote.ssh, [&b"ssh"[..], b"-o", br"X\x41"]);
-        assert_eq!(remote.hashsync_path, b"/opt/h s");
-        for (ssh, path, error) in [
-            (Some(&b""[..]), None, "--ssh: empty command"),
-            (Some(b"  "), None, "--ssh: empty command"),
-            (Some(b"ssh 'open"), None, "--ssh: unterminated single quote"),
-            (None, Some(&b""[..]), "--hashsync-path: empty path"),
+    fn the_ssh_command_is_an_executable_and_its_options() {
+        let program = |executable: &[u8], options: &[&[u8]]| Program {
+            executable: executable.to_vec(),
+            options: options.iter().map(|option| option.to_vec()).collect(),
+        };
+        assert_eq!(Program::parse(b"ssh"), Ok(program(b"ssh", &[])));
+        assert_eq!(
+            Program::parse(br"ssh -o 'X\x41'"),
+            Ok(program(b"ssh", &[b"-o", br"X\x41"]))
+        );
+        for (text, error) in [
+            (&b""[..], "empty command"),
+            (b"  ", "empty command"),
+            (b"ssh 'open", "unterminated single quote"),
         ] {
-            assert_eq!(Remote::new(ssh, None, b"host", path), Err(error.into()));
+            assert_eq!(Program::parse(text), Err(error.into()));
         }
     }
 }

@@ -45,8 +45,8 @@ const TEMPORARY_PREFIX: &str = ".hashsync-";
 /// A new name for a temporary file: `.hashsync-` and 16 random
 /// hexadecimal digits. Every temporary file of this program gets such a
 /// name, so that a file that a failed run leaves shows its owner, and so
-/// that the cache can tell its temporaries apart from the hidden files of
-/// other programs (`is_temporary`, DESIGN.md §11).
+/// that this program can tell its temporaries apart from the hidden files
+/// of other programs (`is_temporary`, DESIGN.md §11).
 pub fn temporary_name() -> String {
     format!("{TEMPORARY_PREFIX}{}", hex(&random_bytes::<8>()))
 }
@@ -54,11 +54,13 @@ pub fn temporary_name() -> String {
 /// True if `name` is the name of a temporary file of this program: it
 /// starts with `.hashsync-`, as every name from `temporary_name` does.
 ///
-/// This function exists so that the cache removes only its own
-/// temporaries, and no other hidden name. For example, an NFS client
+/// This function exists so that this program removes only its own
+/// temporaries, and no other hidden name: those that an exchange lists in
+/// its peer/index directory, and those that expiry finds next to the
+/// account ID and in the tmp_data directory. For example, an NFS client
 /// gives a hidden `.nfs` name to a removed file that a process still has
 /// open, and the removal of that name fails with EBUSY until the file
-/// closes (DESIGN.md §5.6).
+/// closes (DESIGN.md §5.6 and §6.5).
 pub fn is_temporary(name: &[u8]) -> bool {
     name.starts_with(TEMPORARY_PREFIX.as_bytes())
 }

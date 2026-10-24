@@ -142,8 +142,11 @@ pub fn run(token: &str) -> ! {
 
     // This side's tmp_data directory, for the pins and the spools of both
     // streams. An unusable directory ends the run when it opens: here,
-    // before command startup (DESIGN.md §6.5).
+    // before command startup (DESIGN.md §6.5). The segment files that
+    // failed runs left there go once they are older than
+    // `hashlist_max_age`.
     let tmp_data = Arc::new(Directory::open(&config.tmp_data_dir));
+    tmp_data.expire_temporaries(config.hashlist_max_age);
 
     // This side's roles in the deduplicated streams: the receiver of a
     // deduplicated forward stream, and the sender of a deduplicated backward

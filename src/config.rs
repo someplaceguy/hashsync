@@ -31,6 +31,11 @@ pub const DEFAULT_BLOCK_SIZE: u32 = 16 * 1024;
 
 /// 30 days (DESIGN.md §5.6), in seconds.
 pub const DEFAULT_HASHLIST_MAX_AGE: u64 = 30 * 24 * 3600;
+/// The smallest `hashlist_max_age` that gets no warning, an hour. Expiry
+/// cannot tell a temporary that a failed run left from one that a run in
+/// progress is still writing, and a shorter age can remove the latter
+/// (DESIGN.md §7).
+const MIN_RECOMMENDED_HASHLIST_MAX_AGE: u64 = 3600;
 
 const DEFAULT_CANDIDATE_ATTEMPTS: u32 = 128;
 
@@ -185,11 +190,11 @@ impl Exclusions {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
-    block_size: Option<Size>,
+    block_size: Option<Amount>,
     strong_hash: Option<String>,
     index_path: Option<String>,
     threads: Option<u32>,
-    hashlist_max_age: Option<String>,
+    hashlist_max_age: Option<Amount>,
     candidate_attempts: Option<u32>,
     tmp_data_dir: Option<String>,
     #[serde(default)]
@@ -211,10 +216,14 @@ struct RawRoot {
     may_vanish: bool,
 }
 
+/// A size or a duration in the file: an integer, of bytes or seconds, or a
+/// string, which can give a unit (`parse_size`, `parse_duration`). Without
+/// `expecting`, a value of another type, such as a negative integer, would
+/// get serde's message for an untagged enum, which names this type.
 #[derive(Deserialize)]
-#[serde(untagged)]
-enum Size {
-    Bytes(u64),
+#[serde(untagged, expecting = "expected a nonnegative integer or a string")]
+enum Amount {
+    Number(u64),
     Text(String),
 }
 
@@ -293,7 +302,8 @@ pub fn check_profile_name(name: &[u8]) -> Result<(), String> {
 /// of the profile `default`, which it uses when no option selects one. A
 /// file that an option names must exist, so that a mistyped name fails
 /// instead of quietly giving the defaults. A note then names the file, and
-/// the index if the host uses it (`note_files`).
+/// the index if the host uses it (`note_files`), and a warning follows if
+/// the file sets a `hashlist_max_age` below an hour.
 pub fn load(source: &Source, uses_index: bool) -> Config {
     let path = source.path();
     let shown = quoted(&path);
@@ -318,6 +328,13 @@ pub fn load(source: &Source, uses_index: bool) -> Config {
     };
     let index = uses_index.then_some(config.index_path.as_slice());
     note_files(source, &path, found, index);
+    if config.hashlist_max_age < MIN_RECOMMENDED_HASHLIST_MAX_AGE {
+        warn(format!(
+            "{} sets hashlist_max_age below an hour, so expiry can remove the temporary \
+             files of a `hashsync ssh` that is still running",
+            quoted_from_home(&path)
+        ));
+    }
     // The files of profiles share one directory, so their names are
     // distinct, and so are the names of their indexes. A file anywhere can
     // have the name of another one, such as the file of a profile, and then
@@ -375,7 +392,9 @@ pub fn parse(text: &str, source: &Source) -> Result<Config, String> {
     let block_size = match raw.block_size {
         None => DEFAULT_BLOCK_SIZE,
         Some(size) => {
-            let bytes = size.bytes().map_err(|e| format!("block_size: {e}"))?;
+            let bytes = size
+                .value(parse_size)
+                .map_err(|e| format!("block_size: {e}"))?;
             block_size(bytes).map_err(|e| format!("block_size {e}"))?
         }
     };
@@ -410,8 +429,23 @@ pub fn parse(text: &str, source: &Source) -> Result<Config, String> {
     };
     let hashlist_max_age = match raw.hashlist_max_age {
         None => DEFAULT_HASHLIST_MAX_AGE,
-        Some(text) => parse_duration(&text).map_err(|e| format!("hashlist_max_age: {e}"))?,
+        Some(age) => age
+            .value(parse_duration)
+            .map_err(|e| format!("hashlist_max_age: {e}"))?,
     };
+    // Expiry compares whole seconds, so an age of 0 would remove every file
+    // older than the current second: the temporaries of runs in progress,
+    // even ones only milliseconds old, and at the end of each exchange,
+    // all lists but those that the exchange renewed within that second.
+    // What a user who sets 0 most likely wants, a whole list every time,
+    // is what `--no-sender-cache` does (DESIGN.md §7).
+    if hashlist_max_age == 0 {
+        let instead =
+            "to send the whole hash list every time, use `hashsync ssh --no-sender-cache`";
+        return Err(format!(
+            "hashlist_max_age must be at least 1 second; {instead}"
+        ));
+    }
     let mut roots = Vec::with_capacity(raw.roots.len());
     for (i, root) in raw.roots.into_iter().enumerate() {
         roots.push(parse_root(root).map_err(|e| format!("roots[{i}]: {e}"))?);
@@ -441,11 +475,13 @@ pub fn thread_count(requested: u32) -> u32 {
     }
 }
 
-impl Size {
-    fn bytes(self) -> Result<u64, String> {
+impl Amount {
+    /// The number of bytes or seconds, which `parse_text` reads from a
+    /// string.
+    fn value(self, parse_text: fn(&str) -> Result<u64, String>) -> Result<u64, String> {
         match self {
-            Size::Bytes(n) => Ok(n),
-            Size::Text(text) => parse_size(&text),
+            Amount::Number(n) => Ok(n),
+            Amount::Text(text) => parse_text(&text),
         }
     }
 }
@@ -842,8 +878,14 @@ one_filesystem = true
         let config = parse("[[roots]]\npath = '/srv/\\xFF/*'\n").unwrap();
         assert_eq!(config.roots[0].pattern, b"/srv/\xff/*");
         assert!(parse("").unwrap().roots.is_empty());
+        // Sizes and durations can be integers, of bytes and seconds.
         assert_eq!(parse("block_size = 8192").unwrap().block_size, 8192);
         assert_eq!(parse("block_size = 512").unwrap().block_size, 512);
+        let max_age = |text: &str| parse(text).unwrap().hashlist_max_age;
+        assert_eq!(max_age("hashlist_max_age = 1"), 1);
+        assert_eq!(max_age("hashlist_max_age = 3600"), 3600);
+        assert_eq!(max_age("hashlist_max_age = \"3600\""), 3600);
+        assert_eq!(max_age("hashlist_max_age = \"2h\""), 7200);
     }
 
     #[test]
@@ -878,6 +920,14 @@ one_filesystem = true
                 .unwrap_err()
                 .contains("hashlist_max_age")
         );
+        // An age of 0 points to the option that does what it would.
+        for text in ["0", "\"0\"", "\"0d\""] {
+            assert_eq!(
+                parse(&format!("hashlist_max_age = {text}")).unwrap_err(),
+                "hashlist_max_age must be at least 1 second; to send the whole hash list \
+                 every time, use `hashsync ssh --no-sender-cache`",
+            );
+        }
         assert!(
             parse("[[roots]]\npath = \"relative\"")
                 .unwrap_err()
@@ -921,6 +971,23 @@ one_filesystem = true
             let text = format!("[[roots]]\npath = '/a'\nexclude = ['{pattern}']");
             let error = parse(&text).unwrap_err();
             assert_eq!(error, format!("roots[0]: exclude: {expected}"));
+        }
+    }
+
+    /// A size or a duration that is neither a nonnegative integer nor a
+    /// string, such as a negative or fractional number, gets a message that
+    /// says what the key takes, not one that names a type of the program.
+    #[test]
+    fn mistyped_sizes_and_durations_say_what_they_take() {
+        for text in [
+            "block_size = -4096",
+            "block_size = true",
+            "hashlist_max_age = -1",
+            "hashlist_max_age = 1.5",
+        ] {
+            let error = parse(text).unwrap_err();
+            let expected = "expected a nonnegative integer or a string";
+            assert!(error.ends_with(&format!(": {expected}")), "{text}: {error}");
         }
     }
 
@@ -1204,6 +1271,92 @@ one_filesystem = true
             let found = base.policy_difference(&root(other));
             assert_eq!(found, Some(difference), "{other}");
         }
+    }
+
+    /// The man page, `docs/hashsync.1`, describes the keys of the
+    /// configuration file in the two lists of its CONFIGURATION section,
+    /// those of the file and those of each root, with an item for each key
+    /// and for no other, so that a new key cannot go undocumented and a
+    /// removed one cannot stay. Its example files are valid configurations.
+    #[test]
+    fn the_man_page_documents_every_key() {
+        let page = include_str!("../docs/hashsync.1");
+        let section = page
+            .lines()
+            .skip_while(|line| *line != ".Sh CONFIGURATION")
+            .skip(1)
+            .take_while(|line| !line.starts_with(".Sh "));
+        let mut lists: Vec<Vec<&str>> = Vec::new();
+        for line in section {
+            if line.starts_with(".Bl ") {
+                lists.push(Vec::new());
+            } else if let Some(key) = line.strip_prefix(".It Cm ") {
+                lists.last_mut().expect("an item in a list").push(key);
+            }
+        }
+        let sorted = |mut keys: Vec<&'static str>| {
+            keys.sort_unstable();
+            keys
+        };
+        assert_eq!(
+            lists.into_iter().map(sorted).collect::<Vec<_>>(),
+            [
+                sorted(serde_fields::<RawConfig>().to_vec()),
+                sorted(serde_fields::<RawRoot>().to_vec()),
+            ],
+            "the keys of the file and of each root"
+        );
+        // The literal blocks of mdoc, in which `\e` is a backslash.
+        let mut examples = 0;
+        let mut lines = page.lines();
+        while lines.any(|line| line.starts_with(".Bd -literal")) {
+            let block: Vec<&str> = lines.by_ref().take_while(|line| *line != ".Ed").collect();
+            let text = block.join("\n").replace(r"\e", r"\");
+            if text.contains("[[roots]]") {
+                parse(&text).unwrap_or_else(|e| panic!("{e}:\n{text}"));
+                examples += 1;
+            }
+        }
+        assert_eq!(examples, 2, "the examples of configuration files");
+    }
+
+    /// The fields of `T`, which are the keys of its table in the
+    /// configuration file: serde gives them to the deserializer.
+    fn serde_fields<T: for<'de> Deserialize<'de>>() -> &'static [&'static str] {
+        /// A deserializer that keeps the fields of the struct that asks for
+        /// them, and fails.
+        struct Fields(Option<&'static [&'static str]>);
+
+        impl<'de> serde::Deserializer<'de> for &mut Fields {
+            type Error = serde::de::value::Error;
+
+            fn deserialize_any<V: serde::de::Visitor<'de>>(
+                self,
+                _: V,
+            ) -> Result<V::Value, Self::Error> {
+                Err(serde::de::Error::custom("not a struct"))
+            }
+
+            fn deserialize_struct<V: serde::de::Visitor<'de>>(
+                self,
+                _name: &'static str,
+                fields: &'static [&'static str],
+                _: V,
+            ) -> Result<V::Value, Self::Error> {
+                self.0 = Some(fields);
+                Err(serde::de::Error::custom("no values"))
+            }
+
+            serde::forward_to_deserialize_any! {
+                bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+                bytes byte_buf option unit unit_struct newtype_struct seq tuple
+                tuple_struct map enum identifier ignored_any
+            }
+        }
+
+        let mut fields = Fields(None);
+        let _ = T::deserialize(&mut fields);
+        fields.0.expect("a struct")
     }
 
     #[test]
