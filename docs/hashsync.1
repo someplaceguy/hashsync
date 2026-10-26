@@ -3,7 +3,7 @@
 .\" configuration file changes. Tests in src/main.rs and src/config.rs check
 .\" that this page documents every command, option, and configuration key,
 .\" and no others, and the Nix build lints it with mandoc -T lint.
-.Dd October 24, 2026
+.Dd October 26, 2026
 .Dt HASHSYNC 1
 .Os
 .Sh NAME
@@ -436,6 +436,16 @@ needs one only on a host that receives a deduplicated stream, but a file named
 by an option must exist.
 Unknown keys are errors.
 .Pp
+Each profile has its own index, and
+.Nm Cm ssh
+deduplicates each stream against a single index.
+Data sets that share no content and are transferred separately, such as a
+Nix store and a photo collection, are best indexed in separate profiles.
+Updates are then faster, hash lists are smaller, and instances of
+.Nm Cm ssh
+that deduplicate against different profiles do not wait for each other
+.Pq see Sx CAVEATS .
+.Pp
 The following keys are recognized, all optional:
 .Bl -tag -width Ds
 .It Cm block_size
@@ -541,14 +551,17 @@ the path without that prefix; and
 .Ql { literal = \(dqphotos-2019\(dq }
 that fixed name.
 .It Cm immutable
-If true, the contents of the root never change, which is up to the user to
-ensure.
+If true,
+.Nm
+assumes that the contents of the root never change.
 An update indexes a group once, from its first copy that exists, and then
 reuses it without reading it, until
 .Fl -scan-immutable
 or
 .Fl -rebuild ,
 or until an update finds none of its copies, which removes the group.
+If the contents change anyway, transfers are still correct, but deduplicate
+less until the group is indexed again.
 The receiver reads blocks from any copy.
 All copies of a group must have the same
 .Cm exclude
@@ -709,6 +722,8 @@ Use
 as the remote shell of
 .Xr rsync 1 ,
 to pull and to push.
+Deduplication is much more effective with a patched rsync
+.Pq see Sx CAVEATS .
 With
 .Fl -delete-delay ,
 rsync deletes files only after the transfer, so files that are about to be
@@ -725,28 +740,36 @@ Run the server from a statically linked binary in the remote home directory:
 hashsync ssh -n --hashsync-path bin/hashsync nas cat big.iso > big.iso
 .Ed
 .Pp
-A configuration file that indexes a Nix store, a copy of it on another disk,
-and a data directory:
+The default profile, in
+.Pa ~/.config/hashsync/default.toml ,
+for the data directory of the examples above:
 .Bd -literal -offset indent
 block_size = "16KiB"
 
 [[roots]]
-path = "/nix/store/*"
-immutable = true
-identifier = "name"
-exclude = [".links"]
-
+path = "/srv/data"
+exclude = ["*.tmp", ".cache"]
+one_filesystem = true
+.Ed
+.Pp
+A profile for two Nix stores at separate locations, in
+.Pa ~/.config/hashsync/nix.toml ,
+which
+.Ql --profile nix
+selects:
+.Bd -literal -offset indent
 [[roots]]
-path = "/mnt/disk/nix/store/*"
+path = "/nix/store/*"
 immutable = true
 identifier = "name"
 exclude = [".links"]
 may_vanish = true
 
 [[roots]]
-path = "/srv/data"
-exclude = ["*.tmp", ".cache"]
-one_filesystem = true
+path = "/mnt/disk/nix/store/*"
+immutable = true
+identifier = "name"
+exclude = [".links"]
 .Ed
 .Pp
 A root whose name contains the byte FF, which is not valid UTF-8, and
@@ -831,9 +854,11 @@ If SSH multiplexes sessions over one connection, for example with
 still works, but the sender's questions about matching blocks wait behind the
 data of the streams.
 .Sh SECURITY CONSIDERATIONS
-The sender learns a hash of every block in the receiver's index, and can test
-whether the receiver has a block with given contents, so only use
-.Nm
-between hosts that trust each other.
+The sender of a deduplicated stream learns a hash of every block in the
+receiver's index, and can test whether the receiver has a block with given
+contents.
+In a push, the client could read the indexed files through its SSH login
+anyway, but in a pull, the server learns about the client's files, so only
+pull from servers that you trust.
 .Fl -no-sender-cache
-keeps the sender from storing the receiver's hash lists.
+keeps the server from storing the client's hash lists.

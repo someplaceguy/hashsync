@@ -2268,9 +2268,11 @@ run open, as it keeps a local pipeline open.
   invalid compressed data, unexpected answers, missing pins, protocol
   arithmetic overflow, database errors, and invariant violations.
 
-Use trusted peers: the sender learns hashes of all indexed content.
+The sender learns hashes of all indexed content.
 `--no-sender-cache` disables their retention and removes earlier caches
-for that receiver/index (section 5.6).
+for that receiver/index (section 5.6). In a push, the sender is the
+client, which can read the indexed content through its SSH login anyway;
+in a pull, it is the server, so only pull from trusted servers.
 
 ### 6.8 Threads at run time
 

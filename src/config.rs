@@ -1317,7 +1317,7 @@ one_filesystem = true
                 examples += 1;
             }
         }
-        assert_eq!(examples, 2, "the examples of configuration files");
+        assert_eq!(examples, 3, "the examples of configuration files");
     }
 
     /// The fields of `T`, which are the keys of its table in the
