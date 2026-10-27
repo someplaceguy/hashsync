@@ -2268,11 +2268,13 @@ run open, as it keeps a local pipeline open.
   invalid compressed data, unexpected answers, missing pins, protocol
   arithmetic overflow, database errors, and invariant violations.
 
-The sender learns hashes of all indexed content.
-`--no-sender-cache` disables their retention and removes earlier caches
-for that receiver/index (section 5.6). In a push, the sender is the
-client, which can read the indexed content through its SSH login anyway;
-in a pull, it is the server, so only pull from trusted servers.
+The sender learns hashes of all indexed content. In a push, the sender is
+the client, which can read the indexed content through its SSH login
+anyway; in a pull, it is the server, so only pull from trusted servers.
+A trusted server still keeps the receiver's lists in its cache;
+`--no-sender-cache` asks it not to, and to remove the ones cached earlier
+for that receiver/index (section 5.6). An untrusted server receives the
+hashes anyway and can ignore the setting.
 
 ### 6.8 Threads at run time
 

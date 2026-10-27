@@ -872,5 +872,9 @@ contents.
 In a push, the client could read the indexed files through its SSH login
 anyway, but in a pull, the server learns about the client's files, so only
 pull from servers that you trust.
+Even a trusted server keeps the client's hash lists in its cache after a
+pull, where anyone who later gains access to the server can read them.
 .Fl -no-sender-cache
-keeps the server from storing the client's hash lists.
+asks the server not to keep them.
+It does not protect against an untrusted server, which still receives the
+hashes and can ignore the request.

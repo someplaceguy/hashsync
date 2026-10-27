@@ -300,4 +300,4 @@ If SSH multiplexes sessions over one connection, for example with `ControlMaster
 
 == SECURITY CONSIDERATIONS
 
-The sender of a deduplicated stream learns a hash of every block in the receiver's index, and can test whether the receiver has a block with given contents. In a push, the client could read the indexed files through its SSH login anyway, but in a pull, the server learns about the client's files, so only pull from servers that you trust. `--no-sender-cache` keeps the server from storing the client's hash lists.
+The sender of a deduplicated stream learns a hash of every block in the receiver's index, and can test whether the receiver has a block with given contents. In a push, the client could read the indexed files through its SSH login anyway, but in a pull, the server learns about the client's files, so only pull from servers that you trust. Even a trusted server keeps the client's hash lists in its cache after a pull, where anyone who later gains access to the server can read them. `--no-sender-cache` asks the server not to keep them. It does not protect against an untrusted server, which still receives the hashes and can ignore the request.
