@@ -3,7 +3,8 @@
 //! `serve` sends the command's stdout, the backward stream, deduplicated,
 //! and writes the forward stream to the command's stdin. In a push, it
 //! receives the forward stream deduplicated against its own index, which
-//! it updates while the command runs, and sends the backward stream plain.
+//! it updates while the command runs, and again after END, and sends the
+//! backward stream plain.
 //! `serve` starts the command at REQUEST, and with it both streams; the
 //! list exchange of the deduplicated stream runs meanwhile on the control
 //! session (DESIGN.md §5.6 and §6.2). The client's disappearance is fatal
@@ -1866,6 +1867,48 @@ fn a_second_stop_from_the_client_is_a_protocol_error() {
                 && line.contains("protocol error: a second STOP")),
         "stderr:\n{stderr}"
     );
+}
+
+#[test]
+fn a_fatal_end_after_end_spares_the_commands_process_group() {
+    // Once END has given the client the command's status, a fatal end of
+    // `serve` leaves the command's process group alone, as its normal end
+    // does (DESIGN.md §6.9). The command leaves a process in its group,
+    // which reads a FIFO, and exits. After END, this test sends a frame
+    // that cannot come then, a bug of the client, so `serve` aborts. The
+    // process that the command left still reads the FIFO: had `serve`
+    // killed the group, the write to the FIFO would wait for a reader
+    // forever, and the test would hang.
+    let mut serve = Serve::start();
+    // The abort must leave no core file behind.
+    let pid = Pid::from_raw(serve.child.id() as i32).unwrap();
+    let no_core = rustix::process::Rlimit {
+        current: Some(0),
+        maximum: Some(0),
+    };
+    rustix::process::prlimit(Some(pid), rustix::process::Resource::Core, no_core).unwrap();
+    let go = serve.home.path().join("go");
+    mkfifoat(CWD, &go, Mode::RUSR | Mode::WUSR).unwrap();
+    let script = format!("(read go <'{}') </dev/null >/dev/null 2>&1 &", go.display());
+    serve.pull(&["sh", "-c", &script]);
+    let mut control = serve.attach();
+    control.write_all(&frame(HASHNONE, b"")).unwrap();
+    let (_, end) = serve.stream_through_end();
+    assert_eq!(end.outcome(), SUCCESS);
+    // The main thread of `serve` spares the group right after its write of
+    // END, without a wait in between, and then waits for the data reader
+    // (step F1). So once every thread sleeps, the group is spared: a frame
+    // sent before could make `serve` abort while the group is still
+    // registered for the kill.
+    wait_until_asleep(serve.child.id());
+    serve.send(END, b"");
+    let (status, stderr) = serve.finish();
+    assert_eq!(status.signal(), Some(libc::SIGABRT), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("protocol error: unexpected data frame type"),
+        "stderr:\n{stderr}"
+    );
+    std::fs::write(&go, b"go\n").unwrap();
 }
 
 #[test]

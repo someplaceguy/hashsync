@@ -131,8 +131,9 @@ struct Shared {
 }
 
 /// The index of a process: read/write in a modifying process (`update`,
-/// `prune`, `compact`, and the receiver of a run for its update), read-only
-/// in the others, and in that receiver after its update (`into_read_only`).
+/// `prune`, `compact`, the receiver of a run for its update at the start,
+/// and its child for the update after the command), read-only in the
+/// others, and in that receiver after its update (`into_read_only`).
 pub struct Index {
     shared: Arc<Shared>,
 }

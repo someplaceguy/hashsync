@@ -126,11 +126,12 @@ system calls, with no asynchronous runtime or event loop.
    carry them (section 6.2).
 3. Meanwhile, the receiver of each deduplicated stream resolves its
    configured roots, updates its index, and then holds it read-only
-   (section 4.4). `--no-update` skips the update and opens the index
-   read-only. A failed update ends the run, and the command with it. With
-   both streams deduplicated, both hosts update their index at the same
-   time, and each one releases its index after its update, and opens it
-   again only once the other's update is done (section 4.4). Then each
+   (section 4.4). `--no-update` skips this update and the update after
+   the command (step 6), and opens the index read-only. A failed update
+   ends the run, and the command with it. With both streams
+   deduplicated, both hosts update their index at the same time, and each
+   one releases its index after its update, and opens it again only once
+   the other's update is done (section 4.4). Then each
    deduplicated stream has a list exchange, on the control session
    (section 5.6). INDEX names the receiver's account and index, and the
    sender advertises the lists that its cache holds for them. The receiver
@@ -153,13 +154,25 @@ system calls, with no asynchronous runtime or event loop.
 5. Each receiving end decodes its stream from its spool: the client to
    its stdout, the server to the command's stdin. Until `--spool-limit`
    bytes wait in the spool, a blocked destination stops only the
-   decoding. Once the command has exited, both streams have ended or
-   stopped, command stderr has reached its end, and the server's sides of
-   the list exchanges have ended, the server sends END with the command's
-   status. The client then closes both session stdin pipes, writes the
-   rest of the backward stream, checks its end, and flushes stdout. Both
-   SSH sessions must exit successfully before the client returns the
-   command's status (section 6.9).
+   decoding. The client lets go of its stdout once it has written the
+   whole backward stream there, or stopped it, and of its stdin once the
+   forward stream has ended or stopped: it replaces each with
+   `/dev/null`, as its exit would close them (section 4.4). Once the
+   command has exited, both streams have ended or stopped, command stderr
+   has reached its end, and the server's sides of the list exchanges have
+   ended, the server sends END with the command's status. The client then
+   closes both session stdin pipes, writes the rest of the backward
+   stream, checks its end, and flushes stdout.
+6. Then the receiver of each deduplicated stream updates its index
+   again, unless `--no-update`. This **update after the command** indexes
+   the files that the run has just written on that host, such as those
+   that `tar -x` or rsync made from the stream, while they are still in
+   the page cache, so that the next run can deduplicate against them. A
+   child process runs it, so that its failure cannot fail the run: the
+   output has all arrived, and the run only warns (section 6.9). With
+   both streams deduplicated, the two hosts update at the same time. Both
+   SSH sessions must exit successfully before the client prints its
+   summary and returns the command's status (section 6.9).
 
 **Verification is authoritative.** The index, hash lists, caches, and weak
 hash table are hints. Verify the exact buffer of a candidate before writing
@@ -492,8 +505,9 @@ RocksDB has scheduled: closing the database would cancel them
 (section 10). A prune ends the same way, after it has compacted every
 column family into its last level, so that the entries that it and the
 updates before it removed leave the database files. An update with
-`--compact` ends with the same compaction, also in a run with
-`ssh --compact`, and `hashsync compact` does nothing else (section 8).
+`--compact` ends with the same compaction, and so does the update after
+the command of a run with `ssh --compact` (section 3), so that no list
+waits for it. `hashsync compact` does nothing else (section 8).
 RocksDB keeps all files of the database open, so a process raises its
 soft descriptor limit to the hard limit before it opens the index. Its
 children, such as the command of a run whose forward stream is
@@ -503,26 +517,27 @@ under SSH alone.
 **Process access.** A lock on the file `hashsync.lock` in the index
 directory excludes other processes:
 
-- A modifying process (`update`, `prune`, `compact`, or the receiver of a
-  run without `--no-update`, for its update) opens the lock file
-  read/write and takes an exclusive lock before it opens the database
-  read/write. An update first creates the directory and the lock file if
-  necessary, so without the lock file, there is no index. Prune and
-  compact create no directory, lock file, or database, so that a wrong
-  index path leaves no files behind.
+- A modifying process (`update`, `prune`, `compact`, the receiver of a
+  run without `--no-update` for its update at the start, or the child that
+  updates the index after the command) opens the lock file read/write and
+  takes an exclusive lock before it opens the database read/write. An
+  update first creates the directory and the lock file if necessary, so
+  without the lock file, there is no index. Prune and compact create no
+  directory, lock file, or database, so that a wrong index path leaves no
+  files behind.
 - A read-only process (the receiver of a run with `--no-update`, `stats`)
   opens the lock file read-only and takes a shared lock, then opens the
   database read-only. It sees the database as it was when it opened it.
   Read-only processes can coexist but exclude a modifying process.
-- After its update, a run closes the read/write database, turns its
-  exclusive lock into a shared one on the same open file description,
-  which never leaves the index unlocked, and opens the database read-only.
-  So no modifying process can come between the update and the use of the
-  index, and read-only processes can use the index during the rest of the
-  run. A shared lock needs the lock file open for reading, so a modifying
-  process opens it read/write, not write-only. A run with both streams
-  deduplicated is the exception: each host releases its lock after its
-  update (steps L1 to L3 below).
+- After its update at the start, a run closes the read/write database,
+  turns its exclusive lock into a shared one on the same open file
+  description, which never leaves the index unlocked, and opens the
+  database read-only. So no modifying process can come between the update
+  and the use of the index, and read-only processes can use the index
+  while the run uses it. A shared lock needs the lock file open for
+  reading, so a modifying process opens it read/write, not write-only. A
+  run with both streams deduplicated is the exception: each host releases
+  its lock after its update (steps L1 to L3 below).
 - The lock is an open file description lock (`F_OFD_SETLKW`) on the whole
   file, on a close-on-exec descriptor. Unlike a classic POSIX lock, it
   stays when another descriptor of the file closes, and at exit it goes
@@ -543,7 +558,9 @@ directory excludes other processes:
   lock close, while the run can go on. A process never opens an index a
   second time while it has it open: the locks of two open file
   descriptions conflict also within one process, so the second open would
-  wait forever.
+  wait forever. For the same reason, the receiver starts the child that
+  updates the index after the command (section 3) only once the lookups
+  have ended, since it waits for the child.
 
 **Lock waits.** A lock wait has no timeout, so no run may take part in a
 cycle of waits. An update waits for nothing else while it holds its
@@ -576,6 +593,28 @@ control session pass:
 
 With `--no-update`, both hosts take only shared locks, and each opens its
 index at the start of the run, as with one deduplicated stream.
+
+The update after the command (section 3) follows the rule as it is, also
+with both streams deduplicated, and needs no UPDATED: its child waits for
+the exclusive lock only once the run's index has closed, and the receiver
+holds no other lock. But the processes at the other ends of the client's
+stdin and stdout can hold locks of their own. In `hashsync ssh a cat f |
+hashsync ssh b sort`, two pulls with the same index on the client, the
+second run keeps its lock until its stream ends, after `sort` has read
+the EOF of its stdin, and an update of the first run waits for that lock:
+its update after the command, or its update at the start, when the second
+run took the lock first. A producer of stdin can likewise hold a lock
+while it waits for room in the pipe. So the client lets go of stdout once
+it has written the whole backward stream there, or stopped it, and of
+stdin once the forward stream has ended or stopped, or at once with
+`-n`, as the ends of a local pipeline do: it replaces each with
+`/dev/null`. A release at the end of the run would come too late: the
+server sends END only after its update at the start, and the client
+reads the EOF of the data session only once the server has exited, after
+its update after the command (section 6.9). Two pushes to one server
+index in a pipeline wait for each other in the same ways. With `2>&1`
+into the second run, the pipeline still hangs: the client and its SSH
+sessions keep stderr until they exit.
 
 The rule cannot cover the commands. A command that waits for an
 exclusive lock waits for every run that holds a lock of that index, and
@@ -1242,7 +1281,7 @@ receives, and those of a sender to the stream that it sends.
 | data | server to client | The server's HELLO when it receives a deduplicated stream; the backward stream: CHUNK, STREAM_END; END |
 | control | receiver to sender | List exchange: INDEX, HASHLIST, HASHDELTA, HASHKEEP, HASHNONE, HASHDATA |
 | control | sender to receiver | List exchange: ADVERTISE, HASHFULL, CACHE_RESULT |
-| control | either way | UPDATED, after the update of each host (section 4.4) |
+| control | either way | UPDATED, after the update at the start of each host (section 4.4) |
 | control | sender to receiver | QUERY, in the control stream |
 | control | receiver to sender | ANSWER, in the control stream |
 | control | receiving host to sending host | STOP, in the control stream |
@@ -1306,8 +1345,9 @@ Payloads:
   of its exchange (section 5.6). A second one in the same exchange is a
   protocol error.
 - UPDATED: empty. With both streams deduplicated and without
-  `--no-update`, the host's update is done, and its lock released
-  (section 4.4, steps L1 and L2). At most once in each direction.
+  `--no-update`, the host's update at the start of the run is done, and
+  its lock released (section 4.4, steps L1 and L2). At most once in each
+  direction.
 - CHUNK: on the data session, the next bytes of the stream's zstd frame,
   or of its stream frames when compression is disabled, at least one. A
   CHUNK goes out when it holds 256 KiB, and at each flush of the stream:
@@ -2047,13 +2087,15 @@ Data structures:
 The client's **stdin reader**, from the start of the run, once the client
 has sent REQUEST, reads stdin. With `-n` (section 8), the forward stream
 is empty: its spool ends before the sessions start, so before any stop,
-and no stdin reader runs. As
+no stdin reader runs, and the client replaces stdin with `/dev/null` at
+once (section 4.4). As
 `ssh` does, the stdin reader makes a stdin that is not a terminal
 non-blocking while it reads it, unless it is non-blocking already, so that
 no read waits. A terminal stays as it is, because the shell of the user
 shares it. Other processes can share stdin too, so the stdin reader
 restores the flags of stdin at the EOF of stdin and at the stop, and every
-end of the process restores them, also a fatal one (section 6.9).
+end of the process restores them, also a fatal one (section 6.9). When
+the stdin reader ends, the client replaces stdin with `/dev/null`.
 
 - **I1.** In eager delivery, if neither stdin nor the stop pipe is ready,
   which `poll` shows without a wait, mark an idle point in the spool. Wait
@@ -2144,8 +2186,10 @@ waits while stdout is full, so a consumer that pauses holds the stream
 back, and the spool takes the stream meanwhile. A failed write with
 `EPIPE` means that no process reads stdout any more: the decoder raises
 the stop of the backward stream, and ends. Other write failures end the
-run with `die`. Neither host watches an idle destination: the client
-learns that its stdout is broken only at its next write to it.
+run with `die`. When the client's decoder ends, at the end of the stream
+or at the stop, the client replaces stdout with `/dev/null` (section
+4.4). Neither host watches an idle destination: the client learns that
+its stdout is broken only at its next write to it.
 
 **The stop.** Either stream can stop, and the host that receives it
 decides: the server stops the forward stream once no process reads the
@@ -2290,7 +2334,7 @@ SIGTERM during the end still give `128 + signal`.
 
 | Host | Thread | Responsibilities |
 |---|---|---|
-| Server | main | Run the handshake, reading the data session itself, and start the command. Then obtain the command's exit status without reaping, wait for the END conditions of section 6.9, and send END. |
+| Server | main | Run the handshake, reading the data session itself, and start the command. Then obtain the command's exit status without reaping, wait for the END conditions of section 6.9, and send END. Then end the run, with the update after the command (section 6.9, step F3). |
 | Server | data reader | Read the data session once the handshake is done: the forward stream's CHUNK and STREAM_END, and EOF after END. |
 | Server | data writer | Send the backward stream (section 6.6). |
 | Server | session watcher | Until the stop of the forward stream, end the run at the hangup of the data session (section 6.6). |
@@ -2299,10 +2343,10 @@ SIGTERM during the end still give `128 + signal`.
 | Server | exit watcher | Raise the stop of the forward stream when the command exits (section 6.6). |
 | Server | stderr relay | Copy command stderr to server stderr through EOF and flush (section 6.1). |
 | Server | control reader/writer | Pass the queries for a deduplicated forward stream to its lookup workers, the answers for a deduplicated backward stream to its scanner, and the frames of the list exchanges to their sides, and raise the stop of the backward stream at STOP; send answers, queries, and STOP promptly, independently of the streams, and the frames of the server's sides of the list exchanges between them (section 6.2). |
-| Client | main | Start SSH sessions, run the handshake, then wait for END, and end the run (section 6.9). |
+| Client | main | Start SSH sessions, run the handshake, then wait for END, and end the run, with the update after the command (section 6.9). |
 | Client | data reader | Read the data session once the handshake is done: the backward stream's CHUNK and STREAM_END, END, and EOF. |
-| Client | decoder | Decode the backward stream into stdout, with the pins when it is deduplicated, and raise its stop at `EPIPE` (section 6.6). |
-| Client | stdin reader | Copy stdin into the forward stream's spool (section 6.6). |
+| Client | decoder | Decode the backward stream into stdout, with the pins when it is deduplicated, and raise its stop at `EPIPE`; then replace stdout with `/dev/null` (section 6.6). |
+| Client | stdin reader | Copy stdin into the forward stream's spool; then replace stdin with `/dev/null` (section 6.6). |
 | Client | data writer | Send the forward stream (section 6.6). |
 | Client | control reader/writer | Pass the queries for a deduplicated backward stream to its lookup workers, the answers for a deduplicated forward stream to its scanner, and the frames of the list exchanges to their sides, and raise the stop of the forward stream at STOP; send answers, queries, and STOP promptly, and the frames of the client's sides of the list exchanges between them. |
 | Client | signal thread | Handle SIGINT/SIGTERM with status `128 + signal`. |
@@ -2344,12 +2388,16 @@ core dump, with status 1, or `128 + signal` when the client has received
 SIGINT or SIGTERM (section 6.8). Concurrent callers wait for that cleanup
 rather than exiting ahead of it:
 
-- Server: SIGKILL the command's process group and remove the rendezvous
-  socket.
+- Server: SIGKILL the command's process group, until END has gone out,
+  and remove the rendezvous socket. After END, the client has the
+  command's status, and what the command left running in its group
+  outlives a fatal end, as it outlives the normal end.
 - Client: SIGKILL both SSH processes, causing the server's stdin EOF and
   cleanup, and restore the flags of stdin, when the stdin reader made it
   non-blocking (section 6.6). Unlike `ssh`, which leaves them changed at
   a fatal exit, every end restores them, also the normal end.
+- Both: SIGKILL the child that updates the index after the command, while
+  it runs.
 - Process exit closes the unlinked segments of both hosts, which frees all
   their storage.
 - Abandoned cache temporaries remain until the next exchange of that peer
@@ -2437,7 +2485,8 @@ The server, after END:
   are gone, or when a write fails.
 - **F3.** Join the session watcher, which ended at the stop of the forward
   stream. With a deduplicated forward stream, join its lookup workers,
-  which ended at Completing, and close its pins. Remove the rendezvous
+  which ended at Completing, close its pins, and without `--no-update`,
+  update the index after the command (section 3). Remove the rendezvous
   socket, and exit zero.
 
 The client, at END:
@@ -2458,21 +2507,38 @@ The client, at END:
 - **N3.** Join the decoder, which writes the rest of the backward stream
   from its spool to stdout, and checks the end of the stream, or ends at
   the stop of the backward stream, also when stdout breaks after END; the
-  data reader, which reads the data session to its EOF, and takes any
-  byte after END as a protocol error; the control reader, which reads the
-  control session to its EOF, so that SSH never fails with a broken pipe;
-  the stdin reader; with a deduplicated forward stream, the output reader,
-  the scanner, and the sender's side of its list exchange; and with a
-  deduplicated backward stream, the receiver's thread.
-- **N4.** Observe both SSH exits without reaping. Both must exit zero;
-  otherwise the run failed even though END arrived. A failure in steps N2
-  to N4 ends the client with `die`, also after END.
-- **N5.** With a deduplicated backward stream, join its lookup workers,
+  control reader, which reads the control session to its EOF, so that SSH
+  never fails with a broken pipe; the stdin reader; with a deduplicated
+  forward stream, the output reader, the scanner, and the sender's side
+  of its list exchange; and with a deduplicated backward stream, the
+  receiver's thread.
+- **N4.** With a deduplicated backward stream, join its lookup workers,
   which ended at Completing, and close its pins: all their open segments,
   which frees all their storage. The tmp_data directory closes with its
-  last user. The index closed when the lookups ended.
+  last user. The index closed when the lookups ended. Without
+  `--no-update`, update the index after the command (section 3). With
+  both streams deduplicated, the server's update runs at the same time
+  (step F3).
+- **N5.** Join the data reader, which reads the data session to its EOF,
+  and takes any byte after END as a protocol error. Through SSH, that EOF
+  comes only once the server has exited, after its update: sshd passes
+  the EOF of the server's stdout on only once its stderr has ended too,
+  and an SSH multiplexing client keeps its stdout open until the session
+  ends (section 10). Observe both SSH exits without reaping. Both must
+  exit zero; otherwise the run failed even though END arrived. A failure
+  in steps N2 to N5 ends the client with `die`, also after END, but for
+  that of the update after the command.
 - **N6.** Print the summary (section 8) and exit with END's command
   status.
+
+**The update after the command.** The receiver runs it in a child
+process, `hashsync update-after-command` (section 8), which reads the
+configuration file again and reports as the receiver does, and waits for
+it. The output has all arrived by then, so whatever ends the child, an
+error, a panic, or a signal, the receiver only warns with the child's
+status, and the run ends as it would have: a failed update can only
+leave the index less complete for the next run. An edit of the
+configuration file during the run takes effect in this update.
 
 After END, EOF, also inside a frame, and failed writes on either session
 are the normal end. The implementation chooses the ordering and
@@ -2685,13 +2751,19 @@ exclude = ['*.tmp', 'literal\x2Aname', 'back\\slash']
     waits for its own list alone. `--wait`, with the batch delivery of the
     deduplicated streams, sends the fewest bytes, however long the run
     then takes.
-  - `--no-update` skips the update of each receiver's index, takes
+  - Once the command has finished, each receiver updates its index again,
+    to index the files that the run wrote while they are still in the
+    page cache (section 3). The client exits only after that update, and
+    after the server's. A failed update after the command only gives a
+    warning.
+  - `--no-update` skips both updates of each receiver's index, takes
     read-only index access (section 4.4), and still resolves current roots
-    (section 4.2). `--scan-immutable` makes the update of each receiver scan
-    its completed immutable groups again, as `hashsync update
-    --scan-immutable` does, and `--compact` makes it end with a compaction
-    of the index, as `hashsync update --compact` does; with `--no-update`,
-    either is a usage error.
+    (section 4.2). `--scan-immutable` makes the update of each receiver at
+    the start of the run scan its completed immutable groups again, as
+    `hashsync update --scan-immutable` does, and `--compact` makes its
+    update after the command end with a compaction of the index, as
+    `hashsync update --compact` does; with `--no-update`, either is a
+    usage error.
   - `--ssh CMD` (default `ssh`) and `--hashsync-path PATH` (default
     `hashsync`) say how the client starts the server (section 6.1).
   - `--server-profile NAME` and `--server-config PATH` select the server's
@@ -2754,7 +2826,7 @@ exclude = ['*.tmp', 'literal\x2Aname', 'back\\slash']
      END carries (section 6.2); the client counts the rest.
   2. The total. As rsync does, the bytes that the client sent and
      received on both sessions, the elapsed time of the run, including its
-     index update, and the rate of the sent and received bytes in that
+     index updates, and the rate of the sent and received bytes in that
      time. Then the data shrinkage factor, the bytes that the destinations
      of both streams took divided by the sent and received bytes, and the
      bytes saved, the first minus the second, which is negative when the
@@ -2774,6 +2846,14 @@ exclude = ['*.tmp', 'literal\x2Aname', 'back\\slash']
   server entry points. `serve` reads the configuration file that REQUEST
   names, and `attach` reads none, so `--profile` and `--config` are a
   usage error for both.
+- `hashsync update-after-command [--compact] [--server]`: internal, the
+  child in which the receiver of a run updates its index after the
+  command (section 6.9), as `hashsync update [--compact]` does, but
+  without the note that names the configuration file and its index, and
+  without the warnings about the file, which the run gave at its start.
+  The receiver passes the `--profile` or `--config` that selected its
+  file, `-q` and `--no-human-readable` when they apply to it, and on the
+  server `--server`, which marks the child's lines as the server's.
 - `hashsync stats`: report index statistics.
 - `hashsync prune [--scan-immutable]`: remove the roots and paths that no
   current copy holds any more, and the paths that exclusions or
@@ -2831,7 +2911,8 @@ them to its own notes.
 
 SSH carries the server's stderr to the client's, where its lines mix with
 the client's own. So once `serve` and `attach` run, every line that they
-write, notes, warnings, errors, and panic reports alike, starts with
+and the server's update after the command write, notes, warnings,
+errors, and panic reports alike, starts with
 `hashsync (server): ` in place of `hashsync: `, and the user can tell on
 which host to act on it. Only a usage error of their command line, which
 comes before either runs, has no marker. The command's stderr passes
@@ -2993,6 +3074,26 @@ decision history, including fuller measurements, is in version control.
   the compactions that RocksDB has scheduled, closing the database cancels
   them: over short updates they pile up, and lookups slowed from 26 µs to
   41 µs.
+- **Updating the index only at the start of a run:** the files that a run
+  writes, such as those of `tar -x` or rsync, would stay out of the index
+  until the next update, which would read them back from the disk: after
+  a large transfer, most of them have left the page cache by then. The
+  update after the command hashes them while the page cache still holds
+  them, and the next run's update finds them unchanged.
+- **Compaction in the update at the start of a run:** the list waited for
+  it, and the update after the command then changed the index again
+  without a compaction. At the end of that update, the compaction delays
+  only the exit of the run.
+- **The update after the command in the run's own process:** an update
+  that fails ends its process, through `die` or a panic, so it would end
+  the run although the output has all arrived, and on the server, kill
+  what the command left running in its process group.
+- **Letting go of stdin and stdout at the end of the run:** the server
+  sends END only after its update at the start, and through SSH, the
+  client reads the EOF of the data session only once the server has
+  exited, after its update after the command. A consumer of stdout or a
+  producer of stdin that holds a lock that one of these updates waits for
+  would then wait forever (section 4.4).
 - **One memtable limit for all column families:** each column family
   flushes its memtable at 64 MiB, RocksDB's default, and RocksDB also
   flushes the oldest one when all of them together use 256 MiB. With
@@ -3494,9 +3595,25 @@ decision history, including fuller measurements, is in version control.
     does not create, the compaction, and the exclusive lock;
   - compaction: by `hashsync compact`, which changes no entry, needs an
     index that matches the configuration, creates none, and takes the
-    exclusive lock; by `update --compact`; by the updates of a run with
-    `ssh --compact`, in a pull, in a push, and with both streams
-    deduplicated; and `ssh --compact --no-update`, a usage error;
+    exclusive lock; by `update --compact`; by the update after the command
+    of a run with `ssh --compact`, in a pull, in a push, and with both
+    streams deduplicated; and `ssh --compact --no-update`, a usage error;
+  - the update after the command: in a pull, in a push, and with both
+    streams deduplicated, which indexes the files that the run wrote on
+    each receiving host, with its note, and none with `--no-update`; the
+    update at the start alone scanning completed immutable groups again
+    with `--scan-immutable`; a failure of its child, in a pull and in a
+    push, which only warns; and with both streams deduplicated, the
+    client's update, which ends while the server's waits for a lock;
+  - the client's stdout, which reaches its EOF once the backward stream is
+    written, and its stdin, whose writer gets `EPIPE` once the forward
+    stream has stopped, both before END; pipelines of two runs with one
+    index: two pulls and two pushes in which the second run takes the lock
+    first, and two pushes in which the first server's update after the
+    command waits for the second server; a fake SSH that passes the EOF
+    of the server's stdout on only at the server's exit, as sshd does;
+  - a fatal end of the server after END, which spares the command's
+    process group;
   - configuration byte escapes, TOML quoting, literal glob metacharacters,
     and non-UTF-8 values; a `~` that starts a path, also as `\x7E`;
     messages that show paths, names, patterns, and values of the

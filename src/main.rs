@@ -14,7 +14,9 @@
 //! A transfer reuses the hash lists of earlier transfers, replaces indexed
 //! blocks with verified references, read from any current copy of their root,
 //! sends runs of one byte compactly, compresses both streams, and spools both
-//! ends of each. Stdout and stdin each use eager or batch delivery.
+//! ends of each. Stdout and stdin each use eager or batch delivery. Each
+//! receiver updates its index at the start, and again once the command has
+//! finished, to index what the run wrote while the page cache holds it.
 //! `bench` measures how fast this host hashes blocks and scans output.
 
 mod attach;
@@ -130,7 +132,8 @@ impl Cli {
             | Command::Stats
             | Command::Prune { .. }
             | Command::Compact
-            | Command::Ssh(_) => return Ok(source),
+            | Command::Ssh(_)
+            | Command::UpdateAfter { .. } => return Ok(source),
             Command::Serve { .. } => ("serve", "the configuration file that the client names"),
             Command::Attach { .. } => ("attach", "no configuration file"),
             Command::Bench { .. } => ("bench", "no configuration file"),
@@ -256,6 +259,17 @@ enum Command {
     Attach {
         #[arg(long)]
         token: String,
+    },
+    /// Internal: the update after the command of a run's receiver, which
+    /// the run starts as its child (DESIGN.md §3)
+    #[command(name = "update-after-command", hide = true)]
+    UpdateAfter {
+        /// End with a compaction, for ssh --compact
+        #[arg(long)]
+        compact: bool,
+        /// Mark every report as the server's, on the server of the run
+        #[arg(long)]
+        server: bool,
     },
 }
 
@@ -423,6 +437,18 @@ fn main() {
         // REQUEST has told it its roles.
         Command::Serve { token } => server::run(token),
         Command::Attach { token } => attach::run(token),
+        // The run noted the file, its index, and their warnings when it
+        // loaded the file, so the child reads it again without them.
+        Command::UpdateAfter { compact, server } => {
+            if *server {
+                report::mark_as_server();
+            }
+            let options = update::Options {
+                compact: *compact,
+                ..update::Options::default()
+            };
+            update::run(&config::reload(&source), options)
+        }
     }
 }
 

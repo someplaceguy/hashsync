@@ -15,9 +15,10 @@ use crate::roots::{self, Location};
 use crate::scan;
 use crate::units::Bytes;
 
-/// The options of an update: those of `hashsync update`, of which the
-/// update of a run's receiver takes `scan_immutable` and `compact` from the
-/// options of `hashsync ssh` (DESIGN.md §8).
+/// The options of an update: those of `hashsync update`. The receiver of a
+/// run takes `scan_immutable` from the options of `hashsync ssh` for its
+/// update at the start, and `compact` for its update after the command
+/// (DESIGN.md §3 and §8).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Options {
     /// Remove every entry of the index and build it again.

@@ -1,6 +1,6 @@
 // Generated from hashsync.1 by a test; edit hashsync.1 instead.
 = HASHSYNC
-:revdate: October 26, 2026
+:revdate: October 27, 2026
 
 == NAME
 
@@ -27,7 +27,7 @@
 
 `hashsync` `ssh` runs a command on a remote host, much like [.Xr]#ssh(1)#, and deduplicates its standard output, its standard input, or both: data that the receiving host already has in its files is sent as a reference to a block of one of those files. By default, the command's standard output is deduplicated against files on the local host (a _pull_); with `--dedup-stdin`, standard input is deduplicated against files on the remote host instead (a _push_). Blocks are deduplicated at any offset, so this saves bandwidth whenever a stream repeats data that the receiving host already has, as with [.Xr]#tar(1)# archives, [.Xr]#rsync(1)# transfers, or package trees.
 
-The local host is the _client_ and the remote host the _server_. The host that receives a deduplicated stream is its _receiver_, and the other host its _sender_. The receiver keeps an _index_ of the blocks in the regular files under the _roots_ listed in its configuration file (see [.Sx]#CONFIGURATION#). `hashsync` `update` creates the index or brings it up to date, and so does `hashsync` `ssh` when it starts, unless `--no-update` is given. The receiver sends the sender its _hash list_, short hashes of all its blocks, which the sender looks for at every offset of the stream. Every match is verified against the receiver's files, so a file that changed since the last update only reduces deduplication; the output always matches the original stream exactly. Both hosts cache hash lists, so later transfers only send the changes.
+The local host is the _client_ and the remote host the _server_. The host that receives a deduplicated stream is its _receiver_, and the other host its _sender_. The receiver keeps an _index_ of the blocks in the regular files under the _roots_ listed in its configuration file (see [.Sx]#CONFIGURATION#). `hashsync` `update` creates the index or brings it up to date, and so does `hashsync` `ssh`, when it starts and again once the command has finished, unless `--no-update` is given. The receiver sends the sender its _hash list_, short hashes of all its blocks, which the sender looks for at every offset of the stream. Every match is verified against the receiver's files, so a file that changed since the last update only reduces deduplication; the output always matches the original stream exactly. Both hosts cache hash lists, so later transfers only send the changes.
 
 The client starts `hashsync` on the server over two SSH sessions, which run the internal commands `hashsync` `serve` and `hashsync` `attach`. The server's shell looks `hashsync` up in its `PATH`, unless `--hashsync-path` gives its location.
 
@@ -69,14 +69,14 @@ The following options apply to all commands, and can be given before or after th
 `ssh` ++[++`options`++]++ ++[++`-l` `user`++]++ ++[++`user`@++]++`host` ++[++`--`++]++ `command` ++[++`argument ...`++]++::
   Run `command` on `host` over SSH, deduplicating its standard output, its standard input, or both. `hashsync` `ssh` passes its standard input to the command, copies the command's standard output and standard error back, and exits with the command's exit status. It accepts the arguments that [.Xr]#rsync(1)# passes to its remote shell, so `rsync -e 'hashsync ssh'` pulls with deduplication, and `rsync -e 'hashsync ssh --dedup-stdin'` pushes with it. As with [.Xr]#ssh(1)#, options may also follow `host`, and the command and its arguments are joined into a single line, which the server runs with the user's shell (`SHELL`, or [.Pa]#/bin/sh# if it is unset). A command that starts with `-` must follow `--`.
 +
-Both streams start immediately, while each receiver updates its index and sends its hash list, so deduplication improves as the list arrives. Each stream is buffered on both hosts in temporary files, so a slow reader does not hold up the command or the transfer until the buffers are full.
+Both streams start immediately, while each receiver updates its index and sends its hash list, so deduplication improves as the list arrives. Each stream is buffered on both hosts in temporary files, so a slow reader does not hold up the command or the transfer until the buffers are full. Once `command` has finished, each receiver updates its index again, to add the files that the transfer has just written on that host while they are still cached in memory. `hashsync` `ssh` exits after this update. A failure of this update only prints a warning, and does not change the exit status.
 +
 `--batch-stdin`;;
     Send standard input in full buffers rather than as soon as data is available. This compresses better and deduplicates more blocks, but a program that waits for replies, such as [.Xr]#rsync(1)#, would wait forever.
   `--batch-stdout`;;
     Send the command's standard output in full buffers, like `--batch-stdin`.
   `--compact`;;
-    Compact each index after updating it, like `hashsync` `update` `--compact`.
+    Compact each index at the end of its update after the command, like `hashsync` `update` `--compact`.
   `--compression-level` `level`;;
     The zstd compression level, from 1 to 19, or 0 to disable compression. The default is 9.
   `--compression-threads` `threads`;;
@@ -106,7 +106,7 @@ Both streams start immediately, while each receiver updates its index and sends 
   `--probe-threads` `threads`;;
     Number of threads with which the sender looks for the receiver's blocks in the stream. The default, 0, uses half the cores of the sender.
   `--scan-immutable`;;
-    Also rescan fully indexed immutable roots when updating each index, like `hashsync` `update` `--scan-immutable`.
+    Also rescan fully indexed immutable roots when updating each index at the start, like `hashsync` `update` `--scan-immutable`.
   `--server-config` `path`;;
     Use the configuration file at `path` on the server, absolute or relative to the remote home directory, instead of its default profile.
   `--server-profile` `name`;;
@@ -290,7 +290,7 @@ Messages go to standard error. Notes report progress and summaries, and `-q` sup
 
 == CAVEATS
 
-`hashsync` `ssh` holds a lock on each index it deduplicates against until the stream has ended, and `hashsync` commands that need exclusive access to the index wait for it. These include `hashsync` `update` and the index update at the start of another `hashsync` `ssh`. While that second `hashsync` `ssh` waits, its stream is sent without deduplication, or held back if `--wait` is given. With `--no-update`, several instances of `hashsync` `ssh` can share the index.
+`hashsync` `ssh` holds a lock on each index it deduplicates against until the stream has ended, and `hashsync` commands that need exclusive access to the index wait for it. These include `hashsync` `update` and the index updates of another `hashsync` `ssh`. While that second `hashsync` `ssh` waits at the start, its stream is sent without deduplication, or held back if `--wait` is given; after the command has finished, it waits before it exits. With `--no-update`, several instances of `hashsync` `ssh` can share the index.
 
 The lock can cause a deadlock if the `command` that `hashsync` `ssh` runs on the server itself runs a `hashsync` command that needs exclusive access to an index, such as `hashsync` `update`. For example, `hashsync ssh --dedup-stdin nas 'hashsync update; tar -xf -'` never finishes: the update waits for the lock, which is only released once [.Xr]#tar(1)# has read all of its standard input. Two `hashsync` `ssh` commands in opposite directions between the same two hosts can also deadlock if each one's `command` runs `hashsync` `update` on its server, since each update then waits for the other `hashsync` `ssh`.
 

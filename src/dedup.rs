@@ -27,19 +27,24 @@
 //! closes when they end at Completing. In a run with both streams
 //! deduplicated, both hosts update their index at the same time, and each
 //! keeps its index closed from the end of its update until the other host's
-//! update is done too (DESIGN.md §4.4).
+//! update is done too (DESIGN.md §4.4). At the end of the run, once its
+//! index has closed, the receiver updates it again, in a child process
+//! (`AfterCommand`).
 //!
 //! At the stop of a deduplicated stream, its scanner returns at once,
 //! without the end of the stream: it would otherwise wait for answers that
 //! the receiver no longer sends (DESIGN.md §6.6).
 
+use std::os::unix::process::CommandExt;
+use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use crossbeam_channel::{Receiver, Select, Sender, TryRecvError, TrySendError, bounded, unbounded};
+use rustix::process::Pid;
 
-use crate::config::{Config, thread_count};
-use crate::die::die;
+use crate::config::{Config, Source, thread_count};
+use crate::die::{self, die};
 use crate::fsid::FsCache;
 use crate::fsops;
 use crate::hash::StrongHash;
@@ -57,7 +62,8 @@ use crate::segments::Directory;
 use crate::settings::{Deduplicated, RunSettings};
 use crate::spool::{Spool, Taken};
 use crate::stream::{Frames, Item, READ_SIZE, Stop};
-use crate::units::Bytes;
+use crate::sys;
+use crate::units::{self, Bytes};
 use crate::update;
 
 /// The data queue holds `max(1, QUEUED_BYTES / B)` frames; each frame
@@ -710,14 +716,16 @@ impl SendingThreads {
 /// How the receiver of a run gets its index ready, which the lock rule of
 /// DESIGN.md §4.4 decides: an update waits for nothing else while it holds
 /// its exclusive lock, and no run waits for an exclusive lock while it holds
-/// a shared one.
+/// a shared one. The update after the command (`AfterCommand`) follows the
+/// rule too, since the run's index has closed by then.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Preparation {
     /// With `--no-update`: open the index read-only, as it is.
     Open,
-    /// The only update of the run, with its options: update the index, and
-    /// keep it read-only on the same lock, so that no modifying process
-    /// comes between the update and the use of the index.
+    /// This host alone updates its index at the start of the run, with the
+    /// options: update the index, and keep it read-only on the same lock,
+    /// so that no modifying process comes between the update and the use of
+    /// the index.
     UpdateAndKeep(update::Options),
     /// Both hosts update their index, at the same time: update it with the
     /// options, and release it, because the other host can still be waiting
@@ -729,12 +737,13 @@ enum Preparation {
 impl Preparation {
     /// The preparation for a run with `settings`, whose `deduplicated`
     /// streams tell whether the other host updates an index of its own too.
-    /// The update takes `--scan-immutable` and `--compact` from the
-    /// settings, which `--no-update` excludes.
+    /// The update takes `--scan-immutable` from the settings, which
+    /// `--no-update` excludes. `--compact` belongs to the update after the
+    /// command (`AfterCommand::of`), so that the list does not wait for the
+    /// compaction.
     fn of(settings: &RunSettings, deduplicated: Deduplicated) -> Self {
         let options = update::Options {
             scan_immutable: settings.scan_immutable,
-            compact: settings.compact,
             ..update::Options::default()
         };
         match (settings.no_update, deduplicated) {
@@ -807,12 +816,14 @@ impl Receiving {
 
     /// Start the receiver's role on a thread of its own: prepare the index
     /// of `config` for the run, with the `--no-update`, `--scan-immutable`,
-    /// `--compact`, and sender caching of `settings`, and with the other
-    /// host when both streams are `deduplicated`, since it then updates an
-    /// index of its own at the same time (DESIGN.md §4.4). Then start the
+    /// and sender caching of `settings`, and with the other host when both
+    /// streams are `deduplicated`, since it then updates an index of its
+    /// own at the same time (DESIGN.md §4.4). Then start the
     /// lookups, which take over the index and answer the queries as soon as
     /// they arrive, and run the receiver's side of the list exchange
     /// (DESIGN.md §5.6), unless the stream has ended or stopped by then.
+    /// The lookups keep the update after the command for the end of the
+    /// role, with the `--no-update` and `--compact` of `settings`.
     pub fn start(
         self,
         config: Arc<Config>,
@@ -820,10 +831,11 @@ impl Receiving {
         deduplicated: Deduplicated,
     ) -> ReceivingThread {
         let preparation = Preparation::of(settings, deduplicated);
+        let after_command = AfterCommand::of(&config, settings);
         let sender_cache = settings.sender_cache;
         let thread = std::thread::Builder::new()
             .name("receiver".into())
-            .spawn(move || self.run(&config, preparation, sender_cache))
+            .spawn(move || self.run(&config, preparation, sender_cache, after_command))
             .expect("cannot start the receiver's list exchange");
         ReceivingThread(thread)
     }
@@ -838,6 +850,7 @@ impl Receiving {
         config: &Config,
         preparation: Preparation,
         sender_cache: bool,
+        after_command: Option<AfterCommand>,
     ) -> (Lookups, ListBytes) {
         let Receiving {
             pins,
@@ -854,6 +867,7 @@ impl Receiving {
             let lookups = Lookups {
                 pins,
                 workers: Vec::new(),
+                after_command,
             };
             return (lookups, ListBytes::default());
         }
@@ -864,7 +878,12 @@ impl Receiving {
         let lists = exchange.finish(sender_cache, config.hashlist_max_age, || {
             pins.is_completing()
         });
-        (Lookups { pins, workers }, lists)
+        let lookups = Lookups {
+            pins,
+            workers,
+            after_command,
+        };
+        (lookups, lists)
     }
 }
 
@@ -918,11 +937,14 @@ fn prepare(config: &Config, preparation: Preparation, link: &Link) -> (Index, Ve
 }
 
 /// The receiver's role once its list exchange is done (DESIGN.md §6.4):
-/// the pins, which the stream's data reader and decoder take, and the
-/// lookup workers, which own the index until Completing.
+/// the pins, which the stream's data reader and decoder take, the lookup
+/// workers, which own the index until Completing, and the update after the
+/// command, for the end of the role.
 pub struct Lookups {
     pins: Arc<Pins>,
     workers: Vec<JoinHandle<()>>,
+    /// None with `--no-update`.
+    after_command: Option<AfterCommand>,
 }
 
 impl Lookups {
@@ -930,16 +952,86 @@ impl Lookups {
         &self.pins
     }
 
-    /// The normal end (DESIGN.md §6.9): join the workers, which ended at
-    /// Completing, and close the pins, which no other thread holds any
-    /// more.
-    pub fn close(self) {
+    /// The normal end of the receiver's role (DESIGN.md §6.9): join the
+    /// workers, which ended at Completing, and close the pins, which no
+    /// other thread holds any more. The index closed with the last worker,
+    /// so the update after the command can take its exclusive lock now:
+    /// before, a shared lock of this process would keep it waiting forever
+    /// (DESIGN.md §4.4).
+    pub fn end(self) {
         for worker in self.workers {
             worker.join().expect("a lookup worker panicked");
         }
         Arc::into_inner(self.pins)
             .expect("the pins are still in use")
             .close();
+        if let Some(after_command) = self.after_command {
+            after_command.run();
+        }
+    }
+}
+
+/// The receiver's update after the command (DESIGN.md §3). It indexes the
+/// files that the run has just written on this host, such as those that
+/// `tar -x` or rsync made from the stream: they are still in the page cache
+/// now, so hashing them costs little, and the next run can deduplicate
+/// against them. A child process runs it, so that nothing that ends the
+/// update ends the run as well, neither an error nor a panic: the run only
+/// warns, and keeps the command's status. The child reads the
+/// configuration file again, so an edit of the file during the run takes
+/// effect.
+struct AfterCommand {
+    /// The configuration file, which the child selects as this process did.
+    source: Source,
+    /// End with a compaction, which then covers the changes of this update
+    /// too, and which no list waits for.
+    compact: bool,
+}
+
+impl AfterCommand {
+    /// The update after the command of a run with `settings` for the index
+    /// of `config`, which `--no-update` skips.
+    fn of(config: &Config, settings: &RunSettings) -> Option<Self> {
+        (!settings.no_update).then(|| AfterCommand {
+            source: config.source.clone(),
+            compact: settings.compact,
+        })
+    }
+
+    /// Run the update in its child, `hashsync update-after-command`, and
+    /// wait for it. The child is this executable, whatever its path was, and
+    /// it reports as this process does, on stderr, which it shares: without
+    /// notes after `-q`, without scale units after `--no-human-readable`,
+    /// and as the server's on the server. A fatal end of this process kills
+    /// it, as it kills the SSH sessions.
+    fn run(&self) {
+        // The streams have ended by now, and nothing else would show why the
+        // run goes on: the update can take long, since it hashes everything
+        // that the run wrote.
+        report::note("updating index after the command");
+        let mut child = std::process::Command::new("/proc/self/exe");
+        child
+            .arg0("hashsync")
+            .arg("update-after-command")
+            .args(self.source.arg())
+            .args(self.compact.then_some("--compact"))
+            .args(report::is_server().then_some("--server"))
+            .args((!report::notes_enabled()).then_some("--quiet"))
+            .args((!units::human_readable()).then_some("--no-human-readable"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null());
+        let status = match die::spawn_guarded(die::KillGuard::Process, &mut child) {
+            Ok(started) => sys::wait_exit_status(Pid::from_child(&started)),
+            Err(e) => {
+                report::warn(format!("cannot start the update after the command: {e}"));
+                return;
+            }
+        };
+        if status != 0 {
+            report::warn(format!(
+                "the update after the command exited with status {status}"
+            ));
+        }
     }
 }
 

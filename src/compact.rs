@@ -1,7 +1,8 @@
 //! `hashsync compact` (DESIGN.md §4.4 and §8): compact the index, as a
 //! prune does at its end, so that the entries that updates and prunes
 //! removed leave the database files. An update with `--compact` ends with
-//! the same compaction, also the update of a run's receiver.
+//! the same compaction, also the update of a run's receiver after the
+//! command.
 
 use std::time::Instant;
 

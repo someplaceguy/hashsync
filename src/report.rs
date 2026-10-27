@@ -46,6 +46,12 @@ pub fn disable_notes() {
     NOTES.store(false, Relaxed);
 }
 
+/// Whether this process reports progress and summaries, which `--quiet`
+/// disables.
+pub fn notes_enabled() -> bool {
+    NOTES.load(Relaxed)
+}
+
 /// Set once this process is the server, by `serve` and `attach`. SSH
 /// carries the server's stderr to the client's, where its lines mix with
 /// the client's own: the marker tells the user which host a message comes
@@ -57,6 +63,11 @@ static SERVER: AtomicBool = AtomicBool::new(false);
 /// thread starts.
 pub fn mark_as_server() {
     SERVER.store(true, Relaxed);
+}
+
+/// Whether `mark_as_server` marked this process's lines.
+pub fn is_server() -> bool {
+    SERVER.load(Relaxed)
 }
 
 /// Report a panic. Outside the server, `default`, the standard library's

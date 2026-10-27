@@ -50,8 +50,12 @@
 //! stderr relay has finished, and the sides of the list exchanges have
 //! ended (DESIGN.md §6.9). Before END, the closure of either session means
 //! that the client disappeared, which is fatal and kills the command's
-//! process group. After END, the client closes both sessions, and this side
-//! joins every thread and exits (steps F1 to F3).
+//! process group. Once END is out, a fatal end leaves the group alone, as
+//! the normal end does. After END, the client closes both sessions, and
+//! this side joins every thread (steps F1 to F3). As the receiver of a
+//! deduplicated forward stream, it then updates its index again, unless
+//! `--no-update`, while the files that the command wrote are still in the
+//! page cache, and exits.
 
 use std::io::{BufReader, Read, Write};
 use std::net::Shutdown;
@@ -373,6 +377,8 @@ pub fn run(token: &str) -> ! {
         &end,
     );
 
+    // The command's PID is also the ID of its process group, for after END.
+    let command_pid = running.as_ref().ok().map(|command| command.pid);
     // The END conditions (DESIGN.md §6.9). The exit watcher and this thread
     // both wait for the exit, so only the join of the watcher puts its stop,
     // and so STOP, before END. The decoder ends at the end of the forward
@@ -439,10 +445,16 @@ pub fn run(token: &str) -> ! {
         ..end_frame
     };
 
-    // END, after which the closure of a session is the normal end.
+    // END, after which the closure of a session is the normal end. The
+    // client has the command's status then, and what the command left in
+    // its process group outlives the normal end, so from now on, a fatal
+    // end leaves it alone too.
     end.set();
     send_data(&mut data_out, frame::END, &end_frame.encode(), PEER);
     flush_data(&mut data_out, PEER);
+    if let Some(pid) = command_pid {
+        die::spare_process_group(pid);
+    }
 
     // F1. The client closes the data session's stdin once its data writer
     // has ended, and the data reader then reads EOF.
@@ -460,13 +472,15 @@ pub fn run(token: &str) -> ! {
     // which came before END. The lookup workers of a deduplicated forward
     // stream ended at Completing, at its end or at that stop, and the
     // decoder and the data reader, which read the pins, have ended: close
-    // the pins.
+    // the pins. Then the index is updated again, now that the command has
+    // finished (DESIGN.md §3). The client waits for this side's exit, so its
+    // summary comes after the notes of the update.
     session_watcher
         .join()
         .expect("the session watcher panicked");
     drop(forward_pins);
     if let Some((lookups, _)) = forward {
-        lookups.close();
+        lookups.end();
     }
     die::finish(0)
 }

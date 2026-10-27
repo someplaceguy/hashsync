@@ -101,18 +101,19 @@ impl RemoteCommand {
 /// the client, and so does `-n`, which only changes what the client reads.
 #[derive(clap::Args, Clone, Debug, PartialEq, Eq)]
 pub struct RunSettings {
-    /// Skip the update of each index that a stream is deduplicated against,
-    /// and share read-only access to it with other runs
+    /// Skip both updates of each index that a stream is deduplicated
+    /// against, at the start and after the command, and share read-only
+    /// access to it with other runs
     #[arg(long)]
     pub no_update: bool,
 
     /// Scan the completed immutable roots of each index that a stream is
-    /// deduplicated against again too, in its update
+    /// deduplicated against again too, in its update at the start
     #[arg(long, conflicts_with = "no_update")]
     pub scan_immutable: bool,
 
     /// Compact each index that a stream is deduplicated against at the end
-    /// of its update, as update --compact does
+    /// of its update after the command, as update --compact does
     #[arg(long, conflicts_with = "no_update")]
     pub compact: bool,
 
@@ -325,7 +326,7 @@ pub mod tests {
         assert!(!settings.sender_cache);
     }
 
-    /// `--scan-immutable` and `--compact` change the update of a receiver,
+    /// `--scan-immutable` and `--compact` change the updates of a receiver,
     /// which `--no-update` skips, so with it, either is a usage error.
     #[test]
     fn the_options_of_the_update_need_an_update() {

@@ -35,21 +35,36 @@
 //! and the server closes the command's stdout, as the end of the reader of
 //! a local pipeline does.
 //!
+//! This side lets go of stdout once the decoder has written the backward
+//! stream there, and of stdin once the stdin reader has ended, at its EOF
+//! or the stop of the forward stream, or at once with `-n`: it replaces
+//! each with `/dev/null`, so that the process at the other end sees what it
+//! would see at this side's exit, as at the end of a local pipeline. That
+//! process can hold a lock of an index that this run waits for, such as
+//! another run whose stdin is this side's stdout (DESIGN.md §4.4).
+//!
 //! The end is orderly (DESIGN.md §6.9, steps N1 to N6). At END, the main
 //! thread stops the forward stream, closes the data session's stdin once
 //! the forward data writer has ended, and the control session's once the
 //! control writer has ended, without waiting for the EOF of either stdout.
 //! Then the decoder writes the rest of the backward stream, and checks its
-//! end, and the main thread joins every thread. Both sessions must exit
-//! successfully before the client returns the command's status, after a
-//! summary.
+//! end, and the main thread joins the threads. As the receiver of a
+//! deduplicated backward stream, this side then updates its index again,
+//! unless `--no-update`, while the files that the run wrote here are still
+//! in the page cache. Only then does it wait for the EOF of the data
+//! session, which comes once the server has exited, after its own update.
+//! Both sessions must exit successfully before the client returns the
+//! command's status, after a summary.
 
 use std::io::{BufReader, IoSlice, Read, Write};
+use std::os::fd::OwnedFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::Instant;
 
 use crossbeam_channel::{Sender, bounded, unbounded};
+use rustix::fs::{Mode, OFlags};
+use rustix::io::retry_on_intr;
 
 use crate::config::Config;
 use crate::control::{self, Dispatch, EndFlag};
@@ -134,12 +149,13 @@ pub fn run(config: Config, remote: &ssh::Remote, request: &Request, no_stdin: bo
     // deduplicated backward stream into Completing (DESIGN.md §6.6).
     let (forward_writer, forward_spool) = Spool::pipe(Arc::clone(&tmp_data), settings.spool_limit);
     // With `-n`, the forward stream is empty, as `ssh -n` reads `/dev/null`
-    // in place of stdin: its spool ends here, before any stop can come, and
-    // no stdin reader runs (DESIGN.md §8).
+    // in place of stdin: its spool ends here, before any stop can come, no
+    // stdin reader runs (DESIGN.md §8), and this side has no use for stdin.
     let forward_writer = match no_stdin {
         false => Some(forward_writer),
         true => {
             drop(forward_writer);
+            release_stdin();
             None
         }
     };
@@ -253,12 +269,16 @@ pub fn run(config: Config, remote: &ssh::Remote, request: &Request, no_stdin: bo
         backward.map(|receiving| receiving.start(Arc::clone(&config), settings, deduplicated));
     // The stdin reader reads this process's stdin, as ssh does, from the
     // start: its bytes wait in the spool until the forward data writer
-    // takes them.
+    // takes them. At its EOF or the stop, stdin has no more use.
     let stdin_reader = forward_writer.map(|writer| {
         let (stop, delivery) = (forward_stop.clone(), settings.stdin_delivery());
         std::thread::Builder::new()
             .name("stdin-reader".into())
-            .spawn(move || stream::read_stdin(rustix::stdio::stdin(), writer, &stop, delivery))
+            .spawn(move || {
+                let read = stream::read_stdin(rustix::stdio::stdin(), writer, &stop, delivery);
+                release_stdin();
+                read
+            })
             .expect("cannot start the stdin reader")
     });
     read_server_version_and_features(&mut data_in, &remote.host);
@@ -301,7 +321,8 @@ pub fn run(config: Config, remote: &ssh::Remote, request: &Request, no_stdin: bo
 
     // The data reader takes the backward stream into its spool until
     // STREAM_END, and the decoder writes it to stdout, until the stop of
-    // the backward stream once no process reads stdout.
+    // the backward stream once no process reads stdout. Either way, stdout
+    // has no more use then.
     let (end_tx, end_rx) = bounded(1);
     let data_reader = {
         let (end, stop) = (Arc::clone(&end), backward_stop.clone());
@@ -317,7 +338,9 @@ pub fn run(config: Config, remote: &ssh::Remote, request: &Request, no_stdin: bo
             .name("decoder".into())
             .spawn(move || {
                 let pins = backward_pins.as_deref();
-                stream::decode(backward_spool, compressed, &mut stdout, pins)
+                let counts = stream::decode(backward_spool, compressed, &mut stdout, pins);
+                release_stdout();
+                counts
             })
             .expect("cannot start the decoder")
     };
@@ -351,12 +374,11 @@ pub fn run(config: Config, remote: &ssh::Remote, request: &Request, no_stdin: bo
     let control_stdin = control_writer.join().expect("the control writer panicked");
     drop(control_stdin);
     // N3. The decoder writes the rest of the backward stream and checks its
-    // end, or ends at the stop. Then join the other threads: the data
-    // reader reads the data session to its EOF, and the control reader the
-    // control session; the stdin reader and a scan ended at the stop or at
-    // the EOF of stdin, and the sides of the list exchanges at their end.
+    // end, or ends at the stop. Then join the other threads but the data
+    // reader: the control reader reads the control session to its EOF; the
+    // stdin reader and a scan ended at the stop or at the EOF of stdin, and
+    // the sides of the list exchanges at their end.
     let mut stdout_counts = decoder.join().expect("the decoder panicked");
-    let received = data_reader.join().expect("the data reader panicked");
     control_reader.join().expect("the control reader panicked");
     let stdin_read = match stdin_reader {
         Some(reader) => reader.join().expect("the stdin reader panicked"),
@@ -369,22 +391,29 @@ pub fn run(config: Config, remote: &ssh::Remote, request: &Request, no_stdin: bo
     let forward_lists = sending.map(|threads| threads.join());
     let backward = receiving.map(|thread| thread.join());
 
-    // N4. Both sessions must exit successfully before the command's status
-    // is returned, without reaping (DESIGN.md §6.8–6.9).
+    // N4. Nothing uses the pins any more, and the index closed when the
+    // lookups ended. They answered nothing from Completing on, which came
+    // before the decoder ended, so their counts of misses are final. Then
+    // the index is updated again, now that the command has finished
+    // (DESIGN.md §3); with both streams deduplicated, the server updates
+    // its own at the same time.
+    let backward_lists = backward.map(|(lookups, lists)| {
+        stdout_counts.misses = lookups.pins().misses();
+        lookups.end();
+        lists
+    });
+    // N5. The data reader reads the data session to its EOF, which comes
+    // only once the server has exited, after its own update: SSH passes
+    // the EOF of stdout on only once stderr has ended too (DESIGN.md §6.9).
+    // Both sessions must exit successfully before the command's status is
+    // returned, without reaping (DESIGN.md §6.8–6.9).
+    let received = data_reader.join().expect("the data reader panicked");
     for (pid, name) in sessions {
         let status = sys::wait_exit_status(pid);
         if status != 0 {
             die(format!("the {name} session exited with status {status}"));
         }
     }
-    // N5. Nothing uses the pins any more, and the index closed when the
-    // lookups ended. They answered nothing from Completing on, which came
-    // before the decoder ended, so their counts of misses are final.
-    let backward_lists = backward.map(|(lookups, lists)| {
-        stdout_counts.misses = lookups.pins().misses();
-        lookups.close();
-        lists
-    });
     // N6.
     if end_frame.status == 127 && !end_frame.error.is_empty() {
         report::error(format!(
@@ -524,13 +553,47 @@ fn read_data<R: Read>(
             kind => panic!("protocol error: unexpected data frame type {kind}"),
         }
     };
+    // The inlet goes, and the pins with it, before END reaches the main
+    // thread, which closes them while this thread waits for EOF.
+    let received = inlet.received();
+    drop(inlet);
     end.set();
     // The main thread waits for END.
     let _ = end_tx.send(end_frame);
     match protocol::drain_to_eof(data_in.into_inner()) {
-        Ok(true) => inlet.received(),
+        Ok(true) => received,
         Ok(false) => panic!("protocol error: data after END"),
         Err(e) => die(format!("data session: {e}")),
+    }
+}
+
+/// Let go of stdin, which the run has no more use for: a process that
+/// writes it then gets `EPIPE` (`release`).
+fn release_stdin() {
+    release("stdin", |null| rustix::stdio::dup2_stdin(null));
+}
+
+/// Let go of stdout, which the run has no more use for: a process that
+/// reads it then reads its EOF (`release`).
+fn release_stdout() {
+    release("stdout", |null| rustix::stdio::dup2_stdout(null));
+}
+
+/// Replace the standard descriptor `name` with `/dev/null`, through `dup2`,
+/// so that the process at its other end sees now what it would see at this
+/// process's exit. That process can hold what the run still waits for,
+/// such as a lock of an index (DESIGN.md §4.4). `/dev/null` keeps the
+/// descriptor in use, so that no file that the run opens later takes its
+/// number; it was in use before too, since Rust's runtime opens `/dev/null`
+/// on a closed standard descriptor at startup. `dup2` clears close-on-exec
+/// on its copy, as on any standard descriptor.
+fn release(name: &str, dup2: impl Fn(&OwnedFd) -> rustix::io::Result<()>) {
+    let null = retry_on_intr(|| {
+        rustix::fs::open("/dev/null", OFlags::RDWR | OFlags::CLOEXEC, Mode::empty())
+    });
+    let replaced = null.and_then(|null| retry_on_intr(|| dup2(&null)));
+    if let Err(e) = replaced {
+        die(format!("cannot replace {name} with /dev/null: {e}"));
     }
 }
 

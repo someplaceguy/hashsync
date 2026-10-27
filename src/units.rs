@@ -17,6 +17,11 @@ pub fn disable_human_readable() {
     HUMAN_READABLE.store(false, Relaxed);
 }
 
+/// Whether amounts show scale units, which `--no-human-readable` disables.
+pub fn human_readable() -> bool {
+    HUMAN_READABLE.load(Relaxed)
+}
+
 /// An amount of bytes as summaries and statistics show it. An amount below
 /// 1 KiB shows as whole bytes: `512 B`. A larger amount shows with two
 /// decimal digits, in the first of KiB, MiB, GiB, TiB, and PiB in which

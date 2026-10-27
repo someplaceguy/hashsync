@@ -9,7 +9,7 @@
 .\" so parenthesized text followed by punctuation uses .Po and .Pc instead.
 .\" After .Sx, the .Pc goes on a line of its own: groff closes the quotes
 .\" of .Sx only after the macros that follow it on its line.
-.Dd October 26, 2026
+.Dd October 27, 2026
 .Dt HASHSYNC 1
 .Os
 .Sh NAME
@@ -87,8 +87,8 @@ listed in its configuration file
 .Pc .
 .Nm Cm update
 creates the index or brings it up to date, and so does
-.Nm Cm ssh
-when it starts, unless
+.Nm Cm ssh ,
+when it starts and again once the command has finished, unless
 .Fl -no-update
 is given.
 The receiver sends the sender its
@@ -265,6 +265,14 @@ Both streams start immediately, while each receiver updates its index and sends
 its hash list, so deduplication improves as the list arrives.
 Each stream is buffered on both hosts in temporary files, so a slow reader does
 not hold up the command or the transfer until the buffers are full.
+Once
+.Ar command
+has finished, each receiver updates its index again, to add the files that the
+transfer has just written on that host while they are still cached in memory.
+.Nm Cm ssh
+exits after this update.
+A failure of this update only prints a warning, and does not change the exit
+status.
 .Bl -tag -width Ds
 .It Fl -batch-stdin
 Send standard input in full buffers rather than as soon as data is available.
@@ -276,7 +284,7 @@ would wait forever.
 Send the command's standard output in full buffers, like
 .Fl -batch-stdin .
 .It Fl -compact
-Compact each index after updating it, like
+Compact each index at the end of its update after the command, like
 .Nm Cm update Fl -compact .
 .It Fl -compression-level Ar level
 The zstd compression level, from 1 to 19, or 0 to disable compression.
@@ -356,7 +364,8 @@ Number of threads with which the sender looks for the receiver's blocks in the
 stream.
 The default, 0, uses half the cores of the sender.
 .It Fl -scan-immutable
-Also rescan fully indexed immutable roots when updating each index, like
+Also rescan fully indexed immutable roots when updating each index at the
+start, like
 .Nm Cm update Fl -scan-immutable .
 .It Fl -server-config Ar path
 Use the configuration file at
@@ -817,13 +826,13 @@ and
 commands that need exclusive access to the index wait for it.
 These include
 .Nm Cm update
-and the index update at the start of another
+and the index updates of another
 .Nm Cm ssh .
 While that second
 .Nm Cm ssh
-waits, its stream is sent without deduplication, or held back if
+waits at the start, its stream is sent without deduplication, or held back if
 .Fl -wait
-is given.
+is given; after the command has finished, it waits before it exits.
 With
 .Fl -no-update ,
 several instances of

@@ -28,8 +28,9 @@ ctime, and recover interrupted work. `prune` removes, without hashing, the
 roots that no current copy holds and the paths that none holds or that
 exclusions or `one_filesystem` now leave out, in immutable roots only with
 `--scan-immutable`, and then compacts the index (DESIGN.md §4.2).
-`compact` compacts it in the same way, and so do `update --compact` and
-the updates of a run with `ssh --compact` at their end (DESIGN.md §4.4).
+`compact` compacts it in the same way, and so do `update --compact` and,
+in a run with `ssh --compact`, the update after the command (DESIGN.md
+§4.4).
 The copies of an immutable group share one root row: an
 update scans the first copy of an unfinished group that is there, the
 next one when a copy that may vanish disappears before its scan, marks
@@ -48,7 +49,12 @@ its update until the other's is done (DESIGN.md §4.4). The server
 starts the command at once, and the streams flow while each receiver
 updates its index and runs its list exchange on the control session: a
 deduplicated stream finds more blocks as more of its list arrives, and
-with `--wait`, it waits for its whole list (DESIGN.md §3 and §6.3). A
+with `--wait`, it waits for its whole list (DESIGN.md §3 and §6.3). The
+client lets go of its stdout and stdin as soon as their streams are done
+with them. Once the command has finished, each receiver updates its index
+again, unless `--no-update`, in a child process whose failure only gives
+a warning, to index the files that the run wrote while the page cache
+still holds them. A
 deduplicated stream has the hash-list exchange, account identities, and
 durable list caches, replaces indexed blocks with references verified
 through the receiver's pins, and sends constant-byte runs compactly. Both
@@ -145,8 +151,12 @@ disabled. Block references and compressed output follow in steps 4 and 5.
   lookups end, so that no modifying process comes between the update and
   the transfer; with both streams deduplicated, each host releases its
   lock from the end of its update until the other's is done (DESIGN.md
-  §4.4). Support concurrent read-only `--no-update` runs, resolving
-  current roots and reporting missing or incompatible indexes clearly.
+  §4.4). Update again once the command has finished, in a child process
+  whose failure only gives a warning, to index what the run wrote
+  (DESIGN.md §3). Let go of stdin and stdout as soon as their streams are
+  done with them (DESIGN.md §4.4). Support concurrent read-only
+  `--no-update` runs, which update neither time, resolving current roots
+  and reporting missing or incompatible indexes clearly.
 - Export the full canonical hash list from one index snapshot. Run the
   list exchange on the control session while the command runs: INDEX,
   ADVERTISE, full-list verification, a table that fills while the list
@@ -307,10 +317,11 @@ Deliver `hashsync prune [--scan-immutable]` and `hashsync compact`, and
   A vanished immutable root that later returns must be indexed again.
 - Apply the specified exclusive-access rules and retain existing roots that
   happen to have no indexed paths. Compact the database at the end.
-- Let `update --scan-immutable`, and the updates of a run with
-  `ssh --scan-immutable`, scan the completed immutable groups again.
-- Let `hashsync compact`, `update --compact`, and the updates of a run
-  with `ssh --compact` compact the database as prune does.
+- Let `update --scan-immutable`, and the updates at the start of a run
+  with `ssh --scan-immutable`, scan the completed immutable groups again.
+- Let `hashsync compact`, `update --compact`, and the updates after the
+  command of a run with `ssh --compact` compact the database as prune
+  does.
 
 Result: users can remove stale index entries without a content scan,
 compact the index, and scan immutable trees again when they did change.

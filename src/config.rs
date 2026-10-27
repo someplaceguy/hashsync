@@ -10,8 +10,8 @@
 //! about a run is an option of `hashsync ssh` (`settings.rs`). Keys of
 //! later milestones are unknown fields and are rejected.
 
-use std::ffi::OsStr;
-use std::os::unix::ffi::OsStrExt;
+use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::Path;
 
 use serde::Deserialize;
@@ -45,10 +45,9 @@ const DEFAULT_PROFILE: &[u8] = b"default";
 
 #[derive(Debug)]
 pub struct Config {
-    /// The option that selected this file, `--profile NAME` or `--config
-    /// PATH`, for the messages that tell the user what to run; `None` for
-    /// the default profile.
-    selected_by: Option<String>,
+    /// How the options selected this file: for the messages that tell the
+    /// user what to run, and for a child process that reads it again.
+    pub source: Source,
     /// True when the file sets no `index_path`, so that its index is named
     /// after the file.
     index_named_after_file: bool,
@@ -283,6 +282,19 @@ impl Source {
         };
         Some(format!("{option}={}", escapes::shell_word(value)))
     }
+
+    /// The argument that selects the file in a child `hashsync`, which
+    /// resolves it as this process did, in the same environment and working
+    /// directory; none for the profile `default`. The name or path follows
+    /// `=`, as in `option`.
+    pub fn arg(&self) -> Option<OsString> {
+        let (option, value) = match self {
+            Source::Default => return None,
+            Source::Profile(name) => ("--profile=", name),
+            Source::File(path) => ("--config=", path),
+        };
+        Some(OsString::from_vec([option.as_bytes(), value].concat()))
+    }
 }
 
 /// Check that `name` is a profile name: one nonempty file name, which
@@ -306,26 +318,7 @@ pub fn check_profile_name(name: &[u8]) -> Result<(), String> {
 /// the file sets a `hashlist_max_age` below an hour.
 pub fn load(source: &Source, uses_index: bool) -> Config {
     let path = source.path();
-    let shown = quoted(&path);
-    let (text, found) = match fsops::retry_interrupted(|| std::fs::read(OsStr::from_bytes(&path))) {
-        Ok(bytes) => (bytes, true),
-        Err(e)
-            if !uses_index
-                && matches!(source, Source::Default)
-                && e.kind() == std::io::ErrorKind::NotFound =>
-        {
-            (Vec::new(), false)
-        }
-        Err(e) => die(format!("cannot read configuration file {shown}: {e}")),
-    };
-    let text = match String::from_utf8(text) {
-        Ok(text) => text,
-        Err(_) => die(format!("configuration file {shown} is not UTF-8")),
-    };
-    let config = match parse(&text, source) {
-        Ok(config) => config,
-        Err(message) => die(format!("{shown}: {message}")),
-    };
+    let (config, found) = read(source, &path, uses_index);
     let index = uses_index.then_some(config.index_path.as_slice());
     note_files(source, &path, found, index);
     if config.hashlist_max_age < MIN_RECOMMENDED_HASHLIST_MAX_AGE {
@@ -349,6 +342,40 @@ pub fn load(source: &Source, uses_index: bool) -> Config {
         ));
     }
     config
+}
+
+/// Load the file that `source` selects again, for the index of a run's
+/// receiver, in the child that updates it after the command (DESIGN.md
+/// §3): as `load` does, but without the note and the warnings, which the
+/// run gave when it loaded the file at its start.
+pub fn reload(source: &Source) -> Config {
+    read(source, &source.path(), true).0
+}
+
+/// Read and parse the file at `path`, which `source` selects, or die with a
+/// message; also return whether the file was found. Only a host that does
+/// not use an index can do without the file of the profile `default`.
+fn read(source: &Source, path: &[u8], uses_index: bool) -> (Config, bool) {
+    let shown = quoted(path);
+    let (text, found) = match fsops::retry_interrupted(|| std::fs::read(OsStr::from_bytes(path))) {
+        Ok(bytes) => (bytes, true),
+        Err(e)
+            if !uses_index
+                && matches!(source, Source::Default)
+                && e.kind() == std::io::ErrorKind::NotFound =>
+        {
+            (Vec::new(), false)
+        }
+        Err(e) => die(format!("cannot read configuration file {shown}: {e}")),
+    };
+    let text = match String::from_utf8(text) {
+        Ok(text) => text,
+        Err(_) => die(format!("configuration file {shown} is not UTF-8")),
+    };
+    match parse(&text, source) {
+        Ok(config) => (config, found),
+        Err(message) => die(format!("{shown}: {message}")),
+    }
 }
 
 /// Say in a note which configuration file a command uses, the one at `path`
@@ -378,7 +405,7 @@ impl Config {
     /// The command that updates the index of this configuration, for the
     /// messages that tell the user to run it.
     pub fn update_command(&self) -> String {
-        match &self.selected_by {
+        match self.source.option() {
             None => "hashsync update".into(),
             Some(option) => format!("hashsync {option} update"),
         }
@@ -451,7 +478,7 @@ pub fn parse(text: &str, source: &Source) -> Result<Config, String> {
         roots.push(parse_root(root).map_err(|e| format!("roots[{i}]: {e}"))?);
     }
     Ok(Config {
-        selected_by: source.option(),
+        source: source.clone(),
         index_named_after_file,
         block_size,
         strong_hash,

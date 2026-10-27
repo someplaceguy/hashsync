@@ -51,6 +51,15 @@ const HOST: &str = "testhost";
 /// counts exactly.
 const EXACT: &str = "--no-human-readable";
 
+/// Set in the environment of a run, this variable makes the fake ssh give
+/// the server the client's pipes as they are. Otherwise it passes the
+/// server's stderr on through a relay, and the end of the server's stdout
+/// only once that stderr has ended too, as sshd does. A test needs the
+/// pipes as they are for a fake server that ends a session while it still
+/// runs, and for server lines that must reach the client's stderr when the
+/// server writes them.
+const DIRECT_PIPES: &str = "HASHSYNC_TEST_DIRECT_PIPES";
+
 /// The options of the tests that count the references and runs of the
 /// output exactly. With `--wait`, the scanner scans the output only once it
 /// has the whole list: without it, the output can start before the list
@@ -126,6 +135,22 @@ export XDG_RUNTIME_DIR="$HASHSYNC_TEST_SERVER_RUNTIME"
 export HASHSYNC_TEST_LOGIN="$login"
 export SHELL="${{HASHSYNC_TEST_SHELL:-/bin/sh}}"
 cd "$HOME"
+# sshd carries the command's stderr over the connection, and passes the
+# end of its stdout on only once every process that has that stderr has
+# closed it. So unless the test opts out, the command's stderr goes through
+# a relay, which keeps a copy of stdout open until then, as sshd does. The
+# relay gets its end of the FIFO already open: an open of one end waits for
+# the other, so a relay that opened its own would wait forever, with the
+# client's stderr, if the client killed this shell first. The first open
+# reads and writes, so that it waits for nothing.
+if [ -z "${{{DIRECT_PIPES}:-}}" ]; then
+    relay="$XDG_RUNTIME_DIR/ssh-stderr.$$"
+    mkfifo "$relay"
+    exec 4<>"$relay" 5<"$relay" 6>"$relay" 4<&-
+    rm "$relay"
+    cat <&5 3>&1 >&2 5<&- 6>&- &
+    exec 2>&6 5<&- 6>&-
+fi
 exec /bin/sh -c "$1"
 "#
         );
@@ -473,6 +498,15 @@ impl Direction {
         match self {
             Direction::Pull => "server",
             Direction::Push => "client",
+        }
+    }
+
+    /// The start of the lines of the receiver on the client's stderr
+    /// (DESIGN.md §8).
+    fn marker(self) -> &'static str {
+        match self {
+            Direction::Pull => "hashsync: ",
+            Direction::Push => "hashsync (server): ",
         }
     }
 }
@@ -1253,12 +1287,12 @@ fn an_unfinished_group_is_read_from_every_copy() {
 
 #[test]
 fn scan_immutable_scans_the_groups_of_the_receiver_again() {
-    // `--scan-immutable` reaches the update of the receiver, the client in
-    // a pull and the server in a push, which REQUEST tells (DESIGN.md §6.2
-    // and §8): its update scans the completed group again, which it
-    // otherwise reuses, and so indexes the file added to it later. A run
-    // with `--no-update` has no update, so with it, the option is a usage
-    // error.
+    // `--scan-immutable` reaches the update at the start of the receiver,
+    // the client in a pull and the server in a push, which REQUEST tells
+    // (DESIGN.md §6.2 and §8): that update scans the completed group again,
+    // which it otherwise reuses, and so indexes the file added to it later.
+    // The update after the command reuses the group either way. A run with
+    // `--no-update` has no update, so with it, the option is a usage error.
     for direction in DIRECTIONS {
         let transfer = Transfer::new(&[]);
         configure_copies(&transfer, direction, "", &tiled(2, 25));
@@ -1269,19 +1303,20 @@ fn scan_immutable_scans_the_groups_of_the_receiver_again() {
             let mut invocation = transfer.invocation_in(direction, flags, &refs(&command));
             invocation.output().unwrap()
         };
-        let groups = |output: &Output| summary_line(output, "immutable roots: ");
+        // The notes of both updates, in order.
+        let groups = |output: &Output| -> Vec<String> {
+            String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .filter_map(|line| line.split_once("immutable roots: "))
+                .map(|(_, groups)| groups.to_owned())
+                .collect()
+        };
+        let reused = "1 reused, 0 completed, 0 incomplete";
         let output = succeeded(run(&[]));
-        assert!(
-            groups(&output).ends_with("immutable roots: 1 reused, 0 completed, 0 incomplete"),
-            "{direction:?}: {}",
-            groups(&output)
-        );
+        assert_eq!(groups(&output), [reused, reused], "{direction:?}");
         let output = succeeded(run(&["--scan-immutable"]));
-        assert!(
-            groups(&output).ends_with("immutable roots: 0 reused, 1 completed, 0 incomplete"),
-            "{direction:?}: {}",
-            groups(&output)
-        );
+        let scanned = "0 reused, 1 completed, 0 incomplete";
+        assert_eq!(groups(&output), [scanned, reused], "{direction:?}");
         assert!(
             summary_line(&output, "files hashed").contains(" 1 files hashed"),
             "{direction:?}"
@@ -1294,13 +1329,14 @@ fn scan_immutable_scans_the_groups_of_the_receiver_again() {
 
 #[test]
 fn compact_compacts_the_index_of_each_receiver() {
-    // `--compact` reaches the update of each receiver, which REQUEST tells
-    // (DESIGN.md §6.2 and §8): the client in a pull, the server in a push,
-    // and both hosts with both streams deduplicated. Each update removes the
-    // rows of a file that is gone, and leaves the deletions of the rows in
-    // the database files, unless the option makes it end with a compaction,
-    // as `update --compact` does. A run with `--no-update` has no update, so
-    // with it, the option is a usage error.
+    // `--compact` reaches the update after the command of each receiver,
+    // which REQUEST tells (DESIGN.md §6.2 and §8): the client in a pull, the
+    // server in a push, and both hosts with both streams deduplicated. The
+    // update at the start removes the rows of a file that is gone, and the
+    // deletions of the rows stay in the database files, unless the option
+    // makes the update after the command end with a compaction, as `update
+    // --compact` does, and that one alone. A run with `--no-update` has no
+    // update, so with it, the option is a usage error.
     let runs: [(&[&str], &[Direction]); 3] = [
         (&[], &[Direction::Pull]),
         (&["--dedup-stdin"], &[Direction::Push]),
@@ -1333,10 +1369,7 @@ fn compact_compacts_the_index_of_each_receiver() {
         let deletions = |direction: Direction| {
             IndexView::open(&transfer.receiver_index(direction), false).file_deletions()
         };
-        let note = |direction: Direction| match direction {
-            Direction::Pull => "hashsync: compacted index in ",
-            Direction::Push => "hashsync (server): compacted index in ",
-        };
+        let note = |direction: Direction| format!("{}compacted index in ", direction.marker());
 
         let stderr = run(0, &[]);
         assert!(
@@ -1352,12 +1385,85 @@ fn compact_compacts_the_index_of_each_receiver() {
         }
         let stderr = run(1, &["--compact"]);
         for &direction in receivers {
-            assert!(stderr.contains(note(direction)), "{streams:?}:\n{stderr}");
+            let after = format!("{}updating index after the command\n", direction.marker());
+            let compacted = stderr.matches(&note(direction)).count();
+            assert_eq!(compacted, 1, "{streams:?}:\n{stderr}");
+            let at = |part: &str| stderr.find(part).unwrap_or_else(|| panic!("{stderr}"));
+            assert!(at(&after) < at(&note(direction)), "{streams:?}:\n{stderr}");
             assert_eq!(deletions(direction), 0, "{streams:?}, {direction:?}");
         }
 
         let output = invocation(&["--compact", "--no-update"]).output().unwrap();
         assert_eq!(output.status.code(), Some(2), "{streams:?}");
+    }
+}
+
+#[test]
+fn the_update_after_the_command_indexes_what_the_run_wrote() {
+    // Once the command has finished, each receiver updates its index again
+    // (DESIGN.md §3), and so indexes the file that the run wrote in its
+    // root: on the client, its stdout, which goes to a file there, and on
+    // the server, the file that the command writes from its stdin. A note
+    // says when that update begins, and the summary comes after it. With
+    // `--wait`, each deduplicated stream reaches its destination only after
+    // the update at the start, which finds both files empty, too small to
+    // index. With `--no-update`, neither host updates, and the files stay
+    // out of the indexes.
+    let runs: [(&[&str], &[Direction]); 3] = [
+        (&[], &[Direction::Pull]),
+        (&["--dedup-stdin"], &[Direction::Push]),
+        (&["--dedup-stdin", "--dedup-stdout"], &DIRECTIONS),
+    ];
+    for (streams, receivers) in runs {
+        for no_update in [false, true] {
+            let transfer = Transfer::new(&[]);
+            transfer.configure_server("");
+            let mut flags = [streams, &[EXACT, "--wait"]].concat();
+            if no_update {
+                for direction in DIRECTIONS {
+                    transfer.update_receiver(direction, &[]);
+                }
+                flags.push("--no-update");
+            }
+            let input = tiled(4, 77);
+            let source = transfer.env.path("input");
+            std::fs::write(&source, &input).unwrap();
+            let written = transfer
+                .env
+                .path(transfer.indexed(Direction::Push, "written"));
+            let script = format!("cat >'{0}' && cat '{0}'", written.display());
+            let stdout = transfer
+                .env
+                .path(transfer.indexed(Direction::Pull, "written"));
+            let output = transfer
+                .invocation(&flags, &refs(&args(&[&script])))
+                .stdin(File::open(&source).unwrap())
+                .stdout(File::create(&stdout).unwrap())
+                .output()
+                .unwrap();
+            let output = succeeded(output);
+            let case = format!("{streams:?}, no_update: {no_update}");
+            assert!(std::fs::read(&written).unwrap() == input, "{case}");
+            assert!(std::fs::read(&stdout).unwrap() == input, "{case}");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            for direction in DIRECTIONS {
+                let receives = receivers.contains(&direction);
+                // A host that receives no deduplicated stream has no index,
+                // unless this test updated it.
+                let index = transfer.receiver_index(direction);
+                let indexed = index.exists()
+                    && IndexView::open(&index, false)
+                        .paths()
+                        .iter()
+                        .any(|path| path.rel_path == b"written");
+                assert_eq!(indexed, receives && !no_update, "{case}, {direction:?}");
+                let note = format!("{}updating index after the command\n", direction.marker());
+                let at = stderr.find(&note);
+                assert_eq!(at.is_some(), receives && !no_update, "{case}:\n{stderr}");
+                let summary = stderr.find("hashsync: total -- ").unwrap();
+                assert!(at.is_none_or(|at| at < summary), "{case}:\n{stderr}");
+            }
+        }
     }
 }
 
@@ -4457,13 +4563,21 @@ fn a_data_session_that_ends_before_end_fails_the_run() {
     // fails at its end does, and reads what the client sends. The run fails
     // although the stream is complete (DESIGN.md §6.9). The fake control
     // session sends its version and features and stays open until its
-    // stdin ends.
+    // stdin ends. The fake server still runs when it ends the data session,
+    // so the fake ssh gives it the client's pipes as they are.
     let transfer = Transfer::new(&[]);
     let start = version_and_features(FEATURES);
     let data = [&start[..], &fake_frames(b"output")].concat();
     let server = fake_server(&transfer, "ends-before-end", &data, &start);
     transfer.set_hashsync_path(server.as_os_str());
-    let output = transfer.run(&["--compression-level", "0"], &refs(&args(&["true"])));
+    let output = transfer
+        .invocation(
+            &[EXACT, "--compression-level", "0"],
+            &refs(&args(&["true"])),
+        )
+        .env(DIRECT_PIPES, "1")
+        .output()
+        .unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(1), "stderr:\n{stderr}");
     // The end of the run can come before the decoder writes the output.
@@ -5841,7 +5955,8 @@ fn closing_the_control_session_before_end_is_fatal_also_after_completing() {
     // the run (DESIGN.md §6.9). The fake server holds STREAM_END until the
     // test has seen the lookup workers, and closes the control session only
     // once they have ended, so the order of these events does not depend on
-    // timing.
+    // timing. It still runs when it closes the control session, so the fake
+    // ssh gives it the client's pipes as they are.
     let transfer = Transfer::new(&[]);
     let start = version_and_features(FEATURES);
     let frames = fake_frames(b"output");
@@ -5885,6 +6000,7 @@ exec cat >/dev/null
             &[EXACT, "--compression-level", "0"],
             &refs(&args(&["true"])),
         )
+        .env(DIRECT_PIPES, "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -5982,17 +6098,19 @@ fn a_reader_that_waits_during_a_runs_update_gets_in_while_the_run_goes_on() {
     // a shared one, so a `stats` that waits for the lock during the update
     // gets in once the update ends, while the run goes on (DESIGN.md §4.4).
     // The receiver is the client in a pull, and the server in a push, whose
-    // stderr is the client's. This test holds the lock of the index until
-    // the receiver waits for it, after the notes that both hosts write when
-    // the run starts. Then it fills that stderr, a pipe, and releases the
-    // lock, so the note that the receiver has the lock waits in its write,
-    // while the receiver holds its exclusive lock. Meanwhile `stats` starts,
-    // and waits for the lock. Then this test empties the pipe, and `stats`
-    // must end before the command, which waits for this test. A run that
-    // kept its exclusive lock would make `stats` wait for the run, and hang
-    // the test. The receiver's stream stays open meanwhile: the command
-    // writes nothing before it exits, and stdin stays open; else the lookups
-    // would end, and close the index, whatever its lock.
+    // stderr is the client's: the fake ssh gives the server the client's
+    // pipes as they are, without its relay. This test holds the lock of the
+    // index until the receiver waits for it, after the notes that both
+    // hosts write when the run starts. Then it fills that stderr, a pipe,
+    // and releases the lock, so the note that the receiver has the lock
+    // waits in its write, while the receiver holds its exclusive lock.
+    // Meanwhile `stats` starts, and waits for the lock. Then this test
+    // empties the pipe, and `stats` must end before the command, which
+    // waits for this test. A run that kept its exclusive lock would make
+    // `stats` wait for the run, and hang the test. The receiver's stream
+    // stays open meanwhile: the command writes nothing before it exits, and
+    // stdin stays open; else the lookups would end, and close the index,
+    // whatever its lock.
     for direction in DIRECTIONS {
         let transfer = Transfer::new(&[]);
         transfer.configure_receiver(direction, "");
@@ -6016,6 +6134,7 @@ fn a_reader_that_waits_during_a_runs_update_gets_in_while_the_run_goes_on() {
         let (stdin, producer) = std::io::pipe().unwrap();
         let client = transfer
             .invocation_in(direction, &[EXACT], &refs(&args(&[&script])))
+            .env(DIRECT_PIPES, "1")
             .stdin(stdin)
             .stdout(Stdio::piped())
             .stderr(stderr_writer)
@@ -6067,18 +6186,29 @@ fn a_reader_that_waits_during_a_runs_update_gets_in_while_the_run_goes_on() {
 }
 
 /// The server of the client `pid`: its child for the data session, once it
-/// runs `hashsync serve`, which the bootstrap execs (DESIGN.md §6.1). Polls
-/// with no deadline, and fails once the client has ended.
+/// runs `hashsync serve`, which the bootstrap execs (DESIGN.md §6.1).
 fn server_of(pid: u32) -> u32 {
+    child_running(pid, b"serve")
+}
+
+/// The child of the receiver `pid` that updates its index after the
+/// command, `hashsync update-after-command` (DESIGN.md §3).
+fn update_after_the_command_of(pid: u32) -> u32 {
+    child_running(pid, b"update-after-command")
+}
+
+/// The child of `pid` that has the argument `arg`, once it runs. Polls with
+/// no deadline, and fails once `pid` has ended.
+fn child_running(pid: u32, arg: &[u8]) -> u32 {
     loop {
         let state = proc_state(format!("/proc/{pid}"));
         assert!(
             state.is_some_and(|state| state != 'Z'),
-            "the client ended before its server started"
+            "{pid} ended before its child started"
         );
         for child in children(pid) {
             let cmdline = std::fs::read(format!("/proc/{child}/cmdline")).unwrap_or_default();
-            if cmdline.split(|&byte| byte == 0).any(|arg| arg == b"serve") {
+            if cmdline.split(|&byte| byte == 0).any(|word| word == arg) {
                 return child;
             }
         }
@@ -6206,7 +6336,10 @@ fn with_wait_a_deduplicated_stream_waits_for_its_whole_list() {
     // in a note that the stream waits once its bytes have arrived, so
     // before the receiver gets its lock, and says in another one when the
     // list is whole, which only the update can give. With `--wait`, nothing
-    // of the stream went out before, so that note gives no count.
+    // of the stream went out before, so that note gives no count. The fake
+    // ssh gives the server the client's pipes as they are, without its
+    // relay, so the lines of both hosts reach stderr in the order of their
+    // writes.
     for direction in DIRECTIONS {
         let transfer = Transfer::new(&[]);
         transfer.configure_receiver(direction, "");
@@ -6230,6 +6363,7 @@ fn with_wait_a_deduplicated_stream_waits_for_its_whole_list() {
         let flags = [&[EXACT][..], &direction.counted()].concat();
         let client = transfer
             .invocation_in(direction, &flags, &refs(&args(&[&command])))
+            .env(DIRECT_PIPES, "1")
             .stdin(stdin)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -6385,6 +6519,271 @@ fn an_update_waits_for_the_lookups_and_gets_in_while_the_run_writes_stdout() {
     );
     let output = succeeded(output_of(client));
     assert!(output.stdout == [head, rest].concat(), "the output differs");
+}
+
+#[test]
+fn the_client_lets_go_of_stdin_and_stdout_once_their_streams_are_done() {
+    // The client replaces its stdout with `/dev/null` once it has written
+    // the whole backward stream there, and its stdin once the forward
+    // stream has stopped, as the ends of a local pipeline close them, and
+    // not only at its end (DESIGN.md §4.4). The command writes a line,
+    // closes its stdout and its stdin, and waits for this test. Meanwhile
+    // the client's stdout reaches its EOF, after the line, and its stdin
+    // breaks once the server has found the command's stdin closed: both
+    // before END, which waits for the command. A client that kept them
+    // until its end would wait for this test, which waits for them: a
+    // consumer of stdout or a producer of stdin that holds a lock of the
+    // index, such as another run, would wait the same way.
+    let transfer = Transfer::new(&[]);
+    transfer.env.write("tree/blocks", &tiled(4, 78));
+    let go = transfer.env.path("go");
+    mkfifoat(CWD, &go, Mode::RUSR | Mode::WUSR).unwrap();
+    let script = format!("echo done; exec <&- >&-; read go <'{}'", go.display());
+    let (stdin, mut producer) = std::io::pipe().unwrap();
+    let client = transfer
+        .invocation(&[EXACT], &refs(&args(&[&script])))
+        .stdin(stdin)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut client = KillOnDrop(client);
+    let mut stdout = Vec::new();
+    let pipe = client.0.stdout.as_mut().unwrap();
+    pipe.read_to_end(&mut stdout).unwrap();
+    assert_eq!(stdout, b"done\n");
+    // A process that another test starts can hold the other end of the
+    // pipe until it runs its program, so the writes can fill the pipe
+    // first. No deadline: a client that keeps its stdin hangs the test.
+    loop {
+        match producer.write(b"x") {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => break,
+            Err(e) => panic!("write to the client's stdin: {e}"),
+        }
+    }
+    assert_running(&mut client);
+    std::fs::write(&go, b"go\n").unwrap();
+    succeeded(output_of(client));
+}
+
+#[test]
+fn the_clients_update_after_the_command_does_not_wait_for_the_servers() {
+    // With both streams deduplicated, both hosts update their index again
+    // once the command has finished, at the same time (DESIGN.md §3): the
+    // client waits for the EOF of the data session only after its own
+    // update (DESIGN.md §6.9, steps N4 and N5). The fake ssh, as sshd,
+    // passes that EOF on only once the server has exited, after the
+    // server's update. This test takes a shared lock of the server's index
+    // once the server's update at the start is done, so that its update
+    // after the command waits for it. The client's update after the
+    // command still ends meanwhile, as its note shows. A client that waited
+    // for the EOF first would hang the test.
+    let transfer = Transfer::new(&[]);
+    transfer.configure_server("");
+    transfer.env.write("tree/blocks", &tiled(4, 79));
+    transfer.env.write("server-tree/blocks", &tiled(4, 80));
+    transfer.update_receiver(Direction::Pull, &[]);
+    transfer.update_receiver(Direction::Push, &[]);
+    let go = transfer.env.path("go");
+    mkfifoat(CWD, &go, Mode::RUSR | Mode::WUSR).unwrap();
+    let stderr = transfer.env.path("stderr");
+    let script = format!("read go <'{}'", go.display());
+    let client = transfer
+        .both(&[], &refs(&args(&[&script])))
+        .stdout(Stdio::piped())
+        .stderr(File::create(&stderr).unwrap())
+        .spawn()
+        .unwrap();
+    let mut client = KillOnDrop(client);
+    let index = transfer.server_index();
+    let lock_file = index.join("hashsync.lock");
+    wait_for_the_release_after_the_update(&mut client, Direction::Push, &stderr, &lock_file);
+    let lock = shared_lock(&index);
+    std::fs::write(&go, b"go\n").unwrap();
+    wait_for_lock_wait(update_after_the_command_of(server_of(client.0.id())));
+    // The note of the client's update after the command follows the note
+    // that it begins.
+    let begins = "hashsync: updating index after the command\n";
+    wait_for_bytes(&stderr, std::slice::from_mut(&mut client), |bytes| {
+        let text = String::from_utf8_lossy(bytes);
+        text.split_once(begins)
+            .is_some_and(|(_, after)| after.contains("hashsync: updated index in "))
+    });
+    drop(lock);
+    let mut output = output_of(client);
+    output.stderr = std::fs::read(&stderr).unwrap();
+    let output = succeeded(output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("hashsync (server): updating index after the command\n"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn a_failed_update_after_the_command_only_warns() {
+    // The receiver's update after the command runs in a child, which reads
+    // the configuration file again (DESIGN.md §3). The command breaks that
+    // file, so the child fails. The run only warns: the command's output
+    // has all arrived, so it still prints its summary, and ends with the
+    // command's status.
+    for direction in DIRECTIONS {
+        let transfer = Transfer::new(&[]);
+        transfer.configure_server("");
+        let config = match direction {
+            Direction::Pull => transfer.env.config_path(),
+            Direction::Push => transfer.server_config(),
+        };
+        let script = format!("printf '[[[' >>'{}'; exit 3", config.display());
+        let output = transfer
+            .invocation_in(direction, &[EXACT], &refs(&args(&[&script])))
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(3), "{direction:?}:\n{stderr}");
+        let marker = direction.marker();
+        let warning =
+            format!("{marker}warning: the update after the command exited with status 1\n");
+        let at = |part: &str| {
+            let at = stderr.find(part);
+            at.unwrap_or_else(|| panic!("{direction:?}: no {part:?}:\n{stderr}"))
+        };
+        assert!(
+            at(&warning) < at("hashsync: total -- "),
+            "{direction:?}:\n{stderr}"
+        );
+    }
+}
+
+#[test]
+fn two_pulls_in_a_pipeline_end_when_the_second_takes_the_lock_first() {
+    // `hashsync ssh a cat f | hashsync ssh b sort`, two pulls with the same
+    // index on the client, where the second run takes the lock first: the
+    // first run's update at the start waits until the second run closes the
+    // index, once `sort` has read the EOF of its stdin (DESIGN.md §4.4). The
+    // first server sends END only once that update is done, since its side
+    // of the list exchange waits for it, so the first client must let go of
+    // its stdout before END, once it has written its backward stream there.
+    let transfer = Transfer::new(&[]);
+    transfer.env.write("tree/blocks", &tiled(4, 81));
+    transfer.update_receiver(Direction::Pull, &[]);
+    let lock = transfer.env.index_path().join("hashsync.lock");
+    let (pipe_in, pipe_out) = std::io::pipe().unwrap();
+    let second = transfer
+        .invocation(&[EXACT], &refs(&args(&["sort"])))
+        .stdin(pipe_in)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut second = KillOnDrop(second);
+    let receiver = second.0.id();
+    wait_for_shared_lock(&mut second, receiver, &lock);
+    let first = transfer
+        .invocation(&[EXACT], &refs(&args(&["printf 'b\\na\\n'"])))
+        .stdout(pipe_out)
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    succeeded(output_of(KillOnDrop(first)));
+    let second = succeeded(output_of(second));
+    assert_eq!(second.stdout, b"a\nb\n");
+}
+
+#[test]
+fn two_pushes_in_a_pipeline_end_when_the_second_takes_the_lock_first() {
+    // The same pipeline with two pushes to one server index: the first
+    // server's update at the start waits until the second server closes the
+    // index, once its stdin, the first client's stdout, has ended. The first
+    // server joins its receiver's thread, and so waits for that update,
+    // before END, so the first client must let go of its stdout before END.
+    let transfer = Transfer::new(&[]);
+    transfer.configure_server("");
+    transfer.env.write("server-tree/blocks", &tiled(4, 82));
+    transfer.update_receiver(Direction::Push, &[]);
+    let lock = transfer.server_index().join("hashsync.lock");
+    let (pipe_in, pipe_out) = std::io::pipe().unwrap();
+    let second = transfer
+        .push(&[EXACT], &refs(&args(&["cat >/dev/null"])))
+        .stdin(pipe_in)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut second = KillOnDrop(second);
+    let receiver = server_of(second.0.id());
+    wait_for_shared_lock(&mut second, receiver, &lock);
+    let first = transfer
+        .push(&[EXACT], &refs(&args(&["echo x"])))
+        .stdout(pipe_out)
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    succeeded(output_of(KillOnDrop(first)));
+    succeeded(output_of(second));
+}
+
+#[test]
+fn two_pushes_in_a_pipeline_end_when_the_first_updates_after_the_command() {
+    // The same pipeline of two pushes, where the first server takes the
+    // lock first, and lets go of it after its update at the start: its
+    // stdin is empty. Then the second server takes it, and keeps it until
+    // its stdin, the first client's stdout, ends. Meanwhile the first
+    // server's update after the command waits for it. Through SSH, the
+    // first client reads the EOF of its data session only once its server
+    // has exited, after that update, so it must let go of its stdout
+    // before.
+    let transfer = Transfer::new(&[]);
+    transfer.configure_server("");
+    transfer.env.write("server-tree/blocks", &tiled(4, 83));
+    transfer.update_receiver(Direction::Push, &[]);
+    let lock = transfer.server_index().join("hashsync.lock");
+    let go = transfer.env.path("go");
+    mkfifoat(CWD, &go, Mode::RUSR | Mode::WUSR).unwrap();
+    let first_stderr = transfer.env.path("first-stderr");
+    let (pipe_in, pipe_out) = std::io::pipe().unwrap();
+    let script = format!("read go <'{}'; echo x", go.display());
+    let first = transfer
+        .push(&[EXACT], &refs(&args(&[&script])))
+        .stdout(pipe_out)
+        .stderr(File::create(&first_stderr).unwrap())
+        .spawn()
+        .unwrap();
+    let mut first = KillOnDrop(first);
+    let first_server = server_of(first.0.id());
+    wait_for_bytes(&first_stderr, std::slice::from_mut(&mut first), |bytes| {
+        holds(bytes, b"hashsync (server): updated index in ")
+    });
+    while ofd_lock(first_server, &lock).is_some() {
+        assert_running(&mut first);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let second = transfer
+        .push(&[EXACT], &refs(&args(&["cat >/dev/null"])))
+        .stdin(pipe_in)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut second = KillOnDrop(second);
+    let receiver = server_of(second.0.id());
+    wait_for_shared_lock(&mut second, receiver, &lock);
+    std::fs::write(&go, b"go\n").unwrap();
+    let mut first = output_of(first);
+    first.stderr = std::fs::read(&first_stderr).unwrap();
+    succeeded(first);
+    succeeded(output_of(second));
+}
+
+/// Wait until the process `receiver` of the run of `client` holds a shared
+/// lock of the index whose lock file is at `lock`, polling with no
+/// deadline, while that run goes on.
+fn wait_for_shared_lock(client: &mut KillOnDrop, receiver: u32, lock: &std::path::Path) {
+    while ofd_lock(receiver, lock) != Some("READ") {
+        assert_running(client);
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
 #[test]
@@ -6637,8 +7036,9 @@ fn both_streams_are_deduplicated_against_the_indexes_of_their_receivers() {
         let stdin = deduplicated_stream(&output, "stdin");
         let counts = [input.len(), 2, server_blocks.len(), 0];
         assert_eq!(stdin.bytes, counts, "{no_update}");
-        // Both updates write a note, the first one "rebuilt index", a later
-        // one "updated index". With `--no-update`, neither host updates.
+        // Each update writes a note, "rebuilt index" when it creates the
+        // index, "updated index" otherwise. With `--no-update`, neither host
+        // updates.
         let stderr = String::from_utf8_lossy(&output.stderr);
         for host in ["hashsync", "hashsync (server)"] {
             let updated = ["rebuilt index", "updated index"]
@@ -6845,11 +7245,12 @@ fn wait_for_the_release_after_the_update(
     lock: &std::path::Path,
 ) {
     // The server's lines reach the client's stderr with their marker.
-    let (host, receiver) = match direction {
-        Direction::Pull => ("hashsync: ", client.0.id()),
-        Direction::Push => ("hashsync (server): ", server_of(client.0.id())),
+    let receiver = match direction {
+        Direction::Pull => client.0.id(),
+        Direction::Push => server_of(client.0.id()),
     };
-    let notes = ["updated index in ", "rebuilt index in "].map(|note| format!("{host}{note}"));
+    let notes = ["updated index in ", "rebuilt index in "]
+        .map(|note| format!("{}{note}", direction.marker()));
     wait_for_bytes(stderr, std::slice::from_mut(client), |bytes| {
         notes.iter().any(|note| holds(bytes, note.as_bytes()))
     });

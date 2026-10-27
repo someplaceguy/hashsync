@@ -183,9 +183,10 @@ pub fn install_panic_hook() {
 }
 
 /// What an end must undo (DESIGN.md §6.9). A fatal end kills the children:
-/// the client's SSH sessions, and the server's command with its process
-/// group. Every end restores the file status flags that this process added
-/// to an open file description that other processes can share: the
+/// the client's SSH sessions, the server's command with its process group
+/// until END is out, and the child that updates a receiver's index after
+/// the command. Every end restores the file status flags that this process
+/// added to an open file description that other processes can share: the
 /// client's stdin, which its stdin reader makes non-blocking. Every end
 /// also removes the files: the server's rendezvous socket. Registered
 /// identifiers stay valid because children are never reaped: their PIDs
@@ -254,6 +255,12 @@ pub fn spawn_guarded(guard: KillGuard, command: &mut Command) -> std::io::Result
         KillGuard::ProcessGroup => registry.kill_pgroups.push(pid),
     }
     Ok(child)
+}
+
+/// Leave the process group `pgroup`, which `spawn_guarded` registered, out
+/// of a fatal end from now on, as the normal end leaves it.
+pub fn spare_process_group(pgroup: Pid) {
+    registry().kill_pgroups.retain(|&group| group != pgroup);
 }
 
 /// Remove this file when the process ends, normally or fatally. Register
