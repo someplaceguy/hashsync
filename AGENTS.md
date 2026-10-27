@@ -8,3 +8,7 @@ development shell, or runs one command in it: `./shell.sh cargo test`.
 `docs/hashsync.1` is the man page, in mdoc. Change it along with the commands,
 options, and configuration keys that it describes; tests check that each of
 them has an entry there, and that no other entry does.
+
+`docs/hashsync.adoc` is generated from the man page; don't edit it. After a
+change to the man page, a test rewrites it and fails once: run the tests again,
+and keep the new file with the change.

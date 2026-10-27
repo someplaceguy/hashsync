@@ -839,6 +839,75 @@ mod tests {
         flags
     }
 
+    /// `docs/hashsync.adoc` is the man page converted to AsciiDoc by pandoc.
+    /// When the file is not what pandoc makes of `docs/hashsync.1`, the test
+    /// rewrites it and fails, so the next run passes and the new file can be
+    /// committed with the man page. A Nix build keeps failing until then,
+    /// since its rewrite only changes its own copy of the source.
+    #[test]
+    fn the_asciidoc_page_matches_the_man_page() {
+        let man_page = concat!(env!("CARGO_MANIFEST_DIR"), "/docs/hashsync.1");
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/docs/hashsync.adoc");
+        // pandoc warns about a macro that it cannot convert, whose text
+        // would be missing from the AsciiDoc page. Its line wrapping would
+        // split long terms of description lists, which AsciiDoc needs on
+        // one line.
+        let pandoc = std::process::Command::new("pandoc")
+            .args(["--from=mdoc", "--to=asciidoc", "--standalone"])
+            .args(["--fail-if-warnings", "--wrap=none"])
+            .arg(man_page)
+            .output()
+            .expect("cannot run pandoc");
+        assert!(
+            pandoc.status.success(),
+            "pandoc failed: {}",
+            String::from_utf8_lossy(&pandoc.stderr)
+        );
+        let adoc = String::from_utf8(pandoc.stdout).expect("pandoc wrote invalid UTF-8");
+        let page = format!(
+            "// Generated from hashsync.1 by a test; edit hashsync.1 instead.\n{}",
+            fix_list_continuations(&adoc)
+        );
+        if std::fs::read_to_string(path).ok().as_ref() != Some(&page) {
+            std::fs::write(path, page).expect("cannot write docs/hashsync.adoc");
+            panic!(
+                "docs/hashsync.adoc was out of date and has been rewritten; run the tests again"
+            );
+        }
+    }
+
+    /// pandoc indents the blocks of a description list item by two spaces
+    /// per level, together with the `+` lines that join them, but AsciiDoc
+    /// does not nest by indentation: asciidoctor only takes a `+` at the
+    /// start of a line, reads an indented block after one as literal text,
+    /// and attaches the block to the innermost item unless empty lines
+    /// before the `+` move it up, one per level. So this unindents each
+    /// indented `+` and the line after it, and adds an empty line for each
+    /// level that the `+` is less indented than the text before it.
+    fn fix_list_continuations(adoc: &str) -> String {
+        let mut fixed = String::new();
+        // The indentation of the last line with text.
+        let mut last_indent: usize = 0;
+        let mut after_plus = false;
+        for line in adoc.lines() {
+            let text = line.trim_start_matches(' ');
+            let indent = line.len() - text.len();
+            if text == "+" && indent > 0 {
+                fixed.push_str(&"\n".repeat(last_indent.saturating_sub(indent) / 2));
+                fixed.push_str("+\n");
+                after_plus = true;
+                continue;
+            }
+            fixed.push_str(if after_plus { text } else { line });
+            fixed.push('\n');
+            after_plus = false;
+            if !text.is_empty() {
+                last_indent = indent;
+            }
+        }
+        fixed
+    }
+
     /// `--ssh` and `--hashsync-path` say how the client starts the server,
     /// with `ssh` and `hashsync` by default (DESIGN.md §8).
     #[test]

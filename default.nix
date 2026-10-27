@@ -88,9 +88,13 @@ rustPlatform.buildRustPackage {
 
   doCheck = canRun;
 
-  # The transfer tests run rsync with `hashsync ssh` as its remote shell.
-  # The development shell gets it too, since it builds with checks.
-  nativeCheckInputs = [ rsync ];
+  # The transfer tests run rsync with `hashsync ssh` as its remote shell,
+  # and a test of the man page converts it to AsciiDoc with pandoc. The
+  # development shell gets both too, since it builds with checks.
+  nativeCheckInputs = [
+    pandoc
+    rsync
+  ];
 
   postInstall = ''
     installManPage docs/hashsync.1

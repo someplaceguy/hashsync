@@ -1,0 +1,303 @@
+// Generated from hashsync.1 by a test; edit hashsync.1 instead.
+= HASHSYNC
+:revdate: October 26, 2026
+
+== NAME
+
+`hashsync` — run a command over SSH, deduplicating its output or input against indexed files
+
+== SYNOPSIS
+
+[verse]
+--
+`hashsync` ++[++`--profile` `name` ++|++ `--config` `path`++]++ ++[++`-q`++]++ ++[++`--no-human-readable`++]++ `subcommand` ++[++`argument ...`++]++
+--
+
+[verse]
+--
+`hashsync` `update` ++[++`--compact`++]++ ++[++`--rebuild`++]++ ++[++`--scan-immutable`++]++ ++[++`-j` `threads`++]++
+`hashsync` `stats`
+`hashsync` `prune` ++[++`--scan-immutable`++]++
+`hashsync` `compact`
+`hashsync` `ssh` ++[++`options`++]++ ++[++`-l` `user`++]++ ++[++`user`@++]++`host` ++[++`--`++]++ `command` ++[++`argument ...`++]++
+`hashsync` `bench` ++[++`--block-size` `size`++]++ ++[++`--probe-threads` `threads`++]++
+--
+
+== DESCRIPTION
+
+`hashsync` `ssh` runs a command on a remote host, much like [.Xr]#ssh(1)#, and deduplicates its standard output, its standard input, or both: data that the receiving host already has in its files is sent as a reference to a block of one of those files. By default, the command's standard output is deduplicated against files on the local host (a _pull_); with `--dedup-stdin`, standard input is deduplicated against files on the remote host instead (a _push_). Blocks are deduplicated at any offset, so this saves bandwidth whenever a stream repeats data that the receiving host already has, as with [.Xr]#tar(1)# archives, [.Xr]#rsync(1)# transfers, or package trees.
+
+The local host is the _client_ and the remote host the _server_. The host that receives a deduplicated stream is its _receiver_, and the other host its _sender_. The receiver keeps an _index_ of the blocks in the regular files under the _roots_ listed in its configuration file (see [.Sx]#CONFIGURATION#). `hashsync` `update` creates the index or brings it up to date, and so does `hashsync` `ssh` when it starts, unless `--no-update` is given. The receiver sends the sender its _hash list_, short hashes of all its blocks, which the sender looks for at every offset of the stream. Every match is verified against the receiver's files, so a file that changed since the last update only reduces deduplication; the output always matches the original stream exactly. Both hosts cache hash lists, so later transfers only send the changes.
+
+The client starts `hashsync` on the server over two SSH sessions, which run the internal commands `hashsync` `serve` and `hashsync` `attach`. The server's shell looks `hashsync` up in its `PATH`, unless `--hashsync-path` gives its location.
+
+The following options apply to all commands, and can be given before or after the command name:
+
+`--config` `path`::
+  Use the configuration file at `path` instead of a profile. Unless the file sets `index++_++path`, the index is named after the file, as for a profile, so files with the same name share an index.
+`--no-human-readable`::
+  Print byte counts in bytes instead of with units such as KiB, and the hash list sizes of `bench` as plain numbers.
+`--profile` `name`::
+  Use the profile `name`: the configuration file [.Pa]#~/.config/hashsync/#`name`[.Pa]#.toml#, with the index [.Pa]#~/.cache/hashsync/#`name`[.Pa]#.db# unless the file sets `index++_++path`. The name must not be empty or contain a slash. Without `--profile` or `--config`, the profile `default` is used. The two options cannot be combined, and `bench` accepts neither.
+`-q`, `--quiet`::
+  Print only warnings and errors.
+
+`-h` or `--help` prints a short help text, for a specific command if given after its name, and `-V` or `--version` prints the version.
+
+== COMMANDS
+
+`update` ++[++`--compact`++]++ ++[++`--rebuild`++]++ ++[++`--scan-immutable`++]++ ++[++`-j` `threads`++]++::
+  Create the index, or bring it up to date: hash new and changed files, and remove from the index the files and roots that no longer exist or cannot be reached, or that the configuration no longer includes. Files whose identity, size and change time are unchanged are not read again, and fully indexed immutable roots are not scanned at all. If `block++_++size` or `strong++_++hash` changed, the index is rebuilt. Files and directories that cannot be read are skipped with a warning.
++
+`--compact`;;
+    Compact the index at the end, like `compact`.
+  `--rebuild`;;
+    Rebuild the index from scratch.
+  `--scan-immutable`;;
+    Also rescan fully indexed immutable roots, for example after their contents, `exclude` patterns or `one++_++filesystem` setting changed.
+  `-j` `threads`;;
+    Number of threads that scan and hash, overriding the `threads` setting; 0 selects the default.
+`stats`::
+  Print statistics about the index, and warn if its settings differ from the configuration. The index must already exist.
+`prune` ++[++`--scan-immutable`++]++::
+  Remove from the index the files and roots that no longer exist or cannot be reached, or that the configuration no longer includes, without hashing anything, then compact the index. An immutable root stays as long as any of its copies exists (see `identifier`). The index must already exist and match the configuration.
++
+`--scan-immutable`;;
+    Also check the individual paths of immutable roots.
+`compact`::
+  Compact the index by rewriting its database files without the data that updates and prunes have removed. The index must already exist and match the configuration.
+`ssh` ++[++`options`++]++ ++[++`-l` `user`++]++ ++[++`user`@++]++`host` ++[++`--`++]++ `command` ++[++`argument ...`++]++::
+  Run `command` on `host` over SSH, deduplicating its standard output, its standard input, or both. `hashsync` `ssh` passes its standard input to the command, copies the command's standard output and standard error back, and exits with the command's exit status. It accepts the arguments that [.Xr]#rsync(1)# passes to its remote shell, so `rsync -e 'hashsync ssh'` pulls with deduplication, and `rsync -e 'hashsync ssh --dedup-stdin'` pushes with it. As with [.Xr]#ssh(1)#, options may also follow `host`, and the command and its arguments are joined into a single line, which the server runs with the user's shell (`SHELL`, or [.Pa]#/bin/sh# if it is unset). A command that starts with `-` must follow `--`.
++
+Both streams start immediately, while each receiver updates its index and sends its hash list, so deduplication improves as the list arrives. Each stream is buffered on both hosts in temporary files, so a slow reader does not hold up the command or the transfer until the buffers are full.
++
+`--batch-stdin`;;
+    Send standard input in full buffers rather than as soon as data is available. This compresses better and deduplicates more blocks, but a program that waits for replies, such as [.Xr]#rsync(1)#, would wait forever.
+  `--batch-stdout`;;
+    Send the command's standard output in full buffers, like `--batch-stdin`.
+  `--compact`;;
+    Compact each index after updating it, like `hashsync` `update` `--compact`.
+  `--compression-level` `level`;;
+    The zstd compression level, from 1 to 19, or 0 to disable compression. The default is 9.
+  `--compression-threads` `threads`;;
+    Number of zstd worker threads for each stream. The default, 0, uses half the cores of the compressing host.
+  `--dedup-stdin`;;
+    Deduplicate standard input against the server's index. Without `--dedup-stdout`, the command's standard output is only compressed.
+  `--dedup-stdout`;;
+    Deduplicate the command's standard output against the client's index. This is the default without `--dedup-stdin`.
+  `--hashsync-path` `path`;;
+    The `hashsync` executable on the server, such as a statically linked binary on a host where `hashsync` is not installed: a name to look up in `PATH`, or a path, absolute or relative to the remote home directory. It is a single word, not a shell command; use a wrapper script to set its environment. The default is `hashsync`.
+  `-l` `user`;;
+    Log in as `user` on the server.
+  `--lookahead` `size`;;
+    How far ahead of the data already sent the sender looks for the receiver's blocks. It must be at least the receiver's block size, and the sender uses about twice this much memory. The default is 256 MiB or three blocks, whichever is larger.
+  `--negative-cache` `size`;;
+    Size of the sender's cache of hashes that the receiver did not have, which saves the sender from asking again about repeated data. 0 disables the cache. The default is 128 MiB.
+  `--no-compression-long`;;
+    Disable zstd's long-distance matching, which finds repeated data up to 128 MiB apart.
+  `--no-sender-cache`;;
+    Do not cache hash lists on the sender, and remove those cached for this receiver and index, so that the complete list is sent every time.
+  `-s`, `--no-shell`;;
+    Run the command and its arguments as separate words, without a shell. With [.Xr]#rsync(1)#, use this only together with rsync's own `-s` option; otherwise the server would take rsync's shell escapes literally.
+  `-n`, `--no-stdin`;;
+    Give the command an empty standard input, like `ssh -n`, and do not read standard input. This is needed in the background of an interactive shell, or under [.Xr]#nohup(1)#. Cannot be combined with `--dedup-stdin` or `--batch-stdin`.
+  `--no-update`;;
+    Do not update the indexes, and open them read-only, so that other readers can use them at the same time. Each index must exist and match its configuration. Cannot be combined with `--compact` or `--scan-immutable`.
+  `--probe-threads` `threads`;;
+    Number of threads with which the sender looks for the receiver's blocks in the stream. The default, 0, uses half the cores of the sender.
+  `--scan-immutable`;;
+    Also rescan fully indexed immutable roots when updating each index, like `hashsync` `update` `--scan-immutable`.
+  `--server-config` `path`;;
+    Use the configuration file at `path` on the server, absolute or relative to the remote home directory, instead of its default profile.
+  `--server-profile` `name`;;
+    Use the profile `name` on the server instead of its default profile. Cannot be combined with `--server-config`.
+  `--spool-limit` `size` ++|++ `unlimited`;;
+    Maximum amount of data buffered for each stream on each host. The default is 2 GiB.
+  `--ssh` `ssh-command`;;
+    The SSH command, split into words like a shell would, but without expansion. The default is `ssh`. `hashsync` adds options of its own, such as `-T` and `-o Compression=no`; per-host settings belong in [.Xr]#ssh++_++config(5)#.
+  `--wait`;;
+    Make each deduplicated stream wait for the complete hash list, so that it sends as few bytes as possible, however long the receiver's update takes.
+
++
+Unless it fails itself, `hashsync` `ssh` prints a summary to standard error at the end: for each stream, the bytes read and sent and how they were deduplicated, including the matches that the receiver rejected, either as hash collisions (_false positives_) or because the block failed verification, for example because its file changed (_not found_); then the total traffic and time.
+`bench` ++[++`--block-size` `size`++]++ ++[++`--probe-threads` `threads`++]++::
+  Measure how fast this host computes the hashes used for deduplication and looks for indexed blocks in a stream, on one thread and on several, to help choose `strong++_++hash`, `block++_++size` and `--probe-threads`.
++
+`--block-size` `size`;;
+    Measure only blocks of `size`, instead of a few common sizes, and look for blocks of that size instead of the default `block++_++size`.
+  `--probe-threads` `threads`;;
+    Number of threads that look for blocks, as for `hashsync` `ssh`.
+
+== CONFIGURATION
+
+All commands except `bench` read a configuration file in TOML format, by default [.Pa]#~/.config/hashsync/default.toml#, the file of the profile `default`. `--profile` and `--config` select another file; for `hashsync` `ssh`, they select the client's file, and `--server-profile` and `--server-config` select the server's. A configuration file only describes its own host. `hashsync` `ssh` needs one only on a host that receives a deduplicated stream, but a file named by an option must exist. Unknown keys are errors.
+
+Each profile has its own index, and `hashsync` `ssh` deduplicates each stream against a single index. Data sets that share no content and are transferred separately, such as a Nix store and a photo collection, are best indexed in separate profiles. Updates are then faster, hash lists are smaller, and instances of `hashsync` `ssh` that deduplicate against different profiles do not wait for each other (see [.Sx]#CAVEATS#).
+
+The following keys are recognized, all optional:
+
+`block++_++size`::
+  Size of the indexed blocks, at least 512 bytes; at least 4 KiB is recommended. Larger blocks make the index and the hash list smaller, but deduplicate less data. Changing it rebuilds the index. The default is `16KiB`.
+`candidate++_++attempts`::
+  How many indexed blocks with a matching hash the receiver tries before rejecting a match, at least 1. All copies of an immutable root count as one. The default is 128.
+`hashlist++_++max++_++age`::
+  How long this host keeps unused cached hash lists, and the temporary files that `hashsync` leaves when it fails: a number of seconds, or a number followed by `s`, `m`, `h` or `d`, at least 1 second. A value below an hour gets a warning, since expiry could then remove the temporary files of a `hashsync` `ssh` that is still running. The default is `30d`.
+`index++_++path`::
+  Directory of the index, a RocksDB database. The default is [.Pa]#~/.cache/hashsync/#`name`[.Pa]#.db# for the file `name`[.Pa]#.toml#.
+`roots`::
+  The roots to index, as an array of tables written `++[[++roots++]]++`, with the keys described below.
+`strong++_++hash`::
+  Hash used to verify blocks: `blake3`, the default, or `sha256`. Changing it rebuilds the index.
+`threads`::
+  Number of threads that scan and hash files in an update, or look up paths in a prune. The default, 0, uses four per core, but at least 16 and at most 64.
+`tmp++_++data++_++dir`::
+  Directory for the temporary files of `hashsync` `ssh`, which disappear when it exits. Put it on a local disk; on tmpfs, the data would take up memory. The default is [.Pa]#~/.cache/hashsync/tmp-data#.
+
+Each root accepts the following keys:
+
+`path`::
+  An absolute path, or a glob pattern of absolute paths; each match, a directory or a regular file, is a root. `++*++`, `?` and bracket expressions such as `++[++a-z++]++` match within a path component, and `++**++` across components. Matching compares bytes, is case-sensitive, and includes names that start with a dot. Symbolic links are not followed, and files and directories that cannot be reached do not match; they get a warning, like patterns without matches. Two roots with the same path, or one inside the other, are an error. An update also fails if a mount makes it reach the same directory twice, as with a bind mount of a directory that a root contains, or of a parent directory; exclude the mount point, or set `one++_++filesystem` for a mount below a root. This key is required.
+`exclude`::
+  Patterns of files and directories to leave out, together with everything below them. A pattern that starts with `/` matches absolute paths; any other pattern matches names, and cannot contain a slash.
+`identifier`::
+  How an immutable root names its _group_: matches with the same identifier are _copies_ of the same content, which the index stores once. `"path"`, the default, uses the absolute path of the match; `"name"` its last component; `++{++ strip++_++prefix = "/mnt/disk" }` the path without that prefix; and `++{++ literal = "photos-2019" }` that fixed name.
+`immutable`::
+  If true, `hashsync` assumes that the contents of the root never change. An update indexes a group once, from its first copy that exists, and then reuses it without reading it, until `--scan-immutable` or `--rebuild`, or until an update finds none of its copies, which removes the group. If the contents change anyway, transfers are still correct, but deduplicate less until the group is indexed again. The receiver reads blocks from any copy. All copies of a group must have the same `exclude` patterns and `one++_++filesystem` setting. The default is false.
+`may++_++vanish`::
+  If true, the root need not exist: it gets no warning when it does not, and if a copy of a group disappears before the update scans it, the next copy is scanned instead. A group whose copies are all on an unmounted disk is still removed, and indexed again when the disk is back. The default is false.
+`one++_++filesystem`::
+  If true, leave out files and directories on a different mount than their parent directory. Unlike `rsync -x`, this compares mounts rather than devices. The default is false.
+
+Sizes, in the configuration file and in options, are a number of bytes, or a number followed by `KiB`, `MiB`, `GiB` or `TiB`, or by `KB`, `MB`, `GB` or `TB` for powers of 1000, in any case. In the configuration file, sizes and durations can also be integers.
+
+Paths, patterns and identifiers are byte strings: after TOML parsing, `++\++xHH` stands for a byte and `++\\++` for a backslash, and any other backslash is an error, except in patterns, where `++\*++`, `++\++?`, `++\[++`, `++\]++`, `++\++-`, `++\++!` and `++\++^` match those characters literally, as does a byte given as `++\++xHH`. Single-quoted TOML strings avoid doubling the backslashes. In `index++_++path` and `tmp++_++data++_++dir`, `~` and a leading `~/` stand for the home directory, and other relative paths are relative to the working directory, which on the server is the home directory.
+
+== ENVIRONMENT
+
+`HOME`::
+  The home directory, under which the configuration, indexes and caches are kept by default.
+`PATH`::
+  On the server, where the remote shell finds `hashsync` and, with `-s`, where `hashsync` finds the command.
+`SHELL`::
+  On the server, the shell that runs the command, or [.Pa]#/bin/sh# if unset.
+`XDG++_++CACHE++_++HOME`::
+  Used instead of [.Pa]#~/.cache#.
+`XDG++_++CONFIG++_++HOME`::
+  Used instead of [.Pa]#~/.config#.
+`XDG++_++RUNTIME++_++DIR`::
+  On the server, the directory of the socket that connects the two SSH sessions; [.Pa]#/tmp/hashsync-#`uid` if unset.
+
+The XDG variables are only used if they hold an absolute path.
+
+== FILES
+
+[.Pa]#~/.config/hashsync/#`profile`[.Pa]#.toml#::
+  Configuration file of a profile.
+[.Pa]#~/.cache/hashsync/#`profile`[.Pa]#.db/#::
+  Index of a profile, with its lock file [.Pa]#hashsync.lock#.
+[.Pa]#~/.cache/hashsync/account-id#::
+  Random identifier of the user's account, which the hash list caches use to tell accounts apart.
+[.Pa]#~/.cache/hashsync/local-hashlists/#::
+  Cached hash lists of this host's indexes, as sent to other accounts.
+[.Pa]#~/.cache/hashsync/remote-hashlists/#::
+  Cached hash lists received from other accounts.
+[.Pa]#~/.cache/hashsync/tmp-data/#::
+  Default `tmp++_++data++_++dir`.
+
+If `hashsync` fails, it can leave temporary files whose names start with `.hashsync-` in the caches and in `tmp++_++data++_++dir`; `hashsync` `ssh` removes them once they are older than `hashlist++_++max++_++age`.
+
+== EXIT STATUS
+
+`hashsync` `ssh` exits with the exit status of `command`, 128 plus the number of the signal that terminated it, or 127 if it could not be started, even if the program reading its output exited early. If `hashsync` `ssh` itself fails, for example because SSH cannot reach the host, it exits with 1, or with 128 plus the signal number after SIGINT or SIGTERM.
+
+The other commands exit with 0 on success, even if they skipped files or directories that cannot be read, and 1 on failure. Usage errors exit with 2. A bug, or an error in the index database such as corruption, aborts `hashsync` with SIGABRT, which shells report as status 134.
+
+== EXAMPLES
+
+Copy a directory from the host `nas` over an older local copy of it, which the local index covers:
+
+....
+hashsync ssh -n backup@nas tar -C /srv/data -cf - . |
+    tar -C /srv/data -xf -
+....
+
+The same in the other direction, deduplicated against the index on `nas`:
+
+....
+tar -C /srv/data -cf - . |
+    hashsync ssh --dedup-stdin backup@nas tar -C /srv/data -xf -
+....
+
+Use `hashsync` as the remote shell of [.Xr]#rsync(1)#, to pull and to push. Deduplication is much more effective with a patched rsync (see [.Sx]#CAVEATS#). With `--delete-delay`, rsync deletes files only after the transfer, so files that are about to be deleted, such as the old names of renamed files, can still be used for deduplication:
+
+....
+rsync -a --delete-delay -e 'hashsync ssh' nas:/srv/data/ /srv/data/
+rsync -a --delete-delay -e 'hashsync ssh --dedup-stdin' \
+    /srv/data/ nas:/srv/data/
+....
+
+Run the server from a statically linked binary in the remote home directory:
+
+....
+hashsync ssh -n --hashsync-path bin/hashsync nas cat big.iso > big.iso
+....
+
+The default profile, in [.Pa]#~/.config/hashsync/default.toml#, for the data directory of the examples above:
+
+....
+block_size = "16KiB"
+
+[[roots]]
+path = "/srv/data"
+exclude = ["*.tmp", ".cache"]
+one_filesystem = true
+....
+
+A profile for two Nix stores at separate locations, in [.Pa]#~/.config/hashsync/nix.toml#, which `--profile nix` selects:
+
+....
+[[roots]]
+path = "/nix/store/*"
+immutable = true
+identifier = "name"
+exclude = [".links"]
+may_vanish = true
+
+[[roots]]
+path = "/mnt/disk/nix/store/*"
+immutable = true
+identifier = "name"
+exclude = [".links"]
+....
+
+A root whose name contains the byte FF, which is not valid UTF-8, and exclusions of the literal names `literal++*++name` and `back++\++slash`:
+
+....
+[[roots]]
+path = '/srv/archive-\xFF'
+immutable = true
+identifier = { literal = 'archive-\xFF' }
+exclude = ['*.tmp', 'literal\x2Aname', 'back\\slash']
+....
+
+== DIAGNOSTICS
+
+Messages go to standard error. Notes report progress and summaries, and `-q` suppresses them; messages from the server are marked as such. Paths and other values from outside the program are shown in the byte-string syntax of the configuration file.
+
+== SEE ALSO
+
+[.Xr]#rsync(1)#, [.Xr]#ssh(1)#, [.Xr]#tar(1)#, [.Xr]#zstd(1)#, [.Xr]#ssh++_++config(5)#
+
+== CAVEATS
+
+`hashsync` `ssh` holds a lock on each index it deduplicates against until the stream has ended, and `hashsync` commands that need exclusive access to the index wait for it. These include `hashsync` `update` and the index update at the start of another `hashsync` `ssh`. While that second `hashsync` `ssh` waits, its stream is sent without deduplication, or held back if `--wait` is given. With `--no-update`, several instances of `hashsync` `ssh` can share the index.
+
+The lock can cause a deadlock if the `command` that `hashsync` `ssh` runs on the server itself runs a `hashsync` command that needs exclusive access to an index, such as `hashsync` `update`. For example, `hashsync ssh --dedup-stdin nas 'hashsync update; tar -xf -'` never finishes: the update waits for the lock, which is only released once [.Xr]#tar(1)# has read all of its standard input. Two `hashsync` `ssh` commands in opposite directions between the same two hosts can also deadlock if each one's `command` runs `hashsync` `update` on its server, since each update then waits for the other `hashsync` `ssh`.
+
+[.Xr]#rsync(1)# sends file data in pieces of at most 32 KiB, which makes deduplication ineffective. To deduplicate rsync transfers effectively, the rsync that sends the files needs a patch that raises this limit to 8 MiB; the patch is backwards compatible, so the other rsync can be unpatched.
+
+If SSH multiplexes sessions over one connection, for example with `ControlMaster`, `hashsync` `ssh` still works, but the sender's questions about matching blocks wait behind the data of the streams.
+
+== SECURITY CONSIDERATIONS
+
+The sender of a deduplicated stream learns a hash of every block in the receiver's index, and can test whether the receiver has a block with given contents. In a push, the client could read the indexed files through its SSH login anyway, but in a pull, the server learns about the client's files, so only pull from servers that you trust. `--no-sender-cache` keeps the server from storing the client's hash lists.

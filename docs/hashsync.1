@@ -3,6 +3,12 @@
 .\" configuration file changes. Tests in src/main.rs and src/config.rs check
 .\" that this page documents every command, option, and configuration key,
 .\" and no others, and the Nix build lints it with mandoc -T lint.
+.\"
+.\" A test in src/main.rs generates docs/hashsync.adoc from this page with
+.\" pandoc. pandoc puts the punctuation after a .Pq inside its parentheses,
+.\" so parenthesized text followed by punctuation uses .Po and .Pc instead.
+.\" After .Sx, the .Pc goes on a line of its own: groff closes the quotes
+.\" of .Sx only after the macros that follow it on its line.
 .Dd October 26, 2026
 .Dt HASHSYNC 1
 .Os
@@ -51,11 +57,11 @@ the receiving host already has in its files is sent as a reference to a block
 of one of those files.
 By default, the command's standard output is deduplicated against files on the
 local host
-.Pq a Em pull ;
+.Po a Em pull Pc ;
 with
 .Fl -dedup-stdin ,
 standard input is deduplicated against files on the remote host instead
-.Pq a Em push .
+.Po a Em push Pc .
 Blocks are deduplicated at any offset, so this saves bandwidth whenever a stream
 repeats data that the receiving host already has, as with
 .Xr tar 1
@@ -76,7 +82,9 @@ The receiver keeps an
 of the blocks in the regular files under the
 .Em roots
 listed in its configuration file
-.Pq see Sx CONFIGURATION .
+.Po see
+.Sx CONFIGURATION
+.Pc .
 .Nm Cm update
 creates the index or brings it up to date, and so does
 .Nm Cm ssh
@@ -203,7 +211,7 @@ Remove from the index the files and roots that no longer exist or cannot be
 reached, or that the configuration no longer includes, without hashing
 anything, then compact the index.
 An immutable root stays as long as any of its copies exists
-.Pq see Cm identifier .
+.Po see Cm identifier Pc .
 The index must already exist and match the configuration.
 .Bl -tag -width Ds
 .It Fl -scan-immutable
@@ -387,7 +395,7 @@ and sent and how they were deduplicated, including the matches that the
 receiver rejected, either as hash collisions
 .Pq Em false positives
 or because the block failed verification, for example because its file changed
-.Pq Em not found ;
+.Po Em not found Pc ;
 then the total traffic and time.
 .It Xo
 .Cm bench
@@ -444,7 +452,9 @@ Nix store and a photo collection, are best indexed in separate profiles.
 Updates are then faster, hash lists are smaller, and instances of
 .Nm Cm ssh
 that deduplicate against different profiles do not wait for each other
-.Pq see Sx CAVEATS .
+.Po see
+.Sx CAVEATS
+.Pc .
 .Pp
 The following keys are recognized, all optional:
 .Bl -tag -width Ds
@@ -723,7 +733,9 @@ as the remote shell of
 .Xr rsync 1 ,
 to pull and to push.
 Deduplication is much more effective with a patched rsync
-.Pq see Sx CAVEATS .
+.Po see
+.Sx CAVEATS
+.Pc .
 With
 .Fl -delete-delay ,
 rsync deletes files only after the transfer, so files that are about to be
