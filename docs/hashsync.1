@@ -819,25 +819,23 @@ syntax of the configuration file.
 .Xr zstd 1 ,
 .Xr ssh_config 5
 .Sh CAVEATS
+Each index has a lock, and commands that modify the index, such as
+.Nm Cm update ,
+wait until they can hold it exclusively.
 .Nm Cm ssh
-holds a lock on each index it deduplicates against until the stream has ended,
-and
-.Nm
-commands that need exclusive access to the index wait for it.
-These include
-.Nm Cm update
-and the index updates of another
-.Nm Cm ssh .
-While that second
-.Nm Cm ssh
-waits at the start, its stream is sent without deduplication, or held back if
+holds the lock exclusively for its updates at the start and after the command,
+and shares it with other readers in between, until the stream has ended.
+While its update at the start waits for the lock, the stream is sent without
+deduplication
+.Po unless
 .Fl -wait
-is given; after the command has finished, it waits before it exits.
+is given, in which case the stream is not sent until the update has finished
+.Pc .
 With
 .Fl -no-update ,
-several instances of
 .Nm Cm ssh
-can share the index.
+skips both updates and so only needs a read-only lock, which several instances
+can hold at the same time.
 .Pp
 The lock can cause a deadlock if the
 .Ar command
