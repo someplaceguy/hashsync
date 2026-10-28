@@ -669,7 +669,9 @@ Used instead of
 Used instead of
 .Pa ~/.config .
 .It Ev XDG_RUNTIME_DIR
-On the server, the directory of the socket that connects the two SSH sessions;
+On the server, the socket that connects the two SSH sessions is in
+.Pa $XDG_RUNTIME_DIR/hashsync ,
+or in
 .Pa /tmp/hashsync- Ns Ar uid
 if unset.
 .El

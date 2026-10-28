@@ -185,7 +185,7 @@ Paths, patterns and identifiers are byte strings: after TOML parsing, `++\++xHH`
 `XDG++_++CONFIG++_++HOME`::
   Used instead of [.Pa]#~/.config#.
 `XDG++_++RUNTIME++_++DIR`::
-  On the server, the directory of the socket that connects the two SSH sessions; [.Pa]#/tmp/hashsync-#`uid` if unset.
+  On the server, the socket that connects the two SSH sessions is in [.Pa]#$XDG++_++RUNTIME++_++DIR/hashsync#, or in [.Pa]#/tmp/hashsync-#`uid` if unset.
 
 The XDG variables are only used if they hold an absolute path.
 

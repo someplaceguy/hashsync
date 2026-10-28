@@ -1164,6 +1164,16 @@ command. Then it starts its update when it receives a deduplicated stream
 (section 3), and accepts `attach`, whose session carries the list
 exchanges.
 
+`serve` and `attach` refuse a socket directory that is a mount point: they
+open it beneath its parent with `RESOLVE_NO_XDEV`. Otherwise, on a server
+that allows `user_allow_other`, another user could create the directory
+under `/tmp` while it doesn't exist and mount a FUSE filesystem on it. That
+filesystem's daemon would report the right owner and mode 0700, and decide
+what every name in the directory refers to. Both ends also verify with
+`SO_PEERCRED`, which doesn't depend on any filesystem, that the process at
+the other end of the socket runs as the same user, and end the run with
+`die` if it doesn't.
+
 `attach` retries a not-yet-listening socket while its stdin remains open,
 with no deadline. It relays stdin to the socket and the socket to stdout,
 half-closing the socket on stdin EOF. Socket EOF or a peer-closed socket

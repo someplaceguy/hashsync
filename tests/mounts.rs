@@ -1,19 +1,20 @@
-//! Bind-mount cycles, aliases, and `one_filesystem`, tested in an
-//! unprivileged user and mount namespace. Skipped where `unshare -Urm` is
-//! not available.
+//! Bind-mount cycles, aliases, `one_filesystem`, and a mount point as the
+//! rendezvous socket directory, tested in an unprivileged user and mount
+//! namespace. Skipped where `unshare -Urm` is not available.
 
 mod common;
 
 use std::os::unix::ffi::OsStrExt;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 use common::*;
 
 const SAME_DIRECTORY: &str = "are the same directory (cycle or mount alias)";
 
-/// Run `hashsync ARGS...` with the configuration file of `env` after
-/// bind-mounting `binds` (source, target pairs) in a fresh mount namespace.
-fn run_with_binds(env: &Env, binds: &[(&str, &str)], args: &[&str]) -> Output {
+/// A command that bind-mounts `binds` (source, target pairs) in a fresh
+/// user and mount namespace, and then runs the arguments that the caller
+/// adds to it as a command.
+fn with_binds(env: &Env, binds: &[(&str, &str)]) -> Command {
     let mut script = String::new();
     for (source, target) in binds {
         script.push_str(&format!(
@@ -22,10 +23,18 @@ fn run_with_binds(env: &Env, binds: &[(&str, &str)], args: &[&str]) -> Output {
             env.path(target).display()
         ));
     }
-    script.push_str("exec \"$0\" --config \"$@\"\n");
-    Command::new("unshare")
-        .args(["-Urm", "sh", "-c", &script])
+    script.push_str("exec \"$@\"\n");
+    let mut command = Command::new("unshare");
+    command.args(["-Urm", "sh", "-c", &script, "sh"]);
+    command
+}
+
+/// Run `hashsync ARGS...` with the configuration file of `env` after
+/// bind-mounting `binds` (`with_binds`).
+fn run_with_binds(env: &Env, binds: &[(&str, &str)], args: &[&str]) -> Output {
+    with_binds(env, binds)
         .arg(env!("CARGO_BIN_EXE_hashsync"))
+        .arg("--config")
         .arg(env.config_path())
         .args(args)
         .output()
@@ -36,6 +45,38 @@ fn run_with_binds(env: &Env, binds: &[(&str, &str)], args: &[&str]) -> Output {
 /// namespace.
 fn update_with_binds(env: &Env, binds: &[(&str, &str)]) -> Output {
     run_with_binds(env, binds, &["update"])
+}
+
+/// `serve` and `attach` refuse a socket directory that is a mount point,
+/// even one with this user as the owner and mode 0700 (DESIGN.md §6.1).
+#[test]
+fn a_mount_point_is_refused_as_the_socket_directory() {
+    if !namespaces_available() {
+        eprintln!("skipped: no unprivileged user namespaces");
+        return;
+    }
+    let env = Env::new();
+    env.mkdir("runtime/hashsync");
+    env.mkdir("private");
+    env.chmod("private", 0o700);
+    for command in ["serve", "attach"] {
+        // The closed stdin ends a wait for the directory at once, so a
+        // command that waits instead of refusing fails this test rather
+        // than hanging it.
+        let output = with_binds(&env, &[("private", "runtime/hashsync")])
+            .arg(env!("CARGO_BIN_EXE_hashsync"))
+            .args([command, "--token", "0123456789abcdef0123456789abcdef"])
+            .env("XDG_RUNTIME_DIR", env.path("runtime"))
+            .stdin(Stdio::piped())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{command}: {stderr}");
+        assert!(
+            stderr.contains("/runtime/hashsync' is a mount point"),
+            "{command}: {stderr}"
+        );
+    }
 }
 
 #[test]

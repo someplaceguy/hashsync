@@ -19,7 +19,7 @@ rayon = "1.12.0"
 # crate bundles, with LZ4 for its data blocks. bindgen needs libclang
 # (`default.nix`).
 rocksdb = { version = "0.25.0", default-features = false, features = ["bindgen-runtime", "lz4"] }
-rustix = { version = "1.1.5", features = ["event", "fs", "process", "rand", "stdio"] }
+rustix = { version = "1.1.5", features = ["event", "fs", "net", "process", "rand", "stdio"] }
 serde = { version = "1.0.229", features = ["derive"] }
 sha2 = "0.11.0"
 toml = "1.1.6"
