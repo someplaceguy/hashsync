@@ -296,7 +296,7 @@ The lock can cause a deadlock if the `command` that `hashsync` `ssh` runs on the
 
 [.Xr]#rsync(1)# sends file data in pieces of at most 32 KiB, which makes deduplication ineffective. To deduplicate rsync transfers effectively, the rsync that sends the files needs a patch that raises this limit to 8 MiB; the patch is backwards compatible, so the other rsync can be unpatched.
 
-If SSH multiplexes sessions over one connection, for example with `ControlMaster`, `hashsync` `ssh` still works, but the sender's questions about matching blocks wait behind the data of the streams.
+If SSH shares one connection between sessions, for example with `ControlMaster`, `hashsync` `ssh` still works, but deduplicated streams can be slower. The sender waits for the receiver to verify each match before it sends the data that follows, and over a shared connection, each of these round trips also waits for the stream data already queued on the connection. `--ssh 'ssh -S none'` disables connection sharing.
 
 == SECURITY CONSIDERATIONS
 
