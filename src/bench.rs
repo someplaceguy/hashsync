@@ -122,7 +122,7 @@ fn print_hashes(sizes: &[u32]) {
 /// A table with one line per size of the receiver's list: the number of
 /// values, then the rate at which the scanner searches output that matches
 /// none of them, for blocks of `block_size` bytes, first on one thread,
-/// then on `probe_threads` probe threads, or half the cores for 0. With one
+/// then on `probe_threads` probe threads, or one per core for 0. With one
 /// probe thread, the scanner probes on its own thread, as a sender's does,
 /// so the second rate would only repeat the first and is left out. The
 /// header gives the thread count of each rate.

@@ -1586,9 +1586,9 @@ window doubles the next one, to at least one part per probe thread and up
 to a bound per thread. A constant window, or a hit that the check rejects,
 neither doubles nor shortens the next stretch. Short gaps between matches
 thus stay on one thread, and a long run of misses soon uses all probe
-threads. `--probe-threads` sets the thread count; 0 selects half the
-sender's cores, at least one. The sender starts them at the receiver's
-HELLO (section 6.2).
+threads. `--probe-threads` sets the thread count; 0 selects one thread
+per core of the sender. The sender starts them at the receiver's HELLO
+(section 6.2).
 
 **Answers and rescanning.**
 
@@ -2770,20 +2770,20 @@ exclude = ['*.tmp', 'literal\x2Aname', 'back\\slash']
     configuration file in place of its profile `default` (section 7);
     together they are a usage error.
   - The other options set the transfer: `--lookahead SIZE` (section 6.3),
-    `--negative-cache SIZE` (128 MiB), `--probe-threads N` (0 for half the
-    cores of the sender), `--compression-level N` (9; from 1 to 19, and 0
+    `--negative-cache SIZE` (128 MiB), `--probe-threads N` (0 for one per
+    core of the sender), `--compression-level N` (9; from 1 to 19, and 0
     disables compression), `--no-compression-long`,
-    `--compression-threads N` (0 for half the cores of the host that
-    compresses, at least one), `--spool-limit SIZE` (2 GiB, or
-    `unlimited`, for every spool on both hosts; section 6.5), and
-    `--no-sender-cache` (section 5.6). The default lookahead is the larger
-    of 256 MiB and three blocks of the receiver, which leaves room for the
-    probe threads. A `--lookahead` below one block of the receiver is a
-    user error, which the client reports: for a deduplicated backward
-    stream before SSH starts, and for a deduplicated forward stream at the
-    server's HELLO, before its scanner starts. A lookahead buffer or probe
-    threads that the sender's host cannot provide end the run at the
-    receiver's HELLO (section 6.2).
+    `--compression-threads N` (0 for one per core of the host that
+    compresses), `--spool-limit SIZE` (2 GiB, or `unlimited`, for every
+    spool on both hosts; section 6.5), and `--no-sender-cache` (section
+    5.6). The default lookahead is the larger of 256 MiB and three blocks
+    of the receiver, which leaves room for the probe threads. A
+    `--lookahead` below one block of the receiver is a user error, which
+    the client reports: for a deduplicated backward stream before SSH
+    starts, and for a deduplicated forward stream at the server's HELLO,
+    before its scanner starts. A lookahead buffer or probe threads that
+    the sender's host cannot provide end the run at the receiver's HELLO
+    (section 6.2).
 
   After a successful transfer, also when the command fails, the client
   prints a summary to stderr:
@@ -2889,7 +2889,7 @@ exclude = ['*.tmp', 'literal\x2Aname', 'back\\slash']
   of SIZE or of the default size. The first rate is on one thread. The
   second is on the probe threads, which search a long stretch of such
   output at once; `--probe-threads N` sets their count as for `hashsync
-  ssh`, by default half the cores. With one probe thread, the scanner
+  ssh`, by default one per core. With one probe thread, the scanner
   probes on its own thread, so each line has only the first rate. The
   header gives the thread count of each rate, such as `1 thread` and
   `12 threads`. Each rate covers half a second of scanning, which leaves

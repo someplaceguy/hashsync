@@ -244,7 +244,7 @@ enum Command {
         #[arg(long, value_name = "SIZE", value_parser = config::parse_block_size)]
         block_size: Option<u32>,
         /// The probe threads of the second scan rate, as for ssh; 0 selects
-        /// half the cores, and 1 leaves that rate out
+        /// one per core, and 1 leaves that rate out
         #[arg(long, value_name = "N", default_value_t = 0)]
         probe_threads: u32,
     },
@@ -632,7 +632,7 @@ mod tests {
     }
 
     /// `--probe-threads` takes the counts that it takes for `ssh`, and
-    /// selects half the cores by default, with 0 (DESIGN.md §8).
+    /// selects one per core by default, with 0 (DESIGN.md §8).
     #[test]
     fn bench_takes_the_probe_threads_of_ssh() {
         let threads = |words: &[&str]| bench(words).map(|(_, threads)| threads);

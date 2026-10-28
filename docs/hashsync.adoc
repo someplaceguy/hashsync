@@ -80,7 +80,7 @@ Both streams start immediately, while each receiver updates its index and sends 
   `--compression-level` `level`;;
     The zstd compression level, from 1 to 19, or 0 to disable compression. The default is 9.
   `--compression-threads` `threads`;;
-    Number of zstd worker threads for each stream. The default, 0, uses half the cores of the compressing host.
+    Number of zstd worker threads for each stream. The default, 0, uses one thread per core of the compressing host.
   `--dedup-stdin`;;
     Deduplicate standard input against the server's index. Without `--dedup-stdout`, the command's standard output is only compressed.
   `--dedup-stdout`;;
@@ -104,7 +104,7 @@ Both streams start immediately, while each receiver updates its index and sends 
   `--no-update`;;
     Do not update the indexes, and open them read-only, so that other readers can use them at the same time. Each index must exist and match its configuration. Cannot be combined with `--compact` or `--scan-immutable`.
   `--probe-threads` `threads`;;
-    Number of threads with which the sender looks for the receiver's blocks in the stream. The default, 0, uses half the cores of the sender.
+    Number of threads with which the sender looks for the receiver's blocks in the stream. The default, 0, uses one thread per core of the sender.
   `--scan-immutable`;;
     Also rescan fully indexed immutable roots when updating each index at the start, like `hashsync` `update` `--scan-immutable`.
   `--server-config` `path`;;

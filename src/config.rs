@@ -491,13 +491,13 @@ pub fn parse(text: &str, source: &Source) -> Result<Config, String> {
     })
 }
 
-/// `requested` threads, or half the cores of this host, at least one, for
-/// 0: the count of probe threads, and of the worker threads of a zstd
-/// stream (DESIGN.md §7).
+/// `requested` threads, or one per core of this host for 0: the count of
+/// probe threads, and of the worker threads of a zstd stream (DESIGN.md
+/// §8).
 pub fn thread_count(requested: u32) -> u32 {
     match requested {
         0 => std::thread::available_parallelism()
-            .map_or(1, |n| u32::try_from(n.get() / 2).unwrap_or(u32::MAX).max(1)),
+            .map_or(1, |n| u32::try_from(n.get()).unwrap_or(u32::MAX)),
         n => n,
     }
 }

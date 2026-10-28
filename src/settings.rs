@@ -149,7 +149,7 @@ pub struct RunSettings {
     pub negative_cache: u64,
 
     /// The threads that probe the hash table for the scanner; 0 selects
-    /// half the cores of the host that scans
+    /// one per core of the host that scans
     #[arg(long, value_name = "N", default_value_t = 0)]
     pub probe_threads: u32,
 
@@ -162,7 +162,7 @@ pub struct RunSettings {
     #[arg(long = "no-compression-long", action = ArgAction::SetFalse)]
     pub compression_long: bool,
 
-    /// The zstd worker threads of each stream; 0 selects half the cores of
+    /// The zstd worker threads of each stream; 0 selects one per core of
     /// the host that compresses
     #[arg(long, value_name = "N", default_value_t = 0)]
     pub compression_threads: u32,
