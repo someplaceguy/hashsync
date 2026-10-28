@@ -141,7 +141,7 @@ The following keys are recognized, all optional:
 `candidate++_++attempts`::
   How many indexed blocks with a matching hash the receiver tries before rejecting a match, at least 1. All copies of an immutable root count as one. The default is 128.
 `hashlist++_++max++_++age`::
-  How long this host keeps unused cached hash lists, and the temporary files that `hashsync` leaves when it fails: a number of seconds, or a number followed by `s`, `m`, `h` or `d`, at least 1 second. A value below an hour gets a warning, since expiry could then remove the temporary files of a `hashsync` `ssh` that is still running. The default is `30d`.
+  How long this host keeps cached hash lists after the last transfer that used them, and the temporary files that `hashsync` leaves when it fails: a number of seconds, or a number followed by `s`, `m`, `h` or `d`, at least 1 second. A value below an hour gets a warning, since expiry could then remove the temporary files of a `hashsync` `ssh` that is still running. The default is `30d`.
 `index++_++path`::
   Directory of the index, a RocksDB database. The default is [.Pa]#~/.cache/hashsync/#`name`[.Pa]#.db# for the file `name`[.Pa]#.toml#.
 `roots`::

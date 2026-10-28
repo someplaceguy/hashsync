@@ -480,8 +480,8 @@ rejecting a match, at least 1.
 All copies of an immutable root count as one.
 The default is 128.
 .It Cm hashlist_max_age
-How long this host keeps unused cached hash lists, and the temporary files
-that
+How long this host keeps cached hash lists after the last transfer that used
+them, and the temporary files that
 .Nm
 leaves when it fails: a number of seconds, or a number followed by
 .Ql s ,
