@@ -1,0 +1,121 @@
+Send literal data in chunks of up to 8 MiB instead of 32 KiB
+
+For rsync 3.5.1. Apply it with "patch -p1" in the rsync source directory.
+
+rsync sends the file data that the receiver lacks in chunks of at most
+32 KiB, each preceded by its length. When rsync runs over hashsync ssh,
+these lengths split the file data in the stream every 32 KiB, and a block
+of the receiver's files that one of them splits doesn't match. Depending on
+how the data is aligned, that can be up to block_size / 32 KiB of the
+blocks, or half of them with hashsync's default 16 KiB blocks. With chunks
+of up to 8 MiB, almost every block matches.
+
+Only the rsync that sends the files needs the patch: the remote one in a
+pull, the local one in a push. The patch is backwards compatible, so the
+receiving rsync can be unpatched.
+
+The sender now reads up to 16 MiB ahead of --bwlimit, which makes rsync's
+growing-file test fail.
+
+diff --git a/fileio.c b/fileio.c
+index b8db29b857..24b03418f7 100644
+--- a/fileio.c
++++ b/fileio.c
+@@ -356,10 +356,12 @@
+ 	align_fudge = (int32)ALIGNED_OVERSHOOT(offset);
+ 	window_start = offset - align_fudge;
+ 	window_size = map->def_window_size;
+-	if (window_start + window_size > map->file_size)
+-		window_size = (int32)(map->file_size - window_start);
+ 	if (window_size < len + align_fudge)
+ 		window_size = ALIGNED_LENGTH(len + align_fudge);
++	/* Clamp after rounding up, so the rounding can't make us read past EOF
++	 * (which counts as a read error) when the caller didn't ask for that. */
++	if (window_start + window_size > map->file_size)
++		window_size = MAX((int32)(map->file_size - window_start), len + align_fudge);
+ 
+ 	/* make sure we have allocated enough memory for the window */
+ 	if (window_size > map->p_size) {
+diff --git a/io.c b/io.c
+index 2e2fccbd02..77a75720ba 100644
+--- a/io.c
++++ b/io.c
+@@ -1564,7 +1564,7 @@
+ 		return False;
+ 	}
+ 
+-	alloc_xbuf(&iobuf.out, ROUND_UP_1024(IO_BUFFER_SIZE * 2));
++	alloc_xbuf(&iobuf.out, ROUND_UP_1024(MAX(IO_BUFFER_SIZE, LITERAL_CHUNK_SIZE) * 2));
+ 	iobuf.out_fd = f_out;
+ 
+ 	return True;
+diff --git a/match.c b/match.c
+index 4fa3b8599c..1e231981fe 100644
+--- a/match.c
++++ b/match.c
+@@ -369,7 +369,7 @@
+ 		   match. The 3 reads are caused by the
+ 		   running match, the checksum update and the
+ 		   literal send. */
+-		if (backup >= s->blength+CHUNK_SIZE && end-offset > CHUNK_SIZE)
++		if (backup >= s->blength+LITERAL_CHUNK_SIZE && end-offset > CHUNK_SIZE)
+ 			matched(f, s, buf, offset - s->blength, -2);
+ 	} while (++offset < end);
+ 
+@@ -444,7 +444,7 @@
+ 	} else {
+ 		OFF_T j;
+ 		/* by doing this in pieces we avoid too many seeks */
+-		for (j = last_match + CHUNK_SIZE; j < len; j += CHUNK_SIZE)
++		for (j = last_match + LITERAL_CHUNK_SIZE; j < len; j += LITERAL_CHUNK_SIZE)
+ 			matched(f, s, buf, j, -2);
+ 		matched(f, s, buf, len, -1);
+ 	}
+diff --git a/rsync.h b/rsync.h
+index d90c061a5a..b02cc3737e 100644
+--- a/rsync.h
++++ b/rsync.h
+@@ -156,6 +156,14 @@
+ #define SPARSE_WRITE_SIZE (1024)
+ #define WRITE_SIZE (32*1024)
+ #define CHUNK_SIZE (32*1024)
++/* The longest run of literal data that is sent as one uncompressed token.
++ * write_buf() copies a token into the output buffer in one piece, so that
++ * buffer holds two of them, and it can become one MSG_DATA frame, whose
++ * length field has 24 bits. */
++#define LITERAL_CHUNK_SIZE (8*1024*1024)
++#if LITERAL_CHUNK_SIZE > (1 << 23)
++#error "LITERAL_CHUNK_SIZE must be at most 8 MiB"
++#endif
+ #define MAX_MAP_SIZE (256*1024)
+ #define IO_BUFFER_SIZE (32*1024)
+ #define MAX_BLOCK_SIZE ((int32)1 << 17)
+diff --git a/sender.c b/sender.c
+index 1ff6a1d632..6bd1d5bb19 100644
+--- a/sender.c
++++ b/sender.c
+@@ -755,7 +755,10 @@
+ 		}
+ 
+ 		if (st.st_size) {
+-			int32 read_size = MAX(s->blength * 3, MAX_MAP_SIZE);
++			/* hash_search() maps the pending literal data, which can
++			 * reach LITERAL_CHUNK_SIZE, together with the block it
++			 * is matching. */
++			int32 read_size = MAX(s->blength * 3, MAX_MAP_SIZE) + LITERAL_CHUNK_SIZE;
+ 			mbuf = map_file(fd, st.st_size, read_size, s->blength);
+ 		} else
+ 			mbuf = NULL;
+diff --git a/token.c b/token.c
+index b47a7852e8..843c3f1536 100644
+--- a/token.c
++++ b/token.c
+@@ -319,7 +319,7 @@
+ 	if (n > 0) {
+ 		int32 len = 0;
+ 		while (len < n) {
+-			int32 n1 = MIN(CHUNK_SIZE, n-len);
++			int32 n1 = MIN(LITERAL_CHUNK_SIZE, n-len);
+ 			write_int(f, n1);
+ 			write_buf(f, map_ptr(buf, offset+len, n1), n1);
+ 			len += n1;
