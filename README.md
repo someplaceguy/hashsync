@@ -17,7 +17,7 @@ version of a dump or a disk image.
 ```sh
 # Update the local copy of /srv/data from the host nas. Blocks that the
 # local copy already has are sent as references to it.
-hashsync ssh -n nas tar -C /srv/data -cf - . | tar -C /srv/data -xf -
+$ hashsync ssh -n nas tar -C /srv/data -cf - . | tar -C /srv/data -xf -
 ```
 
 hashsync isn't a backup tool with a storage format of its own: the commands
@@ -73,8 +73,6 @@ Only the receiver needs a configuration file and an index:
   hash list arrives. With `--wait`, it waits for the whole list instead,
   so that it sends the fewest bytes. Both hosts cache hash lists, so
   hashsync only sends what changed in the list since the last transfer.
-  Each stream is buffered in temporary files on both hosts, so a slow
-  reader doesn't hold up the command.
 - **Compressed.** What isn't deduplicated is compressed with zstd: by
   default at level 9, with long-distance matching and one thread per core.
 - **No daemon.** The server side is the same binary, which `hashsync ssh`
@@ -91,8 +89,8 @@ which finds it in its `PATH`, unless `--hashsync-path` says where it is.
 With Nix, from a checkout of this repository:
 
 ```sh
-nix-build          # builds result/bin/hashsync, and runs the tests
-nix-env -f . -i    # installs it, with its man page, into your profile
+$ nix-build          # builds result/bin/hashsync, and runs the tests
+$ nix-env -f . -i    # installs it, with its man page, into your profile
 ```
 
 On NixOS, you can add `(pkgs.callPackage /path/to/hashsync { })` to
@@ -102,9 +100,9 @@ A statically linked binary runs on any Linux host of its architecture, so
 you can copy it to a server without a hashsync package:
 
 ```sh
-nix-build --arg pkgs '(import <nixpkgs> {}).pkgsStatic'
-ssh nas mkdir -p bin && scp result/bin/hashsync nas:bin/
-rsync -a -e 'hashsync ssh --hashsync-path bin/hashsync' nas:/srv/data/ /srv/data/
+$ nix-build --arg pkgs '(import <nixpkgs> {}).pkgsStatic'
+$ ssh nas mkdir -p bin && scp result/bin/hashsync nas:bin/
+$ rsync -a -e 'hashsync ssh --hashsync-path bin/hashsync' nas:/srv/data/ /srv/data/
 ```
 
 For a cross build, for example for 64-bit ARM, pass
@@ -116,7 +114,7 @@ and C++ compilers for the bundled RocksDB, LZ4 and zstd, and libclang for
 RocksDB's bindings. RocksDB takes a while to build.
 
 ```sh
-cargo build --release --locked
+$ cargo build --release --locked
 ```
 
 Then copy `target/release/hashsync` to a directory in your `PATH`, and
@@ -138,8 +136,8 @@ build it too, but the first update of a large tree takes a while, and
 until it's done, hashsync has little to deduplicate against.
 
 ```sh
-hashsync update
-hashsync stats
+$ hashsync update
+$ hashsync stats
 ```
 
 hashsync now deduplicates the pull at the top of this page against
@@ -162,14 +160,14 @@ Pull a directory from `nas` over an older local copy, deduplicated against
 the local index:
 
 ```sh
-hashsync ssh -n nas tar -C /srv/data -cf - . | tar -C /srv/data -xf -
+$ hashsync ssh -n nas tar -C /srv/data -cf - . | tar -C /srv/data -xf -
 ```
 
 Push it the other way, deduplicated against the index of `nas`, whose own
 `~/.config/hashsync/default.toml` lists `/srv/data`:
 
 ```sh
-tar -C /srv/data -cf - . | hashsync ssh --dedup-stdin nas tar -C /srv/data -xf -
+$ tar -C /srv/data -cf - . | hashsync ssh --dedup-stdin nas tar -C /srv/data -xf -
 ```
 
 Since tar never waits for a reply, it's safe to add `--batch-stdout` to
@@ -313,13 +311,13 @@ during each copy.
 
 ```sh
 # Push the closure of ./result to the host server.
-extras/hashsync-copy-closure.sh --to server ./result
+$ extras/hashsync-copy-closure.sh --to server ./result
 
 # Pull the closure of a store path from the host builder.
-extras/hashsync-copy-closure.sh --from builder /nix/store/...-myapp-1.0
+$ extras/hashsync-copy-closure.sh --from builder /nix/store/...-myapp-1.0
 
 # Copy it from builder to server: server pulls it, with your SSH agent.
-extras/hashsync-copy-closure.sh --from builder --to server /nix/store/...-myapp-1.0
+$ extras/hashsync-copy-closure.sh --from builder --to server /nix/store/...-myapp-1.0
 ```
 
 In the last form, `builder` must accept a key from your SSH agent, and
@@ -332,14 +330,14 @@ no terminal to ask on.
 # Pull a new version of a disk image next to the old one, which the local
 # index covers, then replace it. A redirection to vm.img itself would empty
 # it before hashsync could use it.
-hashsync ssh -n nas cat /srv/images/vm.img > vm.img.new && mv vm.img.new vm.img
+$ hashsync ssh -n nas cat /srv/images/vm.img > vm.img.new && mv vm.img.new vm.img
 
 # Push it, deduplicated against the old version on nas.
-hashsync ssh --dedup-stdin nas 'cat > /srv/images/vm.img.new && mv /srv/images/vm.img.new /srv/images/vm.img' < vm.img
+$ hashsync ssh --dedup-stdin nas 'cat > /srv/images/vm.img.new && mv /srv/images/vm.img.new /srv/images/vm.img' < vm.img
 
 # Keep a database dump of every day, each deduplicated against the earlier
 # ones, with /backup/dumps in the local index.
-hashsync ssh -n db pg_dump mydb > /backup/dumps/mydb-$(date +%F).sql
+$ hashsync ssh -n db pg_dump mydb > /backup/dumps/mydb-$(date +%F).sql
 ```
 
 ## Quick reference
