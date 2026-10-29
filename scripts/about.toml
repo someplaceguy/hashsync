@@ -1,4 +1,4 @@
-# The configuration of cargo-about, which `scripts/release.sh` runs to
+# The configuration of cargo-about, which `scripts/notices.sh` runs to
 # generate THIRD-PARTY-NOTICES from `scripts/about.hbs`: the licenses of the
 # crates in the hashsync binary, and of the C and C++ libraries that some of
 # them bundle.
@@ -39,7 +39,7 @@ ignore = true
 # The crates below bundle C or C++ libraries whose licenses cargo-about
 # doesn't find on its own. A checksum covers each license text, so a new
 # version of a crate with different text makes cargo-about warn, which
-# stops `scripts/release.sh`, instead of keeping stale notices.
+# stops `scripts/notices.sh`, instead of keeping stale notices.
 
 # RocksDB, under the Apache-2.0 of its GPLv2 or Apache-2.0, which also
 # covers the crate's own MIT, Apache-2.0 or BSD-3-Clause code. Parts of

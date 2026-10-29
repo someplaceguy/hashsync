@@ -12,8 +12,6 @@
 # `scripts/about.hbs` adds by hand, for the Rust standard library and musl,
 # since cargo-about doesn't update them. With it, in order, the script:
 #
-# - regenerates THIRD-PARTY-NOTICES with cargo-about, from
-#   `scripts/about.toml` and `scripts/about.hbs`;
 # - sets VERSION as the version of the crate in Cargo.toml and Cargo.lock,
 #   which is also the version that `hashsync --version` prints;
 # - commits both with jj, as "Release VERSION";
@@ -25,6 +23,8 @@
 # The working copy must have no changes and no description, so that the
 # release commit holds only the changes of the script. The commits after
 # master must have descriptions, since `git push` publishes them as they are.
+# THIRD-PARTY-NOTICES must be up to date, which the script checks with
+# `scripts/notices.sh --check`.
 #
 # The tarball is reproducible: it depends only on the release commit and on
 # the versions of git and zstd, which come from nixpkgs through the
@@ -34,9 +34,8 @@
 #
 # To fix a release before publishing it, amend the release commit, which
 # the tag makes immutable in jj, and run the script again with the same
-# VERSION. If the release commit is still the parent of the working copy,
-# the script amends it with any new notices or Cargo.lock, rather than
-# committing them again. It then moves the tag and replaces the tarball.
+# VERSION. Since the version is already set, the script commits nothing; it
+# moves the tag to the amended commit and replaces the tarball.
 
 set -euo pipefail
 
@@ -104,28 +103,17 @@ git_dir=$(jj git root)
 [ ! -s "$git_dir/info/attributes" ] ||
 	fail "$git_dir/info/attributes could change the tarball; empty it first"
 
+step "checking THIRD-PARTY-NOTICES"
+scripts/notices.sh --check
+
 release_dir=$(realpath -m ../hashsync-releases)
 tarball=$release_dir/hashsync-$version.tar.zst
-
-tmp=$(mktemp -d)
-trap 'rm -rf "$tmp" "$tarball.part"' EXIT
-
-step "regenerating THIRD-PARTY-NOTICES"
-# cargo-about reads the license files of the crates from Cargo's cache.
-./shell.sh cargo fetch --locked
-# When a clarification in `scripts/about.toml` no longer matches its crate,
-# cargo-about only warns, and falls back to the license files that it finds
-# on its own, which leave out the C and C++ libraries that the crate
-# bundles. So any message from it stops the release.
-if ! ./shell.sh sh -c 'exec cargo about generate --frozen --fail -c scripts/about.toml -o "$1" scripts/about.hbs 2>"$2"' \
-	sh "$tmp/notices" "$tmp/about.log" ||
-	[ -s "$tmp/about.log" ]; then
-	cat "$tmp/about.log" >&2
-	fail "cargo about failed or warned; see its messages above"
-fi
-mv "$tmp/notices" THIRD-PARTY-NOTICES
+trap 'rm -f "$tarball.part"' EXIT
 
 step "setting the version to $version"
+# The cargo commands below run offline, and only see the crates in Cargo's
+# cache.
+./shell.sh cargo fetch --locked
 # The first version line of Cargo.toml is that of [package].
 sed -i "0,/^version = \".*\"\$/s//version = \"$version\"/" Cargo.toml
 ./shell.sh cargo update --workspace --offline
@@ -134,21 +122,10 @@ pkgid=$(./shell.sh cargo pkgid --locked --offline)
 [ "${pkgid##*[#@]}" = "$version" ] ||
 	fail "the crate has the package ID '$pkgid' instead of version $version"
 
-paths=(root-file:Cargo.toml root-file:Cargo.lock root-file:THIRD-PARTY-NOTICES)
+paths=(root-file:Cargo.toml root-file:Cargo.lock)
 if [ -n "$(jj diff --name-only -r @ "${paths[@]}")" ]; then
-	if [ "$(jj log -r @- --no-graph -T 'description.first_line()')" = "Release $version" ]; then
-		step "amending the release commit"
-		# The tag of an earlier run makes the commit immutable. jj leaves the
-		# tag on the old commit when the commit is amended, so it only points
-		# here if the commit wasn't, and the script sets it again below.
-		if [ -n "$(jj log -r "present($tag) & @-" --no-graph -T commit_id)" ]; then
-			jj tag delete "$tag"
-		fi
-		jj squash --use-destination-message --into @- "${paths[@]}"
-	else
-		step "committing the release"
-		jj commit -m "Release $version" "${paths[@]}"
-	fi
+	step "committing the release"
+	jj commit -m "Release $version" "${paths[@]}"
 fi
 
 release=$(jj log -r @- --no-graph -T commit_id)

@@ -88,9 +88,10 @@ rustPlatform.buildRustPackage {
     rustPlatform.bindgenHook
   ]
   ++ lib.optionals shell [
-    # `scripts/release.sh` generates THIRD-PARTY-NOTICES with cargo-about,
-    # and makes the release tarball with this git and zstd, so that the
-    # tarball depends on nixpkgs rather than on the tools of the host.
+    # `scripts/notices.sh` generates THIRD-PARTY-NOTICES with cargo-about,
+    # and `scripts/release.sh` makes the release tarball with this git and
+    # zstd, so that the tarball depends on nixpkgs rather than on the tools
+    # of the host.
     cargo-about
     clippy
     git

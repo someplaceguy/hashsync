@@ -15,8 +15,11 @@ change to the man page, a test rewrites it and fails once: run the tests again,
 and keep the new file with the change.
 
 `THIRD-PARTY-NOTICES` holds the licenses of the code that the binary bundles.
-`scripts/release.sh` regenerates it with cargo-about when it makes a release;
-don't edit it.
+Don't edit it: `scripts/notices.sh` regenerates it with cargo-about, from
+`scripts/about.toml` and `scripts/about.hbs`. Run the script after a change to
+either of them, and keep the regenerated file with the change.
+`scripts/release.sh` checks that the file is up to date, with
+`scripts/notices.sh --check`.
 
 When updating dependencies:
 
@@ -35,10 +38,10 @@ When updating dependencies:
   the top of `default.nix`. The native and static builds also run the tests
   and `install-check.sh`. The static build links the C++ runtime statically,
   which has caused link failures before.
-- Run the cargo-about command from `scripts/release.sh`, writing to a
-  temporary file. It should print nothing. If it complains, a license file
-  that `scripts/about.toml` pins by checksum has probably changed: check that
-  the license is still the same, then update the checksum.
+- Run `scripts/notices.sh`, and keep the regenerated `THIRD-PARTY-NOTICES`
+  with the update. If cargo-about complains, a license file that
+  `scripts/about.toml` pins by checksum has probably changed: check that the
+  license is still the same, update the checksum, and run the script again.
 
 The development shell is the package's derivation, so its output path changes
 with `Cargo.lock`. nixpkgs' bindgen hook puts a `-frandom-seed` derived from
