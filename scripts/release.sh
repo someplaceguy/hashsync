@@ -172,5 +172,5 @@ Then publish it:
 
 2. Create the GitHub release of $tag, and attach the tarball to it:
 
-       https://github.com/$github/releases/new?tag=$tag&title=hashsync+$version$prerelease
+       https://github.com/$github/releases/new?tag=$tag&title=v$version$prerelease
 EOF
