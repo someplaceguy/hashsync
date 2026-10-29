@@ -16,8 +16,10 @@
 {
   pkgs ? import <nixpkgs> {},
   shell ? false,
-  # The Cargo feature `mimalloc`: allocate through mimalloc.
-  mimalloc ? true,
+  # The Cargo feature `mimalloc`: allocate through mimalloc. The argument
+  # isn't called `mimalloc`, since `callPackage` would then pass the nixpkgs
+  # package of that name.
+  withMimalloc ? true,
 }:
 
 with pkgs;
@@ -25,9 +27,10 @@ with pkgs;
 let
   cargoToml = lib.importTOML ./Cargo.toml;
 
-  # Cargo's default features, without `mimalloc` when the argument is false.
+  # Cargo's default features, without `mimalloc` when `withMimalloc` is
+  # false.
   features =
-    if mimalloc then
+    if withMimalloc then
       cargoToml.features.default
     else
       lib.remove "mimalloc" cargoToml.features.default;
@@ -109,7 +112,7 @@ rustPlatform.buildRustPackage {
     runHook preInstallCheck
     bash install-check.sh \
       ${lib.optionalString stdenv.hostPlatform.isStatic "--static"} \
-      ${lib.optionalString mimalloc "--mimalloc"} \
+      ${lib.optionalString withMimalloc "--mimalloc"} \
       "$out"
     runHook postInstallCheck
   '';
