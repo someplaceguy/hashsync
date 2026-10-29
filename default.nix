@@ -1,3 +1,6 @@
+# Copyright 2026 Ricardo Correia
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
 # The hashsync package (DESIGN.md §11):
 #
 #     nix-build

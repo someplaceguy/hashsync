@@ -1,3 +1,6 @@
+// Copyright 2026 Ricardo Correia
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! How the process ends (DESIGN.md §6.9).
 //!
 //! Every end goes through this module: `die` after an external failure,

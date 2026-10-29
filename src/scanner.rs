@@ -1,3 +1,6 @@
+// Copyright 2026 Ricardo Correia
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! The sender's scanner (DESIGN.md §6.3): the single owner of the decisions
 //! about the frames of a deduplicated stream.
 //!

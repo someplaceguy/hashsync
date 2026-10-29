@@ -1,3 +1,6 @@
+// Copyright 2026 Ricardo Correia
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! `hashsync prune` through the binary (DESIGN.md §4.2 and §8): the roots
 //! and paths that it removes from the index without hashing, the roots
 //! that it looks into, and the compaction at its end, which `hashsync

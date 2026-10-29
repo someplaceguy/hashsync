@@ -1,3 +1,6 @@
+// Copyright 2026 Ricardo Correia
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! The keys and values of the index's column families (DESIGN.md §4.4).
 //!
 //! Integers are big endian, so the byte order of keys is their numeric

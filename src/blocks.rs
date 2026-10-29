@@ -1,3 +1,6 @@
+// Copyright 2026 Ricardo Correia
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Block selection and file hashing (DESIGN.md §4.1 and §4.5).
 
 use std::fmt;

@@ -1,3 +1,6 @@
+// Copyright 2026 Ricardo Correia
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! End-to-end `hashsync ssh` transfers (PLAN.md steps 3 to 6) over a fake
 //! `ssh` that executes the remote command string with a local `/bin/sh`,
 //! under a separate HOME for the server side. This exercises the real bootstrap

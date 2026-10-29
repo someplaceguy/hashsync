@@ -1,3 +1,6 @@
+// Copyright 2026 Ricardo Correia
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Amounts of bytes in summaries and statistics, and the block and list
 //! sizes in the tables of `bench` (DESIGN.md §8).
 //!

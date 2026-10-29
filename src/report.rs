@@ -1,3 +1,6 @@
+// Copyright 2026 Ricardo Correia
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! What the process reports on stderr (DESIGN.md §8): notes, which give
 //! progress and summaries, warnings, errors, and the server's panic
 //! reports. Each report is one line that starts with `hashsync: `, or on

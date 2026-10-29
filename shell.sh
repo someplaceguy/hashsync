@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+#
+# Copyright 2026 Ricardo Correia
+# SPDX-License-Identifier: GPL-3.0-or-later
 
 set -euo pipefail
 

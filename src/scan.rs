@@ -1,3 +1,6 @@
+// Copyright 2026 Ricardo Correia
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Traversal and hashing of the roots that an update scans (DESIGN.md §4.5
 //! and §4.6): every mutable root, and one copy of each unfinished immutable
 //! group.

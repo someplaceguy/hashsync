@@ -1,3 +1,6 @@
+// Copyright 2026 Ricardo Correia
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! `hashsync serve --token T` (DESIGN.md §3, §6): the server, which runs
 //! the command.
 //!

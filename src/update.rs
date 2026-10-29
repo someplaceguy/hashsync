@@ -1,3 +1,6 @@
+// Copyright 2026 Ricardo Correia
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! `hashsync update [--rebuild] [--scan-immutable] [--compact]` (DESIGN.md
 //! §4 and §8).
 

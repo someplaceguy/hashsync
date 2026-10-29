@@ -1,3 +1,6 @@
+// Copyright 2026 Ricardo Correia
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! The sender's in-memory membership table (DESIGN.md §5.5): open
 //! addressing over 32-bit fingerprints in a flat bucket array. Lookups can
 //! return false positives, never false negatives. The high 32 bits of each

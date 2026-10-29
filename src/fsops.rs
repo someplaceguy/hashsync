@@ -1,3 +1,6 @@
+// Copyright 2026 Ricardo Correia
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Descriptor-relative filesystem access (DESIGN.md §4.5).
 //!
 //! Entries are opened with `O_PATH|O_NOFOLLOW` for classification with

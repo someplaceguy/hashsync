@@ -1,3 +1,6 @@
+// Copyright 2026 Ricardo Correia
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Account identity and the hash-list cache (DESIGN.md §5.6).
 //!
 //! Full lists are immutable and named by content; account and index IDs

@@ -1,3 +1,6 @@
+// Copyright 2026 Ricardo Correia
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
 // The replaceable global allocation functions of C++ (`operator new` and
 // `operator delete` in <new>), defined through mimalloc by its header
 // `mimalloc-new-delete.h`. `build.rs` compiles this file into the

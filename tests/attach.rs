@@ -1,3 +1,6 @@
+// Copyright 2026 Ricardo Correia
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! `hashsync attach` driven directly through its standard streams, with
 //! the test in the place of `serve` on the rendezvous socket
 //! (DESIGN.md §6.1). No wait has a deadline: a regression hangs the test,

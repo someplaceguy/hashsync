@@ -1,3 +1,6 @@
+// Copyright 2026 Ricardo Correia
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! `hashsync ssh [OPTIONS] [-l USER] [USER@]HOST [--] COMMAND [ARGS...]`
 //! (DESIGN.md §3, §5.6, §6, §8): the client, which starts both SSH
 //! sessions, and has the user's stdin, stdout, and exit status.

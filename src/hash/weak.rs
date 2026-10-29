@@ -1,3 +1,6 @@
+// Copyright 2026 Ricardo Correia
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Weak hash: a mixed polynomial rolling hash modulo 2^64 (DESIGN.md §5.1).
 //!
 //! For a window `w[0..B)`, `P = sum(w[i] * a^(B-1-i))`, computed directly

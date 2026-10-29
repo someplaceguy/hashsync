@@ -1,3 +1,6 @@
+// Copyright 2026 Ricardo Correia
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Byte strings in text (DESIGN.md §7 and §8).
 //!
 //! Paths, file names and profile names can hold any byte but NUL, while

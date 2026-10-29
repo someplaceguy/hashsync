@@ -1,3 +1,6 @@
+// Copyright 2026 Ricardo Correia
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! The control session (DESIGN.md §6.2), on either host: one writer and one
 //! reader per host.
 //!

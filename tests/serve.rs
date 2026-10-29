@@ -1,3 +1,6 @@
+// Copyright 2026 Ricardo Correia
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! `hashsync serve` driven directly through its standard streams and its
 //! rendezvous socket, the way the client and `attach` drive it. In a pull,
 //! `serve` sends the command's stdout, the backward stream, deduplicated,

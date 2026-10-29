@@ -1,3 +1,6 @@
+// Copyright 2026 Ricardo Correia
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Persistent identities of filesystems and inodes (DESIGN.md §4.3).
 //!
 //! A filesystem is identified by its UUID from `FS_IOC_GETFSUUID`, or by

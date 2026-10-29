@@ -1,3 +1,6 @@
+// Copyright 2026 Ricardo Correia
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! The rendezvous socket between `serve` and `attach` (DESIGN.md §6.1).
 //!
 //! `serve` listens on `$XDG_RUNTIME_DIR/hashsync/T.sock`, falling back to

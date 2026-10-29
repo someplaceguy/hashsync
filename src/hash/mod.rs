@@ -1,3 +1,6 @@
+// Copyright 2026 Ricardo Correia
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Strong hashes (DESIGN.md §5.3) and the weak hash (§5.1–5.2).
 
 pub mod weak;

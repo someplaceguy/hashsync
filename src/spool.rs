@@ -1,3 +1,6 @@
+// Copyright 2026 Ricardo Correia
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Spools (DESIGN.md §6.5): pipes whose bytes wait in segments, so that
 //! the producer of the bytes waits for their consumer only at the limit of
 //! the spool.

@@ -1,3 +1,6 @@
+// Copyright 2026 Ricardo Correia
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Behavioral tests of immutable roots through the binary (DESIGN.md
 //! §4.2): their identifiers, the copies of a group, the reuse of a
 //! completed group without a scan, and the scans that complete a group or

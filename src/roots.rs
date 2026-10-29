@@ -1,3 +1,6 @@
+// Copyright 2026 Ricardo Correia
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Root expansion and validation (DESIGN.md §4.2).
 //!
 //! Root patterns are expanded by descriptor-relative walking that never

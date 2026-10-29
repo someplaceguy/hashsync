@@ -1,3 +1,6 @@
+// Copyright 2026 Ricardo Correia
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! The canonical hash-list encoding, the list ID (DESIGN.md §5.4), and
 //! direct deltas between lists (§5.6).
 //!

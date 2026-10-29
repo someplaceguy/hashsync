@@ -1,3 +1,6 @@
+// Copyright 2026 Ricardo Correia
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! The dedup block of a deduplicated stream (DESIGN.md §6.3 and §6.4): what
 //! such a stream adds to the blocks that every stream has, and the two
 //! roles that a host can play in it, from the start of the run to its end.

@@ -1,3 +1,6 @@
+// Copyright 2026 Ricardo Correia
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! The two ends of a stream (DESIGN.md §6.6), which both hosts build the
 //! same way, and the stop of a stream.
 //!

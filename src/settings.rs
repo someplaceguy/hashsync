@@ -1,3 +1,6 @@
+// Copyright 2026 Ricardo Correia
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! The settings of one run of `hashsync ssh` (DESIGN.md §7 and §8).
 //!
 //! Everything about a run is an option of `hashsync ssh` on the client.

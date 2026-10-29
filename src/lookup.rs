@@ -1,3 +1,6 @@
+// Copyright 2026 Ricardo Correia
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! The receiver's lookup workers (DESIGN.md §6.4): a pool that answers
 //! queries out of order, each worker with its own index reader.
 //!

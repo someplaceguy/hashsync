@@ -1,3 +1,6 @@
+// Copyright 2026 Ricardo Correia
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! The two SSH sessions and their command lines (DESIGN.md §6.1).
 //!
 //! The `--ssh` command is shell-split; the first word is the executable

@@ -1,3 +1,6 @@
+// Copyright 2026 Ricardo Correia
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! `hashsync bench` (DESIGN.md §8): how fast this host computes the hashes
 //! that deduplication uses, on one thread, and scans output for blocks, on
 //! one thread and on the probe threads.

@@ -1,3 +1,6 @@
+// Copyright 2026 Ricardo Correia
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Shared helpers for integration tests: a temporary environment with a
 //! configuration file, an index directory, and a tree to index; the
 //! frames of the protocol; and the processes that the tests start.

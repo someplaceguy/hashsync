@@ -1,3 +1,6 @@
+// Copyright 2026 Ricardo Correia
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! With the Cargo feature `mimalloc`, compile `src/cxx_allocation.cc`,
 //! which replaces the C++ allocation functions of the process with
 //! mimalloc's (DESIGN.md §9).

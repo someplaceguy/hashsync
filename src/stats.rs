@@ -1,3 +1,6 @@
+// Copyright 2026 Ricardo Correia
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! `hashsync stats` (DESIGN.md §8): a read-only report of the index.
 
 use std::ffi::OsStr;

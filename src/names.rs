@@ -1,3 +1,6 @@
+// Copyright 2026 Ricardo Correia
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! The names that this program makes: hexadecimal text, random bytes for
 //! identities, tokens and names, and the names of temporary files
 //! (DESIGN.md §11).

@@ -1,3 +1,6 @@
+// Copyright 2026 Ricardo Correia
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! `hashsync compact` (DESIGN.md §4.4 and §8): compact the index, as a
 //! prune does at its end, so that the entries that updates and prunes
 //! removed leave the database files. An update with `--compact` ends with

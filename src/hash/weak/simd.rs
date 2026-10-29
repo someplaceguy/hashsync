@@ -1,3 +1,6 @@
+// Copyright 2026 Ricardo Correia
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! The polynomial of a whole window, `P = sum(w[i] * a^(B-1-i))`, as dot
 //! products that vector instructions compute in parallel (DESIGN.md §5.1).
 //!

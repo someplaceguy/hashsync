@@ -1,3 +1,6 @@
+// Copyright 2026 Ricardo Correia
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! `hashsync` runs a remote command through SSH, as ssh does, and
 //! deduplicates one or both of its streams: the command's stdout, replacing
 //! blocks that the client already holds with verified local content, and

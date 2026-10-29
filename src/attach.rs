@@ -1,3 +1,6 @@
+// Copyright 2026 Ricardo Correia
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! `hashsync attach --token T` (DESIGN.md §6.1): the control-session
 //! relay between SSH and `serve`'s rendezvous socket.
 //!

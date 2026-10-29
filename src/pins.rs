@@ -1,3 +1,6 @@
+// Copyright 2026 Ricardo Correia
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! The receiver's pins (DESIGN.md §6.4): the verified blocks that yes
 //! answers promise, kept in extents of segments (DESIGN.md §6.5) until
 //! the output passes their query offsets.

@@ -1,3 +1,6 @@
+// Copyright 2026 Ricardo Correia
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Configuration (DESIGN.md §7).
 //!
 //! Each command reads one configuration file: the file of a profile, the

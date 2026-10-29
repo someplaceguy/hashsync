@@ -1,3 +1,6 @@
+// Copyright 2026 Ricardo Correia
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Glob matching on bytes with `gix-glob`'s raw `wildmatch` (DESIGN.md §4.2).
 //!
 //! Patterns are matched in pathname mode, case-sensitively, with leading

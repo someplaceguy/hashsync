@@ -1,3 +1,6 @@
+// Copyright 2026 Ricardo Correia
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! The receiver's index (DESIGN.md §4.4): a RocksDB database in one
 //! directory.
 //!

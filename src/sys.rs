@@ -1,3 +1,6 @@
+// Copyright 2026 Ricardo Correia
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Unsafe system-call, C-library, and CPU-instruction wrappers. This is the
 //! only module that may use unsafe code (DESIGN.md §11).
 //!

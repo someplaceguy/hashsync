@@ -1,3 +1,6 @@
+// Copyright 2026 Ricardo Correia
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! The list exchange of one deduplicated stream (DESIGN.md §5.6): its
 //! receiver hands its sender the hash list of its index, the target, in the
 //! cheapest form that both sides' list caches allow, and the sender

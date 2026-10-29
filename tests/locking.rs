@@ -1,3 +1,6 @@
+// Copyright 2026 Ricardo Correia
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Process exclusion of the index (DESIGN.md §4.4), tested with separate
 //! processes: this test process holds a lock on the index's lock file while
 //! the binary runs, as another `hashsync` process would. Its classic POSIX

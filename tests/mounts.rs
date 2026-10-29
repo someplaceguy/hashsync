@@ -1,3 +1,6 @@
+// Copyright 2026 Ricardo Correia
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Bind-mount cycles, aliases, `one_filesystem`, and a mount point as the
 //! rendezvous socket directory, tested in an unprivileged user and mount
 //! namespace. Skipped where `unshare -Urm` is not available.

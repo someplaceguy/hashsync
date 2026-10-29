@@ -1,3 +1,6 @@
+// Copyright 2026 Ricardo Correia
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! `hashsync prune [--scan-immutable]` (DESIGN.md §4.2 and §8): remove from
 //! the index what no current copy of a root holds any more, without hashing
 //! a file, then compact the database, as `hashsync compact` does.

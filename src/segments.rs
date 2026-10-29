@@ -1,3 +1,6 @@
+// Copyright 2026 Ricardo Correia
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Segments (DESIGN.md §6.5): open, unlinked files in the tmp_data
 //! directory, which hold the receiver's pins and the bytes of spools.
 //!

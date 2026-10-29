@@ -1,3 +1,6 @@
+// Copyright 2026 Ricardo Correia
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 //! Rayon pools that join their threads when they drop (DESIGN.md §3): the
 //! pools of the reconciliation and of prune (§4.2), of the scan (§4.6), and
 //! of the export (§5.4), and the sender's probe threads (§6.3). The owner of

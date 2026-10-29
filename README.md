@@ -467,6 +467,8 @@ asks the server not to keep it.
 
 ## Development
 
+hashsync is developed at <https://github.com/someplaceguy/hashsync>.
+
 `./shell.sh` enters a development shell with everything needed to build
 and test hashsync, and `./shell.sh cargo test` runs the tests in it.
 `nix-build` builds the package, runs the tests, and checks the installed
@@ -475,6 +477,8 @@ change the man page with it: the tests check that it documents each of
 them, and they regenerate `docs/hashsync.adoc` from it.
 
 ## License
+
+Copyright 2026 Ricardo Correia
 
 hashsync is licensed under the GNU General Public License, version 3 or
 any later version; see [`COPYING`](COPYING). Its binaries also contain
