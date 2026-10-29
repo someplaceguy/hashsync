@@ -14,11 +14,24 @@ has most of the data, even if not in the same place: renamed or moved
 files, a rebuilt package, the backup of a similar machine, or an older
 version of a dump or a disk image.
 
-```sh
-# Update the local copy of /srv/data from the host nas. Blocks that the
-# local copy already has are sent as references to it.
-$ hashsync ssh -n nas tar -C /srv/data -cf - . | tar -C /srv/data -xf -
+```console
+# Copy /srv/data/v2, a new version of /srv/data/v1, from the host nas.
+# Blocks that v1 already has are sent as references to it.
+$ hashsync ssh -n nas tar -C /srv/data -cf - v2 | tar -C /srv/data -xf -
+(...)
+hashsync: stdin -- 0 B --> 13 B wire (compressed)
+hashsync: stdout -- 5.25 GiB (472.28 MiB literal, 4.78 GiB -> 1.49 MiB refs, 448.00 KiB -> 42 B RLE, 0 false positives, 0 not found) + 1.09 MiB hashlist --> 422.64 MiB wire (deduplicated, compressed)
+hashsync: total -- sent 4.35 MiB and received 430.36 MiB in 238.2s (1.83 MiB/s), data shrinkage factor: 12.36, saved 4.82 GiB of data transfer
+
+# rsync, for comparison, only reuses the files of v1 with the same name:
+$ rsync -az -hh --info=stats1 --copy-dest=../v1 nas:/srv/data/v2/ /srv/data/v2/
+
+sent 1000.17K bytes  received 2.12G bytes  1.89M bytes/sec
+total size is 5.25G  speedup is 2.47
 ```
+
+Over a 2 MiB/s link, the copy took 19 minutes with rsync but only 4 minutes
+with hashsync.[^1]
 
 hashsync isn't a backup tool with a storage format of its own: the commands
 at both ends see exactly the bytes that they would see through `ssh`, and
@@ -477,3 +490,11 @@ third-party code under other licenses, which
 [`extras/hashsync-copy-closure.sh`](extras/hashsync-copy-closure.sh) is
 licensed under the Apache License 2.0 instead, so that you can adapt it
 freely; see [`extras/LICENSE-Apache-2.0`](extras/LICENSE-Apache-2.0).
+
+[^1]: v1 and v2 were the
+    [GPT-2 repository](https://huggingface.co/openai-community/gpt2) on
+    Hugging Face as of 2021-05-19 and 2024-02-19; v2 adds a safetensors
+    file and three ONNX files with the same weights as the older files.
+    Both hosts ran on one VM (24 vCPUs of an AMD Ryzen AI 9 HX 370, 16 GiB
+    of RAM), with hashsync 1.0.0, rsync 3.5.1 and OpenSSH over a link
+    limited to 2 MiB/s in each direction.
