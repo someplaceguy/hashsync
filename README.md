@@ -36,14 +36,6 @@ and checks it against a strong hash of the data in the stream, and if it's
 the same, the sender sends a reference to the block instead of the data.
 The receiver then puts the original stream back together.
 
-Only the receiver needs a configuration file and an index:
-
-| | Deduplicated stream | Receiver |
-|---|---|---|
-| Pull, the default | The command's standard output | The local host |
-| Push, with `--dedup-stdin` | The standard input of `hashsync ssh`, which it sends to the command | The remote host |
-| Both, with `--dedup-stdin --dedup-stdout` | Both | Each host, for the stream that it receives |
-
 ## Features
 
 - **Used like ssh.** `hashsync ssh host command` passes its standard input
