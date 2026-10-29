@@ -5,7 +5,7 @@ set -euo pipefail
 # Copy the closures of store paths from one host to another, like
 # nix-copy-closure. The source sends only the paths that the destination does
 # not have, and hashsync sends only the blocks that the destination does not
-# have in its files.
+# have in its Nix store.
 #
 # Without --from, this host pushes the paths to the destination with
 # hashsync; without --to, it pulls them from the source. With both, the
@@ -19,9 +19,9 @@ set -euo pipefail
 # trust the user (root, or a user in trusted-users in nix.conf), since the
 # paths come without signatures, as with nix-copy-closure.
 #
-# On the destination, hashsync uses the profile nix, whose roots should
-# include /nix/store. The source needs no profile. For example, in
-# ~/.config/hashsync/nix.toml:
+# This script uses a separate hashsync profile named nix, whose roots on the
+# destination should include /nix/store. The source needs no profile. For
+# example, in ~/.config/hashsync/nix.toml:
 #
 #     [[roots]]
 #     path = "/nix/store/*"
