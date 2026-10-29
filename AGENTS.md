@@ -5,9 +5,10 @@ docs/PLAN.md contains the implementation plan for the project.
 `default.nix` builds the package (`nix-build default.nix`). `shell.sh` enters the
 development shell, or runs one command in it: `./shell.sh cargo test`.
 
-`docs/hashsync.1` is the man page, in mdoc. Change it along with the commands,
-options, and configuration keys that it describes; tests check that each of
-them has an entry there, and that no other entry does.
+`docs/hashsync.1` is the man page, in mdoc. Change it and `README.md` along
+with the commands, options, and configuration keys that they describe; tests
+check that each of them has an entry in the man page, and that no other entry
+does.
 
 `docs/hashsync.adoc` is generated from the man page; don't edit it. After a
 change to the man page, a test rewrites it and fails once: run the tests again,
