@@ -378,7 +378,7 @@ profile `default`. `--config PATH` selects a configuration file anywhere.
 | `--hashsync-path PATH` | hashsync on the server, if it isn't in the `PATH` there |
 | `--ssh COMMAND` | The SSH command, `ssh` by default |
 
-The man page describes the others.
+[The man page](docs/hashsync.adoc) describes the others.
 
 ### Configuration
 
@@ -455,11 +455,10 @@ asks the server not to keep it.
 
 ## Documentation
 
-- The man page, [`docs/hashsync.1`](docs/hashsync.1), describes every
+- [The man page](docs/hashsync.adoc), `docs/hashsync.1`, describes every
   command, option and configuration key: `man hashsync` once hashsync is
   installed, or `man -l docs/hashsync.1` in a checkout.
-  [`docs/hashsync.adoc`](docs/hashsync.adoc) has the same contents, for
-  reading on the web.
+  `docs/hashsync.adoc` has the same contents, for reading on the web.
 - [`docs/DESIGN.md`](docs/DESIGN.md) describes the design and the protocol
   in detail, with the alternatives that were considered.
 - [`docs/PLAN.md`](docs/PLAN.md) is the implementation plan, with its
