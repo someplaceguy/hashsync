@@ -14,8 +14,10 @@ Only the rsync that sends the files needs the patch: the remote one in a
 pull, the local one in a push. The patch is backwards compatible, so the
 receiving rsync can be unpatched.
 
-The sender now reads up to 16 MiB ahead of --bwlimit, which makes rsync's
-growing-file test fail.
+The sender now buffers up to 16 MiB of output, and reads up to 24 MiB of a
+file ahead of what it has sent. With --bwlimit, it sends the buffered data
+of the earlier files before it opens the next one, so that it doesn't read
+a file long before it sends it (rsync's growing-file test checks this).
 
 diff --git a/fileio.c b/fileio.c
 index b8db29b857..24b03418f7 100644
@@ -91,10 +93,32 @@ index d90c061a5a..b02cc3737e 100644
  #define IO_BUFFER_SIZE (32*1024)
  #define MAX_BLOCK_SIZE ((int32)1 << 17)
 diff --git a/sender.c b/sender.c
-index 1ff6a1d632..6bd1d5bb19 100644
+index 1ff6a1d632..925dbdb61a 100644
 --- a/sender.c
 +++ b/sender.c
-@@ -755,7 +755,10 @@
+@@ -55,6 +55,7 @@
+ extern char *module_dir;
+ extern int module_dirfd;
+ extern int write_batch;
++extern size_t bwlimit_writemax;
+ extern int file_old_total;
+ extern char *files_from;
+ extern BOOL want_progress_now;
+@@ -648,6 +649,13 @@
+ 			exit_cleanup(RERR_PROTOCOL);
+ 		}
+ 
++		/* With --bwlimit, the output buffer can hold the data of the
++		 * earlier files for a long time.  Send it before opening this
++		 * file, so that the file is read when its own data is about to
++		 * be sent rather than long before. */
++		if (bwlimit_writemax)
++			io_flush(FULL_FLUSH);
++
+ 		if (symlink_optout_allowed()) {
+ 			/* Module opted out of symlink confinement ("insecure links =
+ 			 * yes", admin-only) -- or a non-daemon --insecure-links: legacy
+@@ -755,7 +763,10 @@
  		}
  
  		if (st.st_size) {
