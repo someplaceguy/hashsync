@@ -85,8 +85,14 @@ rustPlatform.buildRustPackage {
     rustPlatform.bindgenHook
   ]
   ++ lib.optionals shell [
+    # `scripts/release.sh` generates THIRD-PARTY-NOTICES with cargo-about,
+    # and makes the release tarball with this git and zstd, so that the
+    # tarball depends on nixpkgs rather than on the tools of the host.
+    cargo-about
     clippy
+    git
     rustfmt
+    zstd
   ];
 
   doCheck = canRun;
@@ -99,8 +105,11 @@ rustPlatform.buildRustPackage {
     rsync
   ];
 
+  # The licenses of the bundled code require their notices to come with the
+  # binary.
   postInstall = ''
     installManPage docs/hashsync.1
+    install -Dm644 -t $out/share/doc/hashsync COPYING THIRD-PARTY-NOTICES
   '';
 
   # `install-check.sh` checks the binary as installed, after the fixup that

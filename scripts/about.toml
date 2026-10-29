@@ -1,0 +1,112 @@
+# The configuration of cargo-about, which `scripts/release.sh` runs to
+# generate THIRD-PARTY-NOTICES from `scripts/about.hbs`: the licenses of the
+# crates in the hashsync binary, and of the C and C++ libraries that some of
+# them bundle.
+
+# The licenses that can satisfy a crate's license expression, in order of
+# preference. Each is compatible with the GPL-3.0-or-later of hashsync.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "Unlicense",
+]
+
+# hashsync only runs on Linux.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "x86_64-unknown-linux-gnux32",
+    "i686-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-unknown-linux-musl",
+]
+
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+
+# Leave out hashsync itself, whose license is in COPYING: cargo-about skips
+# the crates with `publish = false`.
+[private]
+ignore = true
+
+# The crates below bundle C or C++ libraries whose licenses cargo-about
+# doesn't find on its own. A checksum covers each license text, so a new
+# version of a crate with different text makes cargo-about warn, which
+# stops `scripts/release.sh`, instead of keeping stale notices.
+
+# RocksDB, under the Apache-2.0 of its GPLv2 or Apache-2.0, which also
+# covers the crate's own MIT, Apache-2.0 or BSD-3-Clause code. Parts of
+# RocksDB come from LevelDB, and its xxHash headers have their own license.
+[librocksdb-sys.clarify]
+license = "Apache-2.0 AND BSD-3-Clause AND BSD-2-Clause"
+
+[[librocksdb-sys.clarify.files]]
+path = "rocksdb/LICENSE.Apache"
+license = "Apache-2.0"
+checksum = "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+
+[[librocksdb-sys.clarify.files]]
+path = "rocksdb/LICENSE.leveldb"
+license = "BSD-3-Clause"
+checksum = "b568f1f37a5a1d37a3e981e7c8b7fc4856ca33b2ca0a45bc8e847aaaf7afe485"
+
+[[librocksdb-sys.clarify.files]]
+path = "rocksdb/util/xxhash.h"
+license = "BSD-2-Clause"
+checksum = "1d3d1a6d2ce8312daa47e5c76669976792de4364e19738d968db5e4acb0bf3d0"
+start = " * xxHash - Extremely Fast Hash algorithm"
+end = " * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE."
+
+[[librocksdb-sys.clarify.files]]
+path = "rocksdb/util/xxph3.h"
+license = "BSD-2-Clause"
+checksum = "95549472283a4e45e868376df620f1b330df058c633191d5e1e84fa2a08b5dd6"
+start = "   xxHash - Extremely Fast Hash algorithm"
+end = "   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE."
+
+# LZ4: the crate's own code is MIT, and the library BSD-2-Clause.
+[lz4-sys.clarify]
+license = "MIT AND BSD-2-Clause"
+
+[[lz4-sys.clarify.files]]
+path = "LICENSE"
+license = "MIT"
+checksum = "77633124ac69bf094e06cf9f3157c54d6e51d6b58a38d4f28141947815ecadfa"
+
+[[lz4-sys.clarify.files]]
+path = "liblz4/lib/LICENSE"
+license = "BSD-2-Clause"
+checksum = "8b58c446121a109ccf32edc094bba3010a3d85e4ee3702950db55e4d3e87736c"
+
+# Zstandard, under the BSD-3-Clause of its BSD-3-Clause or GPLv2, like the
+# crate's own code.
+[zstd-sys.clarify]
+license = "BSD-3-Clause"
+
+[[zstd-sys.clarify.files]]
+path = "LICENSE"
+checksum = "ce4868c8e4ebe47a7d4b3c93dbf6b802033e5ae2fa7638098173f80836daac60"
+
+[[zstd-sys.clarify.files]]
+path = "zstd/LICENSE"
+checksum = "7055266497633c9025b777c78eb7235af13922117480ed5c674677adc381c9d8"
+
+# mimalloc version 3, which the crate builds unless its `v2` feature is on.
+# The library and the crate's own code are both MIT.
+[libmimalloc-sys.clarify]
+license = "MIT"
+
+[[libmimalloc-sys.clarify.files]]
+path = "LICENSE.txt"
+checksum = "a08554fab028af3af047e8588d32d019662c1b1bf07959a195a2f75fe340726b"
+
+[[libmimalloc-sys.clarify.files]]
+path = "c_src/mimalloc/v3/LICENSE"
+checksum = "82ade5d7d9b029044b5fbbc326207fc47c2d44ee4dd71e8a559c36d728217de9"

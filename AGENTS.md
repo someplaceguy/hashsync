@@ -12,3 +12,7 @@ them has an entry there, and that no other entry does.
 `docs/hashsync.adoc` is generated from the man page; don't edit it. After a
 change to the man page, a test rewrites it and fails once: run the tests again,
 and keep the new file with the change.
+
+`THIRD-PARTY-NOTICES` holds the licenses of the code that the binary bundles.
+`scripts/release.sh` regenerates it with cargo-about when it makes a release;
+don't edit it.
