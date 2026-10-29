@@ -19,6 +19,9 @@ file ahead of what it has sent. With --bwlimit, it sends the buffered data
 of the earlier files before it opens the next one, so that it doesn't read
 a file long before it sends it (rsync's growing-file test checks this).
 
+Like rsync, this patch is licensed under the GNU General Public License,
+version 3 or any later version.
+
 diff --git a/fileio.c b/fileio.c
 index b8db29b857..24b03418f7 100644
 --- a/fileio.c

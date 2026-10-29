@@ -119,6 +119,7 @@ rustPlatform.buildRustPackage {
 
   meta = {
     description = "Run a command through SSH, deduplicating its stdout or its stdin against indexed blocks";
+    license = lib.getLicenseFromSpdxId cargoToml.package.license;
     mainProgram = "hashsync";
     platforms = lib.platforms.linux;
   };
