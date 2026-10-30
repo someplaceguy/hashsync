@@ -7,7 +7,7 @@
 #![allow(dead_code)]
 
 use std::ffi::OsStr;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -16,7 +16,8 @@ use std::time::Duration;
 
 use rocksdb::{ColumnFamily, DB, IteratorMode, Options, WriteBatch};
 use rustix::event::{PollFd, PollFlags, poll};
-use rustix::io::retry_on_intr;
+use rustix::fs::{Mode, OFlags};
+use rustix::io::{Errno, retry_on_intr};
 use tempfile::TempDir;
 
 pub const BLOCK: usize = 4096;
@@ -78,6 +79,26 @@ impl Env {
 
     pub fn mkdir(&self, rel: impl AsRef<Path>) {
         std::fs::create_dir_all(self.path(rel)).unwrap();
+    }
+
+    /// Write `data` to the file at `rel`, as `write` does, but for a path
+    /// that may be longer than the kernel takes in one call: each directory
+    /// is created and opened beneath its parent's descriptor, one name at a
+    /// time, as a scan opens them.
+    pub fn write_long(&self, rel: &str, data: &[u8]) {
+        let flags = OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC;
+        let mut dir = rustix::fs::open(self.dir.path(), flags, Mode::empty()).unwrap();
+        let (dirs, file) = rel.rsplit_once('/').unwrap();
+        for name in dirs.split('/') {
+            match rustix::fs::mkdirat(&dir, name, Mode::from_raw_mode(0o755)) {
+                Ok(()) | Err(Errno::EXIST) => {}
+                Err(e) => panic!("mkdir {name}: {e}"),
+            }
+            dir = rustix::fs::openat(&dir, name, flags, Mode::empty()).unwrap();
+        }
+        let flags = OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC | OFlags::CLOEXEC;
+        let file = rustix::fs::openat(&dir, file, flags, Mode::from_raw_mode(0o644)).unwrap();
+        std::fs::File::from(file).write_all(data).unwrap();
     }
 
     /// `hashsync --config CONFIG ARGS...` with the configuration file of this
@@ -781,6 +802,13 @@ pub fn tiled(count: usize, seed: u64) -> Vec<u8> {
         block[..8].copy_from_slice(&(block_no as u64).to_le_bytes());
     }
     data
+}
+
+/// A relative path of 17 directories, one inside the other, each with a
+/// name of 255 bytes, the longest that Linux filesystems take. The path is
+/// longer than the 4095 bytes that the kernel takes in one call.
+pub fn long_dirs() -> String {
+    vec!["d".repeat(255); 17].join("/")
 }
 
 /// Bytes repeating a 16-byte pattern: periodic, never indexed.

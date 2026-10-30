@@ -297,6 +297,38 @@ fn a_path_that_cannot_be_looked_up_goes() {
     );
 }
 
+/// A scan opens one name at a time, so it indexes files at paths longer
+/// than the 4095 bytes that the kernel takes in one call. Prune looks such
+/// a path up in pieces, so its file stays without a warning, in a mutable
+/// root and in a completed group, and goes once it is gone (DESIGN.md
+/// §4.2).
+#[test]
+fn files_at_paths_longer_than_the_kernel_takes_in_one_call_stay() {
+    let env = Env::new();
+    let rel = format!("{}/f", long_dirs());
+    env.write_long(&format!("tree/{rel}"), &random(BLOCK, 1));
+    env.write_long(&format!("group/{rel}"), &random(BLOCK, 2));
+    env.configure(&format!(
+        "{}{}",
+        env.root("tree", ""),
+        env.root("group", "immutable = true")
+    ));
+    env.update();
+    assert_eq!(indexed(&env), [pair("group", &rel), pair("tree", &rel)]);
+
+    let stderr = prune(&env, &["--scan-immutable"]);
+    assert!(warnings(&stderr).is_empty(), "{stderr}");
+    assert!(!stderr.contains("immutable roots"), "{stderr}");
+    assert_eq!(pruned(&stderr), [0, 0, 0], "{stderr}");
+
+    let top = rel.split('/').next().unwrap();
+    std::fs::rename(env.path(format!("tree/{top}")), env.path("moved")).unwrap();
+    let stderr = prune(&env, &[]);
+    assert!(warnings(&stderr).is_empty(), "{stderr}");
+    assert_eq!(pruned(&stderr), [0, 1, 1], "{stderr}");
+    assert_eq!(indexed(&env), [pair("group", &rel)]);
+}
+
 /// A copy can vanish after root resolution. Prune then finds it missing
 /// when it looks into its root, and gives the warning that root resolution
 /// would have given, unless the copy may vanish, as the scan of an update

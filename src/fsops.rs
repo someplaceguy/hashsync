@@ -24,6 +24,10 @@ use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
 /// Flags for the initial open of any entry.
 pub const PATH_FLAGS: OFlags = OFlags::PATH.union(OFlags::NOFOLLOW).union(OFlags::CLOEXEC);
 
+/// The longest path that the kernel takes in one call: `PATH_MAX` counts
+/// the terminating NUL.
+const LONGEST_PATH: usize = libc::PATH_MAX as usize - 1;
+
 /// The metadata used by traversal and hashing.
 #[derive(Clone, Copy, Debug)]
 pub struct Meta {
@@ -61,12 +65,47 @@ pub fn open_path(dir: BorrowedFd<'_>, name: &[u8]) -> Result<OwnedFd, Errno> {
 /// descriptor of the link itself. With `same_mount`, the path must not
 /// cross a mount point either, including at a bind-mounted file, and the
 /// open fails with `EXDEV` where it would.
+///
+/// A scan opens one name at a time, so the index can hold paths longer
+/// than `LONGEST_PATH`, which the kernel rejects in a single call. Such a
+/// path is opened in pieces, each beneath the directory where the previous
+/// piece ends. It fails as a shorter path would, at the same name and with
+/// the same error, unless it has a `..` or an empty name, which no indexed
+/// path has. A name of more than 4093 bytes does not fit in a piece, so
+/// the open fails with `ENAMETOOLONG` at such a name if another name
+/// follows it, even on a filesystem that takes it, as FUSE can. The pieces
+/// can end outside `dir`, though, if a directory on the path moves out of
+/// `dir` between two of them, as can happen during a scan.
 pub fn open_beneath(dir: BorrowedFd<'_>, rel: &[u8], same_mount: bool) -> Result<OwnedFd, Errno> {
     let mut resolve = ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS;
     if same_mount {
         resolve |= ResolveFlags::NO_XDEV;
     }
-    retry_on_intr(|| rustix::fs::openat2(dir, rel, PATH_FLAGS, Mode::empty(), resolve))
+    let open = |dir: BorrowedFd<'_>, rel: &[u8]| {
+        retry_on_intr(|| rustix::fs::openat2(dir, rel, PATH_FLAGS, Mode::empty(), resolve))
+    };
+    // The directory where the pieces opened so far end.
+    let mut reached: Option<OwnedFd> = None;
+    let mut rest = rel;
+    while rest.len() > LONGEST_PATH {
+        // Each piece ends with `/.`, so that the kernel resolves the last
+        // name of the piece as a name in the middle of a path: a symlink
+        // there fails with `ELOOP`, and anything but a directory with
+        // `ENOTDIR`. With a `/` alone, that name would still be the last
+        // one, and the kernel checks a symlink there against
+        // `fs.protected_symlinks` before `RESOLVE_NO_SYMLINKS`, so the open
+        // could fail with `EACCES` instead.
+        let Some(slash) = rest[..LONGEST_PATH - 1].iter().rposition(|&b| b == b'/') else {
+            // The next name does not fit in a piece with the `/.` after it.
+            // Most filesystems reject a name that long with this error.
+            return Err(Errno::NAMETOOLONG);
+        };
+        let (piece, tail) = rest.split_at(slash + 1);
+        let piece = [piece, b"."].concat();
+        reached = Some(open(reached.as_ref().map_or(dir, AsFd::as_fd), &piece)?);
+        rest = tail;
+    }
+    open(reached.as_ref().map_or(dir, AsFd::as_fd), rest)
 }
 
 /// Reopen the object behind an `O_PATH` descriptor for I/O.
@@ -420,6 +459,57 @@ mod tests {
         for escape in [&b"../outside"[..], b"sub/../../outside", b"/etc/passwd"] {
             assert!(kind(escape).is_err(), "{}", String::from_utf8_lossy(escape));
         }
+    }
+
+    #[test]
+    fn open_beneath_opens_long_paths_in_pieces() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("root")).unwrap();
+        std::fs::write(dir.path().join("outside"), b"secret").unwrap();
+        let root = rustix::fs::open(
+            dir.path().join("root").as_path(),
+            PATH_FLAGS | OFlags::DIRECTORY,
+            Mode::empty(),
+        )
+        .unwrap();
+        // A chain of 33 directories with names of 255 bytes, the longest
+        // that Linux filesystems take, and a file at its end. Each 16 names
+        // of the path take 4096 bytes with their `/`, one byte more than
+        // `LONGEST_PATH`, so a piece that ended at the 16th `/` would be too
+        // long, and the path needs three pieces. A symlink beside the 15th
+        // directory ends the first piece, and one beside the 16th starts the
+        // second.
+        let name = [b'd'; 255];
+        let link = [b'l'; 255];
+        let mut chain = open_path(root.as_fd(), b".").unwrap();
+        for depth in 0..33 {
+            rustix::fs::mkdirat(&chain, &name[..], Mode::from_raw_mode(0o755)).unwrap();
+            if depth == 14 || depth == 15 {
+                rustix::fs::symlinkat(&name[..], &chain, &link[..]).unwrap();
+            }
+            chain = open_path(chain.as_fd(), &name).unwrap();
+        }
+        let flags = OFlags::WRONLY | OFlags::CREATE | OFlags::CLOEXEC;
+        rustix::fs::openat(&chain, "f", flags, Mode::from_raw_mode(0o644)).unwrap();
+
+        let kind =
+            |rel: &[u8]| stat(open_beneath(root.as_fd(), rel, false)?.as_fd()).map(|m| m.kind);
+        let mut names = vec![&name[..]; 33];
+        names.push(b"f");
+        assert_eq!(kind(&names.join(&b'/')), Ok(FileType::RegularFile));
+        // A symlink fails as in a short path, at the end of a piece too.
+        for depth in [14, 15] {
+            let mut names = names.clone();
+            names[depth] = &link;
+            assert_eq!(kind(&names.join(&b'/')), Err(Errno::LOOP), "{depth}");
+        }
+        // A `..` cannot climb above the directory where its piece starts:
+        // the second of these 17 fails, before they reach `outside` beside
+        // the root.
+        let (prefix, up) = (names[..16].join(&b'/'), b"../".repeat(17));
+        let escape: [&[u8]; 4] = [&prefix, b"/", &up, b"outside"];
+        assert_eq!(kind(&escape.concat()), Err(Errno::XDEV));
+        assert_eq!(kind(&[b'x'; LONGEST_PATH + 1]), Err(Errno::NAMETOOLONG));
     }
 
     /// The state of the thread `tid` of this process, as `/proc` shows it,

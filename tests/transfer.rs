@@ -36,8 +36,8 @@ use std::time::Duration;
 use common::{
     ANSWER, BLOCK, CHUNK, END, Env, FEATURES, HASHDELTA, HASHLIST, HASHNONE, HELLO, IndexView,
     KillOnDrop, LIT, QUERY, REQUEST, Root, STOP, STREAM_END, exclusive_lock, frame, hello_payload,
-    ofd_lock, proc_state, quoted, random, shared_lock, skip_as_root, tiled, toml_literal,
-    try_recv_frame, version_and_features, wait_for_lock_wait, wait_until_asleep,
+    long_dirs, ofd_lock, proc_state, quoted, random, shared_lock, skip_as_root, tiled,
+    toml_literal, try_recv_frame, version_and_features, wait_for_lock_wait, wait_until_asleep,
 };
 use rocksdb::WriteBatch;
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
@@ -1097,6 +1097,29 @@ fn stale_and_unreadable_candidates_are_misses() {
         let line = deduplicated(&output);
         assert_eq!(line.bytes, [8 * BLOCK, 8 * BLOCK, 0, 0], "{direction:?}");
         assert_eq!(line.misses, [0, 8], "{direction:?}");
+    }
+}
+
+#[test]
+fn candidates_at_paths_longer_than_the_kernel_takes_in_one_call_are_read() {
+    // A scan opens one name at a time, so it indexes a file at a path
+    // longer than the 4095 bytes that the kernel takes in one call. A
+    // candidate read looks the path up in pieces, so every block of the
+    // file becomes a reference (DESIGN.md §6.4).
+    for direction in DIRECTIONS {
+        let transfer = Transfer::new(&[]);
+        transfer.configure_receiver(direction, "");
+        let blocks = tiled(8, 13);
+        let indexed = transfer.indexed(direction, &format!("{}/file", long_dirs()));
+        transfer.env.write_long(&indexed, &blocks);
+        let payload = transfer.env.path("payload");
+        std::fs::write(&payload, &blocks).unwrap();
+        let script = format!("cat '{}'", payload.display());
+        let output = succeeded(transfer.run_stream(direction, &direction.counted(), &script));
+        assert!(output.stdout == blocks, "{direction:?}: the output differs");
+        let line = deduplicated(&output);
+        assert_eq!(line.bytes, [8 * BLOCK, 0, 8 * BLOCK, 0], "{direction:?}");
+        assert_eq!(line.misses, [0, 0], "{direction:?}");
     }
 }
 

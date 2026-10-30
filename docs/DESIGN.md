@@ -1752,7 +1752,10 @@ For `QUERY { offset: x, strong: h }`:
    also uses one; stale rows must not evade the budget.
 4. Open a single-file root directly. Otherwise open its root directory and
    resolve the relative path beneath it without symlinks (`openat2` with
-   `RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS`). Use the `O_PATH` classification
+   `RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS`). A scan opens one name at a time,
+   so it can index a path longer than the kernel takes in one call (4095
+   bytes). Such a path is resolved in pieces, each beneath the directory
+   where the previous piece ends. Use the `O_PATH` classification
    and procfs reopening rules of section 4.5: check that the opened object
    is a regular file before obtaining its readable descriptor. Close
    descriptors before trying the next location.
@@ -3576,7 +3579,9 @@ decision history, including fuller measurements, is in version control.
     I/O; symlinks and cycles during root expansion; directory cycles and
     aliases in either traversal order; root replacement between expansion
     and scanning; links found before and after their owner's row commits;
-    hard links within and across roots, also to a single-file root;
+    hard links within and across roots, also to a single-file root; paths
+    longer than the kernel takes in one call, in prune and in candidate
+    reads;
   - immutable reuse after root-directory identity changes; a missing root
     of a pattern without wildcards, and one that cannot be looked up,
     which are no copies of their groups, and a completed group whose
