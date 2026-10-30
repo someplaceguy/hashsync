@@ -18,21 +18,21 @@ version of a dump or a disk image.
 # Copy /srv/data/v2, a new version of /srv/data/v1, from the host nas.
 # Blocks that v1 already has are sent as references to it.
 
-$ hashsync ssh -n nas tar -C /srv/data -cf - v2 | tar -C /srv/data -xf -
+$ rsync -a --copy-dest=../v1 -e 'hashsync ssh' nas:/srv/data/v2/ /srv/data/v2/
 (...)
-hashsync: stdin -- 0 B --> 13 B wire (compressed)
-hashsync: stdout -- 5.25 GiB (472.28 MiB literal, 4.78 GiB -> 1.49 MiB refs, 448.00 KiB -> 42 B RLE, 0 false positives, 0 not found) + 1.09 MiB hashlist --> 422.64 MiB wire (deduplicated, compressed)
-hashsync: total -- sent 4.35 MiB and received 430.36 MiB in 238.2s (1.83 MiB/s), data shrinkage factor: 12.36, saved 4.82 GiB of data transfer
+hashsync: stdin -- 1000.21 KiB --> 998.97 KiB wire, pipe closed, 0 B dropped, 1000.21 KiB written (compressed)
+hashsync: stdout -- 2.34 GiB (458.11 MiB literal, 1.89 GiB -> 606.25 KiB refs, 0 B -> 0 B RLE, 0 false positives, 0 not found) + 1.09 MiB hashlist --> 414.96 MiB wire (deduplicated, compressed)
+hashsync: total -- sent 3.14 MiB and received 416.47 MiB in 242.5s (1.73 MiB/s), data shrinkage factor: 5.72, saved 1.93 GiB of data transfer
 
-# rsync, for comparison, only reuses the files of v1 with the same name:
+# Without hashsync, rsync only reuses the files of v1 with the same name:
 
 $ rsync -az -hh --info=stats1 --copy-dest=../v1 nas:/srv/data/v2/ /srv/data/v2/
 sent 1000.17K bytes  received 2.12G bytes  1.89M bytes/sec
 total size is 5.25G  speedup is 2.47
 ```
 
-Over a 2 MiB/s link, the copy took 19 minutes with rsync but only 4 minutes
-with hashsync.[^1]
+Over a 2 MiB/s link, the copy took 19 minutes with rsync alone but only 4
+minutes with hashsync.[^1]
 
 hashsync isn't a backup tool with a storage format of its own: the commands
 at both ends see exactly the bytes that they would see through `ssh`, and
@@ -147,11 +147,9 @@ $ hashsync stats
 ```
 
 hashsync now deduplicates the pull at the top of this page against
-`/srv/data`. There, `-n` gives the command an empty standard input, like
-`ssh -n`, so that hashsync doesn't read your terminal. At the end,
-`hashsync ssh` prints a summary of what each stream read, sent and
-deduplicated, and of the total traffic; `-q` leaves out the summary and the
-other notes.
+`/srv/data`. At the end, `hashsync ssh` prints a summary of what each
+stream read, sent and deduplicated, and of the total traffic; `-q` leaves
+out the summary and the other notes.
 
 If little was deduplicated, hashsync may have sent much of the stream
 before the hash list arrived, which happens on a fast network or when the
@@ -163,7 +161,8 @@ list first.
 ### Copying directories with tar
 
 Pull a directory from `nas` over an older local copy, deduplicated against
-the local index:
+the local index. `-n` gives the remote tar an empty standard input, like
+`ssh -n`, so that hashsync doesn't read your terminal:
 
 ```sh
 $ hashsync ssh -n nas tar -C /srv/data -cf - . | tar -C /srv/data -xf -
@@ -497,5 +496,6 @@ freely; see [`extras/LICENSE-Apache-2.0`](extras/LICENSE-Apache-2.0).
     Hugging Face as of 2021-05-19 and 2024-02-19; v2 adds a safetensors
     file and three ONNX files with the same weights as the older files.
     Both hosts ran on one VM (24 vCPUs of an AMD Ryzen AI 9 HX 370, 16 GiB
-    of RAM), with hashsync 1.0.0, rsync 3.5.1 and OpenSSH over a link
+    of RAM), with hashsync 1.0.0, OpenSSH and rsync 3.5.1 patched with
+    [`extras/rsync-3.5.1.patch`](extras/rsync-3.5.1.patch), over a link
     limited to 2 MiB/s in each direction.
