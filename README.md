@@ -66,9 +66,9 @@ The receiver then puts the original stream back together.
   it (deduplication is much more effective with
   [`extras/rsync-3.5.1.patch`](extras/rsync-3.5.1.patch) applied to rsync).
 - **Always exact.** The receiver always checks block references with a
-  strong hash function, so if the index is outdated or a file is changed
-  concurrently, this only results in less deduplication: the output always
-  matches the original stream byte for byte.
+  cryptographically strong hash function, so if the index is outdated or a
+  file is changed concurrently, this only results in less deduplication:
+  the output always matches the original stream byte for byte.
 - **Up-to-date index.** `hashsync ssh` updates the receiver's index before
   the transfer, and again after the command, so that the next transfer can
   be deduplicated against the files that were just written, for example by
