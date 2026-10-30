@@ -17,6 +17,7 @@ version of a dump or a disk image.
 ```console
 # Copy /srv/data/v2, a new version of /srv/data/v1, from the host nas.
 # Blocks that v1 already has are sent as references to it.
+
 $ hashsync ssh -n nas tar -C /srv/data -cf - v2 | tar -C /srv/data -xf -
 (...)
 hashsync: stdin -- 0 B --> 13 B wire (compressed)
@@ -24,8 +25,8 @@ hashsync: stdout -- 5.25 GiB (472.28 MiB literal, 4.78 GiB -> 1.49 MiB refs, 448
 hashsync: total -- sent 4.35 MiB and received 430.36 MiB in 238.2s (1.83 MiB/s), data shrinkage factor: 12.36, saved 4.82 GiB of data transfer
 
 # rsync, for comparison, only reuses the files of v1 with the same name:
-$ rsync -az -hh --info=stats1 --copy-dest=../v1 nas:/srv/data/v2/ /srv/data/v2/
 
+$ rsync -az -hh --info=stats1 --copy-dest=../v1 nas:/srv/data/v2/ /srv/data/v2/
 sent 1000.17K bytes  received 2.12G bytes  1.89M bytes/sec
 total size is 5.25G  speedup is 2.47
 ```
@@ -41,7 +42,7 @@ hashsync only changes what goes over the network.
 
 The host that receives a deduplicated stream, the *receiver*, keeps an
 *index* of the blocks (16 KiB by default) of the files in the directories
-that its configuration file lists, the *roots*. It sends the other host,
+(*roots*) that are listed in its configuration file. It sends the other host,
 the *sender*, its *hash list*: a short hash of each of its blocks. The
 sender computes a rolling hash at every offset of the stream and looks it
 up in the list. For each match, the receiver reads the block from its file
