@@ -497,5 +497,5 @@ freely; see [`extras/LICENSE-Apache-2.0`](extras/LICENSE-Apache-2.0).
     file and three ONNX files with the same weights as the older files.
     Both hosts ran on one VM (24 vCPUs of an AMD Ryzen AI 9 HX 370, 16 GiB
     of RAM), with hashsync 1.0.0, OpenSSH and rsync 3.5.1 patched with
-    [`extras/rsync-3.5.1.patch`](extras/rsync-3.5.1.patch), over a link
-    limited to 2 MiB/s in each direction.
+    [`extras/rsync-3.5.1.patch`](https://github.com/someplaceguy/hashsync/blob/master/extras/rsync-3.5.1.patch),
+    over a link limited to 2 MiB/s in each direction.
