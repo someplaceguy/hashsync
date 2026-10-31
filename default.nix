@@ -99,6 +99,11 @@ rustPlatform.buildRustPackage {
     zstd
   ];
 
+  # patchShebangs points the `#!/usr/bin/env bash` of hashsync-copy-closure
+  # at this bash. With strictDeps, which buildRustPackage turns on, it only
+  # looks for interpreters in buildInputs.
+  buildInputs = [ bashNonInteractive ];
+
   doCheck = canRun;
 
   # The transfer tests run rsync with `hashsync ssh` as its remote shell,
@@ -110,10 +115,13 @@ rustPlatform.buildRustPackage {
   ];
 
   # The licenses of the bundled code require their notices to come with the
-  # binary.
+  # binary, and the Apache License requires its text to come with
+  # hashsync-copy-closure.
   postInstall = ''
     installManPage docs/hashsync.1
-    install -Dm644 -t $out/share/doc/hashsync COPYING THIRD-PARTY-NOTICES
+    install -Dm755 extras/hashsync-copy-closure.sh $out/bin/hashsync-copy-closure
+    install -Dm644 -t $out/share/doc/hashsync COPYING THIRD-PARTY-NOTICES \
+      extras/LICENSE-Apache-2.0
   '';
 
   # `install-check.sh` checks the binary as installed, after the fixup that
@@ -132,7 +140,11 @@ rustPlatform.buildRustPackage {
 
   meta = {
     description = "Run a command through SSH, deduplicating its stdout or its stdin against indexed blocks";
-    license = lib.getLicenseFromSpdxId cargoToml.package.license;
+    # hashsync-copy-closure is under the Apache License 2.0.
+    license = [
+      (lib.getLicenseFromSpdxId cargoToml.package.license)
+      lib.licenses.asl20
+    ];
     mainProgram = "hashsync";
     platforms = lib.platforms.linux;
   };

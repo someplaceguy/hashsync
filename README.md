@@ -290,7 +290,8 @@ copies the closures of Nix store paths from one host to another, like
 doesn't have, and of those, hashsync sends only the blocks that the
 destination doesn't already have in its Nix store. A rebuilt package gets
 a new store path, but much of its contents is often the same as in the old
-one, which hashsync then sends as references.
+one, which hashsync then sends as references. The Nix package installs the
+script as `hashsync-copy-closure`.
 
 Both hosts need Nix and hashsync, with `nix-store` and `hashsync` in the
 `PATH` of SSH commands. On the destination, the Nix daemon must trust the
