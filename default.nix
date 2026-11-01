@@ -85,6 +85,7 @@ rustPlatform.buildRustPackage {
 
   nativeBuildInputs = [
     installShellFiles
+    makeWrapper
     rustPlatform.bindgenHook
   ]
   ++ lib.optionals shell [
@@ -114,12 +115,22 @@ rustPlatform.buildRustPackage {
     rsync
   ];
 
-  # The licenses of the bundled code require their notices to come with the
-  # binary, and the Apache License requires its text to come with
-  # hashsync-copy-closure.
   postInstall = ''
     installManPage docs/hashsync.1
-    install -Dm755 extras/hashsync-copy-closure.sh $out/bin/hashsync-copy-closure
+
+    # hashsync-copy-closure runs the hashsync in the PATH. The wrapper puts the
+    # hashsync of this package first, but only on this host: with both --from
+    # and --to, the destination runs the functions of the script with its own
+    # PATH. The script stays out of bin so that its usage message shows its
+    # name, not the name of a wrapped file.
+    install -Dm755 extras/hashsync-copy-closure.sh \
+      $out/libexec/hashsync/hashsync-copy-closure
+    makeWrapper $out/libexec/hashsync/hashsync-copy-closure \
+      $out/bin/hashsync-copy-closure --prefix PATH : $out/bin
+
+    # The licenses of the bundled code require their notices to come with the
+    # binary, and the Apache License requires its text to come with
+    # hashsync-copy-closure.
     install -Dm644 -t $out/share/doc/hashsync COPYING THIRD-PARTY-NOTICES \
       extras/LICENSE-Apache-2.0
   '';
