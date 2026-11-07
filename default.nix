@@ -49,6 +49,44 @@ let
   # The tests and the install check run the binary, which a cross build
   # cannot do.
   canRun = stdenv.buildPlatform.canExecute stdenv.hostPlatform;
+
+  # The CPU that rustc compiles for, from the `gcc.arch` of the platform,
+  # when that isn't the default of its architecture. GCC then compiles the
+  # C and C++ code for it too: the `cc` crate passes `-march=x86-64`, which
+  # would override the `-march` of the compiler wrapper, unless rustc has
+  # a `-C target-cpu`. Without SSE 4.2, RocksDB computes its CRC32C
+  # checksums in software. These `-march` names are the same for rustc.
+  gccArch = stdenv.hostPlatform.gcc.arch or null;
+  defaultGccArch = (lib.systems.elaborate stdenv.hostPlatform.config).gcc.arch or null;
+  rustCpus = [
+    "x86-64-v2"
+    "x86-64-v3"
+    "x86-64-v4"
+    "znver1"
+    "znver2"
+    "znver3"
+    "znver4"
+    "znver5"
+  ];
+  targetCpu =
+    if gccArch == defaultGccArch then
+      null
+    else if lib.elem gccArch rustCpus then
+      gccArch
+    else
+      throw "hashsync: no rustc CPU for gcc.arch \"${gccArch}\"; add it to rustCpus in default.nix";
+
+  # Cargo adds the flags of this variable to those that the Cargo
+  # configuration of nixpkgs gives the target, such as
+  # -Cforce-frame-pointers=yes; RUSTFLAGS would replace them.
+  #
+  # Rust links a static binary for musl as a static PIE, but nixpkgs builds
+  # the static libraries of a static build without -fPIE, and the link then
+  # fails on those of libstdc++. So a static binary is not position
+  # independent.
+  targetRustflags =
+    lib.optional stdenv.hostPlatform.isStatic "-C relocation-model=static"
+    ++ lib.optional (targetCpu != null) "-C target-cpu=${targetCpu}";
 in
 
 rustPlatform.buildRustPackage {
@@ -67,15 +105,9 @@ rustPlatform.buildRustPackage {
   buildNoDefaultFeatures = true;
   buildFeatures = features;
 
-  # Rust links a static binary for musl as a static PIE, but nixpkgs builds
-  # the static libraries of a static build without -fPIE, and the link then
-  # fails on those of libstdc++. So a static binary is not position
-  # independent. Cargo adds the flags of this variable to those that the
-  # Cargo configuration of nixpkgs gives the target, such as
-  # -Cforce-frame-pointers=yes; RUSTFLAGS would replace them.
-  env = lib.optionalAttrs stdenv.hostPlatform.isStatic {
+  env = lib.optionalAttrs (targetRustflags != [ ]) {
     "CARGO_TARGET_${stdenv.hostPlatform.rust.cargoEnvVarTarget}_RUSTFLAGS" =
-      "-C relocation-model=static";
+      lib.concatStringsSep " " targetRustflags;
   };
 
   # RocksDB and, with the `mimalloc` feature, `src/cxx_allocation.cc` are
