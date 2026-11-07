@@ -554,7 +554,7 @@ dependencies = [
 
 [[package]]
 name = "hashsync"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "blake3",
  "bstr",
