@@ -19,14 +19,22 @@ file ahead of what it has sent. With --bwlimit, it sends the buffered data
 of the earlier files before it opens the next one, so that it doesn't read
 a file long before it sends it (rsync's growing-file test checks this).
 
+If a block of a file matches a block of the receiver's copy, rsync sends
+only the block's index, in 4 bytes. If a file mostly matches, the sender's
+output for the whole file can then fit in its buffer, and the receiver
+would get nothing until the sender had read the whole file. So after each
+matching block, the sender still sends its output once 64 KiB are
+waiting, like unpatched rsync, and the receiver can copy the matching
+blocks while the sender reads the rest of the file.
+
 With --max-alloc, rsync exits if it has to allocate that many bytes or
-more at once. The patched rsync allocates 16 MiB at once for its output
-buffer, which holds two chunks of 8 MiB. So if --max-alloc is less than
-32 MiB, the patched rsync halves the chunk size until the output buffer is
-at most half of --max-alloc. For example, with --max-alloc=16M, the chunks
-are 4 MiB, and with --max-alloc=1M, the smallest value that rsync accepts,
-they are 256 KiB. rsync's daemon-delete-msg-overflow test uses
---max-alloc=1M.
+more at once. When the patched rsync sends files, it allocates 16 MiB at
+once for its output buffer, which holds two chunks of 8 MiB. So if
+--max-alloc is less than 32 MiB, the patched rsync halves the chunk size
+until the output buffer is at most half of --max-alloc. For example, with
+--max-alloc=16M, the chunks are 4 MiB, and with --max-alloc=1M, the
+smallest value that rsync accepts, they are 256 KiB. rsync's
+daemon-delete-msg-overflow test uses --max-alloc=1M.
 
 With --progress, the patched rsync also shows the progress before it sends
 a chunk of more than 32 KiB, and not only after. rsync measures the
@@ -57,7 +65,7 @@ index b8db29b857..24b03418f7 100644
  	/* make sure we have allocated enough memory for the window */
  	if (window_size > map->p_size) {
 diff --git a/io.c b/io.c
-index 7fbd5a60a3..9acbdebcb4 100644
+index 7fbd5a60a3..8da91224d6 100644
 --- a/io.c
 +++ b/io.c
 @@ -44,6 +44,7 @@
@@ -68,17 +76,35 @@ index 7fbd5a60a3..9acbdebcb4 100644
  extern int io_timeout;
  extern int am_server;
  extern int am_sender;
-@@ -1571,7 +1572,7 @@
+@@ -1571,7 +1572,11 @@
  		return False;
  	}
  
 -	alloc_xbuf(&iobuf.out, ROUND_UP_1024(IO_BUFFER_SIZE * 2));
-+	alloc_xbuf(&iobuf.out, ROUND_UP_1024(MAX(IO_BUFFER_SIZE, literal_chunk_size) * 2));
++	/* Only the sender needs room for two chunks of literal data.  rsync
++	 * writes out this buffer only when it is full, or when it flushes or
++	 * waits for input, so with a bigger buffer, the generator would hold
++	 * back the checksums that the sender waits for. */
++	alloc_xbuf(&iobuf.out, ROUND_UP_1024((am_sender ? literal_chunk_size : IO_BUFFER_SIZE) * 2));
  	iobuf.out_fd = f_out;
  
  	return True;
+@@ -2376,6 +2381,13 @@
+ 		perform_io(iobuf.msg.size, PIO_NEED_MSGROOM);
+ }
+ 
++/* Write out some of the buffered output if at least len bytes are waiting. */
++void io_flush_if_buffered(size_t len)
++{
++	if (iobuf.out.len >= iobuf.out_empty_len + len)
++		io_flush(NORMAL_FLUSH);
++}
++
+ void write_shortint(int f, unsigned short x)
+ {
+ 	char b[2];
 diff --git a/match.c b/match.c
-index 6f17b354e7..08f713d256 100644
+index 6f17b354e7..a0963981fa 100644
 --- a/match.c
 +++ b/match.c
 @@ -24,6 +24,7 @@
@@ -89,7 +115,7 @@ index 6f17b354e7..08f713d256 100644
  
  extern struct name_num_item *xfer_sum_nni;
  extern int xfer_sum_len;
-@@ -137,6 +138,14 @@
+@@ -137,12 +138,30 @@
  			(long)s->sums[i].len, (long)n);
  	}
  
@@ -104,7 +130,23 @@ index 6f17b354e7..08f713d256 100644
  	send_token(f, i, buf, last_match, n, i < 0 ? 0 : s->sums[i].len);
  	data_transfer += n;
  
-@@ -405,7 +414,7 @@
+ 	if (i >= 0) {
+ 		stats.matched_data += s->sums[i].len;
+ 		n += s->sums[i].len;
++		/* The receiver copies a whole block of its own file for each
++		 * 4-byte match token, so write out some of the output once
++		 * 64 KiB are waiting, as unpatched rsync does when its buffer
++		 * is full.  Otherwise, if a file mostly matches, the receiver
++		 * would get none of its tokens until the sender had read the
++		 * whole file.  This can't split a chunk of literal data: rsync
++		 * ends a MSG_DATA frame only when it starts to write it out,
++		 * and the chunks before this token are already whole in the
++		 * buffer. */
++		io_flush_if_buffered(IO_BUFFER_SIZE * 2);
+ 	}
+ 
+ 	for (j = 0; j < n; j += CHUNK_SIZE) {
+@@ -405,7 +424,7 @@
  		   match. The 3 reads are caused by the
  		   running match, the checksum update and the
  		   literal send. */
@@ -113,7 +155,7 @@ index 6f17b354e7..08f713d256 100644
  			matched(f, s, buf, offset - s->blength, -2);
  	} while (++offset < end);
  
-@@ -480,7 +489,7 @@
+@@ -480,7 +499,7 @@
  	} else {
  		OFF_T j;
  		/* by doing this in pieces we avoid too many seeks */
@@ -123,7 +165,7 @@ index 6f17b354e7..08f713d256 100644
  		matched(f, s, buf, len, -1);
  	}
 diff --git a/options.c b/options.c
-index 4be82eed64..0cd3b7e963 100644
+index 4be82eed64..0046e77a6a 100644
 --- a/options.c
 +++ b/options.c
 @@ -210,6 +210,7 @@
@@ -139,8 +181,8 @@ index 4be82eed64..0cd3b7e963 100644
  	if (!max_alloc)
  		max_alloc = SIZE_ARG_MAX;
 +	/* rsync exits if it has to allocate --max-alloc bytes or more at once.
-+	 * It allocates two chunks at once for the output buffer, and one chunk
-+	 * plus up to 384 KiB for the window through which the sender reads a
++	 * The sender allocates two chunks at once for its output buffer, and
++	 * one chunk plus up to 384 KiB for the window through which it reads a
 +	 * file.  So halve the chunk size until it is at most a quarter of
 +	 * --max-alloc.  The chunk size stays a power of two, so if rsync sends
 +	 * a file whole, its chunks start at multiples of hashsync's block size. */
@@ -151,7 +193,7 @@ index 4be82eed64..0cd3b7e963 100644
  	if (old_style_args < 0) {
  		if (!am_server && protect_args <= 0 && (arg = getenv("RSYNC_OLD_ARGS")) != NULL && *arg) {
 diff --git a/rsync.h b/rsync.h
-index adf9bf1f12..6bbc007ec6 100644
+index adf9bf1f12..173c3724a1 100644
 --- a/rsync.h
 +++ b/rsync.h
 @@ -157,6 +157,15 @@
@@ -161,8 +203,8 @@ index adf9bf1f12..6bbc007ec6 100644
 +/* The longest run of literal data that is sent as one uncompressed token.
 + * The sender uses literal_chunk_size, which parse_arguments() sets to this,
 + * or to less with a small --max-alloc.  write_buf() copies a token into the
-+ * output buffer in one piece, so that buffer holds two of them, and it can
-+ * become one MSG_DATA frame, whose length field has 24 bits. */
++ * output buffer in one piece, so the sender's buffer holds two of them, and
++ * it can become one MSG_DATA frame, whose length field has 24 bits. */
 +#define LITERAL_CHUNK_SIZE (8*1024*1024)
 +#if LITERAL_CHUNK_SIZE > (1 << 23)
 +#error "LITERAL_CHUNK_SIZE must be at most 8 MiB"
