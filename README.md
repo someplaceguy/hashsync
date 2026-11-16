@@ -64,7 +64,7 @@ The receiver then puts the original stream back together.
 - **Works with rsync.** `rsync -e 'hashsync ssh'` pulls with
   deduplication, and `rsync -e 'hashsync ssh --dedup-stdin'` pushes with
   it (deduplication is much more effective with
-  [`extras/rsync-3.5.1.patch`](extras/rsync-3.5.1.patch) applied to rsync).
+  [`extras/rsync-3.5.2.patch`](extras/rsync-3.5.2.patch) applied to rsync).
 - **Always exact.** The receiver always checks block references with a
   cryptographically strong hash function, so if the index is outdated or a
   file is changed concurrently, this only results in less deduplication:
@@ -196,19 +196,19 @@ another backup already has, cost little.
 in pieces of at most 32 KiB, each preceded by its length. hashsync can't
 match a block that one of these lengths splits, so with the default
 16 KiB blocks, it can miss up to half of the blocks.
-[`extras/rsync-3.5.1.patch`](extras/rsync-3.5.1.patch) raises the limit to
+[`extras/rsync-3.5.2.patch`](extras/rsync-3.5.2.patch) raises the limit to
 8 MiB. Only the rsync that sends the files needs it: the remote one in a
 pull and the local one in a push. It works with an unpatched rsync on the
 other side. So in a backup, use the patched rsync on the machine being
 backed up.
 
-Apply the patch with `patch -p1` in the source directory of rsync 3.5.1,
+Apply the patch with `patch -p1` in the source directory of rsync 3.5.2,
 then build rsync as usual. With Nix, for example in
 `environment.systemPackages`:
 
 ```nix
 (pkgs.rsync.overrideAttrs (old: {
-  patches = (old.patches or [ ]) ++ [ /path/to/hashsync/extras/rsync-3.5.1.patch ];
+  patches = (old.patches or [ ]) ++ [ /path/to/hashsync/extras/rsync-3.5.2.patch ];
 }))
 ```
 
@@ -498,5 +498,5 @@ freely; see [`extras/LICENSE-Apache-2.0`](extras/LICENSE-Apache-2.0).
     file and three ONNX files with the same weights as the older files.
     Both hosts ran on one VM (24 vCPUs of an AMD Ryzen AI 9 HX 370, 16 GiB
     of RAM), with hashsync 1.0.0, OpenSSH and rsync 3.5.1 patched with
-    [`extras/rsync-3.5.1.patch`](https://github.com/someplaceguy/hashsync/blob/master/extras/rsync-3.5.1.patch),
+    [`extras/rsync-3.5.1.patch`](https://github.com/someplaceguy/hashsync/blob/v1.0.0/extras/rsync-3.5.1.patch),
     over a link limited to 2 MiB/s in each direction.

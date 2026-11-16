@@ -1,0 +1,232 @@
+Send literal data in chunks of up to 8 MiB instead of 32 KiB
+
+For rsync 3.5.2. Apply it with "patch -p1" in the rsync source directory.
+
+rsync sends the file data that the receiver lacks in chunks of at most
+32 KiB, each preceded by its length. When rsync runs over hashsync ssh,
+these lengths split the file data in the stream every 32 KiB, and a block
+of the receiver's files that one of them splits doesn't match. Depending on
+how the data is aligned, that can be up to block_size / 32 KiB of the
+blocks, or half of them with hashsync's default 16 KiB blocks. With chunks
+of up to 8 MiB, almost every block matches.
+
+Only the rsync that sends the files needs the patch: the remote one in a
+pull, the local one in a push. The patch is backwards compatible, so the
+receiving rsync can be unpatched.
+
+The sender now buffers up to 16 MiB of output, and reads up to 24 MiB of a
+file ahead of what it has sent. With --bwlimit, it sends the buffered data
+of the earlier files before it opens the next one, so that it doesn't read
+a file long before it sends it (rsync's growing-file test checks this).
+
+With --max-alloc, rsync exits if it has to allocate that many bytes or
+more at once. The patched rsync allocates 16 MiB at once for its output
+buffer, which holds two chunks of 8 MiB. So if --max-alloc is less than
+32 MiB, the patched rsync halves the chunk size until the output buffer is
+at most half of --max-alloc. For example, with --max-alloc=16M, the chunks
+are 4 MiB, and with --max-alloc=1M, the smallest value that rsync accepts,
+they are 256 KiB. rsync's daemon-delete-msg-overflow test uses
+--max-alloc=1M.
+
+With --progress, the patched rsync also shows the progress before it sends
+a chunk of more than 32 KiB, and not only after. rsync measures the
+transfer rate of a file from the first progress update of the file, so
+without this, rsync would show a rate of 0 for a file that it sends in one
+chunk. rsync's output-options test checks the rate.
+
+Like rsync, this patch is licensed under the GNU General Public License,
+version 3 or any later version.
+
+diff --git a/fileio.c b/fileio.c
+index b8db29b857..24b03418f7 100644
+--- a/fileio.c
++++ b/fileio.c
+@@ -356,10 +356,12 @@
+ 	align_fudge = (int32)ALIGNED_OVERSHOOT(offset);
+ 	window_start = offset - align_fudge;
+ 	window_size = map->def_window_size;
+-	if (window_start + window_size > map->file_size)
+-		window_size = (int32)(map->file_size - window_start);
+ 	if (window_size < len + align_fudge)
+ 		window_size = ALIGNED_LENGTH(len + align_fudge);
++	/* Clamp after rounding up, so the rounding can't make us read past EOF
++	 * (which counts as a read error) when the caller didn't ask for that. */
++	if (window_start + window_size > map->file_size)
++		window_size = MAX((int32)(map->file_size - window_start), len + align_fudge);
+ 
+ 	/* make sure we have allocated enough memory for the window */
+ 	if (window_size > map->p_size) {
+diff --git a/io.c b/io.c
+index 7fbd5a60a3..9acbdebcb4 100644
+--- a/io.c
++++ b/io.c
+@@ -44,6 +44,7 @@
+ 
+ extern int bwlimit;
+ extern size_t bwlimit_writemax;
++extern int32 literal_chunk_size;
+ extern int io_timeout;
+ extern int am_server;
+ extern int am_sender;
+@@ -1571,7 +1572,7 @@
+ 		return False;
+ 	}
+ 
+-	alloc_xbuf(&iobuf.out, ROUND_UP_1024(IO_BUFFER_SIZE * 2));
++	alloc_xbuf(&iobuf.out, ROUND_UP_1024(MAX(IO_BUFFER_SIZE, literal_chunk_size) * 2));
+ 	iobuf.out_fd = f_out;
+ 
+ 	return True;
+diff --git a/match.c b/match.c
+index 6f17b354e7..08f713d256 100644
+--- a/match.c
++++ b/match.c
+@@ -24,6 +24,7 @@
+ 
+ extern int checksum_seed;
+ extern int append_mode;
++extern int32 literal_chunk_size;
+ 
+ extern struct name_num_item *xfer_sum_nni;
+ extern int xfer_sum_len;
+@@ -137,6 +138,14 @@
+ 			(long)s->sums[i].len, (long)n);
+ 	}
+ 
++	/* show_progress() measures the rate of a file from its first update,
++	 * so update before a run of literal data that is longer than the
++	 * chunks of unpatched rsync (CHUNK_SIZE), as well as after it.
++	 * Otherwise, if rsync sends a file in one chunk, the file's first
++	 * update comes only at its end, and rsync shows its rate as 0. */
++	if (n > CHUNK_SIZE && buf && INFO_GTE(PROGRESS, 1))
++		show_progress(last_match, buf->file_size);
++
+ 	send_token(f, i, buf, last_match, n, i < 0 ? 0 : s->sums[i].len);
+ 	data_transfer += n;
+ 
+@@ -405,7 +414,7 @@
+ 		   match. The 3 reads are caused by the
+ 		   running match, the checksum update and the
+ 		   literal send. */
+-		if (backup >= s->blength+CHUNK_SIZE && end-offset > CHUNK_SIZE)
++		if (backup >= s->blength+literal_chunk_size && end-offset > CHUNK_SIZE)
+ 			matched(f, s, buf, offset - s->blength, -2);
+ 	} while (++offset < end);
+ 
+@@ -480,7 +489,7 @@
+ 	} else {
+ 		OFF_T j;
+ 		/* by doing this in pieces we avoid too many seeks */
+-		for (j = last_match + CHUNK_SIZE; j < len; j += CHUNK_SIZE)
++		for (j = last_match + literal_chunk_size; j < len; j += literal_chunk_size)
+ 			matched(f, s, buf, j, -2);
+ 		matched(f, s, buf, len, -1);
+ 	}
+diff --git a/options.c b/options.c
+index 4be82eed64..0cd3b7e963 100644
+--- a/options.c
++++ b/options.c
+@@ -210,6 +210,7 @@
+ #define DEFAULT_MAX_ALLOC (1024L * 1024 * 1024)
+ size_t max_alloc = DEFAULT_MAX_ALLOC;
+ char *max_alloc_arg;
++int32 literal_chunk_size = LITERAL_CHUNK_SIZE;
+ 
+ static int version_opt_cnt = 0;
+ static int remote_option_alloc = 0;
+@@ -2120,6 +2121,15 @@
+ 	 * daemon each get their own ceiling from the one portable spelling. */
+ 	if (!max_alloc)
+ 		max_alloc = SIZE_ARG_MAX;
++	/* rsync exits if it has to allocate --max-alloc bytes or more at once.
++	 * It allocates two chunks at once for the output buffer, and one chunk
++	 * plus up to 384 KiB for the window through which the sender reads a
++	 * file.  So halve the chunk size until it is at most a quarter of
++	 * --max-alloc.  The chunk size stays a power of two, so if rsync sends
++	 * a file whole, its chunks start at multiples of hashsync's block size. */
++	literal_chunk_size = LITERAL_CHUNK_SIZE;
++	while (literal_chunk_size > CHUNK_SIZE && (size_t)literal_chunk_size > max_alloc / 4)
++		literal_chunk_size /= 2;
+ 
+ 	if (old_style_args < 0) {
+ 		if (!am_server && protect_args <= 0 && (arg = getenv("RSYNC_OLD_ARGS")) != NULL && *arg) {
+diff --git a/rsync.h b/rsync.h
+index adf9bf1f12..6bbc007ec6 100644
+--- a/rsync.h
++++ b/rsync.h
+@@ -157,6 +157,15 @@
+ #define SPARSE_WRITE_SIZE (1024)
+ #define WRITE_SIZE (32*1024)
+ #define CHUNK_SIZE (32*1024)
++/* The longest run of literal data that is sent as one uncompressed token.
++ * The sender uses literal_chunk_size, which parse_arguments() sets to this,
++ * or to less with a small --max-alloc.  write_buf() copies a token into the
++ * output buffer in one piece, so that buffer holds two of them, and it can
++ * become one MSG_DATA frame, whose length field has 24 bits. */
++#define LITERAL_CHUNK_SIZE (8*1024*1024)
++#if LITERAL_CHUNK_SIZE > (1 << 23)
++#error "LITERAL_CHUNK_SIZE must be at most 8 MiB"
++#endif
+ #define MAX_MAP_SIZE (256*1024)
+ #define IO_BUFFER_SIZE (32*1024)
+ #define MAX_BLOCK_SIZE ((int32)1 << 17)
+diff --git a/sender.c b/sender.c
+index c1b9039601..2f3fb5b1ce 100644
+--- a/sender.c
++++ b/sender.c
+@@ -57,6 +57,8 @@
+ extern const char *orig_dir;
+ extern int module_dirfd;
+ extern int write_batch;
++extern size_t bwlimit_writemax;
++extern int32 literal_chunk_size;
+ extern int file_old_total;
+ extern char *files_from;
+ extern BOOL want_progress_now;
+@@ -656,6 +658,13 @@
+ 			exit_cleanup(RERR_PROTOCOL);
+ 		}
+ 
++		/* With --bwlimit, the output buffer can hold the data of the
++		 * earlier files for a long time.  Send it before opening this
++		 * file, so that the file is read when its own data is about to
++		 * be sent rather than long before. */
++		if (bwlimit_writemax)
++			io_flush(FULL_FLUSH);
++
+ 		if (symlink_optout_allowed()) {
+ 			/* Module opted out of symlink confinement ("insecure links =
+ 			 * yes", admin-only) -- or a non-daemon --insecure-links: legacy
+@@ -763,7 +772,10 @@
+ 		}
+ 
+ 		if (st.st_size) {
+-			int32 read_size = MAX(s->blength * 3, MAX_MAP_SIZE);
++			/* hash_search() maps the pending literal data, which can
++			 * reach literal_chunk_size, together with the block it
++			 * is matching. */
++			int32 read_size = MAX(s->blength * 3, MAX_MAP_SIZE) + literal_chunk_size;
+ 			mbuf = map_file(fd, st.st_size, read_size, s->blength);
+ 		} else
+ 			mbuf = NULL;
+diff --git a/token.c b/token.c
+index b47a7852e8..9a1f8e07b4 100644
+--- a/token.c
++++ b/token.c
+@@ -31,6 +31,7 @@
+ 
+ extern int do_compression;
+ extern int protocol_version;
++extern int32 literal_chunk_size;
+ extern int module_id;
+ extern int do_compression_level;
+ extern int do_compression_threads;
+@@ -319,7 +320,7 @@
+ 	if (n > 0) {
+ 		int32 len = 0;
+ 		while (len < n) {
+-			int32 n1 = MIN(CHUNK_SIZE, n-len);
++			int32 n1 = MIN(literal_chunk_size, n-len);
+ 			write_int(f, n1);
+ 			write_buf(f, map_ptr(buf, offset+len, n1), n1);
+ 			len += n1;
