@@ -420,6 +420,16 @@ pub fn run(token: &str) -> ! {
         },
     };
     let (mut data_out, _) = data_writer.join().expect("the data writer panicked");
+    // Only the sides of the list exchanges keep this side from sending END
+    // now. If the update at the start of a deduplicated forward stream
+    // still runs, the run waits for it: say so, since the update reports no
+    // progress until it ends (DESIGN.md §3). Say it before the join of the
+    // sender's side: with both streams deduplicated, the client's side of
+    // that exchange waits for this side's update too (step L2 of DESIGN.md
+    // §4.4).
+    if let Some(thread) = &receiving {
+        thread.update_at_start().note_wait();
+    }
     // The sides of the list exchanges end before END, which is the last
     // frame of the data session: an exchange that the receiver began with
     // its target ends with its CACHE_RESULT, and one that ended before

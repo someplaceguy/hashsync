@@ -30,9 +30,11 @@
 //! closes when they end at Completing. In a run with both streams
 //! deduplicated, both hosts update their index at the same time, and each
 //! keeps its index closed from the end of its update until the other host's
-//! update is done too (DESIGN.md §4.4). At the end of the run, once its
-//! index has closed, the receiver updates it again, in a child process
-//! (`AfterCommand`).
+//! update is done too (DESIGN.md §4.4). The run cannot end before the
+//! update at the start does, so the host says in a note when the run has
+//! nothing else left to wait for (`UpdateAtStart`). At the end of the run,
+//! once its index has closed, the receiver updates it again, in a child
+//! process (`AfterCommand`).
 //!
 //! At the stop of a deduplicated stream, its scanner returns at once,
 //! without the end of the stream: it would otherwise wait for answers that
@@ -48,6 +50,7 @@ use rustix::process::Pid;
 
 use crate::config::{Config, Source, thread_count};
 use crate::die::{self, die};
+use crate::escapes::quoted_from_home;
 use crate::fsid::FsCache;
 use crate::fsops;
 use crate::hash::StrongHash;
@@ -826,7 +829,9 @@ impl Receiving {
     /// they arrive, and run the receiver's side of the list exchange
     /// (DESIGN.md §5.6), unless the stream has ended or stopped by then.
     /// The lookups keep the update after the command for the end of the
-    /// role, with the `--no-update` and `--compact` of `settings`.
+    /// role, with the `--no-update` and `--compact` of `settings`. The
+    /// returned thread also gives the update at the start, so that the host
+    /// can say when the run waits for it.
     pub fn start(
         self,
         config: Arc<Config>,
@@ -836,11 +841,26 @@ impl Receiving {
         let preparation = Preparation::of(settings, deduplicated);
         let after_command = AfterCommand::of(&config, settings);
         let sender_cache = settings.sender_cache;
-        let thread = std::thread::Builder::new()
-            .name("receiver".into())
-            .spawn(move || self.run(&config, preparation, sender_cache, after_command))
-            .expect("cannot start the receiver's list exchange");
-        ReceivingThread(thread)
+        let update_at_start = UpdateAtStart::new(&config, preparation);
+        let thread = {
+            let update_at_start = update_at_start.clone();
+            std::thread::Builder::new()
+                .name("receiver".into())
+                .spawn(move || {
+                    self.run(
+                        &config,
+                        preparation,
+                        &update_at_start,
+                        sender_cache,
+                        after_command,
+                    )
+                })
+                .expect("cannot start the receiver's list exchange")
+        };
+        ReceivingThread {
+            thread,
+            update_at_start,
+        }
     }
 
     /// The body of the role's thread (`start`). The receiver always
@@ -852,6 +872,7 @@ impl Receiving {
         self,
         config: &Config,
         preparation: Preparation,
+        update_at_start: &UpdateAtStart,
         sender_cache: bool,
         after_command: Option<AfterCommand>,
     ) -> (Lookups, ListBytes) {
@@ -863,7 +884,7 @@ impl Receiving {
         } = self;
         // The control reader keeps its own end of the link.
         drop(frames);
-        let (index, locations) = prepare(config, preparation, &link);
+        let (index, locations) = prepare(config, preparation, update_at_start, &link);
         if pins.is_completing() {
             list_exchange::send_none(&link, config.hashlist_max_age);
             index.close();
@@ -890,25 +911,99 @@ impl Receiving {
     }
 }
 
-/// The thread of the receiver's role, for its join at the normal end.
-pub struct ReceivingThread(JoinHandle<(Lookups, ListBytes)>);
+/// The thread of the receiver's role, for its join at the normal end, and
+/// the update at the start that it runs.
+pub struct ReceivingThread {
+    thread: JoinHandle<(Lookups, ListBytes)>,
+    update_at_start: UpdateAtStart,
+}
 
 impl ReceivingThread {
+    /// The update at the start of the role, so that the host can say when
+    /// the run waits for it.
+    pub fn update_at_start(&self) -> &UpdateAtStart {
+        &self.update_at_start
+    }
+
     /// Join the thread, once the list exchange has ended. Returns the
     /// lookups, and the bytes of the lists sent.
     pub fn join(self) -> (Lookups, ListBytes) {
-        self.0
+        self.thread
             .join()
             .expect("the receiver's list exchange panicked")
     }
 }
 
+/// The receiver's update at the start of the run (DESIGN.md §3). This type
+/// exists so that a host can say when the run waits for that update. The
+/// run cannot end before the update does, even when the command finished
+/// long before, and the update reports no progress until it ends, so
+/// without a note a long update looks like a hang. The receiver's thread
+/// runs the update, and another thread of the host prints the note once it
+/// sees that the run has nothing else left to wait for (`note_wait`).
+#[derive(Clone)]
+pub struct UpdateAtStart(Arc<UpdateState>);
+
+struct UpdateState {
+    /// True until the update has written all its changes, also before the
+    /// receiver's thread has begun it: the run waits for it from the start.
+    /// Always false with `--no-update`, which skips the update. A lock, not
+    /// an atomic, holds it, so that the note of the wait never comes after
+    /// the notes that say the update is done: `note_wait` holds the lock
+    /// while it writes the note, and the update takes the lock to clear the
+    /// flag before it writes its own notes.
+    pending: Mutex<bool>,
+    /// The index that the update brings up to date, which the note names.
+    index_path: Vec<u8>,
+}
+
+impl UpdateAtStart {
+    /// The update of the index of `config` that `preparation` makes, if
+    /// any.
+    fn new(config: &Config, preparation: Preparation) -> Self {
+        UpdateAtStart(Arc::new(UpdateState {
+            pending: Mutex::new(preparation != Preparation::Open),
+            index_path: config.index_path.clone(),
+        }))
+    }
+
+    /// Update the index of `config` with `options`, as `update::perform`
+    /// does, and record that the run no longer waits for the update once
+    /// the update has written all its changes.
+    fn perform(&self, config: &Config, options: update::Options) -> (Index, Vec<Location>) {
+        update::perform(config, options, || {
+            *self.0.pending.lock().unwrap() = false;
+        })
+    }
+
+    /// Say in a note that the run waits for the update, unless the update
+    /// has ended. A host calls this once the run has nothing else left to
+    /// wait for on that host: the server once only its sides of the list
+    /// exchanges keep it from sending END, and the client once it lets go
+    /// of its stdout (DESIGN.md §3).
+    pub fn note_wait(&self) {
+        let pending = self.0.pending.lock().unwrap();
+        if *pending {
+            report::note(format_args!(
+                "waiting for the update of index {}",
+                quoted_from_home(&self.0.index_path)
+            ));
+        }
+    }
+}
+
 /// Prepare the receiver's index for one run, as `preparation` says
 /// (DESIGN.md §4.4), with the other host through `link` when both hosts
-/// update their index. Returns the index, read-only with a shared lock,
-/// with the current root locations, from which the lookups read candidate
+/// update their index. An update goes through `update_at_start`, which
+/// records its end. Returns the index, read-only with a shared lock, with
+/// the current root locations, from which the lookups read candidate
 /// blocks.
-fn prepare(config: &Config, preparation: Preparation, link: &Link) -> (Index, Vec<Location>) {
+fn prepare(
+    config: &Config,
+    preparation: Preparation,
+    update_at_start: &UpdateAtStart,
+    link: &Link,
+) -> (Index, Vec<Location>) {
     match preparation {
         Preparation::Open => {
             fsops::raise_descriptor_limit();
@@ -917,7 +1012,7 @@ fn prepare(config: &Config, preparation: Preparation, link: &Link) -> (Index, Ve
             (index::open_current(config, Access::ReadOnly), locations)
         }
         Preparation::UpdateAndKeep(options) => {
-            let (index, locations) = update::perform(config, options);
+            let (index, locations) = update_at_start.perform(config, options);
             (index.into_read_only(&config.index_path), locations)
         }
         // L1. The update, then the lock goes: the other host updates its own
@@ -930,7 +1025,7 @@ fn prepare(config: &Config, preparation: Preparation, link: &Link) -> (Index, Ve
         // have changed the index in between, and a rebuild with other
         // settings ends the run, as with `--no-update`.
         Preparation::UpdateAndReopen(options) => {
-            let (index, locations) = update::perform(config, options);
+            let (index, locations) = update_at_start.perform(config, options);
             index.close();
             link.send(frame::UPDATED, Vec::new());
             link.expect_empty(frame::UPDATED, "UPDATED");

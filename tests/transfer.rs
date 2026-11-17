@@ -6297,6 +6297,74 @@ fn the_command_runs_while_the_receivers_update_waits() {
 }
 
 #[test]
+fn a_run_says_when_it_waits_for_the_update_at_the_start() {
+    // The run cannot end before the receiver's update at the start does,
+    // and the update reports no progress until it ends, so the receiver
+    // says in a note that the run waits for it (DESIGN.md §3): the server
+    // once only its sides of the list exchanges keep it from sending END,
+    // and the client once it lets go of its stdout. This test holds a
+    // shared lock on the index of one receiver, so that its update waits,
+    // and then lets the command end. With both streams deduplicated, the
+    // test lets it end only once the other host has updated its index and
+    // released it, so only the host whose update waits has a note to give:
+    // the server's note must not wait for the client's side of the
+    // exchange of the backward stream, which waits for the server's update
+    // (DESIGN.md §4.4). The test waits for the note with no deadline, so a
+    // host that never gives it hangs the test.
+    for both in [false, true] {
+        for waiting in DIRECTIONS {
+            let transfer = Transfer::new(&[]);
+            let receivers = if both {
+                DIRECTIONS.to_vec()
+            } else {
+                vec![waiting]
+            };
+            for &receiver in &receivers {
+                transfer.configure_receiver(receiver, "");
+                transfer.update_receiver(receiver, &[]);
+            }
+            let index = transfer.receiver_index(waiting);
+            let lock = shared_lock(&index);
+            let mut go = Gate::new(transfer.env.path("go"));
+            let command = args(&[&format!("read go <'{}'", go.path.display())]);
+            let mut invocation = if both {
+                transfer.both(&[], &refs(&command))
+            } else {
+                transfer.invocation_in(waiting, &[], &refs(&command))
+            };
+            let stderr = transfer.env.path("stderr");
+            let client = invocation
+                .stdout(Stdio::null())
+                .stderr(File::create(&stderr).unwrap())
+                .spawn()
+                .unwrap();
+            let mut client = KillOnDrop(client);
+            for &other in receivers.iter().filter(|&&receiver| receiver != waiting) {
+                let other_lock = transfer.receiver_index(other).join("hashsync.lock");
+                wait_for_the_release_after_the_update(&mut client, other, &stderr, &other_lock);
+            }
+            go.release();
+            let note = format!(
+                "{}waiting for the update of index {}\n",
+                waiting.marker(),
+                quoted(&index)
+            );
+            wait_for_bytes(&stderr, std::slice::from_mut(&mut client), |bytes| {
+                holds(bytes, note.as_bytes())
+            });
+            drop(lock);
+            succeeded(output_of(client));
+            let stderr = std::fs::read_to_string(&stderr).unwrap();
+            assert_eq!(
+                stderr.matches("waiting for the update of index").count(),
+                1,
+                "both: {both}, {waiting:?}:\n{stderr}"
+            );
+        }
+    }
+}
+
+#[test]
 fn a_note_says_how_much_of_the_stream_went_before_its_whole_list() {
     // Without `--wait`, the stream flows before its list is whole, and the
     // sender says in a note when the list is whole, with the bytes of the
@@ -6306,7 +6374,9 @@ fn a_note_says_how_much_of_the_stream_went_before_its_whole_list() {
     // client's stdout. Then this test lets the update go. The client's
     // stdin stays open, so the stream still runs when the list is whole,
     // and has sent the line alone. No deadline: a sender that never writes
-    // the note hangs the test.
+    // the note hangs the test. The update ended before the list went out,
+    // and so before the command, so the run never waits for it, and no
+    // note says that it does (DESIGN.md §3).
     for direction in DIRECTIONS {
         let transfer = Transfer::new(&[]);
         transfer.configure_receiver(direction, "");
@@ -6347,6 +6417,11 @@ fn a_note_says_how_much_of_the_stream_went_before_its_whole_list() {
         });
         drop(producer);
         succeeded(output_of(client));
+        let stderr = std::fs::read_to_string(&stderr).unwrap();
+        assert!(
+            !stderr.contains("waiting for the update of index"),
+            "{direction:?}:\n{stderr}"
+        );
     }
 }
 

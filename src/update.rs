@@ -38,7 +38,7 @@ pub struct Options {
 }
 
 pub fn run(config: &Config, options: Options) {
-    let (index, _) = perform(config, options);
+    let (index, _) = perform(config, options, || {});
     index.close();
 }
 
@@ -49,7 +49,16 @@ pub fn run(config: &Config, options: Options) {
 /// update and its use, or, in a run with both streams deduplicated, closes
 /// it until the other host's update is done too (DESIGN.md §4.4). Its
 /// lookups read candidate blocks through these locations.
-pub fn perform(config: &Config, options: Options) -> (index::Index, Vec<Location>) {
+///
+/// `written` runs once the index holds all the changes of the update, just
+/// before the notes that say the update is done. The receiver of a run
+/// uses it to stop saying that the run waits for the update: a note that
+/// says so must not come after those notes (`dedup::UpdateAtStart`).
+pub fn perform(
+    config: &Config,
+    options: Options,
+    written: impl FnOnce(),
+) -> (index::Index, Vec<Location>) {
     fsops::raise_descriptor_limit();
 
     // Resolve and validate the roots before the index is opened: a rejected
@@ -120,6 +129,7 @@ pub fn perform(config: &Config, options: Options) -> (index::Index, Vec<Location
     );
 
     index.finish_writes();
+    written();
 
     report::note(format_args!(
         "{} in {:.1}s: {} directories, {} files hashed ({}), \

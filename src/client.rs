@@ -337,12 +337,24 @@ pub fn run(config: Config, remote: &ssh::Remote, request: &Request, no_stdin: bo
     };
     let decoder = {
         let mut stdout = Stdout::new(backward_stop.clone());
+        let update_at_start = receiving
+            .as_ref()
+            .map(|thread| thread.update_at_start().clone());
         std::thread::Builder::new()
             .name("decoder".into())
             .spawn(move || {
                 let pins = backward_pins.as_deref();
                 let counts = stream::decode(backward_spool, compressed, &mut stdout, pins);
                 release_stdout();
+                // The whole backward stream is out, or it stopped. If this
+                // side's update at the start still runs, the run now waits
+                // for it: END comes only after the server's side of the
+                // list exchange has ended, which waits for this side's.
+                // Say so, since the update reports no progress until it
+                // ends (DESIGN.md §3).
+                if let Some(update_at_start) = update_at_start {
+                    update_at_start.note_wait();
+                }
                 counts
             })
             .expect("cannot start the decoder")

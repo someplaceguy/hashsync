@@ -263,6 +263,11 @@ must follow
 .Pp
 Both streams start immediately, while each receiver updates its index and sends
 its hash list, so deduplication improves as the list arrives.
+If
+.Ar command
+finishes while this update is still running,
+.Nm Cm ssh
+prints a message and waits for the update to finish.
 Each stream is buffered on both hosts in temporary files, so a slow reader does
 not hold up the command or the transfer until the buffers are full.
 Once

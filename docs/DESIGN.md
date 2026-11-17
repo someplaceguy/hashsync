@@ -162,7 +162,16 @@ system calls, with no asynchronous runtime or event loop.
    has reached its end, and the server's sides of the list exchanges have
    ended, the server sends END with the command's status. The client then
    closes both session stdin pipes, writes the rest of the backward
-   stream, checks its end, and flushes stdout.
+   stream, checks its end, and flushes stdout. The server's sides of the
+   list exchanges end only after the receivers' updates at the start
+   (step 3), so the run cannot end before those updates, even when the
+   command has exited long before, and hashsync reports no progress of
+   an update until the update ends. So that a long update does not look
+   like a hang, the receiver says in a note that the run waits for its
+   update, and names the index: the server once only its sides of the
+   list exchanges keep it from sending END, and the client once it lets
+   go of its stdout. Neither host prints the note if its update has ended
+   by then.
 6. Then the receiver of each deduplicated stream updates its index
    again, unless `--no-update`. This **update after the command** indexes
    the files that the run has just written on that host, such as those
@@ -2347,7 +2356,7 @@ SIGTERM during the end still give `128 + signal`.
 
 | Host | Thread | Responsibilities |
 |---|---|---|
-| Server | main | Run the handshake, reading the data session itself, and start the command. Then obtain the command's exit status without reaping, wait for the END conditions of section 6.9, and send END. Then end the run, with the update after the command (section 6.9, step F3). |
+| Server | main | Run the handshake, reading the data session itself, and start the command. Then obtain the command's exit status without reaping, wait for the END conditions of section 6.9, with a note when the run waits for the update at the start (section 3), and send END. Then end the run, with the update after the command (section 6.9, step F3). |
 | Server | data reader | Read the data session once the handshake is done: the forward stream's CHUNK and STREAM_END, and EOF after END. |
 | Server | data writer | Send the backward stream (section 6.6). |
 | Server | session watcher | Until the stop of the forward stream, end the run at the hangup of the data session (section 6.6). |
@@ -2358,7 +2367,7 @@ SIGTERM during the end still give `128 + signal`.
 | Server | control reader/writer | Pass the queries for a deduplicated forward stream to its lookup workers, the answers for a deduplicated backward stream to its scanner, and the frames of the list exchanges to their sides, and raise the stop of the backward stream at STOP; send answers, queries, and STOP promptly, independently of the streams, and the frames of the server's sides of the list exchanges between them (section 6.2). |
 | Client | main | Start SSH sessions, run the handshake, then wait for END, and end the run, with the update after the command (section 6.9). |
 | Client | data reader | Read the data session once the handshake is done: the backward stream's CHUNK and STREAM_END, END, and EOF. |
-| Client | decoder | Decode the backward stream into stdout, with the pins when it is deduplicated, and raise its stop at `EPIPE`; then replace stdout with `/dev/null` (section 6.6). |
+| Client | decoder | Decode the backward stream into stdout, with the pins when it is deduplicated, and raise its stop at `EPIPE`; then replace stdout with `/dev/null` (section 6.6), with a note when the run waits for the update at the start (section 3). |
 | Client | stdin reader | Copy stdin into the forward stream's spool; then replace stdin with `/dev/null` (section 6.6). |
 | Client | data writer | Send the forward stream (section 6.6). |
 | Client | control reader/writer | Pass the queries for a deduplicated backward stream to its lookup workers, the answers for a deduplicated forward stream to its scanner, and the frames of the list exchanges to their sides, and raise the stop of the forward stream at STOP; send answers, queries, and STOP promptly, and the frames of the client's sides of the list exchanges between them. |
@@ -3540,7 +3549,10 @@ decision history, including fuller measurements, is in version control.
     list; a command and a consumer that answer each other; and `rsync -e`
     both ways;
   - the start: a command that runs, and whose streams flow, while the
-    receiver's update waits for a lock, in both directions; with `--wait`,
+    receiver's update waits for a lock, in both directions; the note of a
+    run whose command has ended while that update still runs, in a pull,
+    in a push, and with both streams deduplicated, from the host whose
+    update it is, and no such note once the update has ended; with `--wait`,
     a deduplicated stream that waits for its whole list, with the notes of
     that wait, and then finds every block, and a plain stream that flows
     meanwhile; a table that finds a block once its value has arrived, and
