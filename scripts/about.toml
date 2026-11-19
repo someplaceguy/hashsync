@@ -86,7 +86,13 @@ license = "BSD-2-Clause"
 checksum = "8b58c446121a109ccf32edc094bba3010a3d85e4ee3702950db55e4d3e87736c"
 
 # Zstandard, under the BSD-3-Clause of its BSD-3-Clause or GPLv2, like the
-# crate's own code.
+# crate's own code. zstd-sys declares `BSD-3-Clause AND BSD-2-Clause` as its
+# license, for the BSD-2-Clause code in the decoders of zstd's legacy
+# formats (`zstd/lib/legacy`). The dictionary builder's
+# `zstd/lib/dictBuilder/divsufsort.c` is MIT. The crate builds the decoders
+# only with its `legacy` feature, and the dictionary builder only with
+# `zdict_builder`. hashsync turns neither on, but RocksDB's `zstd` feature
+# turns on both.
 [zstd-sys.clarify]
 license = "BSD-3-Clause"
 
