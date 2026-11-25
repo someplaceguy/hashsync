@@ -120,26 +120,21 @@ pub fn account_id() -> [u8; 16] {
         // process's `hashlist_max_age`, which can be as short as a second
         // (`expire_temporaries`). The rename then fails with ENOENT, or on
         // NFS the write or the fsync fails with ESTALE, and the loop tries
-        // again.
+        // again. As `rename_noreplace` asks, `write_file` closes the
+        // temporary before the rename: next to `account-id`,
+        // `expire_temporaries` removes only `.hashsync-` temporaries, so a
+        // hidden name left behind if this host crashes would stay.
         create_dirs(&base, &dir, 0o777);
         let temp = dir.join(temporary_name());
         let written = write_file(&temp, 0o600, |file| {
             file.write_all(format!("{}\n", hex(&random_bytes::<16>())).as_bytes())
         });
         match written {
-            Ok(_) => {}
+            Ok(()) => {}
             Err(e) if stale(&e) => continue,
             Err(e) => fatal("initialize", &path, e),
         }
-        match retry_on_intr(|| {
-            rustix::fs::renameat_with(
-                rustix::fs::CWD,
-                &temp,
-                rustix::fs::CWD,
-                &path,
-                RenameFlags::NOREPLACE,
-            )
-        }) {
+        match rename_noreplace(&temp, &path) {
             Ok(()) | Err(Errno::NOENT) => {}
             Err(Errno::EXIST) => remove("remove", &temp),
             Err(e) => fatal("publish", &path, e),
@@ -189,15 +184,14 @@ fn create_new(path: &Path, mode: u32) -> std::io::Result<File> {
     })
 }
 
-/// Create `path` exclusively with `mode`, fill it, and fsync it.
+/// Create `path` exclusively with `mode`, fill it, fsync it, and close it.
 fn write_file(
     path: &Path,
     mode: u32,
     fill: impl FnOnce(&mut File) -> std::io::Result<()>,
-) -> std::io::Result<File> {
+) -> std::io::Result<()> {
     let mut file = create_new(path, mode)?;
-    fill_file(&mut file, fill)?;
-    Ok(file)
+    fill_file(&mut file, fill)
 }
 
 /// Fill a new file, and fsync it.
@@ -291,6 +285,62 @@ fn rename_temporary(temp: &Path, path: &Path) {
         Err(e) if absent(&e) => {}
         Err(e) => fatal("publish", path, e),
     }
+}
+
+/// Give the file at `from` the name `to` and remove the name `from`,
+/// unless `to` exists, with the errors of `renameat2` with
+/// `RENAME_NOREPLACE`: EEXIST if `to` exists, and ENOENT if `from` is gone.
+///
+/// Some filesystems reject that flag with EINVAL, as they do every rename
+/// flag: NFS, eCryptfs, Ceph, 9p, OpenZFS before 2.2, and FUSE servers
+/// without rename flags, such as sshfs before 3.7.7. On those,
+/// `rename_by_link` does the same with a hard link and an unlink.
+///
+/// `from` must be a name that no other process can create or give to
+/// another file (such as a fresh random `temporary_name()`, which other
+/// processes only ever remove). `renameat2` is one atomic call and has no
+/// gap, whereas `rename_by_link` calls `linkat` to give the file the name
+/// `to` and then unlinks `from`. If another process gave some other file
+/// the name `from` between those two calls, `rename_by_link` would remove
+/// that other file's name.
+///
+/// Callers should close `from` first where they can: when `rename_by_link`
+/// unlinks a file that a process on this host has open, NFS and FUSE
+/// filesystems such as sshfs rename it instead, to a hidden name that
+/// starts with `.nfs` or `.fuse_hidden`. That name disappears once no
+/// process on this host has the file open, but it stays behind if this
+/// host crashes.
+fn rename_noreplace(from: &Path, to: &Path) -> rustix::io::Result<()> {
+    let renamed = retry_on_intr(|| {
+        rustix::fs::renameat_with(
+            rustix::fs::CWD,
+            from,
+            rustix::fs::CWD,
+            to,
+            RenameFlags::NOREPLACE,
+        )
+    });
+    match renamed {
+        Err(Errno::INVAL) => rename_by_link(from, to),
+        result => result,
+    }
+}
+
+/// `rename_noreplace` with a hard link, for filesystems that reject
+/// `RENAME_NOREPLACE`. `linkat` gives the file the name `to` atomically,
+/// and only if `to` does not exist, with the same errors as `renameat2`
+/// with `RENAME_NOREPLACE`. `remove` then unlinks `from`: if another
+/// process already removed it, `remove` treats that as normal absence; on
+/// any other error it ends the run. Between those two calls, or if this
+/// process or the host crashes between them, the file has both names.
+/// Filesystems without hard links, such as vboxsf and OrangeFS, fail
+/// `linkat` with EPERM.
+fn rename_by_link(from: &Path, to: &Path) -> rustix::io::Result<()> {
+    retry_on_intr(|| {
+        rustix::fs::linkat(rustix::fs::CWD, from, rustix::fs::CWD, to, AtFlags::empty())
+    })?;
+    remove("remove", from);
+    Ok(())
 }
 
 /// The versioned wrapper of a stored list (DESIGN.md §5.6): the magic
@@ -513,15 +563,13 @@ impl ListFile {
             remove("remove", &moved);
             return;
         }
-        match retry_on_intr(|| {
-            rustix::fs::renameat_with(
-                rustix::fs::CWD,
-                &moved,
-                rustix::fs::CWD,
-                &self.path,
-                RenameFlags::NOREPLACE,
-            )
-        }) {
+        // This process still has the file open through `self.file`, and
+        // other processes may have it open too, so it cannot be closed
+        // first as `rename_noreplace` asks. On NFS or FUSE, the file can
+        // then keep a hidden name until no process on this host has it
+        // open, just as after the `remove` call above; `expire` removes
+        // any such name left behind if this host crashes.
+        match rename_noreplace(&moved, &self.path) {
             Ok(()) => {}
             // The list was published again meanwhile: the same content is
             // in place.
@@ -1200,6 +1248,33 @@ pub(crate) mod tests {
                 .collect();
             assert_eq!(names, vec![std::ffi::OsString::from("account-id")]);
         });
+    }
+
+    /// `rename_noreplace` gives a file a new name only if no file has that
+    /// name, with the errors of `renameat2`, and `rename_by_link` must
+    /// behave the same on filesystems without `RENAME_NOREPLACE`. The
+    /// temporary directory is usually on a filesystem with that flag, so
+    /// this test also calls `rename_by_link` directly; when `TMPDIR` is on
+    /// NFS or sshfs, `rename_noreplace` itself takes the fallback.
+    #[test]
+    fn renames_without_replacement_also_work_by_hard_link() {
+        let renames: [fn(&Path, &Path) -> rustix::io::Result<()>; 2] =
+            [rename_noreplace, rename_by_link];
+        for rename in renames {
+            let dir = tempfile::tempdir().unwrap();
+            let from = dir.path().join("from");
+            let to = dir.path().join("to");
+            std::fs::write(&from, b"new").unwrap();
+            std::fs::write(&to, b"old").unwrap();
+            assert_eq!(rename(&from, &to), Err(Errno::EXIST));
+            assert_eq!(names(dir.path()), ["from", "to"]);
+            assert_eq!(std::fs::read(&to).unwrap(), b"old");
+            std::fs::remove_file(&to).unwrap();
+            assert_eq!(rename(&from, &to), Ok(()));
+            assert_eq!(names(dir.path()), ["to"]);
+            assert_eq!(std::fs::read(&to).unwrap(), b"new");
+            assert_eq!(rename(&from, &to), Err(Errno::NOENT));
+        }
     }
 
     /// Failed runs leave temporaries next to the account ID and in the

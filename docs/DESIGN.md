@@ -918,9 +918,14 @@ Each UNIX account has one random 128-bit `account_id` in
 `$XDG_CACHE_HOME/hashsync/account-id` (fallback
 `~/.cache/hashsync/account-id`), which all its configuration files share.
 Initialize it durably with atomic no-replace publication; concurrent
-initializers use the winner's ID. Never overwrite an existing ID. INDEX and
-ADVERTISE exchange account IDs, and INDEX names the receiver's index ID;
-the sender needs no index for the exchange.
+initializers use the winner's ID. Never overwrite an existing ID. To
+rename a file without replacing an existing one, call `renameat2` with
+`RENAME_NOREPLACE`. On filesystems that reject that flag, such as NFS,
+create a hard link at the new name with `linkat` instead, and then unlink
+the old name. If a file already has the new name, `linkat` fails just as
+`renameat2` with `RENAME_NOREPLACE` does. INDEX and ADVERTISE exchange
+account IDs, and INDEX names the receiver's index ID; the sender needs no
+index for the exchange.
 
 Let `A` be the receiver account, `B` the sender account, and `I` the
 receiver index, encoded as fixed-width lowercase hex. Under
@@ -1093,12 +1098,14 @@ side removes a listed list only if its name still names the listed file,
 and nobody renewed the file since the listing: it moves the name to a new
 temporary name, compares the file there with its open file and with the
 modification time that the file had at the listing, removes it if both
-match, and moves it back otherwise. Keeping reuses the inode, so only the
-renewal tells a later run's target apart. A rename changes the ctime of
-the moved file on most filesystems, but not its modification time, so the
-comparison comes after the rename, once the name is the side's alone. A
-listed temporary belongs to an earlier run, or to a concurrent run with
-the same target, which then publishes nothing: normal absence.
+match, and moves it back otherwise. If another file has taken the name by
+then, that file holds the same list, and the side removes the moved one
+instead. Keeping reuses the inode, so only the renewal tells a later
+run's target apart. A rename changes the ctime of the moved file on most
+filesystems, but not its modification time, so the comparison comes after
+the rename, once the name is the side's alone. A listed temporary belongs
+to an earlier run, or to a concurrent run with the same target, which then
+publishes nothing: normal absence.
 
 The end of an exchange and expiry can remove the base of a concurrent
 exchange at any time. So each side reads its base once, through one open
