@@ -1,109 +1,77 @@
 # hashsync
 
-hashsync runs a command on another host over SSH, much like `ssh`, and
-deduplicates the command's output, its input, or both against the files
-that the receiving host already has: wherever the data contains a block of
-one of those files, hashsync sends a reference to the block instead of its
-contents. Everything else is compressed with zstd.
+**Drop-in SSH stream deduplication and compression against files the receiver already has.**
 
-hashsync finds these blocks at any offset of the stream, so it doesn't
-matter what format the stream is in, or which file the receiving host has
-the data in. This makes hashsync useful with tar, rsync,
-`nix-store --export` and similar tools whenever the receiving host already
-has most of the data, even if not in the same place: renamed or moved
-files, a rebuilt package, the backup of a similar machine, or an older
-version of a dump or a disk image.
+`hashsync` runs remote commands over SSH just like `ssh`, while transparently deduplicating the data flowing over the wire. Whenever a stream contains a block of data that already exists in an indexed file on the receiving host, `hashsync` sends a compact reference instead of the raw bytes—and compresses everything else with zstd.
+
+Because block matching is done at every byte offset of the stream, `hashsync` is completely agnostic to container formats, file paths, and alignment. Pair it with `tar`, `rsync`, `nix-store --export`, `pg_dump`, or raw disk images whenever the destination already holds overlapping data: moved or renamed files, rebuilt packages, sibling machine backups, or older versions of archives and VM images.
+
+`hashsync` is not a backup system and introduces no storage format of its own. Both ends see the exact same byte stream they would over plain `ssh`—only the traffic crossing the network changes.
+
+### At a glance
+
+Pulling `/srv/data/v2`—an updated version of `/srv/data/v1`—from `nas` over a 2 MiB/s link:[^1]
 
 ```console
-# Copy /srv/data/v2, a new version of /srv/data/v1, from the host nas.
-# Blocks that v1 already has are sent as references to it.
-
+# With hashsync: blocks already present anywhere in v1 travel as references.
 $ rsync -a --copy-dest=../v1 -e 'hashsync ssh' nas:/srv/data/v2/ /srv/data/v2/
 (...)
 hashsync: stdin -- 1000.21 KiB --> 998.97 KiB wire, pipe closed, 0 B dropped, 1000.21 KiB written (compressed)
 hashsync: stdout -- 2.34 GiB (458.11 MiB literal, 1.89 GiB -> 606.25 KiB refs, 0 B -> 0 B RLE, 0 false positives, 0 not found) + 1.09 MiB hashlist --> 414.96 MiB wire (deduplicated, compressed)
 hashsync: total -- sent 3.14 MiB and received 416.47 MiB in 242.5s (1.73 MiB/s), data shrinkage factor: 5.72, saved 1.93 GiB of data transfer
 
-# Without hashsync, rsync only reuses the files of v1 with the same name:
-
+# With plain rsync: only files sharing the same name in v1 are reused.
 $ rsync -az -hh --info=stats1 --copy-dest=../v1 nas:/srv/data/v2/ /srv/data/v2/
 sent 1000.17K bytes  received 2.12G bytes  1.89M bytes/sec
 total size is 5.25G  speedup is 2.47
 ```
 
-Over a 2 MiB/s link, the copy took 19 minutes with rsync alone but only 4
-minutes with hashsync.[^1]
+Over that 2 MiB/s link, plain `rsync` received **2.12 GB in 19 minutes**. With `hashsync`, it received **416 MiB in 4 minutes**—nearly five times faster.
 
-hashsync isn't a backup tool with a storage format of its own: the commands
-at both ends see exactly the bytes that they would see through `ssh`, and
-hashsync only changes what goes over the network.
+---
+
+## Key capabilities
+
+- **Familiar SSH interface.** `hashsync ssh host command` forwards standard input, streams back standard output and standard error, and exits with the remote command's status. It invokes your existing `ssh` binary, so `~/.ssh/config`, keys, and your SSH agent work out of the box.
+- **Pull, push, or bidirectional.** Out of the box, `hashsync ssh` deduplicates the remote command's stdout against the local index (pull). Pass `--dedup-stdin` to deduplicate your stdin against the remote index instead (push), or combine `--dedup-stdin --dedup-stdout` to deduplicate both directions.
+- **First-class `rsync` support.** Drop `hashsync ssh` straight into `rsync -e` for pulls, or `hashsync ssh --dedup-stdin` for pushes. Applying [`extras/rsync-3.5.2.patch`](extras/rsync-3.5.2.patch) to the sending `rsync` makes deduplication dramatically more effective (see [Backups with rsync](#backups-with-rsync)).
+- **Cryptographically exact reconstruction.** Every candidate block match is verified on the receiver with a cryptographic hash (BLAKE3 by default) before being emitted. Stale indexes, hash collisions, or files modified mid-transfer can only lower the dedup ratio—never corrupt the stream.
+- **Self-maintaining indexes.** `hashsync ssh` refreshes the receiver's index when a transfer starts and again right after the command exits, capturing newly written files (from `tar -x`, `rsync`, etc.) while they are still warm in the page cache. Unchanged files are skipped automatically, and *immutable* roots (like Nix store paths) are scanned only once.
+- **Zero-wait streaming & delta hash lists.** Data starts flowing immediately rather than blocking on the index update; deduplication ramps up as the hash list arrives. Add `--wait` when bandwidth matters more than startup latency and you want the full hash list loaded first. Both hosts cache hash lists so subsequent runs only exchange the diff.
+- **Multithreaded zstd compression.** Everything not replaced by a block reference is compressed with zstd (default level 9, long-distance matching enabled, one worker thread per CPU core).
+- **Single binary, no daemon.** There are no background services or ports to expose—`hashsync ssh` launches the same `hashsync` binary on the remote host over SSH. Need to talk to a server without a package? Copy over a single statically linked binary.
 
 ## How it works
 
-The host that receives a deduplicated stream, the *receiver*, keeps an
-*index* of the blocks (16 KiB by default) of the files in the directories
-(*roots*) that are listed in its configuration file. It sends the other host,
-the *sender*, its *hash list*: a short hash of each of its blocks. The
-sender computes a rolling hash at every offset of the stream and looks it
-up in the list. For each match, the receiver reads the block from its file
-and checks it against a strong hash of the data in the stream, and if it's
-the same, the sender sends a reference to the block instead of the data.
-The receiver then puts the original stream back together.
+Each deduplicated stream has a **receiver** (the host receiving the stream and holding the local files) and a **sender** (the host transmitting the stream):
 
-## Features
-
-- **Used like ssh.** `hashsync ssh host command` passes its standard input
-  to the command, copies the command's standard output and standard error
-  back, and exits with the command's exit status. It runs your `ssh`, so
-  your SSH configuration, keys and SSH agent apply as usual.
-- **Pull, push, or both.** By default, the command's output is
-  deduplicated against the files of the local host. With `--dedup-stdin`,
-  the standard input of `hashsync ssh` is deduplicated against the files of
-  the remote host instead, and with `--dedup-stdin --dedup-stdout`, both
-  are.
-- **Works with rsync.** `rsync -e 'hashsync ssh'` pulls with
-  deduplication, and `rsync -e 'hashsync ssh --dedup-stdin'` pushes with
-  it (deduplication is much more effective with
-  [`extras/rsync-3.5.2.patch`](extras/rsync-3.5.2.patch) applied to rsync).
-- **Always exact.** The receiver always checks block references with a
-  cryptographically strong hash function, so if the index is outdated or a
-  file is changed concurrently, this only results in less deduplication:
-  the output always matches the original stream byte for byte.
-- **Up-to-date index.** `hashsync ssh` updates the receiver's index before
-  the transfer, and again after the command, so that the next transfer can
-  be deduplicated against the files that were just written, for example by
-  `tar -x` or rsync. Updates don't read unchanged files again, and
-  *immutable* roots, such as Nix store paths, are indexed only once.
-- **Starts right away.** hashsync doesn't wait for the index update
-  before it sends the stream, and finds more blocks to deduplicate as the
-  hash list arrives. With `--wait`, it waits for the whole list instead,
-  so that it sends the fewest bytes. Both hosts cache hash lists, so
-  hashsync only sends what changed in the list since the last transfer.
-- **Compressed.** What isn't deduplicated is compressed with zstd: by
-  default at level 9, with long-distance matching and one thread per core.
-- **No daemon.** The server side is the same binary, which `hashsync ssh`
-  starts over SSH. There's no service or network port to set up, and a
-  statically linked build can be copied to hosts that don't have hashsync
-  installed.
+1. **Index blocks on the receiver.** The receiver maintains a RocksDB index of fixed-size, aligned blocks (16 KiB by default) across all regular files inside the directories (*roots*) listed in its configuration.
+2. **Share a compact hash list.** At transfer time, the receiver sends the sender a *hash list* containing a short 64-bit rolling hash for every indexed block (or just a delta against a previously cached list).
+3. **Scan the stream at every offset.** The sender slides a rolling hash byte-by-byte across the outgoing stream and probes the receiver's hash list.
+4. **Verify before referencing.** Whenever the sender sees a hit, it asks the receiver to verify the block against a full cryptographic hash of the stream window. The receiver reads the candidate block from disk, verifies the digest, and replies yes or no.
+5. **Reconstruct transparently.** On a confirmed match, the sender emits a tiny reference instead of the block's bytes. The receiver stitches the verified blocks and compressed literal chunks back into an exact copy of the original stream.
 
 ## Installation
 
-hashsync runs on Linux 5.8 or later, and needs to be installed on both
-hosts. On the server, `hashsync ssh` starts it through the remote shell,
-which finds it in its `PATH`, unless `--hashsync-path` says where it is.
+`hashsync` requires **Linux 5.8 or newer** and must be available on both the local and remote hosts. On the remote side, `hashsync ssh` invokes `hashsync` via the remote shell's `PATH` unless you point to it explicitly with `--hashsync-path`.
 
-With Nix, from a checkout of this repository:
+### With Nix
+
+From a checkout of this repository:
 
 ```sh
-$ nix-build          # builds result/bin/hashsync, and runs the tests
-$ nix-env -f . -i    # installs it, with its man page, into your profile
+# Build ./result/bin/hashsync and run the full test suite
+$ nix-build
+
+# Install hashsync (along with its man page and helper script) into your profile
+$ nix-env -f . -i
 ```
 
-On NixOS, you can add `(pkgs.callPackage /path/to/hashsync { })` to
-`environment.systemPackages` instead.
+On NixOS, add `(pkgs.callPackage /path/to/hashsync { })` to `environment.systemPackages`.
 
-A statically linked binary runs on any Linux host of its architecture, so
-you can copy it to a server without a hashsync package:
+#### Deploying a static binary to another Linux host
+
+Nix can produce a fully static musl binary that runs on any Linux machine of the same architecture—handy for servers where you don't want to install Nix or build from source:
 
 ```sh
 $ nix-build --arg pkgs '(import <nixpkgs> {}).pkgsStatic'
@@ -111,100 +79,73 @@ $ ssh nas mkdir -p bin && scp result/bin/hashsync nas:bin/
 $ rsync -a -e 'hashsync ssh --hashsync-path bin/hashsync' nas:/srv/data/ /srv/data/
 ```
 
-For a cross build, for example for 64-bit ARM, pass
-`--arg pkgs 'import <nixpkgs> { crossSystem = "aarch64-linux"; }'` to
-`nix-build`.
+#### Cross-compilation
 
-Without Nix, build hashsync with Cargo. This needs a recent stable Rust, C
-and C++ compilers for the bundled RocksDB, LZ4 and zstd, and libclang for
-RocksDB's bindings. RocksDB takes a while to build.
+To build for another architecture—for example, 64-bit ARM—pass `crossSystem` to `pkgs`:
+
+```sh
+$ nix-build --arg pkgs 'import <nixpkgs> { crossSystem = "aarch64-linux"; }'
+```
+
+### With Cargo
+
+If you aren't using Nix, build directly with Cargo. You will need a recent stable Rust toolchain, C and C++ compilers (for the bundled RocksDB, LZ4, and zstd libraries), and `libclang` (for generating RocksDB bindings). Compiling RocksDB takes a few minutes.
 
 ```sh
 $ cargo build --release --locked
 ```
 
-Then copy `target/release/hashsync` to a directory in your `PATH`, and
-`docs/hashsync.1` to a directory where `man` finds it, such as
-`/usr/local/share/man/man1`.
+Install `target/release/hashsync` somewhere in your `PATH`, and copy `docs/hashsync.1` to your man path (for instance, `/usr/local/share/man/man1`).
 
 ## Quick start
 
-On the host that receives the data, which for a pull is the local host,
-list the directories to index in `~/.config/hashsync/default.toml`:
+1. **Declare what to index.** On the *receiving* host (your local machine for pulls), create `~/.config/hashsync/default.toml` listing the directories you want `hashsync` to deduplicate against:
 
-```toml
-[[roots]]
-path = "/srv/data"
-```
+   ```toml
+   [[roots]]
+   path = "/srv/data"
+   ```
 
-Then build the index, and look at what it holds. `hashsync ssh` would
-build it too, but the first update of a large tree takes a while, and
-until it's done, hashsync has little to deduplicate against.
+2. **Build the initial index.** While `hashsync ssh` updates the index automatically, running `hashsync update` once upfront avoids starting your first transfer against an empty index on a large tree (which could take a while to complete):
 
-```sh
-$ hashsync update
-$ hashsync stats
-```
+   ```sh
+   $ hashsync update
+   $ hashsync stats
+   ```
 
-hashsync now deduplicates the pull at the top of this page against
-`/srv/data`. At the end, `hashsync ssh` prints a summary of what each
-stream read, sent and deduplicated, and of the total traffic; `-q` leaves
-out the summary and the other notes.
+3. **Run a transfer.** With `/srv/data` indexed, commands like the `rsync` pull at the top of this page automatically deduplicate against it. When a run finishes, `hashsync ssh` prints a breakdown of literal bytes, deduplicated references, wire traffic, and overall shrinkage (pass `-q` to silence notes and summaries).
 
-If little was deduplicated, hashsync may have sent much of the stream
-before the hash list arrived, which happens on a fast network or when the
-receiver's update takes a while. With `--wait`, it waits for the whole
-list first.
+> **Tip:** If a transfer deduplicates much less than expected, the stream may have outpaced the initial index update or hash-list transfer—common on fast networks or after many local file changes. Pass `--wait` to hold the stream until the complete hash list is ready.
 
-## Examples
+## Usage recipes
 
-### Copying directories with tar
+### Syncing directories with `tar`
 
-Pull a directory from `nas` over an older local copy, deduplicated against
-the local index. `-n` gives the remote tar an empty standard input, like
-`ssh -n`, so that hashsync doesn't read your terminal:
+Pull a directory tree from `nas` into a local copy that is already indexed. Passing `-n` (like `ssh -n`) gives the remote command an empty stdin so `hashsync` won't read from your terminal:
 
 ```sh
 $ hashsync ssh -n nas tar -C /srv/data -cf - . | tar -C /srv/data -xf -
 ```
 
-Push it the other way, deduplicated against the index of `nas`, whose own
-`~/.config/hashsync/default.toml` lists `/srv/data`:
+Push the other direction, deduplicating against the index configured in `~/.config/hashsync/default.toml` on `nas`:
 
 ```sh
 $ tar -C /srv/data -cf - . | hashsync ssh --dedup-stdin nas tar -C /srv/data -xf -
 ```
 
-Since tar never waits for a reply, it's safe to add `--batch-stdout` to
-the pull, or `--batch-stdin` to the push. hashsync then sends the data in
-full buffers rather than as soon as it's available, so that it can
-deduplicate and compress it better. Don't compress the archive (`tar -z`,
-`-J`, `--zstd`): hashsync can't deduplicate compressed data, and it
-compresses the stream anyway. Also, unlike rsync, tar doesn't delete the
-files that are gone from the source.
+Because `tar` is unidirectional and never waits for responses, you can safely add `--batch-stdout` on pulls or `--batch-stdin` on pushes. Batch mode flushes only full buffers instead of every idle pause, improving both deduplication and compression ratios. Avoid compressing the archive yourself (`tar -z`, `-J`, `--zstd`): compressed streams can't be deduplicated, and `hashsync` already compresses the wire traffic. Note also that unlike `rsync`, `tar` does not delete files removed from the source.
 
-### Backups with rsync
+### Backups with `rsync`
 
-For its delta transfer, rsync compares each file only with the file of
-the same name on the receiving side, or with a few others when you give it
-options such as `--fuzzy` or `--copy-dest`. With hashsync as its remote
-shell, the transfer is also deduplicated against every file in the
-receiving host's index, so renamed, moved and copied files, and files that
-another backup already has, cost little.
+Standard `rsync` delta transfers only compare each file against a same-named file on the destination (or a narrow set of candidates with `--fuzzy` / `--copy-dest`). Using `hashsync` as `rsync`'s remote shell extends deduplication across *every* file in the receiver's index—so renamed files, moved directories, duplicated assets, and content already stored in another machine's backup transfer almost for free.
 
-**Patch rsync.** rsync sends the file data that the receiving side lacks
-in pieces of at most 32 KiB, each preceded by its length. hashsync can't
-match a block that one of these lengths splits, so with the default
-16 KiB blocks, it can miss up to half of the blocks.
-[`extras/rsync-3.5.2.patch`](extras/rsync-3.5.2.patch) raises the limit to
-8 MiB. Only the rsync that sends the files needs it: the remote one in a
-pull and the local one in a push. It works with an unpatched rsync on the
-other side. So in a backup, use the patched rsync on the machine being
-backed up.
+#### Patching `rsync` for much better deduplication
 
-Apply the patch with `patch -p1` in the source directory of rsync 3.5.2,
-then build rsync as usual. With Nix, for example in
-`environment.systemPackages`:
+By default, `rsync` transmits missing literal file data in chunks of at most 32 KiB, inserting a length header before each chunk. Any 16 KiB block straddling one of those headers cannot match on the wire, which can cost up to half of all deduplicable blocks.
+
+[`extras/rsync-3.5.2.patch`](extras/rsync-3.5.2.patch) raises that literal chunk cap to 8 MiB. It is backwards compatible with stock `rsync`, and **only the sending side needs the patch** (the remote host when pulling; the local host when pushing)—meaning for backups, install the patched `rsync` on the machine being backed up.
+
+Apply it in an `rsync` 3.5.2 source tree with `patch -p1` and build normally, or override `pkgs.rsync` in Nix:
 
 ```nix
 (pkgs.rsync.overrideAttrs (old: {
@@ -212,137 +153,104 @@ then build rsync as usual. With Nix, for example in
 }))
 ```
 
-**Choose the options.** Pass `--delete-delay` to rsync, so that it
-deletes files only after the transfer, and the files about to be deleted,
-such as the old names of renamed files, can still be used for
-deduplication. Don't use rsync's `-z`, which compresses the data before
-hashsync sees it, or hashsync's `--batch-stdin` and `--batch-stdout`, with
-which rsync would wait forever.
+#### Recommended flags & scheduling
 
-**Schedule the backups.** To back up every night, add the rsync command
-to the crontab of the host that runs it, with `hashsync` and `rsync` in
-cron's `PATH`. The crontab lines below pass `-q` and `--wait` to hashsync:
-`-q` keeps it quiet unless something goes wrong, and with `--wait`, it
-holds back the data until the backup server has updated its index and
-sent its hash list. The backup then takes longer, but hashsync sends the
-fewest bytes. Run backups that use the same index one after another: if
-they run at the same time, each `hashsync ssh` has to wait for the others
-before it can update the index, and deduplicates less in the meantime
-(unless `--wait` is used).
+- **Use `rsync --delete-delay`:** Defers deletions until after the transfer finishes, keeping old files (such as pre-rename paths) on disk so `hashsync` can still reference their blocks.
+- **Skip `rsync -z`:** Pre-compressing the stream defeats deduplication; `hashsync` handles compression itself.
+- **Do not use `hashsync --batch-stdin` or `hashsync --batch-stdout`:** `rsync` is interactive and will deadlock if either direction buffers indefinitely.
+- **In cron jobs, use `-q --wait`:** `-q` keeps cron mail quiet unless errors occur, and `--wait` guarantees minimum network data usage by waiting for the complete hash list before sending data.
+- **Stagger backups sharing an index:** Concurrent `hashsync ssh` runs targeting the same index contend for its exclusive update lock, reducing deduplication while waiting (or pausing under `--wait`). Run them sequentially, or separate them into distinct profiles.
 
-#### Pushing backups
+#### Pushing backups (`laptop` → `nas`)
 
-The backup server, here `nas`, receives the backups, so it has the index.
-On `nas`, list the backup directory in `~/.config/hashsync/default.toml`:
+Since `nas` receives the backup stream, `nas` owns the index. Configure `~/.config/hashsync/default.toml` on `nas`:
 
 ```toml
 [[roots]]
 path = "/backup"
 ```
 
-Back up the local machine, here `laptop`, to the `nas` server, with rsync
-running on `laptop`:
+Push from `laptop`:
 
 ```console
 laptop$ rsync -a --delete-delay -e 'hashsync ssh --dedup-stdin' /home/alice/ nas:/backup/laptop/
 ```
 
-To back up `laptop` every night, add this line to its crontab:
+Nightly crontab entry on `laptop` (ensure `hashsync` and `rsync` are on cron's `PATH`):
 
-```
+```cron
 0 3 * * *  rsync -a --delete-delay -e 'hashsync ssh -q --wait --dedup-stdin' /home/alice/ nas:/backup/laptop/
 ```
 
-#### Pulling backups
+#### Pulling backups (`nas` ← `laptop`)
 
-The backup server, here `nas`, receives the backups, so it has the index.
-On `nas`, list the backup directory in `~/.config/hashsync/default.toml`:
+Again, `nas` receives the stream and maintains `/backup` in `~/.config/hashsync/default.toml`:
 
 ```toml
 [[roots]]
 path = "/backup"
 ```
 
-Run rsync on the `nas` server to pull the data of `laptop` into the
-backup:
+Pull from `laptop` by running `rsync` on `nas`:
 
 ```console
 nas$ rsync -a --delete-delay -e 'hashsync ssh' laptop:/home/alice/ /backup/laptop/
 ```
 
-To back up `laptop` every night, add this line to the crontab of `nas`:
+Nightly crontab entry on `nas`:
 
-```
+```cron
 0 3 * * *  rsync -a --delete-delay -e 'hashsync ssh -q --wait' laptop:/home/alice/ /backup/laptop/
 ```
 
-In a pull, the machine being backed up learns a hash of every block in the
-backup server's index (see [Security](#security)). If it shouldn't learn
-anything about the other backups, give it a profile of its own, such as
-`~/.config/hashsync/laptop.toml` with `/backup/laptop` as its only root,
-and pull with `rsync -e 'hashsync ssh --profile laptop'`.
+> **Privacy note for pulled backups:** When pulling, the remote host receives hashes of every block in the receiver's index (see [Security](#security)). If `laptop` shouldn't learn anything about other machines backed up under `/backup`, give it an isolated profile—e.g. `~/.config/hashsync/laptop.toml` indexing only `/backup/laptop`—and pull with `rsync -e 'hashsync ssh --profile laptop'`.
 
 ### Copying Nix closures
 
-[`extras/hashsync-copy-closure.sh`](extras/hashsync-copy-closure.sh)
-copies the closures of Nix store paths from one host to another, like
-`nix-copy-closure`. It copies only the store paths that the destination
-doesn't have, and of those, hashsync sends only the blocks that the
-destination doesn't already have in its Nix store. A rebuilt package gets
-a new store path, but much of its contents is often the same as in the old
-one, which hashsync then sends as references. The Nix package installs the
-script as `hashsync-copy-closure`.
+[`extras/hashsync-copy-closure.sh`](extras/hashsync-copy-closure.sh) (installed on `PATH` as `hashsync-copy-closure` by the Nix package) works like `nix-copy-closure`, transferring only store paths missing on the destination—and deduplicating their contents against everything already in the destination's `/nix/store`. Rebuilt derivations get fresh store paths, yet often share large portions of their binaries and assets with previous builds, which `hashsync` sends as references.
 
-Both hosts need Nix and hashsync, with `nix-store` and `hashsync` in the
-`PATH` of SSH commands. On the destination, the Nix daemon must trust the
-user (root, or a user in `trusted-users` in `nix.conf`), because the paths
-arrive without signatures, as with `nix-copy-closure`. The script uses a
-separate hashsync profile named `nix`, which on the destination must index
-the store, for example with this `~/.config/hashsync/nix.toml`:
+**Prerequisites:**
 
-```toml
-[[roots]]
-path = "/nix/store/*"
-immutable = true
-exclude = [".links"]
-may_vanish = true
-```
+- Both hosts need `nix-store` and `hashsync` in the default SSH `PATH`.
+- Just like `nix-copy-closure`, the destination Nix daemon must trust the SSH user (`root` or listed in `trusted-users` in `nix.conf`), since closures arrive unsigned.
+- The script uses a dedicated profile called `nix`. On the **destination**, create `~/.config/hashsync/nix.toml`:
 
-Each store path is a root that never changes, so it's indexed only once.
-`.links` only holds extra hard links to the files of store paths, so it's
-left out, and with `may_vanish`, hashsync doesn't warn when the garbage
-collector removes a store path during an update. Build the index once
-with `hashsync update --profile nix`; after that, hashsync updates it
-during each copy.
+  ```toml
+  [[roots]]
+  path = "/nix/store/*"
+  immutable = true
+  exclude = [".links"]
+  may_vanish = true
+  ```
+
+  Each store path becomes its own immutable root, indexed once and never rescanned. `.links` is excluded because it only duplicates hard links to existing store files, and `may_vanish = true` silences warnings if Nix garbage collection deletes a store path mid-update.
+
+Build the index once with `hashsync update --profile nix`; transfers will keep it current from then on.
 
 ```sh
-# Push the closure of ./result to the host server.
+# Push the closure of ./result to server
 $ extras/hashsync-copy-closure.sh --to server ./result
 
-# Pull the closure of a store path from the host builder.
+# Pull a store path closure from builder
 $ extras/hashsync-copy-closure.sh --from builder /nix/store/...-myapp-1.0
 
-# Copy it from builder to server: server pulls it, with your SSH agent.
+# Copy directly from builder to server (server pulls using your forwarded SSH agent)
 $ extras/hashsync-copy-closure.sh --from builder --to server /nix/store/...-myapp-1.0
 ```
 
-In the last form, `builder` must accept a key from your SSH agent, and
-`server` must already know the host key of `builder`, since that login has
-no terminal to ask on.
+For host-to-host copies (`--from` and `--to` together), `builder` must accept a key loaded in your SSH agent and `server` must already have `builder`'s host key in its `known_hosts` (there is no interactive TTY to confirm new host keys).
 
-### Files and dumps
+### Disk images and database dumps
 
 ```sh
-# Pull a new version of a disk image next to the old one, which the local
-# index covers, then replace it. A redirection to vm.img itself would empty
-# it before hashsync could use it.
+# Pull an updated VM image alongside the existing indexed copy, then swap it in.
+# Redirecting directly to vm.img would truncate it before hashsync can read its blocks.
 $ hashsync ssh -n nas cat /srv/images/vm.img > vm.img.new && mv vm.img.new vm.img
 
-# Push it, deduplicated against the old version on nas.
+# Push a VM image deduplicated against the previous copy on nas.
 $ hashsync ssh --dedup-stdin nas 'cat > /srv/images/vm.img.new && mv /srv/images/vm.img.new /srv/images/vm.img' < vm.img
 
-# Keep a database dump of every day, each deduplicated against the earlier
-# ones, with /backup/dumps in the local index.
+# Stream daily PostgreSQL dumps deduplicated against earlier dumps under /backup/dumps.
 $ hashsync ssh -n db pg_dump mydb > /backup/dumps/mydb-$(date +%F).sql
 ```
 
@@ -350,153 +258,111 @@ $ hashsync ssh -n db pg_dump mydb > /backup/dumps/mydb-$(date +%F).sql
 
 ### Commands
 
-| Command | Description |
+| Command | Purpose |
 |---|---|
-| `hashsync ssh [options] [user@]host command [arg ...]` | Run `command` on `host`, deduplicating its output or, with `--dedup-stdin`, its input |
-| `hashsync update` | Create the index, or bring it up to date |
-| `hashsync stats` | Show statistics about the index |
-| `hashsync prune` | Remove from the index the files and roots that are gone or no longer configured, without hashing anything, then compact it |
-| `hashsync compact` | Compact the index |
-| `hashsync bench` | Measure how fast this host hashes and inspects a data stream for blocks to deduplicate |
+| `hashsync ssh [options] [user@]host command [arg ...]` | Execute `command` over SSH, deduplicating stdout (default), stdin (`--dedup-stdin`), or both |
+| `hashsync update` | Create the index or bring it up to date |
+| `hashsync stats` | Display statistics for the current index |
+| `hashsync prune` | Drop missing or unconfigured roots and files without hashing, then compact |
+| `hashsync compact` | Rewrite the RocksDB index files to reclaim deleted space |
+| `hashsync bench` | Benchmark local hashing and stream-scanning throughput |
 
-`--profile NAME` selects the profile `NAME`, with the configuration file
-`~/.config/hashsync/NAME.toml` and an index of its own, instead of the
-profile `default`. `--config PATH` selects a configuration file anywhere.
-`-q` prints only warnings and errors.
+**Global flags** (accepted before or after the subcommand):
 
-### Options of hashsync ssh
+- `--profile NAME` — Use `~/.config/hashsync/NAME.toml` and its own dedicated index instead of `default`.
+- `--config PATH` — Use a configuration file at an explicit path.
+- `-q` / `--quiet` — Suppress progress notes and summaries; show only warnings and errors.
 
-| Option | Description |
+### Common `hashsync ssh` options
+
+| Option | Effect |
 |---|---|
-| `--dedup-stdin` | Deduplicate the standard input of `hashsync ssh`, which it sends to the command, against the server's index, instead of the command's output against the client's |
-| `--dedup-stdout` | With `--dedup-stdin`, deduplicate the command's output as well |
-| `-n` | Give the command an empty standard input, like `ssh -n` |
-| `-l user` | Log in as `user` |
-| `-s` | Run the command and its arguments without the remote shell |
-| `--batch-stdin`, `--batch-stdout` | Send the stream in full buffers, to deduplicate and compress it better; programs that wait for replies, such as rsync, then hang |
-| `--wait` | Wait for the receiver's whole hash list before sending the stream |
-| `--no-update` | Leave the indexes as they are, letting several `hashsync ssh` commands that use the same index run at the same time without waiting for each other to update it |
-| `--compact` | Compact each index after the command |
-| `--compression-level N` | zstd level from 1 to 19, or 0 to disable compression; 9 by default |
-| `--server-profile NAME`, `--server-config PATH` | The configuration file on the server |
-| `--hashsync-path PATH` | hashsync on the server, if it isn't in the `PATH` there |
-| `--ssh COMMAND` | The SSH command, `ssh` by default |
+| `--dedup-stdin` | Deduplicate stdin against the remote index instead of stdout against the local index |
+| `--dedup-stdout` | Combine with `--dedup-stdin` to deduplicate both streams |
+| `-n` | Feed an empty stdin to the remote command (equivalent to `ssh -n`) |
+| `-l user` | Specify the remote SSH login user |
+| `-s` | Execute the remote command directly (`argv`) without invoking a remote shell |
+| `--batch-stdin`, `--batch-stdout` | Flush streams only on full buffers rather than idle pauses, improving dedup and compression (incompatible with interactive tools like `rsync`) |
+| `--wait` | Hold stream transmission until the receiver's complete hash list has arrived |
+| `--no-update` | Skip pre- and post-transfer index updates; allows multiple concurrent runs to share a read-only index |
+| `--compact` | Compact updated indexes after the command completes |
+| `--compression-level N` | Set zstd compression level (`1`–`19`, or `0` to disable; default `9`) |
+| `--server-profile NAME`, `--server-config PATH` | Select a non-default profile or config file on the remote host |
+| `--hashsync-path PATH` | Path to the remote `hashsync` executable when not in remote `PATH` |
+| `--ssh COMMAND` | Override the SSH command (default `ssh`) |
 
-[The man page](docs/hashsync.adoc) describes the others.
+See the [full man page](docs/hashsync.adoc) for every command, flag, and configuration key.
 
 ### Configuration
 
-```toml
-# ~/.config/hashsync/default.toml. Every key is optional; these are the
-# ones you're most likely to need.
+All settings in `~/.config/hashsync/default.toml` are optional. Here is a typical starting configuration:
 
-# Size of the indexed blocks. With smaller blocks, hashsync finds more
-# matches, and with larger ones, the index and the hash list are smaller.
-# Changing it rebuilds the index.
+```toml
+# Indexed block size (default: "16KiB"). Smaller blocks match more data;
+# larger blocks shrink the index and hash list. Changing this rebuilds the index.
 block_size = "16KiB"
 
 [[roots]]
-path = "/srv/data"             # a directory, a file, or a glob pattern
-exclude = ["*.tmp", ".cache"]  # names, or absolute paths if they start with /
-one_filesystem = true          # leave out other filesystems mounted inside
+path = "/srv/data"             # directory, single file, or glob pattern
+exclude = ["*.tmp", ".cache"]  # basename patterns, or absolute paths if starting with /
+one_filesystem = true          # do not cross mount boundaries
 
 [[roots]]
-path = "/srv/photos/*"         # each match is a root of its own
-immutable = true               # never changes: index it once, don't scan it again
+path = "/srv/photos/*"         # each glob match becomes an independent root
+immutable = true               # content never changes: index once, skip future rescans
 ```
 
-Data sets that share no content and are transferred separately, such as a
-Nix store and a photo collection, are best kept in separate profiles:
-their updates are faster, their hash lists are smaller, and `hashsync ssh`
-commands that use one don't wait for those that use the other.
+**Separate unrelated datasets into separate profiles.** If two trees share no content and are synced independently (such as `/nix/store` and a photo archive), giving each its own profile speeds up index updates, keeps hash lists compact, and eliminates lock contention between transfers.
 
-### Index maintenance
+### Maintaining the index
 
-`hashsync ssh` keeps the receiver's index up to date, but you can also run
-`hashsync update` yourself, for example from cron, so that `hashsync ssh`
-has little left to update. Updates also remove from the index the files
-that are gone, and `hashsync prune` removes them without hashing anything,
-then compacts the index. To shrink the index after an update has removed a
-lot, run `hashsync compact`, or pass `--compact` to `update` or `ssh`.
+`hashsync ssh` updates the receiver's index automatically, so no index maintenance is needed.
 
-## Things to know
+That said, if you want you can schedule `hashsync update` periodically (e.g., via cron) to make transfers start up faster, since the less new data there is to index, the quicker the index updates when a transfer starts. Routine updates already drop deleted files. However, you can also use `hashsync prune` to clean up vanished paths without hashing anything new, and `hashsync compact` (or `--compact` with `update` / `ssh`) to reclaim disk space after heavy churn.
 
-- Only complete blocks are indexed, so files smaller than a block
-  (16 KiB by default) don't help.
-- Compressed or encrypted data can't be deduplicated. Send data through
-  hashsync uncompressed, and let it compress the stream.
-- Commands that modify an index, such as `hashsync update`, wait until no
-  other command uses it. `hashsync ssh` modifies the index when it updates
-  it, so if you start one while another uses the same index, the new one
-  sends its stream without deduplication until it can update the index.
-  With `--wait`, it waits instead. With `--no-update`, any number of them
-  can share an index.
-- For the same reason, don't run a command that updates an index inside a
-  `hashsync ssh` that uses the same index:
-  `hashsync ssh --dedup-stdin nas 'hashsync update; tar -xf -'` never
-  finishes, because the update waits for `hashsync ssh`, and
-  `hashsync ssh` waits for tar to read all of its input.
-- Each `hashsync ssh` opens two SSH sessions to the server, so use SSH keys
-  and an SSH agent rather than typing a password twice. Sharing one SSH
-  connection between sessions (`ControlMaster`) works, but slows down
-  deduplicated streams; `--ssh 'ssh -S none'` turns it off.
-- The streams are buffered in temporary files on both hosts, up to 2 GiB
-  per stream and host by default (`--spool-limit`), in
-  `~/.cache/hashsync/tmp-data` (the `tmp_data_dir` setting). Keep that
-  directory on a local disk, not on tmpfs.
+## Good to know
+
+- **Small files are ignored.** Only complete blocks are indexed, so files smaller than `block_size` (16 KiB by default) cannot contribute matches.
+- **Send uncompressed, unencrypted data.** Pre-compressed or encrypted payloads destroy block similarity. Pass raw streams into `hashsync` and let its built-in zstd compression handle the wire encoding.
+- **Index locking and concurrency.** Modifying operations (`update`, `prune`, `compact`, and the pre-/post-transfer updates of `hashsync ssh`) require an exclusive lock on the index. If a second `hashsync ssh` starts against the same index while it is busy, the new run streams without deduplication (though still compressed) until it acquires the lock—or pauses if `--wait` is set. Pass `--no-update` whenever you want multiple concurrent transfers sharing one index read-only.
+- **Avoid recursive index deadlocks.** Never invoke an index-modifying `hashsync` command inside the remote command of a `hashsync ssh` session that uses the same index. For example, `hashsync ssh --dedup-stdin nas 'hashsync update; tar -xf -'` will deadlock: `hashsync update` waits for the session to finish using the index, while the session waits for `tar` to consume stdin.
+- **Two SSH sessions per transfer.** Every `hashsync ssh` run opens both a data session and a control session. Configure SSH keys and an agent so you aren't prompted for a password twice. OpenSSH connection multiplexing (`ControlMaster`) works, but slows down deduplicated streams because verification round trips queue behind bulk stream data; disable it per call with `--ssh 'ssh -S none'`.
+- **Temporary spooling space.** Streams spool through unlinked temporary files in `~/.cache/hashsync/tmp-data` (configurable via `tmp_data_dir`), capped at 2 GiB per stream per host by default (`--spool-limit`). Keep `tmp_data_dir` on a local disk rather than `tmpfs` so streaming buffering doesn't consume RAM.
 
 ## Security
 
-The sender of a deduplicated stream learns a hash of every block in the
-receiver's index, and can test whether the receiver has a block with given
-contents. In a push, the client learns nothing that it couldn't read
-through its SSH login anyway. In a pull, though, the server learns about
-the client's files, so only pull from servers that you trust, or with a
-profile that indexes only what the server may know about. Even a trusted
-server keeps the client's hash list in its cache after a pull, where
-anyone who later gets into the server can read it; `--no-sender-cache`
-asks the server not to keep it.
+To match blocks on the wire, the sender receives a hash of every block in the receiver's index and can test whether the receiver holds any chosen block of data:
+
+- **Pushing (`--dedup-stdin`):** The local client only learns about files on a server it already has SSH access to, so there is no additional exposure.
+- **Pulling (default):** The *remote server* learns about blocks present on your local machine. Only pull from servers you trust—or point `--profile` at a narrowly scoped index containing only data that the server is permitted to know about.
+- **Cached hash lists:** By default, the sender caches received hash lists on disk to speed up future transfers. If a trusted server is later compromised, those cached lists remain readable there. Pass `--no-sender-cache` to instruct the server not to store your hash list (note that this only applies to honest servers; an untrusted server still receives the hashes during the transfer and can ignore the flag).
 
 ## Documentation
 
-- [The man page](docs/hashsync.adoc), `docs/hashsync.1`, describes every
-  command, option and configuration key: `man hashsync` once hashsync is
-  installed, or `man -l docs/hashsync.1` in a checkout.
-  `docs/hashsync.adoc` has the same contents, for reading on the web.
-- [`docs/DESIGN.md`](docs/DESIGN.md) describes the design and the protocol
-  in detail, with the alternatives that were considered.
-- [`docs/PLAN.md`](docs/PLAN.md) is the implementation plan, with its
-  status.
+- **Man page:** Run `man hashsync` after installation or `man -l docs/hashsync.1` from a checkout for a complete reference to every command, option, and config key. A web-readable version is available at [`docs/hashsync.adoc`](docs/hashsync.adoc).
+- **Architecture & protocol:** [`docs/DESIGN.md`](docs/DESIGN.md) documents the internal design, wire protocol, locking rules, and design trade-offs in depth.
+- **Implementation status:** [`docs/PLAN.md`](docs/PLAN.md) tracks the implementation roadmap and current status.
 
 ## Development
 
-hashsync is developed at <https://github.com/someplaceguy/hashsync>.
+Source repository: <https://github.com/someplaceguy/hashsync>
 
-`./shell.sh` enters a development shell with everything needed to build
-and test hashsync, and `./shell.sh cargo test` runs the tests in it.
-`nix-build` builds the package, runs the tests, and checks the installed
-result. When you change a command, an option or a configuration key,
-change the man page with it: the tests check that it documents each of
-them, and they regenerate `docs/hashsync.adoc` from it.
+Enter a ready-to-use development shell or run tests directly through `./shell.sh`:
+
+```sh
+$ ./shell.sh                # open an interactive dev shell
+$ ./shell.sh cargo test     # run the test suite
+$ nix-build                 # full package build, tests, and install checks
+```
+
+Whenever you add, rename, or remove a command, option, or configuration key, update `docs/hashsync.1` alongside it. The test suite verifies complete 1-to-1 coverage in the man page and automatically regenerates `docs/hashsync.adoc` when it changes.
 
 ## License
 
-Copyright 2026 Ricardo Correia
+Copyright 2026 Ricardo Correia.
 
-hashsync is licensed under the GNU General Public License, version 3 or
-any later version; see [`COPYING`](COPYING). Its binaries also contain
-third-party code under other licenses, which
-[`THIRD-PARTY-NOTICES`](THIRD-PARTY-NOTICES) lists.
+`hashsync` is licensed under the GNU General Public License, version 3 or later; see [`COPYING`](COPYING). Compiled binaries bundle third-party libraries whose licenses are collected in [`THIRD-PARTY-NOTICES`](THIRD-PARTY-NOTICES).
 
-[`extras/hashsync-copy-closure.sh`](extras/hashsync-copy-closure.sh) is
-licensed under the Apache License 2.0 instead, so that you can adapt it
-freely; see [`extras/LICENSE-Apache-2.0`](extras/LICENSE-Apache-2.0).
+[`extras/hashsync-copy-closure.sh`](extras/hashsync-copy-closure.sh) is separately licensed under the Apache License 2.0 so you can modify and embed it freely; see [`extras/LICENSE-Apache-2.0`](extras/LICENSE-Apache-2.0).
 
-[^1]: v1 and v2 were the
-    [GPT-2 repository](https://huggingface.co/openai-community/gpt2) on
-    Hugging Face as of 2021-05-19 and 2024-02-19; v2 adds a safetensors
-    file and three ONNX files with the same weights as the older files.
-    Both hosts ran on one VM (24 vCPUs of an AMD Ryzen AI 9 HX 370, 16 GiB
-    of RAM), with hashsync 1.0.0, OpenSSH and rsync 3.5.1 patched with
-    [`extras/rsync-3.5.1.patch`](https://github.com/someplaceguy/hashsync/blob/v1.0.0/extras/rsync-3.5.1.patch),
-    over a link limited to 2 MiB/s in each direction.
+[^1]: Measured using the [GPT-2 repository](https://huggingface.co/openai-community/gpt2) on Hugging Face from 2021-05-19 (`v1`) and 2024-02-19 (`v2`), where `v2` adds a safetensors file and three ONNX files sharing weights with earlier checkpoints. Both endpoints ran on a single VM (24 vCPUs on an AMD Ryzen AI 9 HX 370, 16 GiB RAM) using `hashsync` 1.0.0, OpenSSH, and `rsync` 3.5.1 patched with [`extras/rsync-3.5.1.patch`](https://github.com/someplaceguy/hashsync/blob/v1.0.0/extras/rsync-3.5.1.patch), throttled to 2 MiB/s in each direction.
